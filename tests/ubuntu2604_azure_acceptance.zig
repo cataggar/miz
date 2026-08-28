@@ -593,9 +593,7 @@ const Result = struct {
 const max_output_bytes: usize = 1024 * 1024;
 
 fn toolPath(allocator: Allocator) ![]u8 {
-    const root = try source.rootAlloc(allocator);
-    defer allocator.free(root);
-    return std.fs.path.join(allocator, &.{ root, "zig-out/bin/ubuntu2604_release" });
+    return source.releaseToolAlloc(allocator);
 }
 
 /// Runs `argv` from the repository root with `environment` layered over the
@@ -781,10 +779,12 @@ const Harness = struct {
             .{key},
         );
         defer std.testing.allocator.free(key_variable);
+        const tool = try source.releaseToolAlloc(std.testing.allocator);
+        defer std.testing.allocator.free(tool);
         const tool_variable = try std.fmt.allocPrint(
             std.testing.allocator,
-            "UBUNTU2604_RELEASE_TOOL={s}/zig-out/bin/ubuntu2604_release",
-            .{repository},
+            "UBUNTU2604_RELEASE_TOOL={s}",
+            .{tool},
         );
         defer std.testing.allocator.free(tool_variable);
 

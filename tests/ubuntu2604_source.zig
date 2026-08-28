@@ -35,6 +35,42 @@ pub fn rootAlloc(allocator: Allocator) ![]u8 {
     };
 }
 
+/// The release binary the harness guards execute.
+///
+/// `build.zig` declares the installed artifact as a dependency of these tests
+/// and names it through `MIZ_UBUNTU2604_RELEASE_TOOL`, so a clean tree builds
+/// and installs the tool before the first guard runs. A direct `zig test`
+/// invocation without that variable falls back to the default install prefix.
+/// Either way an absent binary is reported as a missing build dependency
+/// rather than as a command that failed to produce output.
+pub fn releaseToolAlloc(allocator: Allocator) ![]u8 {
+    const declared = std.testing.environ.getAlloc(
+        allocator,
+        "MIZ_UBUNTU2604_RELEASE_TOOL",
+    ) catch |err| switch (err) {
+        error.EnvironmentVariableMissing => null,
+        else => return err,
+    };
+    const tool = declared orelse tool: {
+        const root = try rootAlloc(allocator);
+        defer allocator.free(root);
+        break :tool try std.fs.path.join(
+            allocator,
+            &.{ root, "zig-out", "bin", "ubuntu2604_release" },
+        );
+    };
+    errdefer allocator.free(tool);
+    _ = Dir.cwd().statFile(std.testing.io, tool, .{}) catch {
+        std.debug.print(
+            "{s}: release tool is not installed; " ++
+                "these guards depend on the ubuntu2604_release artifact\n",
+            .{tool},
+        );
+        return error.ReleaseToolMissing;
+    };
+    return tool;
+}
+
 /// Reads a repository-relative file. Caller owns the result.
 pub fn readAlloc(allocator: Allocator, relative: []const u8) ![]u8 {
     const root = try rootAlloc(allocator);

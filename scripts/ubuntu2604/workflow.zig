@@ -2143,11 +2143,16 @@ const Expected = struct {
         self.* = undefined;
     }
 
-    fn find(self: *const Expected, name: []const u8) ?Entry {
-        for (self.entries.items) |entry| {
-            if (std.mem.eql(u8, entry.name, name)) return entry;
+    fn findIndex(self: *const Expected, name: []const u8) ?usize {
+        for (self.entries.items, 0..) |entry, index| {
+            if (std.mem.eql(u8, entry.name, name)) return index;
         }
         return null;
+    }
+
+    fn find(self: *const Expected, name: []const u8) ?Entry {
+        const index = self.findIndex(name) orelse return null;
+        return self.entries.items[index];
     }
 };
 
@@ -2210,6 +2215,16 @@ fn readExpected(
                 .{},
             ),
         });
+        // The allowlist is the identity of the publication: a repeated name
+        // would make "exactly these assets" ambiguous, so it is rejected here
+        // rather than silently collapsed by a later lookup.
+        for (entries.items[0 .. entries.items.len - 1]) |earlier| {
+            if (std.mem.eql(u8, earlier.name, name)) return fail(
+                diagnostic,
+                "publication allowlist line is malformed",
+                .{},
+            );
+        }
     }
     return .{ .text = text, .entries = entries };
 }
@@ -2364,50 +2379,66 @@ pub fn releaseAssets(
     defer expected.deinit(allocator);
     var document = try support.readObject(allocator, io, release_path, diagnostic);
     defer document.deinit();
-    const assets = support.arrayOf(document.get("assets")) orelse return fail(
-        diagnostic,
-        "remote release asset allowlist/size mismatch: no assets",
-        .{},
-    );
-    const draft = support.isTrue(document.get("draft"));
 
-    if (final) {
-        var matched: usize = 0;
-        for (assets) |asset| {
-            const entry = support.objectOf(asset) orelse break;
-            const name = support.stringOf(entry.get("name")) orelse break;
-            if (expected.find(name) == null) break;
-            matched += 1;
-        }
-        if (draft or assets.len != expected.entries.items.len or
-            matched != assets.len)
-        {
-            return fail(
-                diagnostic,
+    // Every rejection below is the stage's single diagnostic, because the
+    // Python compared whole dictionaries and reported one mismatch either way.
+    const mismatch = struct {
+        fn report(
+            final_stage: bool,
+            count: usize,
+            report_diagnostic: *Diagnostic,
+        ) Error {
+            if (final_stage) return fail(
+                report_diagnostic,
                 "published release did not retain the exact final allowlist",
                 .{},
             );
+            return fail(
+                report_diagnostic,
+                "remote release asset allowlist/size mismatch: {d} assets",
+                .{count},
+            );
         }
-        return;
+    }.report;
+
+    const assets = support.arrayOf(document.get("assets")) orelse
+        return mismatch(final, 0, diagnostic);
+    const draft = support.isTrue(document.get("draft"));
+    if (final and draft) return mismatch(true, assets.len, diagnostic);
+    if (assets.len != expected.entries.items.len) {
+        return mismatch(final, assets.len, diagnostic);
     }
 
-    var matched: usize = 0;
+    // Cardinality alone would accept the same asset listed twice while a
+    // required one is absent, so each remote asset must claim a distinct
+    // allowlist entry and every entry must end up claimed.
+    const claimed = allocator.alloc(bool, expected.entries.items.len) catch
+        return error.OutOfMemory;
+    defer allocator.free(claimed);
+    @memset(claimed, false);
+
     for (assets) |asset| {
-        const entry = support.objectOf(asset) orelse break;
-        const name = support.stringOf(entry.get("name")) orelse break;
-        const size = support.integerOf(entry.get("size")) orelse break;
-        const record = expected.find(name) orelse break;
-        if (@as(u64, @intCast(size)) != record.bytes) break;
-        matched += 1;
+        const entry = support.objectOf(asset) orelse
+            return mismatch(final, assets.len, diagnostic);
+        const name = support.stringOf(entry.get("name")) orelse
+            return mismatch(final, assets.len, diagnostic);
+        const index = expected.findIndex(name) orelse
+            return mismatch(final, assets.len, diagnostic);
+        if (claimed[index]) return mismatch(final, assets.len, diagnostic);
+        claimed[index] = true;
+        const size = support.integerOf(entry.get("size")) orelse
+            return mismatch(final, assets.len, diagnostic);
+        if (size < 0 or
+            @as(u64, @intCast(size)) != expected.entries.items[index].bytes)
+        {
+            return mismatch(final, assets.len, diagnostic);
+        }
     }
-    if (assets.len != expected.entries.items.len or matched != assets.len) {
-        return fail(
-            diagnostic,
-            "remote release asset allowlist/size mismatch: {d} assets",
-            .{assets.len},
-        );
+    for (claimed) |taken| {
+        if (!taken) return mismatch(final, assets.len, diagnostic);
     }
-    if (!draft) return fail(
+
+    if (!final and !draft) return fail(
         diagnostic,
         "release stopped being a draft before verification",
         .{},

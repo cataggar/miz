@@ -1224,6 +1224,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "miz", .module = host_miz_mod },
+            // The Android smoke bundle arrives from outside this repository
+            // and may use any container `tarfile`'s `r:*` mode accepts; bzip2
+            // is the one the standard library cannot decode on its own.
+            .{ .name = "bzip2z", .module = host_bzip2z.module("bzip2z") },
         },
     });
     const ubuntu2604_release_exe = b.addExecutable(.{
@@ -1304,6 +1308,14 @@ pub fn build(b: *std.Build) void {
             "MIZ_UBUNTU2604_SOURCE_ROOT",
             b.build_root.path orelse ".",
         );
+        // The harness guards run the real release tool the shell calls, so
+        // the installed artifact is a declared dependency rather than
+        // something a previous `zig build` is assumed to have left behind.
+        run_guard.setEnvironmentVariable(
+            "MIZ_UBUNTU2604_RELEASE_TOOL",
+            b.getInstallPath(.bin, "ubuntu2604_release"),
+        );
+        run_guard.step.dependOn(&install_ubuntu2604_release.step);
         run_ubuntu2604_guards[guard_index] = run_guard;
         ubuntu2604_guard_step.dependOn(&run_guard.step);
     }

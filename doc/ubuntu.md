@@ -866,7 +866,10 @@ provide valid runtime, bundle, source manifest, and extracted `config.json`
 digests. The raw `producer_source_commit` and immutable image reference are
 validated only inside the verifier and are never copied into public
 evidence. The artifact digests verify both extracted files and the bundle
-config.
+config. `android-bundle.tar` may be a plain tar or a gzip-, bzip2-, xz-, or
+zstd-compressed one: the producer is external, the name says nothing about the
+container, and the config digest is read from whatever the archive actually
+holds rather than from bytes assumed to be tar.
 
 These secrets are deliberately not scoped to the `ubuntu2604-release`
 environment, so the native-QEMU job -- which needs no Azure credential --

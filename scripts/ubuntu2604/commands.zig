@@ -50,12 +50,10 @@ pub fn requireSha256Argument(
     return value;
 }
 
-/// `Path.resolve()`: an absolute, normalized spelling that does not require
-/// the path to exist. The resolved form is what the Python prints in its
-/// "missing" diagnostics.
-pub fn resolvePath(allocator: Allocator, path: []const u8) Error![]u8 {
-    return std.fs.path.resolve(allocator, &.{path}) catch error.OutOfMemory;
-}
+/// `Path.resolve()`. Lives in `support` because the Android smoke command
+/// exports resolved paths too; re-exported here under the name the release
+/// commands and their tests use.
+pub const resolvePath = support.resolvePath;
 
 pub const CandidateOptions = struct {
     key: []const u8,
@@ -79,7 +77,7 @@ pub fn candidate(
     options: CandidateOptions,
     diagnostic: *Diagnostic,
 ) Error!void {
-    const asset = try resolvePath(allocator, options.asset);
+    const asset = try resolvePath(allocator, io, options.asset);
     defer allocator.free(asset);
     if (!support.isRegularFile(io, asset)) return fail(
         diagnostic,
@@ -118,7 +116,7 @@ pub fn candidate(
     );
     const flavor = contracts.parseFlavor(entry.flavor).?;
 
-    const provenance_root = try resolvePath(allocator, options.provenance_dir);
+    const provenance_root = try resolvePath(allocator, io, options.provenance_dir);
     defer allocator.free(provenance_root);
 
     var arena: std.heap.ArenaAllocator = .init(allocator);
@@ -389,9 +387,9 @@ fn stageInto(
         "release tag must be Ubuntu-26.04-YYYYMMDD",
         .{},
     );
-    const candidates_root = try resolvePath(allocator, options.candidates);
+    const candidates_root = try resolvePath(allocator, io, options.candidates);
     defer allocator.free(candidates_root);
-    const azure_root = try resolvePath(allocator, options.azure_results);
+    const azure_root = try resolvePath(allocator, io, options.azure_results);
     defer allocator.free(azure_root);
 
     for ([_][]const u8{ candidates_root, azure_root }) |root| {
@@ -904,9 +902,9 @@ pub fn stage(
     options: StageOptions,
     diagnostic: *Diagnostic,
 ) Error!void {
-    const output = try resolvePath(allocator, options.output);
+    const output = try resolvePath(allocator, io, options.output);
     defer allocator.free(output);
-    const notes = try resolvePath(allocator, options.notes);
+    const notes = try resolvePath(allocator, io, options.notes);
     defer allocator.free(notes);
 
     var output_was_empty = false;
@@ -1068,7 +1066,7 @@ pub fn azureResult(
     defer verified.deinit();
     const flavor = verified.flavor();
 
-    const vhd = try resolvePath(allocator, options.vhd);
+    const vhd = try resolvePath(allocator, io, options.vhd);
     defer allocator.free(vhd);
     if (!support.isRegularFile(io, vhd)) return fail(
         diagnostic,

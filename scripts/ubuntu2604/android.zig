@@ -447,6 +447,7 @@ fn prepareVerified(
         return fail(diagnostic, "Android smoke bundle digest mismatch", .{});
     }
     const config_digest = archive.bundleConfigDigest(
+        allocator,
         io,
         bundle_path,
         config_max_bytes,
@@ -471,9 +472,9 @@ fn prepareVerified(
         return fail(diagnostic, "Android smoke bundle config digest mismatch", .{});
     }
 
-    const absolute_runtime = try absolutePath(allocator, io, runtime_path);
+    const absolute_runtime = try support.resolvePath(allocator, io, runtime_path);
     defer allocator.free(absolute_runtime);
-    const absolute_bundle = try absolutePath(allocator, io, bundle_path);
+    const absolute_bundle = try support.resolvePath(allocator, io, bundle_path);
     defer allocator.free(absolute_bundle);
 
     const values = [_][2][]const u8{
@@ -505,14 +506,6 @@ fn prepareVerified(
         "Android smoke verified environment value is malformed",
         .{},
     );
-}
-
-fn absolutePath(allocator: Allocator, io: Io, path: []const u8) Error![]u8 {
-    if (std.fs.path.isAbsolute(path)) return allocator.dupe(u8, path);
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const length = Dir.cwd().realPathFile(io, ".", &buffer) catch
-        return allocator.dupe(u8, path);
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ buffer[0..length], path });
 }
 
 fn appendFile(io: Io, path: []const u8, data: []const u8) !void {

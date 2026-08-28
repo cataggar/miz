@@ -1784,3 +1784,775 @@ test "the publisher is draft-first, allowlisted, and fail-safe" {
     // Publication depends on no interpreter.
     try script.expectOmits(source.interpreter);
 }
+
+// ---- github-release-assets ----
+
+const release_workflow = release.workflow;
+
+/// Runs `github-release-assets` against a remote release document and the
+/// staged allowlist, returning the diagnostic text of a rejection.
+fn checkReleaseAssets(
+    subject: *const Tree,
+    remote: []const u8,
+    expected_lines: []const u8,
+    stage_name: []const u8,
+) !?[]const u8 {
+    const remote_path = try subject.path("release.json", .{});
+    defer allocator.free(remote_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = remote_path, .data = remote });
+    const expected_path = try subject.path("expected.tsv", .{});
+    defer allocator.free(expected_path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = expected_path,
+        .data = expected_lines,
+    });
+
+    var diagnostic: support.Diagnostic = .{};
+    release_workflow.releaseAssets(
+        allocator,
+        io,
+        remote_path,
+        expected_path,
+        stage_name,
+        &diagnostic,
+    ) catch |err| switch (err) {
+        error.Failed => return diagnostic.message(),
+        else => return err,
+    };
+    return null;
+}
+
+const publication_allowlist =
+    "ubuntu-26.04-x86_64.qcow2\t" ++ "a" ** 64 ++ "\t2048\n" ++
+    "ubuntu-26.04-aarch64.qcow2\t" ++ "b" ** 64 ++ "\t4096\n";
+
+fn expectAssetsAccepted(
+    subject: *const Tree,
+    remote: []const u8,
+    stage_name: []const u8,
+) !void {
+    const message = try checkReleaseAssets(
+        subject,
+        remote,
+        publication_allowlist,
+        stage_name,
+    );
+    if (message) |text| {
+        std.debug.print("unexpected rejection: {s}\n", .{text});
+        return error.UnexpectedRejection;
+    }
+}
+
+fn expectAssetsRejected(
+    subject: *const Tree,
+    remote: []const u8,
+    stage_name: []const u8,
+    expected_message: []const u8,
+) !void {
+    const message = try checkReleaseAssets(
+        subject,
+        remote,
+        publication_allowlist,
+        stage_name,
+    ) orelse return error.ExpectedRejection;
+    try std.testing.expectEqualStrings(expected_message, message);
+}
+
+const draft_mismatch = "remote release asset allowlist/size mismatch: 2 assets";
+const final_mismatch = "published release did not retain the exact final allowlist";
+
+test "github-release-assets binds each remote asset to one allowlist entry" {
+    var subject = try tree();
+    defer subject.deinit();
+
+    const exact =
+        \\{"draft": true, "assets": [
+        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096}
+        \\]}
+    ;
+    try expectAssetsAccepted(&subject, exact, "draft");
+
+    // Order is not part of the contract; the binding is.
+    const reordered =
+        \\{"draft": true, "assets": [
+        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048}
+        \\]}
+    ;
+    try expectAssetsAccepted(&subject, reordered, "draft");
+
+    // The count matches and every name is allowlisted, but one expected asset
+    // is absent: without a one-to-one binding this reads as a clean release.
+    const duplicated =
+        \\{"draft": true, "assets": [
+        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048}
+        \\]}
+    ;
+    try expectAssetsRejected(&subject, duplicated, "draft", draft_mismatch);
+
+    const wrong_size =
+        \\{"draft": true, "assets": [
+        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4097}
+        \\]}
+    ;
+    try expectAssetsRejected(&subject, wrong_size, "draft", draft_mismatch);
+
+    const unknown_name =
+        \\{"draft": true, "assets": [
+        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "SHA256SUMS", "size": 4096}
+        \\]}
+    ;
+    try expectAssetsRejected(&subject, unknown_name, "draft", draft_mismatch);
+
+    const extra =
+        \\{"draft": true, "assets": [
+        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "SHA256SUMS", "size": 1}
+        \\]}
+    ;
+    try expectAssetsRejected(
+        &subject,
+        extra,
+        "draft",
+        "remote release asset allowlist/size mismatch: 3 assets",
+    );
+
+    // A release that stopped being a draft is refused before it is downloaded.
+    const published =
+        \\{"draft": false, "assets": [
+        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096}
+        \\]}
+    ;
+    try expectAssetsRejected(
+        &subject,
+        published,
+        "draft",
+        "release stopped being a draft before verification",
+    );
+}
+
+test "github-release-assets holds the final stage to the same one-to-one set" {
+    var subject = try tree();
+    defer subject.deinit();
+
+    const exact =
+        \\{"draft": false, "assets": [
+        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096}
+        \\]}
+    ;
+    try expectAssetsAccepted(&subject, exact, "final");
+
+    const duplicated =
+        \\{"draft": false, "assets": [
+        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096}
+        \\]}
+    ;
+    try expectAssetsRejected(&subject, duplicated, "final", final_mismatch);
+
+    // The published bytes are the validated bytes, so a size that changed
+    // between the draft check and publication is a rejection, not a detail
+    // the final stage may ignore.
+    const resized =
+        \\{"draft": false, "assets": [
+        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2049},
+        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096}
+        \\]}
+    ;
+    try expectAssetsRejected(&subject, resized, "final", final_mismatch);
+
+    const still_draft =
+        \\{"draft": true, "assets": [
+        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096}
+        \\]}
+    ;
+    try expectAssetsRejected(&subject, still_draft, "final", final_mismatch);
+
+    const missing =
+        \\{"draft": false, "assets": [
+        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048}
+        \\]}
+    ;
+    try expectAssetsRejected(
+        &subject,
+        missing,
+        "final",
+        final_mismatch,
+    );
+}
+
+test "the publication allowlist refuses a repeated asset name" {
+    var subject = try tree();
+    defer subject.deinit();
+
+    const remote =
+        \\{"draft": true, "assets": [
+        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048}
+        \\]}
+    ;
+    const repeated =
+        "ubuntu-26.04-x86_64.qcow2\t" ++ "a" ** 64 ++ "\t2048\n" ++
+        "ubuntu-26.04-x86_64.qcow2\t" ++ "a" ** 64 ++ "\t2048\n";
+    const message = try checkReleaseAssets(
+        &subject,
+        remote,
+        repeated,
+        "draft",
+    ) orelse return error.ExpectedRejection;
+    try std.testing.expectEqualStrings(
+        "publication allowlist line is malformed",
+        message,
+    );
+}
+
+// ---- prepare-android-smoke-inputs ----
+
+const android = release.android;
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+fn hexDigest(bytes: []const u8) [64]u8 {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+const TarEntry = struct { name: []const u8, data: []const u8 };
+
+/// A ustar archive, which is what the external producer's `tarfile` writes.
+fn buildTar(entries: []const TarEntry) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (entries) |entry| {
+        var header: [512]u8 = @splat(0);
+        @memcpy(header[0..entry.name.len], entry.name);
+        _ = try std.fmt.bufPrint(header[100..108], "0000644\x00", .{});
+        _ = try std.fmt.bufPrint(header[108..116], "0000000\x00", .{});
+        _ = try std.fmt.bufPrint(header[116..124], "0000000\x00", .{});
+        _ = try std.fmt.bufPrint(header[124..136], "{o:0>11} ", .{entry.data.len});
+        _ = try std.fmt.bufPrint(header[136..148], "{o:0>11} ", .{@as(u64, 0)});
+        @memset(header[148..156], ' ');
+        header[156] = '0';
+        @memcpy(header[257..262], "ustar");
+        @memcpy(header[263..265], "00");
+        var checksum: u32 = 0;
+        for (header) |byte| checksum += byte;
+        _ = try std.fmt.bufPrint(header[148..156], "{o:0>6}\x00 ", .{checksum});
+        try out.appendSlice(allocator, &header);
+        try out.appendSlice(allocator, entry.data);
+        try out.appendNTimes(allocator, 0, (512 - (entry.data.len % 512)) % 512);
+    }
+    try out.appendNTimes(allocator, 0, 1024);
+    return out.toOwnedSlice(allocator);
+}
+
+const ZipEntry = struct {
+    name: []const u8,
+    data: []const u8,
+    external_attributes: u32 = 0o100644 << 16,
+    flags: u16 = 0,
+};
+
+/// A stored-only ZIP, which is what the producer uploads.
+fn buildZip(entries: []const ZipEntry) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const offsets = try allocator.alloc(u32, entries.len);
+    defer allocator.free(offsets);
+
+    for (entries, offsets) |entry, *offset| {
+        offset.* = @intCast(out.items.len);
+        var header: [30]u8 = @splat(0);
+        std.mem.writeInt(u32, header[0..4], 0x0403_4b50, .little);
+        std.mem.writeInt(u16, header[6..8], entry.flags, .little);
+        std.mem.writeInt(u32, header[14..18], std.hash.Crc32.hash(entry.data), .little);
+        std.mem.writeInt(u32, header[18..22], @intCast(entry.data.len), .little);
+        std.mem.writeInt(u32, header[22..26], @intCast(entry.data.len), .little);
+        std.mem.writeInt(u16, header[26..28], @intCast(entry.name.len), .little);
+        try out.appendSlice(allocator, &header);
+        try out.appendSlice(allocator, entry.name);
+        try out.appendSlice(allocator, entry.data);
+    }
+
+    const directory_offset = out.items.len;
+    for (entries, offsets) |entry, offset| {
+        var record: [46]u8 = @splat(0);
+        std.mem.writeInt(u32, record[0..4], 0x0201_4b50, .little);
+        std.mem.writeInt(u16, record[8..10], entry.flags, .little);
+        std.mem.writeInt(u32, record[16..20], std.hash.Crc32.hash(entry.data), .little);
+        std.mem.writeInt(u32, record[20..24], @intCast(entry.data.len), .little);
+        std.mem.writeInt(u32, record[24..28], @intCast(entry.data.len), .little);
+        std.mem.writeInt(u16, record[28..30], @intCast(entry.name.len), .little);
+        std.mem.writeInt(u32, record[38..42], entry.external_attributes, .little);
+        std.mem.writeInt(u32, record[42..46], offset, .little);
+        try out.appendSlice(allocator, &record);
+        try out.appendSlice(allocator, entry.name);
+    }
+
+    var eocd: [22]u8 = @splat(0);
+    std.mem.writeInt(u32, eocd[0..4], 0x0605_4b50, .little);
+    std.mem.writeInt(u16, eocd[8..10], @intCast(entries.len), .little);
+    std.mem.writeInt(u16, eocd[10..12], @intCast(entries.len), .little);
+    std.mem.writeInt(u32, eocd[12..16], @intCast(out.items.len - directory_offset), .little);
+    std.mem.writeInt(u32, eocd[16..20], @intCast(directory_offset), .little);
+    try out.appendSlice(allocator, &eocd);
+    return out.toOwnedSlice(allocator);
+}
+
+const config_json = "{\"ociVersion\": \"1.0.0\"}";
+const runtime_bytes = "#!/bin/sh\nexec /system/bin/app_process\n";
+const private_url = "https://producer.invalid/private/android.zip";
+const private_token = "ghs_privatetokenvalue";
+
+/// Everything `prepare` binds, staged on disk: the ZIP the producer publishes,
+/// the secret that names it, and the values the caller expects back.
+const Smoke = struct {
+    subject: Tree,
+    archive_path: []u8,
+    output_dir: []u8,
+    github_env: []u8,
+    secret: []u8,
+    bundle_sha256: [64]u8,
+    runtime_sha256: [64]u8,
+    config_sha256: [64]u8,
+    provenance_sha256: [64]u8,
+
+    const Overrides = struct {
+        bundle: ?[]const u8 = null,
+        members: ?[]const ZipEntry = null,
+        provenance_json: ?[]const u8 = null,
+        archive_sha256: ?[]const u8 = null,
+        provenance_secret_sha256: ?[]const u8 = null,
+        architecture: []const u8 = "aarch64",
+    };
+
+    fn create(overrides: Overrides) !Smoke {
+        var subject = try tree();
+        errdefer subject.deinit();
+
+        const default_bundle = try buildTar(&.{
+            .{ .name = "rootfs/init", .data = "binary" },
+            .{ .name = "./config.json", .data = config_json },
+        });
+        defer allocator.free(default_bundle);
+        const bundle = overrides.bundle orelse default_bundle;
+
+        const bundle_sha256 = hexDigest(bundle);
+        const runtime_sha256 = hexDigest(runtime_bytes);
+        const config_sha256 = hexDigest(config_json);
+
+        const default_provenance = try std.fmt.allocPrint(allocator,
+            \\{{"android_immutable_reference": "registry.invalid/android@sha256:{s}",
+            \\ "android_manifest_digest": "{s}",
+            \\ "architecture": "{s}",
+            \\ "bundle_archive_sha256": "{s}",
+            \\ "config_json_sha256": "{s}",
+            \\ "producer_source_commit": "{s}",
+            \\ "runtime_sha256": "{s}",
+            \\ "schema": "{s}",
+            \\ "type": "{s}"}}
+        , .{
+            "c" ** 64,
+            "d" ** 64,
+            overrides.architecture,
+            &bundle_sha256,
+            &config_sha256,
+            "e" ** 40,
+            &runtime_sha256,
+            android.provenance_schema,
+            android.provenance_type,
+        });
+        defer allocator.free(default_provenance);
+        const provenance_json = overrides.provenance_json orelse default_provenance;
+        const provenance_sha256 = hexDigest(provenance_json);
+
+        const default_members = [_]ZipEntry{
+            .{ .name = "android-bundle.tar", .data = bundle },
+            .{ .name = "android-runtime", .data = runtime_bytes },
+            .{ .name = "provenance.json", .data = provenance_json },
+        };
+        const zip = try buildZip(overrides.members orelse &default_members);
+        defer allocator.free(zip);
+        const archive_sha256 = hexDigest(zip);
+
+        const archive_path = try subject.path("producer.zip", .{});
+        errdefer allocator.free(archive_path);
+        try Dir.cwd().writeFile(io, .{ .sub_path = archive_path, .data = zip });
+
+        const output_dir = try subject.path("android", .{});
+        errdefer allocator.free(output_dir);
+        const github_env = try subject.path("github.env", .{});
+        errdefer allocator.free(github_env);
+        try Dir.cwd().writeFile(io, .{ .sub_path = github_env, .data = "" });
+
+        const secret = try std.fmt.allocPrint(
+            allocator,
+            "{{\"artifact_sha256\": \"{s}\", \"artifact_url\": \"{s}\", \"provenance_sha256\": \"{s}\"}}",
+            .{
+                overrides.archive_sha256 orelse &archive_sha256,
+                private_url,
+                overrides.provenance_secret_sha256 orelse &provenance_sha256,
+            },
+        );
+        errdefer allocator.free(secret);
+
+        return .{
+            .subject = subject,
+            .archive_path = archive_path,
+            .output_dir = output_dir,
+            .github_env = github_env,
+            .secret = secret,
+            .bundle_sha256 = bundle_sha256,
+            .runtime_sha256 = runtime_sha256,
+            .config_sha256 = config_sha256,
+            .provenance_sha256 = provenance_sha256,
+        };
+    }
+
+    fn deinit(self: *Smoke) void {
+        allocator.free(self.secret);
+        allocator.free(self.github_env);
+        allocator.free(self.output_dir);
+        allocator.free(self.archive_path);
+        self.subject.deinit();
+    }
+
+    fn options(self: *const Smoke, architecture: []const u8) android.Options {
+        return .{
+            .architecture = architecture,
+            .output_dir = self.output_dir,
+            .github_env = self.github_env,
+            .secret = self.secret,
+            .token = private_token,
+            .local_archive = self.archive_path,
+        };
+    }
+
+    fn prepare(self: *const Smoke, architecture: []const u8) !void {
+        var diagnostic: support.Diagnostic = .{};
+        release.android.prepare(
+            allocator,
+            io,
+            self.options(architecture),
+            &diagnostic,
+        ) catch |err| switch (err) {
+            error.Failed => {
+                std.debug.print("unexpected rejection: {s}\n", .{diagnostic.message()});
+                return error.UnexpectedRejection;
+            },
+            else => return err,
+        };
+    }
+
+    fn expectRejected(self: *const Smoke, expected: []const u8) !void {
+        var diagnostic: support.Diagnostic = .{};
+        release.android.prepare(
+            allocator,
+            io,
+            self.options("aarch64"),
+            &diagnostic,
+        ) catch |err| switch (err) {
+            error.Failed => {
+                try std.testing.expectEqualStrings(expected, diagnostic.message());
+                return;
+            },
+            else => return err,
+        };
+        return error.ExpectedRejection;
+    }
+
+    fn environment(self: *const Smoke) ![]u8 {
+        return Dir.cwd().readFileAlloc(
+            io,
+            self.github_env,
+            allocator,
+            .limited(1024 * 1024),
+        );
+    }
+};
+
+test "prepare-android-smoke-inputs exports only digests and verified paths" {
+    var smoke = try Smoke.create(.{});
+    defer smoke.deinit();
+    try smoke.prepare("aarch64");
+
+    const exported = try smoke.environment();
+    defer allocator.free(exported);
+
+    // Every exported value is a digest or a path inside the private directory.
+    const expected_lines = [_][]const u8{
+        "MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256=",
+        "MIZ_UBUNTU2604_ANDROID_RUNTIME=",
+        "MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256=",
+        "MIZ_UBUNTU2604_ANDROID_BUNDLE=",
+        "MIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256=",
+        "MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256=",
+    };
+    for (expected_lines) |line| {
+        try std.testing.expect(std.mem.indexOf(u8, exported, line) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, exported, &smoke.bundle_sha256) != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported, &smoke.runtime_sha256) != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported, &smoke.config_sha256) != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, exported, &smoke.provenance_sha256) != null,
+    );
+
+    // The private boundary: neither the producer's URL nor its bearer token
+    // may reach the workflow environment.
+    try std.testing.expect(std.mem.indexOf(u8, exported, private_url) == null);
+    try std.testing.expect(std.mem.indexOf(u8, exported, private_token) == null);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "producer.invalid") == null);
+
+    // The runtime and bundle are exported as absolute paths, and the archive
+    // the secret named is removed once its members are bound.
+    var lines = std.mem.splitScalar(u8, exported, '\n');
+    while (lines.next()) |line| {
+        const separator = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const name = line[0..separator];
+        const value = line[separator + 1 ..];
+        if (std.mem.eql(u8, name, "MIZ_UBUNTU2604_ANDROID_RUNTIME") or
+            std.mem.eql(u8, name, "MIZ_UBUNTU2604_ANDROID_BUNDLE"))
+        {
+            try std.testing.expect(std.fs.path.isAbsolute(value));
+            try std.testing.expect(support.isRegularFile(io, value));
+        }
+    }
+    const staged = try smoke.subject.path("android/artifact.zip", .{});
+    defer allocator.free(staged);
+    try std.testing.expect(!support.pathExists(io, staged));
+}
+
+test "prepare-android-smoke-inputs accepts every container tarfile accepts" {
+    // gzip is the container an external producer is most likely to use for a
+    // file it still calls `android-bundle.tar`; the digest binding has to hold
+    // through it rather than hashing compressed bytes as if they were tar.
+    const plain = try buildTar(&.{
+        .{ .name = "./config.json", .data = config_json },
+    });
+    defer allocator.free(plain);
+
+    const compressed = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(compressed);
+    var sink: std.Io.Writer = .fixed(compressed);
+    var window: [std.compress.flate.max_window_len]u8 = undefined;
+    var deflate = try std.compress.flate.Compress.init(
+        &sink,
+        &window,
+        .gzip,
+        .default,
+    );
+    try deflate.writer.writeAll(plain);
+    try deflate.finish();
+
+    var smoke = try Smoke.create(.{ .bundle = sink.buffered() });
+    defer smoke.deinit();
+    try smoke.prepare("aarch64");
+
+    const exported = try smoke.environment();
+    defer allocator.free(exported);
+    // The config digest is the one from inside the compressed tar.
+    try std.testing.expect(std.mem.indexOf(u8, exported, &smoke.config_sha256) != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, exported, &hexDigest(config_json)) != null,
+    );
+}
+
+test "prepare-android-smoke-inputs binds the archive to the secret's digest" {
+    var smoke = try Smoke.create(.{ .archive_sha256 = "0" ** 64 });
+    defer smoke.deinit();
+    try smoke.expectRejected("Android smoke archive digest mismatch");
+    // A rejected input set leaves nothing behind for a later step to pick up.
+    try std.testing.expect(!support.pathExists(io, smoke.output_dir));
+}
+
+test "prepare-android-smoke-inputs binds the manifest to the secret's digest" {
+    var smoke = try Smoke.create(.{ .provenance_secret_sha256 = "1" ** 64 });
+    defer smoke.deinit();
+    try smoke.expectRejected("Android smoke provenance digest mismatch");
+    try std.testing.expect(!support.pathExists(io, smoke.output_dir));
+}
+
+test "prepare-android-smoke-inputs binds the bundle to the manifest" {
+    const unbound = try std.fmt.allocPrint(allocator,
+        \\{{"android_immutable_reference": "registry.invalid/android@sha256:{s}",
+        \\ "android_manifest_digest": "{s}",
+        \\ "architecture": "aarch64",
+        \\ "bundle_archive_sha256": "{s}",
+        \\ "config_json_sha256": "{s}",
+        \\ "producer_source_commit": "{s}",
+        \\ "runtime_sha256": "{s}",
+        \\ "schema": "{s}",
+        \\ "type": "{s}"}}
+    , .{
+        "c" ** 64,
+        "d" ** 64,
+        "2" ** 64,
+        &hexDigest(config_json),
+        "e" ** 40,
+        &hexDigest(runtime_bytes),
+        android.provenance_schema,
+        android.provenance_type,
+    });
+    defer allocator.free(unbound);
+
+    var smoke = try Smoke.create(.{ .provenance_json = unbound });
+    defer smoke.deinit();
+    try smoke.expectRejected("Android smoke bundle digest mismatch");
+    try std.testing.expect(!support.pathExists(io, smoke.output_dir));
+}
+
+test "prepare-android-smoke-inputs binds the bundle config to the manifest" {
+    const other = try buildTar(&.{
+        .{ .name = "./config.json", .data = "{\"ociVersion\": \"1.1.0\"}" },
+    });
+    defer allocator.free(other);
+
+    // The bundle is the one the manifest names, but its config is not.
+    const mismatched = try std.fmt.allocPrint(allocator,
+        \\{{"android_immutable_reference": "registry.invalid/android@sha256:{s}",
+        \\ "android_manifest_digest": "{s}",
+        \\ "architecture": "aarch64",
+        \\ "bundle_archive_sha256": "{s}",
+        \\ "config_json_sha256": "{s}",
+        \\ "producer_source_commit": "{s}",
+        \\ "runtime_sha256": "{s}",
+        \\ "schema": "{s}",
+        \\ "type": "{s}"}}
+    , .{
+        "c" ** 64,
+        "d" ** 64,
+        &hexDigest(other),
+        &hexDigest(config_json),
+        "e" ** 40,
+        &hexDigest(runtime_bytes),
+        android.provenance_schema,
+        android.provenance_type,
+    });
+    defer allocator.free(mismatched);
+
+    var smoke = try Smoke.create(.{
+        .bundle = other,
+        .provenance_json = mismatched,
+    });
+    defer smoke.deinit();
+    try smoke.expectRejected("Android smoke bundle config digest mismatch");
+}
+
+test "prepare-android-smoke-inputs requires the exact archive member set" {
+    const bundle = try buildTar(&.{
+        .{ .name = "./config.json", .data = config_json },
+    });
+    defer allocator.free(bundle);
+
+    // An extra member is a member nothing bound, so the set is refused whole.
+    var extra = try Smoke.create(.{
+        .bundle = bundle,
+        .members = &.{
+            .{ .name = "android-bundle.tar", .data = bundle },
+            .{ .name = "android-runtime", .data = runtime_bytes },
+            .{ .name = "provenance.json", .data = "{}" },
+            .{ .name = "notes.txt", .data = "hello" },
+        },
+    });
+    defer extra.deinit();
+    try extra.expectRejected("Android smoke archive member set is not exact");
+    try std.testing.expect(!support.pathExists(io, extra.output_dir));
+
+    var renamed = try Smoke.create(.{
+        .bundle = bundle,
+        .members = &.{
+            .{ .name = "android-bundle.tar", .data = bundle },
+            .{ .name = "android-runtime.bin", .data = runtime_bytes },
+            .{ .name = "provenance.json", .data = "{}" },
+        },
+    });
+    defer renamed.deinit();
+    try renamed.expectRejected("Android smoke archive member set is not exact");
+}
+
+test "prepare-android-smoke-inputs refuses an unsafe archive member" {
+    const bundle = try buildTar(&.{
+        .{ .name = "./config.json", .data = config_json },
+    });
+    defer allocator.free(bundle);
+
+    // A symlink member would let the producer write outside the private
+    // directory, so the member set is rejected before anything is extracted.
+    var symlinked = try Smoke.create(.{
+        .bundle = bundle,
+        .members = &.{
+            .{ .name = "android-bundle.tar", .data = bundle },
+            .{
+                .name = "android-runtime",
+                .data = "/etc/shadow",
+                .external_attributes = 0o120777 << 16,
+            },
+            .{ .name = "provenance.json", .data = "{}" },
+        },
+    });
+    defer symlinked.deinit();
+    try symlinked.expectRejected("Android smoke archive contains an unsafe member");
+    try std.testing.expect(!support.pathExists(io, symlinked.output_dir));
+
+    var encrypted = try Smoke.create(.{
+        .bundle = bundle,
+        .members = &.{
+            .{ .name = "android-bundle.tar", .data = bundle },
+            .{ .name = "android-runtime", .data = runtime_bytes, .flags = 0x1 },
+            .{ .name = "provenance.json", .data = "{}" },
+        },
+    });
+    defer encrypted.deinit();
+    try encrypted.expectRejected("Android smoke archive contains an unsafe member");
+}
+
+test "prepare-android-smoke-inputs refuses a manifest for another architecture" {
+    var smoke = try Smoke.create(.{ .architecture = "x86_64" });
+    defer smoke.deinit();
+    try smoke.expectRejected("Android smoke provenance architecture mismatch");
+    try std.testing.expect(!support.pathExists(io, smoke.output_dir));
+}
+
+test "prepare-android-smoke-inputs refuses to reuse an existing directory" {
+    var smoke = try Smoke.create(.{});
+    defer smoke.deinit();
+    try Dir.cwd().createDirPath(io, smoke.output_dir);
+    const planted = try smoke.subject.path("android/leftover", .{});
+    defer allocator.free(planted);
+    try Dir.cwd().writeFile(io, .{ .sub_path = planted, .data = "stale" });
+
+    try smoke.expectRejected("Android smoke input directory already exists");
+    // A refusal must not delete a directory it did not create.
+    try std.testing.expect(support.isRegularFile(io, planted));
+}
+
+test "prepare-android-smoke-inputs never writes the secret or token anywhere" {
+    var smoke = try Smoke.create(.{});
+    defer smoke.deinit();
+    try smoke.prepare("aarch64");
+
+    const files = try support.listFiles(allocator, io, smoke.output_dir);
+    defer support.freePaths(allocator, files);
+    for (files) |relative| {
+        const path = try smoke.subject.path("android/{s}", .{relative});
+        defer allocator.free(path);
+        const bytes = try Dir.cwd().readFileAlloc(
+            io,
+            path,
+            allocator,
+            .limited(4 * 1024 * 1024),
+        );
+        defer allocator.free(bytes);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, private_url) == null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, private_token) == null);
+    }
+}

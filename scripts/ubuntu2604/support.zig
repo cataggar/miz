@@ -471,6 +471,78 @@ pub fn listFilesWithSuffix(
     return results.toOwnedSlice(allocator);
 }
 
+/// `Path.resolve()`: an absolute, normalized spelling that does not require
+/// the path to exist. The resolved form is what the Python prints in its
+/// "missing" diagnostics, so a relative argument has to come back anchored at
+/// the working directory rather than merely lexically tidied --
+/// `std.fs.path.resolve` alone leaves `bundle/asset.qcow2` relative, which
+/// would print a path the operator cannot paste back.
+///
+/// Like `Path.resolve(strict=False)`, symlinks are followed for the part of
+/// the path that exists and the remaining tail is kept lexically: a component
+/// that does not exist cannot be a symlink, so its spelling is already final.
+pub fn resolvePath(allocator: Allocator, io: Io, path: []const u8) Error![]u8 {
+    const absolute = try absolutePath(allocator, io, path);
+    defer allocator.free(absolute);
+    const lexical = std.fs.path.resolve(allocator, &.{absolute}) catch
+        return error.OutOfMemory;
+    defer allocator.free(lexical);
+    return canonicalizeExisting(allocator, io, lexical, 0);
+}
+
+/// The lexical path anchored at the working directory. A failure to read the
+/// working directory leaves the caller's spelling untouched: resolution is for
+/// diagnostics, and a broken `.` must not turn a real rejection into an error
+/// about the process's own state.
+fn absolutePath(allocator: Allocator, io: Io, path: []const u8) Error![]u8 {
+    if (std.fs.path.isAbsolute(path)) {
+        return allocator.dupe(u8, path) catch error.OutOfMemory;
+    }
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const length = Dir.cwd().realPathFile(io, ".", &buffer) catch
+        return allocator.dupe(u8, path) catch error.OutOfMemory;
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}",
+        .{ buffer[0..length], path },
+    ) catch error.OutOfMemory;
+}
+
+/// Canonicalizes the longest existing prefix of `lexical` and re-attaches the
+/// tail that does not exist yet.
+fn canonicalizeExisting(
+    allocator: Allocator,
+    io: Io,
+    lexical: []const u8,
+    depth: usize,
+) Error![]u8 {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    if (Dir.cwd().realPathFile(io, lexical, &buffer)) |length| {
+        return allocator.dupe(u8, buffer[0..length]) catch error.OutOfMemory;
+    } else |_| {}
+    // A bound on how much of the tail may be missing, so a pathological
+    // spelling cannot turn a diagnostic into an unbounded walk.
+    if (depth >= 64) return allocator.dupe(u8, lexical) catch error.OutOfMemory;
+    const parent = std.fs.path.dirname(lexical) orelse
+        return allocator.dupe(u8, lexical) catch error.OutOfMemory;
+    if (parent.len == 0 or parent.len >= lexical.len) {
+        return allocator.dupe(u8, lexical) catch error.OutOfMemory;
+    }
+    const base = std.fs.path.basename(lexical);
+    if (base.len == 0) return allocator.dupe(u8, lexical) catch error.OutOfMemory;
+    const resolved_parent = try canonicalizeExisting(allocator, io, parent, depth + 1);
+    defer allocator.free(resolved_parent);
+    const separator: []const u8 = if (std.mem.endsWith(u8, resolved_parent, "/"))
+        ""
+    else
+        "/";
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}{s}{s}",
+        .{ resolved_parent, separator, base },
+    ) catch error.OutOfMemory;
+}
+
 pub fn joinPath(
     allocator: Allocator,
     parts: []const []const u8,
@@ -655,6 +727,75 @@ test "listFiles follows symlinks the way Path.is_file does" {
     defer freePaths(std.testing.allocator, files);
     try std.testing.expectEqual(@as(usize, 1), files.len);
     try std.testing.expectEqualStrings("linked.pem", files[0]);
+}
+
+test "resolvePath anchors a relative path the way Path.resolve does" {
+    const io = std.testing.io;
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var root_buffer: [TempTree.max_path_len]u8 = undefined;
+    const root = tree.path(&root_buffer, "resolve");
+    try Dir.cwd().createDirPath(io, root);
+
+    // A relative path comes back absolute rather than merely tidied, which is
+    // what makes a "missing" diagnostic paste-able.
+    const absolute_root = try resolvePath(std.testing.allocator, io, root);
+    defer std.testing.allocator.free(absolute_root);
+    try std.testing.expect(std.fs.path.isAbsolute(absolute_root));
+    try std.testing.expect(std.mem.endsWith(u8, absolute_root, "/resolve"));
+
+    // Redundant components normalize away, and a tail that does not exist is
+    // still resolved rather than rejected.
+    const noisy = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/./nested/../asset.qcow2",
+        .{root},
+    );
+    defer std.testing.allocator.free(noisy);
+    const normalized = try resolvePath(std.testing.allocator, io, noisy);
+    defer std.testing.allocator.free(normalized);
+    const expected = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/asset.qcow2",
+        .{absolute_root},
+    );
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, normalized);
+
+    // `.` resolves to the working directory itself, not to ".".
+    const here = try resolvePath(std.testing.allocator, io, ".");
+    defer std.testing.allocator.free(here);
+    try std.testing.expect(std.fs.path.isAbsolute(here));
+    try std.testing.expect(!std.mem.eql(u8, here, "."));
+}
+
+test "resolvePath canonicalizes the existing prefix and keeps the missing tail" {
+    const io = std.testing.io;
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var real_buffer: [TempTree.max_path_len]u8 = undefined;
+    const real = tree.path(&real_buffer, "real");
+    try Dir.cwd().createDirPath(io, real);
+    var link_buffer: [TempTree.max_path_len]u8 = undefined;
+    const link = tree.path(&link_buffer, "link");
+    try Dir.cwd().symLink(io, "real", link, .{});
+
+    // `Path.resolve()` follows symlinks through the part of the path that
+    // exists, so the printed path names the real location.
+    const through_link = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/absent/deeper.json",
+        .{link},
+    );
+    defer std.testing.allocator.free(through_link);
+    const resolved = try resolvePath(std.testing.allocator, io, through_link);
+    defer std.testing.allocator.free(resolved);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        resolved,
+        "/real/absent/deeper.json",
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, resolved, "/link/") == null);
 }
 
 test "canonicalDigest hashes the compact sorted encoding" {
