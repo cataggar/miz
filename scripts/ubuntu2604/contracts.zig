@@ -230,6 +230,38 @@ pub const candidate_fields = [_][]const u8{
     "workflow",
 };
 
+/// The full-flavor native result binds the complete candidate identity, the
+/// accepted workflow attempt, and the exact signed bytes and contract set.
+pub const native_result_fields = [_][]const u8{
+    "architecture",
+    "asset_name",
+    "candidate_sha256",
+    "certificate_sha256",
+    "contracts",
+    "fallback_uki_sha256",
+    "flavor",
+    "key",
+    "schema",
+    "source_commit",
+    "status",
+    "type",
+    "virtual_size",
+    "workflow",
+};
+
+/// Core native acceptance carries the same public identity plus the
+/// architecture-specific Android smoke provenance.
+pub const core_native_result_fields = [_][]const u8{
+    "android_smoke",
+} ++ native_result_fields;
+
+pub fn nativeResultFields(flavor: Flavor) []const []const u8 {
+    return switch (flavor) {
+        .full => &native_result_fields,
+        .core => &core_native_result_fields,
+    };
+}
+
 /// `AZURE_RESULT_FIELDS`: the exact top-level key set of a full-flavor Azure
 /// acceptance result.
 pub const azure_result_fields = [_][]const u8{
@@ -319,6 +351,8 @@ test "contract and field sets are stored sorted and duplicate-free" {
         &full_native_contracts,
         &core_native_contracts,
         &candidate_fields,
+        &native_result_fields,
+        &core_native_result_fields,
         &azure_result_fields,
         &core_azure_result_fields,
     };
@@ -331,5 +365,9 @@ test "contract and field sets are stored sorted and duplicate-free" {
     try std.testing.expectEqual(
         azure_result_fields.len + 1,
         core_azure_result_fields.len,
+    );
+    try std.testing.expectEqual(
+        native_result_fields.len + 1,
+        core_native_result_fields.len,
     );
 }

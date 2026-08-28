@@ -47,7 +47,6 @@ const usage_text =
     \\  candidate                     bind a built QCOW2 to its provenance tree
     \\  verify-candidate              re-verify a candidate against its asset
     \\  verify-native-result          verify native acceptance against a candidate
-    \\  verify-native-evidence        verify a native result against a manifest
     \\  verify-vhd                    validate a derived upload VHD
     \\  azure-contracts               print the Azure contracts for a flavor
     \\  azure-result                  record an Azure acceptance result

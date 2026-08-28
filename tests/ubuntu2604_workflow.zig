@@ -39,7 +39,7 @@ test "each matrix carries exactly the published full-flavor candidates" {
             std.mem.count(u8, section, "- key: x86_64-full"),
         );
         try std.testing.expectEqual(
-            @as(usize, if (std.mem.eql(u8, boundary[0], "native_qemu")) 0 else 1),
+            @as(usize, 1),
             std.mem.count(u8, section, "- key: aarch64-full"),
         );
         try source.expectOmitsIn(section, "-core", boundary[0]);
@@ -48,19 +48,11 @@ test "each matrix carries exactly the published full-flavor candidates" {
             "asset_name: Ubuntu-26.04-x86_64.qcow2",
             boundary[0],
         );
-        if (std.mem.eql(u8, boundary[0], "native_qemu")) {
-            try source.expectOmitsIn(
-                section,
-                "asset_name: Ubuntu-26.04-aarch64.qcow2",
-                boundary[0],
-            );
-        } else {
-            try source.expectContainsIn(
-                section,
-                "asset_name: Ubuntu-26.04-aarch64.qcow2",
-                boundary[0],
-            );
-        }
+        try source.expectContainsIn(
+            section,
+            "asset_name: Ubuntu-26.04-aarch64.qcow2",
+            boundary[0],
+        );
     }
 }
 
@@ -111,6 +103,22 @@ test "publication fails closed across all three matrices" {
     try source.expectContainsIn(
         publish,
         "--azure-results \"$AZURE_RESULTS_DIR\"",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        publish,
+        "--candidate-run-id \"$CANDIDATE_RUN_ID\"",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        publish,
+        "--candidate-run-attempt \"$CANDIDATE_RUN_ATTEMPT\"",
+        workflow_path,
+    );
+    try source.expectContainsIn(publish, "--run-id \"$RUN_ID_VALUE\"", workflow_path);
+    try source.expectContainsIn(
+        publish,
+        "--run-attempt \"$RUN_ATTEMPT_VALUE\"",
         workflow_path,
     );
 }
@@ -495,12 +503,22 @@ test "native acceptance cannot silently skip" {
     defer workflow.deinit();
     const native = try workflow.section("  native_qemu:", "  azure_acceptance:");
     const needles = [_][]const u8{
+        "runner: ubuntu-24.04",
+        "runner: [self-hosted, Linux, ARM64, kvm]",
+        "FLAVOR: full",
         "if [[ ! -c /dev/kvm ]]",
-        "sudo chown \"$(id -u):$(id -g)\" /dev/kvm",
+        "sudo -n chown \"$(id -u):$(id -g)\" /dev/kvm",
         "test -r /dev/kvm",
         "test -w /dev/kvm",
+        "test \"$(uname -m)\" = \"$expected_uname\"",
+        "test \"$(dpkg --print-architecture)\" = \"$expected_deb\"",
+        "\"$RELEASE_TOOL\" kvm-api-version",
+        "qemu-efi-aarch64 qemu-system-arm",
+        "qemu=qemu-system-aarch64",
         "OVMF_CODE_4M.ms.fd",
         "OVMF_VARS_4M.ms.fd",
+        "AAVMF_CODE.ms.fd",
+        "AAVMF_VARS.ms.fd",
         "MIZ_UBUNTU2604_UEFI_CODE=",
         "MIZ_UBUNTU2604_UEFI_VARS=",
         "test -f \"$uefi_code\"",
@@ -512,10 +530,32 @@ test "native acceptance cannot silently skip" {
         "sudo rm -rf -- \"$fixture\"",
         "ldd \"$binary\"",
         "while read -r library",
+        "MIZ_UBUNTU2604_SOURCE_COMMIT=",
+        "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ID=",
+        "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ATTEMPT=",
+        "-Dubuntu2604-flavor=\"$FLAVOR\"",
     };
     for (needles) |needle| try source.expectContainsIn(native, needle, workflow_path);
-    try source.expectOmitsIn(native, "AAVMF_CODE", workflow_path);
     try source.expectOmitsIn(native, "/usr/bin/coreutils", workflow_path);
+    for ([_][]const u8{ "force_tcg", "accel=tcg", "MIZ_VM_ACCEL=software" }) |needle| {
+        try source.expectOmitsIn(native, needle, workflow_path);
+    }
+    const capability_start = try source.indexOfIn(
+        native,
+        "- name: Require matching native KVM runner",
+        workflow_path,
+    );
+    const capability_end = try source.indexOfIn(
+        native,
+        "- name: Check out accepted source",
+        workflow_path,
+    );
+    const capability = native[capability_start..capability_end];
+    try source.expectContainsIn(
+        capability,
+        "Unsupported native acceptance architecture",
+        workflow_path,
+    );
     try source.expectOrder(
         native,
         "sudo apt-get install -y --no-install-recommends \"${packages[@]}\"",
@@ -540,9 +580,26 @@ test "native acceptance cannot silently skip" {
         "echo \"MIZ_UBUNTU2604_UEFI_CODE=$uefi_code\"",
         workflow_path,
     );
-    // The native evidence check is a release-tooling subcommand now, and it
-    // still runs against both the result and the candidate it must bind.
-    try source.expectContainsIn(native, "\"$RELEASE_TOOL\" verify-native-evidence", workflow_path);
+    try source.expectOrder(
+        native,
+        "- name: Build accepted-source release tooling",
+        "- name: Require the stable KVM API version",
+        workflow_path,
+    );
+    // The workflow uses the canonical candidate-aware document validator,
+    // not the retired weaker manifest-only verifier.
+    try source.expectContainsIn(native, "\"$RELEASE_TOOL\" verify-native-result", workflow_path);
+    try source.expectOmitsIn(native, "verify-native-evidence", workflow_path);
+    try source.expectContainsIn(
+        native,
+        "--manifest \"$CANDIDATE_DIR/candidate.json\"",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        native,
+        "--asset \"$CANDIDATE_DIR/$ASSET_NAME\"",
+        workflow_path,
+    );
     try source.expectContainsIn(
         native,
         "--result \"$RESULT_DIR/native-result.json\"",
@@ -550,7 +607,12 @@ test "native acceptance cannot silently skip" {
     );
     try source.expectContainsIn(
         native,
-        "--candidate \"$CANDIDATE_DIR/candidate.json\"",
+        "--key \"$CANDIDATE_KEY\"",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        native,
+        "--source-commit \"$SOURCE_COMMIT\"",
         workflow_path,
     );
 }

@@ -568,6 +568,9 @@ jobs:
           echo "MIZ_UBUNTU2604_IMAGE=$GITHUB_WORKSPACE/$asset" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_SIGNING_CERTIFICATE=$GITHUB_WORKSPACE/$RESULT_DIR/signing-certificate.pem" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_ACCEPTANCE_RESULT=$GITHUB_WORKSPACE/$RESULT_DIR/native-result.json" >> "$GITHUB_ENV"
+          echo "MIZ_UBUNTU2604_SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_ENV"
+          echo "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ID=$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+          echo "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
       - name: Fetch and verify digest-bound Android container smoke inputs
         env:

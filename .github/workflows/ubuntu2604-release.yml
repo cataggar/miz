@@ -420,15 +420,50 @@ jobs:
             architecture: x86_64
             runner: ubuntu-24.04
             asset_name: Ubuntu-26.04-x86_64.qcow2
+          - key: aarch64-full
+            architecture: aarch64
+            runner: [self-hosted, Linux, ARM64, kvm]
+            asset_name: Ubuntu-26.04-aarch64.qcow2
     env:
       CANDIDATE_KEY: ${{ matrix.key }}
       ARCHITECTURE: ${{ matrix.architecture }}
+      FLAVOR: full
       ASSET_NAME: ${{ matrix.asset_name }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       CANDIDATE_DIR: .release/native/${{ matrix.key }}/candidate
       RESULT_DIR: artifact-staging/native-results/${{ matrix.key }}
       RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
     steps:
+      - name: Require matching native KVM runner
+        run: |
+          set -euo pipefail
+          case "$ARCHITECTURE" in
+            x86_64)
+              expected_uname=x86_64
+              expected_deb=amd64
+              ;;
+            aarch64)
+              expected_uname=aarch64
+              expected_deb=arm64
+              ;;
+            *)
+              echo "::error::Unsupported native acceptance architecture: $ARCHITECTURE"
+              exit 1
+              ;;
+          esac
+          source /etc/os-release
+          test "${ID:-}" = ubuntu
+          test "$(uname -m)" = "$expected_uname"
+          test "$(dpkg --print-architecture)" = "$expected_deb"
+          sudo -n true
+          if [[ ! -c /dev/kvm ]]; then
+            echo "::error::Matching-architecture native acceptance requires a KVM-capable runner with /dev/kvm"
+            exit 1
+          fi
+          sudo -n chown "$(id -u):$(id -g)" /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -457,13 +492,27 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           packages=(
-            openssh-client openssl qemu-utils
+            ca-certificates openssh-client openssl qemu-utils
             sbsigntool swtpm swtpm-tools
           )
-          test "$ARCHITECTURE" = x86_64
-          packages+=(ovmf qemu-system-x86)
-          uefi_code=/usr/share/OVMF/OVMF_CODE_4M.ms.fd
-          uefi_vars=/usr/share/OVMF/OVMF_VARS_4M.ms.fd
+          case "$ARCHITECTURE" in
+            x86_64)
+              packages+=(ovmf qemu-system-x86)
+              qemu=qemu-system-x86_64
+              uefi_code=/usr/share/OVMF/OVMF_CODE_4M.ms.fd
+              uefi_vars=/usr/share/OVMF/OVMF_VARS_4M.ms.fd
+              ;;
+            aarch64)
+              packages+=(qemu-efi-aarch64 qemu-system-arm)
+              qemu=qemu-system-aarch64
+              uefi_code=/usr/share/AAVMF/AAVMF_CODE.ms.fd
+              uefi_vars=/usr/share/AAVMF/AAVMF_VARS.ms.fd
+              ;;
+            *)
+              echo "::error::Unsupported native acceptance architecture: $ARCHITECTURE"
+              exit 1
+              ;;
+          esac
           sudo apt-get install -y --no-install-recommends "${packages[@]}"
           uefi_code=$(readlink -f -- "$uefi_code")
           uefi_vars=$(readlink -f -- "$uefi_vars")
@@ -475,17 +524,10 @@ jobs:
             echo "MIZ_UBUNTU2604_UEFI_CODE=$uefi_code"
             echo "MIZ_UBUNTU2604_UEFI_VARS=$uefi_vars"
           } >> "$GITHUB_ENV"
-          if [[ ! -c /dev/kvm ]]; then
-            echo "::error::Matching-architecture native acceptance requires a KVM-capable runner with /dev/kvm"
-            exit 1
-          fi
-          sudo chown "$(id -u):$(id -g)" /dev/kvm
-          test -r /dev/kvm
-          test -w /dev/kvm
           for tool in qemu-img sbverify ssh ssh-keygen swtpm; do
             command -v "$tool" >/dev/null
           done
-          command -v qemu-system-x86_64 >/dev/null
+          command -v "$qemu" >/dev/null
 
       - name: Build accepted-source release tooling
         run: |
@@ -496,6 +538,14 @@ jobs:
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
+
+      # The runner's /dev/kvm was proven present and writable before the
+      # checkout; this proves it speaks the stable KVM ABI the acceptance
+      # harness targets, using the tooling built from the accepted source.
+      - name: Require the stable KVM API version
+        run: |
+          set -euo pipefail
+          "$RELEASE_TOOL" kvm-api-version
 
       - name: Provision privileged offline-root containment fixture
         run: |
@@ -543,6 +593,9 @@ jobs:
           echo "MIZ_UBUNTU2604_IMAGE=$GITHUB_WORKSPACE/$asset" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_SIGNING_CERTIFICATE=$GITHUB_WORKSPACE/$RESULT_DIR/signing-certificate.pem" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_ACCEPTANCE_RESULT=$GITHUB_WORKSPACE/$RESULT_DIR/native-result.json" >> "$GITHUB_ENV"
+          echo "MIZ_UBUNTU2604_SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_ENV"
+          echo "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ID=$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+          echo "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
       - name: Run matching-architecture native Secure Boot acceptance
         run: |
@@ -553,15 +606,19 @@ jobs:
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build \
             -Dubuntu2604-arch="$ARCHITECTURE" \
+            -Dubuntu2604-flavor="$FLAVOR" \
             test-ubuntu2604-acceptance
           test -s "$MIZ_UBUNTU2604_ACCEPTANCE_RESULT"
 
-      - name: Validate explicit native acceptance evidence
+      - name: Validate exact native acceptance evidence
         run: |
           set -euo pipefail
-          "$RELEASE_TOOL" verify-native-evidence \
+          "$RELEASE_TOOL" verify-native-result \
+            --manifest "$CANDIDATE_DIR/candidate.json" \
+            --asset "$CANDIDATE_DIR/$ASSET_NAME" \
             --result "$RESULT_DIR/native-result.json" \
-            --candidate "$CANDIDATE_DIR/candidate.json"
+            --key "$CANDIDATE_KEY" \
+            --source-commit "$SOURCE_COMMIT"
 
       - name: Upload native acceptance failure diagnostics
         if: failure()
@@ -783,6 +840,8 @@ jobs:
       contents: write
     env:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      CANDIDATE_RUN_ID: ${{ needs.prepare.outputs.candidate_run_id }}
+      CANDIDATE_RUN_ATTEMPT: ${{ needs.prepare.outputs.candidate_run_attempt }}
       CANDIDATES_DIR: .release/publication/candidates
       NATIVE_RESULTS_DIR: .release/publication/native
       AZURE_RESULTS_DIR: .release/publication/azure
@@ -845,6 +904,9 @@ jobs:
           merge-multiple: false
 
       - name: Validate exact two-architecture release gate
+        env:
+          RUN_ID_VALUE: ${{ github.run_id }}
+          RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           test "$PREPARE_RESULT" = success
@@ -855,7 +917,11 @@ jobs:
             --candidates "$CANDIDATES_DIR" \
             --native-results "$NATIVE_RESULTS_DIR" \
             --azure-results "$AZURE_RESULTS_DIR" \
-            --source-commit "$SOURCE_COMMIT"
+            --source-commit "$SOURCE_COMMIT" \
+            --candidate-run-id "$CANDIDATE_RUN_ID" \
+            --candidate-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
+            --run-id "$RUN_ID_VALUE" \
+            --run-attempt "$RUN_ATTEMPT_VALUE"
 
       - name: Publish exactly two accepted Ubuntu assets
         run: scripts/ubuntu2604_publish.sh

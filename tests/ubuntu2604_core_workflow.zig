@@ -202,6 +202,9 @@ test "core build and acceptance contracts are explicit" {
         "test -f \"$uefi_code\"",
         "test -f \"$uefi_vars\"",
         "verify-native-result",
+        "MIZ_UBUNTU2604_SOURCE_COMMIT=",
+        "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ID=",
+        "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ATTEMPT=",
     };
     for (native_needles) |needle| try source.expectContainsIn(native, needle, workflow_path);
     for ([_][]const u8{ "force_tcg", "accel=tcg", "MIZ_VM_ACCEL=software" }) |needle| {
