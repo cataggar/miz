@@ -474,8 +474,10 @@ sudo -E zig build \
 
 ### Repeatable bare-metal image benchmark
 
-`scripts/ubuntu2604_image_benchmark.py` is the opt-in host benchmark for issue
-#550. It is deliberately not part of normal CI. The profile is fixed to the
+`scripts/ubuntu2604_image_benchmark.zig` is the opt-in host benchmark for issue
+#550, built as `zig-out/bin/ubuntu2604-image-benchmark` by
+`zig build install-ubuntu2604-image-benchmark`. It is deliberately not part of
+normal CI. The profile is fixed to the
 pinned 20260731 Ubuntu 26.04 source, `aarch64`, `baremetal`, the exact 5 GiB
 size, and `ReleaseSafe`. It performs one warm-up and exactly three measured
 runs. Every run has a fresh work and output directory; only the explicitly
@@ -489,7 +491,7 @@ Prerequisites:
 
 - a native `aarch64` Ubuntu host running as root, because package scripts run
   in the architecture-matched offline root;
-- Zig 0.16.0, `file`, `python3`, and the aarch64 `systemd-boot-efi` stub;
+- Zig 0.16.0, `file`, and the aarch64 `systemd-boot-efi` stub;
 - the pinned Canonical image, `SHA256SUMS`, detached signature, and arm64
   manifest with the hashes listed above;
 - the seven exact arm64 lock files emitted by a previously successful
@@ -513,11 +515,12 @@ The benchmark never refreshes those inputs. The builder options
 `--debz-cache`, `--debz-lock-dir`, and `--offline` exist so the measured runs
 consume those exact inputs without a symlink or ambient network fallback.
 
-Invoke the benchmark from a clean checkout at the commit being measured. The
-output root must not already exist:
+Invoke the benchmark from a clean checkout at the commit being measured, using
+the tool built from that same checkout. The output root must not already exist:
 
 ```console
-sudo -E python3 scripts/ubuntu2604_image_benchmark.py \
+zig build install-ubuntu2604-image-benchmark
+sudo -E zig-out/bin/ubuntu2604-image-benchmark run \
   --output-root /data/miz-benchmarks/ubuntu2604-baremetal-<commit> \
   --source /data/miz-inputs/ubuntu-26.04-server-cloudimg-arm64.img \
   --sha256sums /data/miz-inputs/SHA256SUMS \
@@ -590,6 +593,15 @@ copies are removed in the unconditional cleanup step. The uploaded artifact
 contains the summary, phase/resource timings, exact input/cache/lock
 inventories, provenance, validation logs, staging evidence, and an explicit
 8m50s non-regression gate, including partial evidence after a failure.
+
+The workflow runs no interpreter of its own: its staging check, its
+non-regression gate, and that private-material scan are the
+`verify-staging`, `gate`, and `scan-private-material` subcommands of the same
+benchmark tool, so each contract is unit tested rather than embedded in a job
+step. That tool is built immediately after the Zig toolchain is installed and
+before every preflight that can fail, so a runner that is too small, missing a
+host dependency, or carrying the wrong Zig version still reaches the gate, the
+evidence scan, and the artifact upload instead of losing its partial evidence.
 
 GitHub's standard hosted ARM image carries many unrelated preinstalled tool
 stacks. The workflow removes only disposable hosted-runner tool directories
