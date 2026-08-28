@@ -2728,6 +2728,9 @@ fn utsField(field: []const u8) []const u8 {
     return field[0..end];
 }
 
+/// A borrowed view of the three `utsname` fields the benchmark records. The
+/// slices point into the caller's `utsname`, so they are only valid while that
+/// value is alive -- use `hostDocument` for anything that outlives it.
 const HostIdentity = struct {
     system: []const u8,
     kernel: []const u8,
@@ -2740,6 +2743,30 @@ fn hostIdentity(uts: *const std.posix.utsname) HostIdentity {
         .kernel = utsField(&uts.release),
         .machine = utsField(&uts.machine),
     };
+}
+
+/// The recorded host identity, with every string copied out of `uts`.
+///
+/// `uts` is a `std.posix.uname()` value on the caller's stack, while this
+/// document is returned upwards and ends up embedded in the benchmark summary.
+/// Borrowing the `utsname` storage would leave the summary's `system`,
+/// `kernel`, and `machine` reading a dead frame. The copies are owned by
+/// `allocator`, which is the arena that owns every other document the run
+/// produces, so they are released with it.
+pub fn hostDocument(
+    allocator: Allocator,
+    uts: *const std.posix.utsname,
+    zig_version: []const u8,
+    cpu_count: i64,
+) !Value {
+    const host = hostIdentity(uts);
+    return object(allocator, &.{
+        .{ "system", str(try allocator.dupe(u8, host.system)) },
+        .{ "kernel", str(try allocator.dupe(u8, host.kernel)) },
+        .{ "machine", str(try allocator.dupe(u8, host.machine)) },
+        .{ "cpu_count", int(cpu_count) },
+        .{ "zig", str(try allocator.dupe(u8, zig_version)) },
+    });
 }
 
 fn monotonicNanoseconds(io: Io) i96 {
@@ -3495,13 +3522,12 @@ fn preflight(
         return context.fail("benchmark requires Zig 0.16.0", .{});
     }
 
-    const host_document = try object(allocator, &.{
-        .{ "system", str(host.system) },
-        .{ "kernel", str(host.kernel) },
-        .{ "machine", str(host.machine) },
-        .{ "cpu_count", int(@intCast(std.Thread.getCpuCount() catch 0)) },
-        .{ "zig", str(try allocator.dupe(u8, version_text)) },
-    });
+    const host_document = try hostDocument(
+        allocator,
+        &uts,
+        version_text,
+        @intCast(std.Thread.getCpuCount() catch 0),
+    );
 
     const source_commit = try gitOutput(
         allocator,

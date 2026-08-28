@@ -1224,6 +1224,84 @@ test "summary generation uses three measured medians" {
     try expectContains(readable, "not compared");
 }
 
+/// Writes a known name into a `utsname` field, which is a fixed-size,
+/// NUL-terminated character array.
+fn setUtsField(field: []u8, value: []const u8) void {
+    @memset(field, 0);
+    @memcpy(field[0..value.len], value);
+}
+
+/// Builds the host document from a `utsname` that lives several frames below
+/// the caller, so the storage its strings were read from is guaranteed to be
+/// dead by the time the caller inspects them.
+fn hostDocumentFromDeepFrame(allocator: Allocator, depth: usize) !Value {
+    if (depth > 0) return hostDocumentFromDeepFrame(allocator, depth - 1);
+    var uts = std.mem.zeroes(std.posix.utsname);
+    setUtsField(&uts.sysname, "Linux");
+    setUtsField(&uts.release, "6.14.0-1234-benchmark");
+    setUtsField(&uts.machine, "aarch64");
+    return benchmark.hostDocument(allocator, &uts, "0.16.0", 8);
+}
+
+/// Overwrites the stack region the frames above used, so a document that had
+/// borrowed a `utsname` there would now read the pattern instead.
+fn clobberStack(depth: usize) u8 {
+    var scratch: [8192]u8 = undefined;
+    for (&scratch, 0..) |*byte, index| {
+        byte.* = @truncate(index *% 251 +% depth +% 1);
+    }
+    const carry: u8 = if (depth == 0) 0 else clobberStack(depth - 1);
+    std.mem.doNotOptimizeAway(&scratch);
+    return scratch[scratch.len - 1] +% carry;
+}
+
+test "the recorded host identity outlives the utsname it was read from" {
+    var fixture = try Fixture.create();
+    defer fixture.deinit();
+    const allocator = fixture.allocator();
+
+    const document = try hostDocumentFromDeepFrame(allocator, 6);
+    std.mem.doNotOptimizeAway(clobberStack(24));
+
+    const fields = [_][2][]const u8{
+        .{ "system", "Linux" },
+        .{ "kernel", "6.14.0-1234-benchmark" },
+        .{ "machine", "aarch64" },
+        .{ "zig", "0.16.0" },
+    };
+    for (fields) |field| {
+        const value = document.object.get(field[0]) orelse return error.TestMissingField;
+        try std.testing.expect(value == .string);
+        try std.testing.expectEqualStrings(field[1], value.string);
+    }
+    try std.testing.expectEqual(@as(i64, 8), document.object.get("cpu_count").?.integer);
+
+    // The summary embeds this document, so it must also survive being
+    // serialized after the frame is gone.
+    const summary = try benchmark.buildSummary(
+        allocator,
+        &.{
+            try summaryRun(allocator, "run-0", "warmup", 100, 100),
+            try summaryRun(allocator, "run-1", "measured", 30, 30),
+            try summaryRun(allocator, "run-2", "measured", 10, 10),
+            try summaryRun(allocator, "run-3", "measured", 20, 20),
+        },
+        "b" ** 40,
+        document,
+        try fixture.parse("{}"),
+        "d" ** 64,
+        try fixture.parse("[]"),
+        &fixture.context,
+    );
+    std.mem.doNotOptimizeAway(clobberStack(24));
+    const path = try fixture.path(&.{"benchmark-summary.json"});
+    try benchmark.writeJson(allocator, fixture.io, path, summary);
+    const written = try fixture.read(path);
+    try expectContains(written, "\"machine\": \"aarch64\"");
+    try expectContains(written, "\"kernel\": \"6.14.0-1234-benchmark\"");
+    try expectContains(written, "\"system\": \"Linux\"");
+}
+
 test "a summary requires exactly three measured runs" {
     var fixture = try Fixture.create();
     defer fixture.deinit();
