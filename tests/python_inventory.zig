@@ -1,43 +1,25 @@
-//! Temporary inventory of the Python this repository still owns.
+//! Permanent guard against repository-owned Python.
 //!
-//! The repository is migrating every repository-owned Python program and every
-//! Python invocation to Zig. Until that finishes, a partially migrated tree has
-//! to be able to state precisely what Python is left, so review can see each
-//! port shrink the list and can catch a new dependency being added by accident.
-//! This test is that statement, enforced by CI rather than by convention.
+//! The migration to Zig is complete: no tracked `*.py` file may exist, and no
+//! tracked file may execute a Python interpreter on the host or in a guest.
+//! This test enforces both statements in CI.
 //!
-//! Two things are tracked, because they are removed differently.
+//! An invocation site is a `python`, `python3`, or `python3.12` token used as a
+//! command (see `isCommandUse`), which is what an execution dependency looks
+//! like in a shell script, a workflow, a build file, or an `argv` array. Prose
+//! is deliberately invisible to this scan: a Zig doc comment saying a module
+//! replaced a Python script names no command.
 //!
-//! * Every tracked `*.py` file is listed as `.source`. A port deletes these
-//!   whole, so only their presence is tracked.
-//! * Every *invocation site* in any other tracked file is counted. An
-//!   invocation site is a `python`, `python3`, or `python3.12` token used as a
-//!   command (see `isCommandUse`), which is what an execution dependency
-//!   actually looks like in a shell script, a workflow, a build file, or an
-//!   `argv` array. Prose is deliberately invisible to this scan: a Zig doc
-//!   comment saying a module replaced a Python script names no command, so
-//!   migration commentary never enters the inventory and the list can only
-//!   shrink as ports land.
-//!
-//! Each non-source entry declares what its sites are: `.execution` runs Python
-//! on the host or in a guest, `.documentation` shows a Python command to a
-//! reader, and `.reference` is an explicitly exempted compatibility string --
-//! an interpreter line in test data, for example -- that has the shape of a
-//! command but executes nothing here. Only `.execution` blocks the zero-Python
-//! goal; `.reference` entries may outlive the migration.
-//!
-//! No `.execution` entry is left: nothing this repository owns runs Python any
-//! more, on the host or in a guest. What remains is one inert `.py` file with
-//! no caller, whose deletion finishes the migration.
+//! A few compatibility strings have the shape of commands but execute nothing
+//! here, such as interpreter lines used as test data. They are explicitly
+//! allowlisted with exact site counts so any new interpreter-shaped string
+//! still requires review.
 //!
 //! `.tools/` is excluded: it holds locally provisioned toolchains this
 //! repository does not own, and it is not tracked by Git in any case. This file
 //! is excluded from the invocation scan because its own fixtures are, by
 //! construction, the command spellings the scanner must detect.
 //!
-//! When the last entry is gone, this file is replaced by a permanent
-//! zero-Python guard.
-
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -45,25 +27,10 @@ const Dir = std.Io.Dir;
 const Io = std.Io;
 const Writer = std.Io.Writer;
 
-/// What a tracked file's invocation sites actually are.
-const Kind = enum {
-    /// A repository-owned Python program or test.
-    source,
-    /// The file executes Python, on the host or inside a guest.
-    execution,
-    /// Documentation that shows a Python command to a reader.
-    documentation,
-    /// An explicitly exempted compatibility string: it has the shape of a
-    /// command but nothing in this repository executes it.
-    reference,
-};
-
 const Entry = struct {
     path: []const u8,
-    kind: Kind,
-    /// Invocation sites in the file. `null` for `.source` entries, whose unit
-    /// of removal is the whole file.
-    sites: ?usize = null,
+    /// Inert compatibility-reference sites in the file, always at least one.
+    sites: usize,
     note: []const u8,
 };
 
@@ -71,41 +38,27 @@ const Entry = struct {
 /// cannot be a subject of its own scan.
 const guard_path = "tests/python_inventory.zig";
 
-/// Sorted by path. Keep it sorted: review reads this as a checklist.
+/// Inert compatibility references, sorted by path for review.
 const inventory = [_]Entry{
     .{
         .path = "packages/miz/src/customize.zig",
-        .kind = .reference,
         .sites = 2,
         .note = "hook interpreter lines in test data; nothing runs them",
     },
     .{
         .path = "packages/miz/src/unsafe_chroot.zig",
-        .kind = .reference,
         .sites = 2,
         .note = "hook interpreter lines in test data; nothing runs them",
     },
     .{
         .path = "packages/miz/src/vm_backend.zig",
-        .kind = .reference,
         .sites = 2,
         .note = "customization interpreter strings in test data",
     },
-    .{
-        .path = "scripts/azure_vhd.py",
-        .kind = .source,
-        .note = "superseded by scripts/azure_vhd.zig; no caller runs the Python",
-    },
 };
 
-/// Totals restated so a diff shows the migration moving. Both must only ever
-/// decrease; an increase means a new Python dependency was introduced.
-///
-/// Nothing in this repository executes Python any more: the execution count is
-/// zero and may never rise again. The one remaining source file is inert --
-/// it has no caller -- and its deletion is the last step of the migration,
-/// after which this inventory becomes a permanent zero-Python guard.
-const remaining_source_files = 1;
+/// These are permanent invariants, not migration counters: neither may rise.
+const remaining_source_files = 0;
 const remaining_execution_sites = 0;
 
 /// No tracked file is anywhere near this size, and the limit keeps a stray
@@ -286,43 +239,23 @@ fn report(failures: *Writer.Allocating) !void {
 
 test "the inventory is sorted, unique, and internally consistent" {
     var previous: []const u8 = "";
-    var sources: usize = 0;
-    var execution_sites: usize = 0;
     for (inventory) |entry| {
         try std.testing.expect(std.mem.lessThan(u8, previous, entry.path));
         previous = entry.path;
         try std.testing.expect(entry.note.len > 0);
-        try std.testing.expectEqual(
-            isPythonSourcePath(entry.path),
-            entry.kind == .source,
-        );
-        if (entry.kind == .source) {
-            try std.testing.expectEqual(@as(?usize, null), entry.sites);
-            sources += 1;
-        } else {
-            try std.testing.expect(entry.sites.? > 0);
-            if (entry.kind == .execution) execution_sites += entry.sites.?;
-        }
+        try std.testing.expect(!isPythonSourcePath(entry.path));
+        try std.testing.expect(entry.sites > 0);
         try std.testing.expect(!isTools(entry.path));
         try std.testing.expect(!std.mem.eql(u8, entry.path, guard_path));
     }
-    try std.testing.expectEqual(remaining_source_files, sources);
-    try std.testing.expectEqual(remaining_execution_sites, execution_sites);
+    try std.testing.expectEqual(@as(usize, 0), remaining_execution_sites);
 }
 
 test "nothing in this repository executes Python" {
-    // The migration's goal, stated as an assertion rather than as a count so
-    // it reads as the contract it is: no tracked file runs an interpreter, on
-    // the host or in a guest. Only `.reference` compatibility strings and the
-    // one inert `.source` file remain, and neither executes anything.
     try std.testing.expectEqual(@as(usize, 0), remaining_execution_sites);
-    for (inventory) |entry| {
-        try std.testing.expect(entry.kind != .execution);
-        try std.testing.expect(entry.kind != .documentation);
-    }
 }
 
-test "every tracked Python file is inventoried as a source entry" {
+test "no tracked file is Python source" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -334,38 +267,21 @@ test "every tracked Python file is inventoried as a source entry" {
     var failures: Writer.Allocating = .init(allocator);
     defer failures.deinit();
 
-    var seen = std.StringHashMap(void).init(allocator);
-    defer seen.deinit();
-
+    var sources: usize = 0;
     var paths = tracked.iterator();
     while (paths.next()) |path| {
         if (path.len == 0 or isTools(path)) continue;
         if (!isPythonSourcePath(path)) continue;
-        try seen.put(path, {});
-        const entry = find(path) orelse {
-            try failures.writer.print(
-                "{s}: Python source is not inventoried\n",
-                .{path},
-            );
-            continue;
-        };
-        if (entry.kind != .source) try failures.writer.print(
-            "{s}: Python source is inventoried as .{s}\n",
-            .{ path, @tagName(entry.kind) },
-        );
-    }
-
-    for (inventory) |entry| {
-        if (entry.kind != .source) continue;
-        if (seen.contains(entry.path)) continue;
+        sources += 1;
         try failures.writer.print(
-            "{s}: inventoried source is no longer tracked; remove the entry\n",
-            .{entry.path},
+            "{s}: tracked Python source; this repository owns no Python " ++
+                "programs. Port it to Zig or delete it.\n",
+            .{path},
         );
     }
 
     try report(&failures);
-    try std.testing.expectEqual(remaining_source_files, seen.count());
+    try std.testing.expectEqual(remaining_source_files, sources);
 }
 
 test "every Python invocation site outside a Python file is inventoried" {
@@ -386,6 +302,8 @@ test "every Python invocation site outside a Python file is inventoried" {
     var paths = tracked.iterator();
     while (paths.next()) |path| {
         if (path.len == 0 or isTools(path)) continue;
+        // A `*.py` file is rejected whole by the source guard; counting its
+        // interior sites here would only restate that failure.
         if (isPythonSourcePath(path)) continue;
         if (std.mem.eql(u8, path, guard_path)) continue;
 
@@ -432,20 +350,19 @@ test "every Python invocation site outside a Python file is inventoried" {
             _ = try scanFile(contents, path, &failures.writer);
             continue;
         };
-        if (listed.sites.? != sites) {
+        if (listed.sites != sites) {
             try failures.writer.print(
-                "{s}: inventory records {d} invocation site(s), found {d}\n",
-                .{ path, listed.sites.?, sites },
+                "{s}: reference allowlist records {d} invocation site(s), found {d}\n",
+                .{ path, listed.sites, sites },
             );
             _ = try scanFile(contents, path, &failures.writer);
         }
     }
 
     for (inventory) |entry| {
-        if (entry.kind == .source) continue;
         if (seen.contains(entry.path)) continue;
         try failures.writer.print(
-            "{s}: inventoried but no longer tracked or no longer invokes Python; remove the entry\n",
+            "{s}: allowlisted but no longer tracked or no longer contains a Python reference; remove the entry\n",
             .{entry.path},
         );
     }
