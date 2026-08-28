@@ -1790,13 +1790,20 @@ test "the publisher is draft-first, allowlisted, and fail-safe" {
 const release_workflow = release.workflow;
 
 /// Runs `github-release-assets` against a remote release document and the
-/// staged allowlist, returning the diagnostic text of a rejection.
+/// staged allowlist. `true` means accepted; on `false` the rejection text is
+/// in `diagnostic`.
+///
+/// The caller owns the `Diagnostic` because its message lives in the struct's
+/// own inline buffer: returning `diagnostic.message()` from here would hand
+/// back a slice into a frame that has already been popped, which compares
+/// correctly only for as long as nothing reuses the stack.
 fn checkReleaseAssets(
     subject: *const Tree,
     remote: []const u8,
     expected_lines: []const u8,
     stage_name: []const u8,
-) !?[]const u8 {
+    diagnostic: *support.Diagnostic,
+) !bool {
     const remote_path = try subject.path("release.json", .{});
     defer allocator.free(remote_path);
     try Dir.cwd().writeFile(io, .{ .sub_path = remote_path, .data = remote });
@@ -1807,19 +1814,27 @@ fn checkReleaseAssets(
         .data = expected_lines,
     });
 
-    var diagnostic: support.Diagnostic = .{};
     release_workflow.releaseAssets(
         allocator,
         io,
         remote_path,
         expected_path,
         stage_name,
-        &diagnostic,
+        diagnostic,
     ) catch |err| switch (err) {
-        error.Failed => return diagnostic.message(),
+        error.Failed => return false,
         else => return err,
     };
-    return null;
+    return true;
+}
+
+/// Overwrites the stack the callee just released. A helper that hands back a
+/// slice into its own frame still compares equal by luck; it does not survive
+/// a comparison taken after this.
+fn clobberStack() void {
+    var scratch: [8192]u8 = undefined;
+    for (&scratch, 0..) |*byte, index| byte.* = @truncate(index +% 0x5a);
+    std.mem.doNotOptimizeAway(&scratch);
 }
 
 const publication_allowlist =
@@ -1831,16 +1846,16 @@ fn expectAssetsAccepted(
     remote: []const u8,
     stage_name: []const u8,
 ) !void {
-    const message = try checkReleaseAssets(
+    var diagnostic: support.Diagnostic = .{};
+    if (try checkReleaseAssets(
         subject,
         remote,
         publication_allowlist,
         stage_name,
-    );
-    if (message) |text| {
-        std.debug.print("unexpected rejection: {s}\n", .{text});
-        return error.UnexpectedRejection;
-    }
+        &diagnostic,
+    )) return;
+    std.debug.print("unexpected rejection: {s}\n", .{diagnostic.message()});
+    return error.UnexpectedRejection;
 }
 
 fn expectAssetsRejected(
@@ -1849,13 +1864,18 @@ fn expectAssetsRejected(
     stage_name: []const u8,
     expected_message: []const u8,
 ) !void {
-    const message = try checkReleaseAssets(
+    var diagnostic: support.Diagnostic = .{};
+    if (try checkReleaseAssets(
         subject,
         remote,
         publication_allowlist,
         stage_name,
-    ) orelse return error.ExpectedRejection;
-    try std.testing.expectEqualStrings(expected_message, message);
+        &diagnostic,
+    )) return error.ExpectedRejection;
+    // The message is read after the callee's frame has been reused, so this
+    // asserts the text is owned here rather than borrowed from that frame.
+    clobberStack();
+    try std.testing.expectEqualStrings(expected_message, diagnostic.message());
 }
 
 const draft_mismatch = "remote release asset allowlist/size mismatch: 2 assets";
@@ -2002,15 +2022,18 @@ test "the publication allowlist refuses a repeated asset name" {
     const repeated =
         "ubuntu-26.04-x86_64.qcow2\t" ++ "a" ** 64 ++ "\t2048\n" ++
         "ubuntu-26.04-x86_64.qcow2\t" ++ "a" ** 64 ++ "\t2048\n";
-    const message = try checkReleaseAssets(
+    var diagnostic: support.Diagnostic = .{};
+    if (try checkReleaseAssets(
         &subject,
         remote,
         repeated,
         "draft",
-    ) orelse return error.ExpectedRejection;
+        &diagnostic,
+    )) return error.ExpectedRejection;
+    clobberStack();
     try std.testing.expectEqualStrings(
         "publication allowlist line is malformed",
-        message,
+        diagnostic.message(),
     );
 }
 
