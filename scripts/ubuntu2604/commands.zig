@@ -1,7 +1,7 @@
 //! The release commands that produce documents rather than only check them.
 //!
 //! `candidate` binds a freshly built QCOW2 to its provenance tree, and `stage`
-//! turns two independently accepted candidates into the exact set of files a
+//! turns four independently accepted candidates into the exact set of files a
 //! GitHub release may carry. Staging is transactional on purpose: it builds
 //! the asset directory and the release notes under temporary names and commits
 //! both, so a failure part-way through leaves the publication inputs exactly
@@ -302,7 +302,7 @@ fn findDocuments(
         .{ contracts.release_order.len, filename, root, relative.len },
     );
 
-    var found: [contracts.release_order.len]?Located = .{ null, null };
+    var found: [contracts.release_order.len]?Located = @splat(null);
     errdefer for (&found) |*slot| {
         if (slot.*) |*located| located.deinit(allocator);
     };
@@ -341,7 +341,12 @@ fn findDocuments(
             .{filename},
         );
     }
-    return .{ found[0].?, found[1].? };
+    var ordered: [contracts.release_order.len]Located = undefined;
+    for (&found, 0..) |*slot, index| {
+        ordered[index] = slot.*.?;
+        slot.* = null;
+    }
+    return ordered;
 }
 
 /// Per-asset staging record, kept in publication order.
@@ -495,14 +500,6 @@ fn stageInto(
         );
         defer azure.deinit();
         const azure_object = azure.object();
-        _ = try documents.validateIdentity(
-            azure_object,
-            documents.azure_result_type,
-            1,
-            key,
-            source_commit,
-            diagnostic,
-        );
         if (!documents.hasWorkflowIdentity(azure_object.get("workflow"))) {
             return fail(diagnostic, "{s}: Azure workflow identity is absent", .{key});
         }
@@ -834,22 +831,33 @@ fn writeNotes(
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     try text.print(allocator,
-        \\Ubuntu Server 26.04 generalized Gen2 images built from the accepted source commit `{s}`. Every published QCOW2 passed hosted structural validation and protected-environment native validation on a matching Azure architecture.
+        \\Ubuntu 26.04 full/server and core/appliance generalized Gen2 images built from the accepted source commit `{s}`. Every published QCOW2 passed hosted structural validation, native KVM acceptance on a matching architecture, and Azure Trusted Launch acceptance.
+        \\
+        \\## Highlights
+        \\
+        \\- Exact four-asset matrix: full and core for x86_64 and AArch64.
+        \\- Full remains 5 GiB with systemd, cloud-init, WALinuxAgent, and `sshd.service`.
+        \\- Core is 3584 MiB (3.5 GiB), 30% smaller, with mizinit, azagent, and supervised OpenSSH.
+        \\- Every asset is digest-bound across build, native KVM, Azure Trusted Launch, staging, upload, and redownload verification.
         \\
         \\All UKIs are trusted through enrolled leaf SHA-256 `{s}`.
         \\Artifact Signing leaf certificate SHA-256: `{s}`.
         \\
-        \\| Asset | SHA-256 | UKI SHA-256 | File size | Virtual size | Azure validation | Derived VHD evidence (not published) |
-        \\| --- | --- | --- | ---: | ---: | --- | --- |
+        \\| Asset | Flavor / boot stack | SHA-256 | UKI SHA-256 | File size | Virtual size | Azure validation | Derived VHD evidence (not published) |
+        \\| --- | --- | --- | --- | ---: | ---: | --- | --- |
         \\
     , .{ source_commit, certificate_sha256, signing_certificate_sha256 });
 
     for (staged) |item| {
         try text.print(
             allocator,
-            "| `{s}` | `{s}` | `{s}` | {s} | {s} | `{s}` / `{s}` | `{s}`; current {d} bytes; file {d} bytes |\n",
+            "| `{s}` | {s} | `{s}` | `{s}` | {s} | {s} | `{s}` / `{s}` | `{s}`; current {d} bytes; file {d} bytes |\n",
             .{
                 item.asset_name,
+                if (std.mem.eql(u8, item.flavor, "full"))
+                    "full: systemd, cloud-init, WALinuxAgent"
+                else
+                    "core: mizinit, azagent, supervised OpenSSH",
                 item.sha256,
                 item.fallback_uki_sha256,
                 formatMib(item.bytes).slice(),
@@ -865,11 +873,15 @@ fn writeNotes(
 
     try text.appendSlice(allocator,
         \\
-        \\Both server images boot systemd and use cloud-init for account/key provisioning, WALinuxAgent for Azure Ready/extensions, and `sshd.service`.
+        \\Full images have an exact 5 GiB virtual disk and boot systemd with cloud-init, WALinuxAgent, and `sshd.service`. Core images are exactly 3584 MiB (3.5 GiB), 30% smaller, and use `mizinit` as PID 1 with `azagent` plus directly supervised OpenSSH instead of systemd, cloud-init, or WALinuxAgent.
         \\
-        \\Acceptance required signed UKIs, Azure Trusted Launch with Secure Boot and vTPM, the exact signer in UEFI db, kernel lockdown, module trust, key-only SSH, cloud-init provisioning, agent Ready, runtime Ubuntu release identity, root growth on an enlarged OS disk, managed-data-disk policy, and reboot/reconnect. Candidate and derived-VHD hashes were checked at every handoff; temporary VHDs and Azure resources were deleted.
+        \\All four candidates required signed UKIs, matching-architecture KVM with no TCG fallback, Azure Trusted Launch with Secure Boot and vTPM, the exact signer in UEFI db, kernel lockdown, module trust, key-only SSH, provisioning, runtime Ubuntu identity, root growth, disk-policy enforcement, persistent and unique identity, and reboot/reconnect. Core additionally required mizinit PID-1 and SSH supervision, azagent provisioning, resource and managed-data-disk contracts, Binder, and matching digest-bound Android container provenance in native and Azure acceptance. Candidate and derived-VHD hashes were checked at every handoff; temporary VHDs and Azure resources were deleted.
+        \\
+        \\Publication is an exact four-asset transaction: standalone zstd QCOW2 files with no backing images, verified remote names and sizes, and a redownloaded SHA-256 check before the draft becomes final. After the tag date, a finalized release is immutable.
         \\
         \\**No checksum sidecar assets are published**; SHA-256 digests are recorded only in these notes and the workflow job summary.
+        \\
+        \\Catalog aliases are a separate digest-pinned handoff. Rotate the full aliases and add core aliases only from the finalized release URLs, SHA-256 values, and signing identity recorded here; never infer or predeclare those pins.
         \\
         \\Internal provenance bindings:
         \\
@@ -1013,11 +1025,11 @@ fn isEmptyDirectory(
 }
 
 test "release tags accept only the dated Ubuntu spelling" {
-    try std.testing.expect(isReleaseTag("Ubuntu-26.04-20260822"));
+    try std.testing.expect(isReleaseTag("Ubuntu-26.04-20260828"));
     try std.testing.expect(!isReleaseTag("Ubuntu-26.04-2026082"));
-    try std.testing.expect(!isReleaseTag("Ubuntu-26.04-202608222"));
-    try std.testing.expect(!isReleaseTag("Ubuntu-26.10-20260822"));
-    try std.testing.expect(!isReleaseTag("ubuntu-26.04-20260822"));
+    try std.testing.expect(!isReleaseTag("Ubuntu-26.04-202608288"));
+    try std.testing.expect(!isReleaseTag("Ubuntu-26.10-20260828"));
+    try std.testing.expect(!isReleaseTag("ubuntu-26.04-20260828"));
     try std.testing.expect(!isReleaseTag("Ubuntu-26.04-2026082x"));
 }
 

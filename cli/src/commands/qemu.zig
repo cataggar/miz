@@ -38,7 +38,11 @@ const ImageFamily = enum {
     freebsd,
 
     fn supportsModel(self: ImageFamily) bool {
-        return self == .azure_linux;
+        // Model selection becomes available only when the catalog has a
+        // complete, digest-pinned x86_64/AArch64 pair for both models from one
+        // release and signing identity. This keeps a partially landed rotation
+        // from resolving through aliases.
+        return familyHasCompleteModelSet(self);
     }
 };
 
@@ -140,6 +144,54 @@ const known_images = [_]KnownImage{
     },
 };
 
+fn familyHasCompleteModel(family: ImageFamily, model: ImageModel) bool {
+    var x86_64: usize = 0;
+    var aarch64: usize = 0;
+    for (known_images) |known| {
+        if (known.family != family or known.model != model) continue;
+        switch (known.architecture) {
+            .x86_64 => x86_64 += 1,
+            .aarch64 => aarch64 += 1,
+        }
+    }
+    return x86_64 == 1 and aarch64 == 1;
+}
+
+fn familyHasCompleteModelSet(family: ImageFamily) bool {
+    if (!familyHasCompleteModel(family, .full) or
+        !familyHasCompleteModel(family, .core))
+    {
+        return false;
+    }
+
+    var release_tag: ?[]const u8 = null;
+    var certificate: ?[]const u8 = null;
+    var certificate_initialized = false;
+    for (known_images) |known| {
+        if (known.family != family) continue;
+        const separator = std.mem.lastIndexOfScalar(u8, known.release_spec, '@') orelse
+            return false;
+        const tag = known.release_spec[separator + 1 ..];
+        if (tag.len == 0) return false;
+        if (release_tag) |expected| {
+            if (!std.mem.eql(u8, expected, tag)) return false;
+        } else {
+            release_tag = tag;
+        }
+
+        if (!certificate_initialized) {
+            certificate = known.certificate_sha256;
+            certificate_initialized = true;
+        } else if (certificate) |expected| {
+            const actual = known.certificate_sha256 orelse return false;
+            if (!std.mem.eql(u8, expected, actual)) return false;
+        } else if (known.certificate_sha256 != null) {
+            return false;
+        }
+    }
+    return release_tag != null and certificate_initialized;
+}
+
 const default_image_name = known_images[0].disk_name;
 const default_image_spec = known_images[0].release_spec;
 const default_ssh_port: u16 = 2222;
@@ -176,8 +228,8 @@ const help_text =
     \\
     \\Options:
     \\  --snapshot          Discard guest disk and UEFI variable changes on exit.
-    \\  --model <m>         AzureLinux alias model: full (default) or core;
-    \\                      Ubuntu core catalog support is not yet available.
+    \\  --model <m>         Catalog alias model: full (default) or core.
+    \\                      Ubuntu core awaits finalized release digest pins.
     \\  --architecture <a>  Guest architecture: auto, x86_64, or aarch64.
     \\  --arch <a>          Alias for --architecture.
     \\  --admin-username <n> Provision this administrator account (requires a key).
@@ -518,7 +570,7 @@ fn runVm(
                 .{ @tagName(options.image_model), options.image_path },
             ),
             error.ImageModelRequiresAlias => std.debug.print(
-                "qemu: --model only applies to AzureLinux aliases; image '{s}' does not support model selection\n",
+                "qemu: --model requires a catalog family with complete full/core pins; image '{s}' does not support model selection\n",
                 .{options.image_path},
             ),
             else => std.debug.print("qemu: failed to resolve image: {s}\n", .{@errorName(err)}),
@@ -1026,13 +1078,14 @@ fn resolveImageAlloc(
         );
     }
     if (std.mem.eql(u8, basename, "Ubuntu")) {
-        if (options.model_was_explicit) return error.ImageModelRequiresAlias;
+        if (options.model_was_explicit and !ImageFamily.ubuntu.supportsModel())
+            return error.ImageModelRequiresAlias;
         return resolvedKnownImageAlloc(
             allocator,
             imageForFamilyAndArchitecture(
                 .ubuntu,
                 catalogArchitecture(options),
-                .full,
+                options.image_model,
             ),
             std.fs.path.dirname(argument),
             true,
@@ -3126,12 +3179,12 @@ test "qemu parser recognizes help" {
     try std.testing.expect(parsed.options.help);
 }
 
-test "qemu help lists finalized Ubuntu aliases and core deferral" {
+test "qemu help lists finalized Ubuntu aliases and digest-pinned core handoff" {
     for ([_][]const u8{
         "Ubuntu\n",
         "Ubuntu-26.04-x86_64",
         "Ubuntu-26.04-aarch64",
-        "Ubuntu core catalog support is not yet available",
+        "Ubuntu core awaits finalized release digest pins",
     }) |text| {
         try std.testing.expect(std.mem.indexOf(u8, help_text, text) != null);
     }
@@ -3554,6 +3607,11 @@ test "qemu rejects model selection for FreeBSD aliases" {
 }
 
 test "qemu rejects model selection for Ubuntu until core is cataloged" {
+    try std.testing.expect(ImageFamily.azure_linux.supportsModel());
+    try std.testing.expect(familyHasCompleteModel(.ubuntu, .full));
+    try std.testing.expect(!familyHasCompleteModel(.ubuntu, .core));
+    try std.testing.expect(!familyHasCompleteModelSet(.ubuntu));
+    try std.testing.expect(!ImageFamily.ubuntu.supportsModel());
     for ([_][]const u8{
         "Ubuntu",
         "Ubuntu-26.04-x86_64",

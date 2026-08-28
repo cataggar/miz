@@ -23,6 +23,7 @@ const support = release.support;
 
 const allocator = std.testing.allocator;
 const io = std.testing.io;
+const publication_tag = "Ubuntu-26.04-20260828";
 
 fn tree() !Tree {
     return Tree.create(allocator, io);
@@ -89,7 +90,7 @@ fn stage(subject: *const Tree, release_tag: []const u8) !void {
 }
 
 fn expectStageRejected(subject: *const Tree) !void {
-    try std.testing.expectError(error.Failed, stage(subject, "Ubuntu-26.04-20260822"));
+    try std.testing.expectError(error.Failed, stage(subject, publication_tag));
 }
 
 fn makeAll(subject: *const Tree) !void {
@@ -134,14 +135,14 @@ fn remake(subject: *const Tree, key: []const u8) !void {
     try fixture.makeBundle(subject, key, .{});
 }
 
-test "the release gate requires one valid native result for each full candidate" {
+test "the release gate requires valid native and Azure results for all four candidates" {
     var subject = try tree();
     defer subject.deinit();
     try makeReleaseEvidence(&subject);
     try releaseGate(&subject);
 }
 
-test "the release gate rejects missing, duplicate, and unexpected native results" {
+test "the release gate rejects missing, duplicate, extra, and unexpected native results" {
     {
         var subject = try tree();
         defer subject.deinit();
@@ -177,8 +178,22 @@ test "the release gate rejects missing, duplicate, and unexpected native results
             io,
             unexpected,
             &.{.{ .key = "key" }},
-            "aarch64-core",
+            "riscv64-core",
         );
+        try expectReleaseGateRejected(&subject);
+    }
+    {
+        var subject = try tree();
+        defer subject.deinit();
+        try makeReleaseEvidence(&subject);
+        const source_result = try subject.nativeResultPath("x86_64-core");
+        defer allocator.free(source_result);
+        const extra_dir = try subject.path("native/extra", .{});
+        defer allocator.free(extra_dir);
+        try Dir.cwd().createDirPath(io, extra_dir);
+        const extra_result = try subject.path("native/extra/native-result.json", .{});
+        defer allocator.free(extra_result);
+        try Dir.cwd().copyFile(source_result, Dir.cwd(), extra_result, io, .{});
         try expectReleaseGateRejected(&subject);
     }
     {
@@ -201,6 +216,62 @@ test "the release gate rejects missing, duplicate, and unexpected native results
         );
         try expectReleaseGateRejected(&subject);
     }
+}
+
+test "the release gate rejects missing, duplicate, and extra candidate or Azure evidence" {
+    var subject = try tree();
+    defer subject.deinit();
+    try makeReleaseEvidence(&subject);
+
+    const candidate_key = "aarch64-core";
+    const candidate = try subject.manifestPath(candidate_key);
+    defer allocator.free(candidate);
+    try Dir.cwd().deleteFile(io, candidate);
+    try expectReleaseGateRejected(&subject);
+    try remake(&subject, candidate_key);
+
+    try fixture.patchString(
+        allocator,
+        io,
+        candidate,
+        &.{.{ .key = "key" }},
+        "x86_64-core",
+    );
+    try expectReleaseGateRejected(&subject);
+    try remake(&subject, candidate_key);
+
+    const extra_candidate_dir = try subject.path("candidates/extra", .{});
+    defer allocator.free(extra_candidate_dir);
+    try Dir.cwd().createDirPath(io, extra_candidate_dir);
+    const extra_candidate = try subject.path("candidates/extra/candidate.json", .{});
+    defer allocator.free(extra_candidate);
+    try Dir.cwd().copyFile(candidate, Dir.cwd(), extra_candidate, io, .{});
+    try expectReleaseGateRejected(&subject);
+    try Dir.cwd().deleteTree(io, extra_candidate_dir);
+
+    const azure = try subject.azureResultPath(candidate_key);
+    defer allocator.free(azure);
+    try Dir.cwd().deleteFile(io, azure);
+    try expectReleaseGateRejected(&subject);
+    try remake(&subject, candidate_key);
+
+    try fixture.patchString(
+        allocator,
+        io,
+        azure,
+        &.{.{ .key = "key" }},
+        "x86_64-core",
+    );
+    try expectReleaseGateRejected(&subject);
+    try remake(&subject, candidate_key);
+
+    const extra_azure_dir = try subject.path("azure/extra", .{});
+    defer allocator.free(extra_azure_dir);
+    try Dir.cwd().createDirPath(io, extra_azure_dir);
+    const extra_azure = try subject.path("azure/extra/azure-result.json", .{});
+    defer allocator.free(extra_azure);
+    try Dir.cwd().copyFile(azure, Dir.cwd(), extra_azure, io, .{});
+    try expectReleaseGateRejected(&subject);
 }
 
 test "the release gate rejects stale or invalid native evidence" {
@@ -276,6 +347,36 @@ test "the release gate retains candidate and Azure fail-closed validation" {
         var subject = try tree();
         defer subject.deinit();
         try makeReleaseEvidence(&subject);
+        const azure = try subject.azureResultPath("x86_64-core");
+        defer allocator.free(azure);
+        try fixture.patchString(
+            allocator,
+            io,
+            azure,
+            &.{ .{ .key = "workflow" }, .{ .key = "run_id" } },
+            "999",
+        );
+        try expectReleaseGateRejected(&subject);
+    }
+    {
+        var subject = try tree();
+        defer subject.deinit();
+        try makeReleaseEvidence(&subject);
+        const manifest = try subject.manifestPath("aarch64-core");
+        defer allocator.free(manifest);
+        try fixture.patchString(
+            allocator,
+            io,
+            manifest,
+            &.{ .{ .key = "workflow" }, .{ .key = "run_attempt" } },
+            "2",
+        );
+        try expectReleaseGateRejected(&subject);
+    }
+    {
+        var subject = try tree();
+        defer subject.deinit();
+        try makeReleaseEvidence(&subject);
         const asset = try subject.assetPath("x86_64-full");
         defer allocator.free(asset);
         try Dir.cwd().writeFile(io, .{ .sub_path = asset, .data = "tampered" });
@@ -283,11 +384,27 @@ test "the release gate retains candidate and Azure fail-closed validation" {
     }
 }
 
-test "a successful stage publishes exactly the two full-flavor assets" {
+test "the release gate rejects core native and Azure Android provenance disagreement" {
+    var subject = try tree();
+    defer subject.deinit();
+    try makeReleaseEvidence(&subject);
+    const azure = try subject.azureResultPath("aarch64-core");
+    defer allocator.free(azure);
+    try fixture.patchString(
+        allocator,
+        io,
+        azure,
+        &.{ .{ .key = "android_smoke" }, .{ .key = "runtime_sha256" } },
+        "9" ** 64,
+    );
+    try expectReleaseGateRejected(&subject);
+}
+
+test "a successful stage publishes exactly four full and core assets" {
     var subject = try tree();
     defer subject.deinit();
     try makeAll(&subject);
-    try stage(&subject, "Ubuntu-26.04-20260822");
+    try stage(&subject, publication_tag);
 
     const manifest_path = try subject.path("staged/publish-manifest.json", .{});
     defer allocator.free(manifest_path);
@@ -336,20 +453,68 @@ test "a successful stage publishes exactly the two full-flavor assets" {
         .limited(64 * 1024),
     );
     defer allocator.free(notes);
-    try std.testing.expect(std.mem.indexOf(u8, notes, "Ubuntu Server 26.04") != null);
+    const required_notes = [_][]const u8{
+        "Ubuntu 26.04 full/server and core/appliance",
+        "systemd, cloud-init, WALinuxAgent",
+        "mizinit, azagent, supervised OpenSSH",
+        "exact 5 GiB",
+        "3584 MiB (3.5 GiB), 30% smaller",
+        "native KVM",
+        "Azure Trusted Launch",
+        "matching digest-bound Android container provenance",
+        "standalone zstd QCOW2 files with no backing images",
+        "finalized release is immutable",
+        "separate digest-pinned handoff",
+    };
+    for (required_notes) |text| {
+        try std.testing.expect(std.mem.indexOf(u8, notes, text) != null);
+    }
     try std.testing.expect(std.mem.indexOf(
         u8,
         notes,
         "No checksum sidecar assets are published",
     ) != null);
-    // Publication never mentions the appliance flavor, in any casing.
-    const lowered = try allocator.alloc(u8, notes.len);
-    defer allocator.free(lowered);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        std.ascii.lowerString(lowered, notes),
-        "core",
-    ) == null);
+}
+
+test "image-info validation requires standalone zstd QCOW2 bytes" {
+    var subject = try tree();
+    defer subject.deinit();
+    const info = try subject.path("image-info.json", .{});
+    defer allocator.free(info);
+    var diagnostic: support.Diagnostic = .{};
+
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = info,
+        .data =
+        \\{"format":"qcow2","virtual-size":2097152,
+        \\"backing-filename":"","full-backing-filename":null,
+        \\"format-specific":{"data":{"compression-type":"zstd"}}}
+        ,
+    });
+    try release.workflow.verifyImageInfo(
+        allocator,
+        io,
+        info,
+        fixture.virtual_size,
+        "fixture size",
+        &diagnostic,
+    );
+
+    try fixture.patchString(
+        allocator,
+        io,
+        info,
+        &.{.{ .key = "backing-filename" }},
+        "base.qcow2",
+    );
+    try std.testing.expectError(error.Failed, release.workflow.verifyImageInfo(
+        allocator,
+        io,
+        info,
+        fixture.virtual_size,
+        "fixture size",
+        &diagnostic,
+    ));
 }
 
 test "the candidate and Azure result schemas bind the published bytes" {
@@ -1210,7 +1375,7 @@ test "stage rejects a missing or duplicated candidate document" {
     try expectStageRejected(&subject);
 }
 
-test "stage requires exactly two Azure results" {
+test "stage requires exactly four Azure results" {
     var subject = try tree();
     defer subject.deinit();
     try makeAll(&subject);
@@ -1220,15 +1385,45 @@ test "stage requires exactly two Azure results" {
     try expectStageRejected(&subject);
 }
 
-test "stage never expands publication to the core assets" {
+test "stage release ordering contains the exact full and core asset matrix" {
     var subject = try tree();
     defer subject.deinit();
     try makeAll(&subject);
-    try fixture.makeBundle(&subject, "x86_64-core", .{});
-    try expectStageRejected(&subject);
-    try std.testing.expectEqual(@as(usize, 2), contracts.release_order.len);
-    for (contracts.release_order) |key| {
-        try std.testing.expectEqualStrings("full", contracts.lookup(key).?.flavor);
+    try stage(&subject, publication_tag);
+    try std.testing.expectEqual(@as(usize, 4), contracts.release_order.len);
+    const expected = [_]struct {
+        key: []const u8,
+        flavor: []const u8,
+        asset_name: []const u8,
+    }{
+        .{
+            .key = "x86_64-full",
+            .flavor = "full",
+            .asset_name = "Ubuntu-26.04-x86_64.qcow2",
+        },
+        .{
+            .key = "aarch64-full",
+            .flavor = "full",
+            .asset_name = "Ubuntu-26.04-aarch64.qcow2",
+        },
+        .{
+            .key = "x86_64-core",
+            .flavor = "core",
+            .asset_name = "Ubuntu-26.04-x86_64.core.qcow2",
+        },
+        .{
+            .key = "aarch64-core",
+            .flavor = "core",
+            .asset_name = "Ubuntu-26.04-aarch64.core.qcow2",
+        },
+    };
+    for (contracts.release_order, expected) |key, item| {
+        try std.testing.expectEqualStrings(item.key, key);
+        try std.testing.expectEqualStrings(item.flavor, contracts.lookup(key).?.flavor);
+        try std.testing.expectEqualStrings(
+            item.asset_name,
+            contracts.lookup(key).?.asset_name,
+        );
     }
 }
 
@@ -2025,7 +2220,7 @@ test "the publisher is draft-first, allowlisted, and fail-safe" {
     var script = try Source.open(allocator, "scripts/ubuntu2604_publish.sh");
     defer script.deinit();
 
-    try script.expectContains("test \"$(wc -l <\"$expected_file\")\" -eq 2");
+    try script.expectContains("test \"$(wc -l <\"$expected_file\")\" -eq 4");
     // The published allowlist is derived by the release tooling from the
     // staged manifest, and the shell only consumes the result.
     try script.expectContains("\"$RELEASE_TOOL\" publish-expected");
@@ -2033,6 +2228,9 @@ test "the publisher is draft-first, allowlisted, and fail-safe" {
     try script.expectContains("--draft");
     try script.expectContains("stale-asset-ids");
     try script.expectContains("retaining $RELEASE_TAG as a draft");
+    try script.expectContains("--json isDraft");
+    try script.expectContains("date -u +%Y%m%d");
+    try script.expectContains("Final release $RELEASE_TAG is immutable after its tag date");
     try script.expectContains("gh release download \"$RELEASE_TAG\"");
     try script.expectContains("\"$RELEASE_TOOL\" github-release-downloaded");
     try source.expectOrder(
@@ -2109,8 +2307,10 @@ noinline fn clobberStack() void {
 }
 
 const publication_allowlist =
-    "ubuntu-26.04-x86_64.qcow2\t" ++ "a" ** 64 ++ "\t2048\n" ++
-    "ubuntu-26.04-aarch64.qcow2\t" ++ "b" ** 64 ++ "\t4096\n";
+    "Ubuntu-26.04-x86_64.qcow2\t" ++ "a" ** 64 ++ "\t2048\n" ++
+    "Ubuntu-26.04-aarch64.qcow2\t" ++ "b" ** 64 ++ "\t4096\n" ++
+    "Ubuntu-26.04-x86_64.core.qcow2\t" ++ "c" ** 64 ++ "\t6144\n" ++
+    "Ubuntu-26.04-aarch64.core.qcow2\t" ++ "d" ** 64 ++ "\t8192\n";
 
 fn expectAssetsAccepted(
     subject: *const Tree,
@@ -2149,7 +2349,7 @@ fn expectAssetsRejected(
     try std.testing.expectEqualStrings(expected_message, diagnostic.message());
 }
 
-const draft_mismatch = "remote release asset allowlist/size mismatch: 2 assets";
+const draft_mismatch = "remote release asset allowlist/size mismatch: 4 assets";
 const final_mismatch = "published release did not retain the exact final allowlist";
 
 test "github-release-assets binds each remote asset to one allowlist entry" {
@@ -2158,8 +2358,10 @@ test "github-release-assets binds each remote asset to one allowlist entry" {
 
     const exact =
         \\{"draft": true, "assets": [
-        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
-        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096}
+        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6144},
+        \\  {"name": "Ubuntu-26.04-aarch64.core.qcow2", "size": 8192}
         \\]}
     ;
     try expectAssetsAccepted(&subject, exact, "draft");
@@ -2167,8 +2369,10 @@ test "github-release-assets binds each remote asset to one allowlist entry" {
     // Order is not part of the contract; the binding is.
     const reordered =
         \\{"draft": true, "assets": [
-        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096},
-        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048}
+        \\  {"name": "Ubuntu-26.04-aarch64.core.qcow2", "size": 8192},
+        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6144},
+        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2048}
         \\]}
     ;
     try expectAssetsAccepted(&subject, reordered, "draft");
@@ -2177,32 +2381,40 @@ test "github-release-assets binds each remote asset to one allowlist entry" {
     // is absent: without a one-to-one binding this reads as a clean release.
     const duplicated =
         \\{"draft": true, "assets": [
-        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
-        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048}
+        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6144},
+        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6144}
         \\]}
     ;
     try expectAssetsRejected(&subject, duplicated, "draft", draft_mismatch);
 
     const wrong_size =
         \\{"draft": true, "assets": [
-        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
-        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4097}
+        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6145},
+        \\  {"name": "Ubuntu-26.04-aarch64.core.qcow2", "size": 8192}
         \\]}
     ;
     try expectAssetsRejected(&subject, wrong_size, "draft", draft_mismatch);
 
     const unknown_name =
         \\{"draft": true, "assets": [
-        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
-        \\  {"name": "SHA256SUMS", "size": 4096}
+        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6144},
+        \\  {"name": "SHA256SUMS", "size": 8192}
         \\]}
     ;
     try expectAssetsRejected(&subject, unknown_name, "draft", draft_mismatch);
 
     const extra =
         \\{"draft": true, "assets": [
-        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
-        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6144},
+        \\  {"name": "Ubuntu-26.04-aarch64.core.qcow2", "size": 8192},
         \\  {"name": "SHA256SUMS", "size": 1}
         \\]}
     ;
@@ -2210,14 +2422,16 @@ test "github-release-assets binds each remote asset to one allowlist entry" {
         &subject,
         extra,
         "draft",
-        "remote release asset allowlist/size mismatch: 3 assets",
+        "remote release asset allowlist/size mismatch: 5 assets",
     );
 
     // A release that stopped being a draft is refused before it is downloaded.
     const published =
         \\{"draft": false, "assets": [
-        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
-        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096}
+        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6144},
+        \\  {"name": "Ubuntu-26.04-aarch64.core.qcow2", "size": 8192}
         \\]}
     ;
     try expectAssetsRejected(
@@ -2234,16 +2448,20 @@ test "github-release-assets holds the final stage to the same one-to-one set" {
 
     const exact =
         \\{"draft": false, "assets": [
-        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
-        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096}
+        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6144},
+        \\  {"name": "Ubuntu-26.04-aarch64.core.qcow2", "size": 8192}
         \\]}
     ;
     try expectAssetsAccepted(&subject, exact, "final");
 
     const duplicated =
         \\{"draft": false, "assets": [
-        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096},
-        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096}
+        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "Ubuntu-26.04-aarch64.core.qcow2", "size": 8192},
+        \\  {"name": "Ubuntu-26.04-aarch64.core.qcow2", "size": 8192}
         \\]}
     ;
     try expectAssetsRejected(&subject, duplicated, "final", final_mismatch);
@@ -2253,23 +2471,29 @@ test "github-release-assets holds the final stage to the same one-to-one set" {
     // the final stage may ignore.
     const resized =
         \\{"draft": false, "assets": [
-        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2049},
-        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096}
+        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2049},
+        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6144},
+        \\  {"name": "Ubuntu-26.04-aarch64.core.qcow2", "size": 8192}
         \\]}
     ;
     try expectAssetsRejected(&subject, resized, "final", final_mismatch);
 
     const still_draft =
         \\{"draft": true, "assets": [
-        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048},
-        \\  {"name": "ubuntu-26.04-aarch64.qcow2", "size": 4096}
+        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6144},
+        \\  {"name": "Ubuntu-26.04-aarch64.core.qcow2", "size": 8192}
         \\]}
     ;
     try expectAssetsRejected(&subject, still_draft, "final", final_mismatch);
 
     const missing =
         \\{"draft": false, "assets": [
-        \\  {"name": "ubuntu-26.04-x86_64.qcow2", "size": 2048}
+        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2048},
+        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
+        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6144}
         \\]}
     ;
     try expectAssetsRejected(
@@ -2871,7 +3095,7 @@ fn publishExpected(
         out,
         manifest_path,
         staged,
-        "Ubuntu-26.04-20260822",
+        publication_tag,
         fixture.source_commit,
         diagnostic,
     ) catch |err| switch (err) {
@@ -2887,7 +3111,7 @@ fn stagedSubject() !Tree {
     var subject = try tree();
     errdefer subject.deinit();
     try makeAll(&subject);
-    try stage(&subject, "Ubuntu-26.04-20260822");
+    try stage(&subject, publication_tag);
     return subject;
 }
 
@@ -3096,7 +3320,7 @@ test "github-release-downloaded refuses a missing asset and a wrong one" {
     try std.testing.expect(!try checkDownloaded(&subject, expected, &missing));
     clobberStack();
     try std.testing.expectEqualStrings(
-        "downloaded release allowlist mismatch: 1 files",
+        "downloaded release allowlist mismatch: 3 files",
         missing.message(),
     );
 

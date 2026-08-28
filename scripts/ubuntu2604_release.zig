@@ -9,7 +9,7 @@
 //! The tool also absorbs the inline Python those callers used to embed. Those
 //! checks were always domain logic -- "is this the exact image the build
 //! validated", "did Azure return the settings we asked for", "is this release
-//! carrying exactly the two published assets" -- and they belong next to the
+//! carrying exactly the four published assets" -- and they belong next to the
 //! schemas they check rather than inside a shell heredoc.
 
 const std = @import("std");
@@ -54,7 +54,7 @@ const usage_text =
     \\  stage                         stage the exact published asset set
     \\  verify-image-info             check a miz image-info document
     \\  candidate-signing-env         export the candidate signing bindings
-    \\  release-gate                  check the two-architecture release gate
+    \\  release-gate                  check the exact four-candidate release gate
     \\  core-gate                     check and record the core validation gate
     \\  kvm-api-version               check the host KVM API version
     \\  azure-cleanup-tags            check temporary resource-group ownership

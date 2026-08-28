@@ -884,7 +884,7 @@ pub const ReleaseGateOptions = struct {
     run_attempt: []const u8,
 };
 
-/// The publish job's exact two-architecture gate.
+/// The publish job's exact four-candidate gate.
 pub fn releaseGate(
     allocator: Allocator,
     io: Io,
@@ -916,16 +916,21 @@ pub fn releaseGate(
     );
     defer support.freePaths(allocator, azure_paths);
 
-    if (candidate_paths.len != 2 or native_paths.len != 2 or azure_paths.len != 2) {
+    if (candidate_paths.len != contracts.release_order.len or
+        native_paths.len != contracts.release_order.len or
+        azure_paths.len != contracts.release_order.len)
+    {
         return fail(
             diagnostic,
-            "release gate did not receive two candidates, two native results, and two Azure results",
+            "release gate did not receive four candidates, four native results, and four Azure results",
             .{},
         );
     }
 
-    var candidate_index: [2]?usize = .{ null, null };
-    var candidate_values: [2]?std.json.Parsed(std.json.Value) = .{ null, null };
+    var candidate_index: [contracts.release_order.len]?usize = @splat(null);
+    var candidate_values: [contracts.release_order.len]?std.json.Parsed(
+        std.json.Value,
+    ) = @splat(null);
     defer for (&candidate_values) |*slot| {
         if (slot.*) |parsed| parsed.deinit();
     };
@@ -940,8 +945,10 @@ pub fn releaseGate(
         diagnostic,
     );
 
-    var native_index: [2]?usize = .{ null, null };
-    var native_values: [2]?std.json.Parsed(std.json.Value) = .{ null, null };
+    var native_index: [contracts.release_order.len]?usize = @splat(null);
+    var native_values: [contracts.release_order.len]?std.json.Parsed(
+        std.json.Value,
+    ) = @splat(null);
     defer for (&native_values) |*slot| {
         if (slot.*) |parsed| parsed.deinit();
     };
@@ -962,8 +969,10 @@ pub fn releaseGate(
         diagnostic,
     );
 
-    var azure_index: [2]?usize = .{ null, null };
-    var azure_values: [2]?std.json.Parsed(std.json.Value) = .{ null, null };
+    var azure_index: [contracts.release_order.len]?usize = @splat(null);
+    var azure_values: [contracts.release_order.len]?std.json.Parsed(
+        std.json.Value,
+    ) = @splat(null);
     defer for (&azure_values) |*slot| {
         if (slot.*) |parsed| parsed.deinit();
     };
@@ -1059,6 +1068,16 @@ pub fn releaseGate(
             "Azure",
             diagnostic,
         );
+        if (candidate.flavor() == .core and !support.jsonEqual(
+            native.get("android_smoke") orelse .null,
+            azure.get("android_smoke") orelse .null,
+        )) {
+            return fail(
+                diagnostic,
+                "{s}: native and Azure Android smoke provenance differ",
+                .{key},
+            );
+        }
     }
 }
 
@@ -1066,8 +1085,8 @@ fn loadReleaseByKey(
     allocator: Allocator,
     io: Io,
     paths: []const []const u8,
-    index: *[2]?usize,
-    values: *[2]?std.json.Parsed(std.json.Value),
+    index: *[contracts.release_order.len]?usize,
+    values: *[contracts.release_order.len]?std.json.Parsed(std.json.Value),
     duplicate_message: []const u8,
     incomplete_message: []const u8,
     diagnostic: *Diagnostic,
@@ -1117,8 +1136,8 @@ fn requireExactWorkflow(
 }
 
 fn requireUniqueNativeDigests(
-    index: *const [2]?usize,
-    values: *const [2]?std.json.Parsed(std.json.Value),
+    index: anytype,
+    values: anytype,
     incomplete_message: []const u8,
     diagnostic: *Diagnostic,
 ) Error!void {
@@ -2220,7 +2239,7 @@ fn readExpected(
     return .{ .text = text, .entries = entries };
 }
 
-/// The publication allowlist: exactly the two published assets, and nothing
+/// The publication allowlist: exactly the four published assets, and nothing
 /// else staged next to them.
 pub fn publishExpected(
     allocator: Allocator,

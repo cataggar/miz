@@ -13,10 +13,13 @@
 Bare metal is `aarch64` only: the kernel it names is published for `arm64`
 alone, because the machines it exists for are.
 
-Only the two full images are currently release assets. Core candidates are
-built, signed, and accepted by a separate protected validation workflow, but
-are retained only as short-lived workflow artifacts. Core publication,
-release assets, tags, and catalog aliases remain deferred to #627.
+The protected release contract is now defined to publish an exact four-asset
+matrix: full and core for both architectures. The existing
+[`Ubuntu-26.04-20260822`](https://github.com/cataggar/miz/releases/tag/Ubuntu-26.04-20260822)
+release remains immutable and full-only. The four-asset workflow uses the new
+tag `Ubuntu-26.04-20260828`; that tag and release do not become final until all
+four candidates pass digest-bound native KVM and Azure Trusted Launch
+acceptance and publication redownload verification.
 
 ## QEMU catalog aliases
 
@@ -47,8 +50,12 @@ canonical-DER SHA-256,
 `08796d5bf0e16eb1731408be816bbbc014e9a81d91c7afbf34bf8c9e4617ae19`.
 An existing image is reused and is never refreshed or overwritten.
 
-Only the full model is cataloged. `miz qemu Ubuntu --model core` is rejected
-until the core release and catalog work in #627 is complete.
+Only the immutable `20260822` full model is currently cataloged.
+`miz qemu Ubuntu --model core` remains rejected until the new release has
+actually completed and a follow-up catalog change pins its final core asset
+URLs, SHA-256 digests, and signer. The resolver requires a complete x86_64 and
+AArch64 pair for both models under one release tag and signing identity, so
+partial catalog data cannot enable selection.
 
 ## Immutable source and package provenance
 
@@ -758,15 +765,17 @@ lockdown, signed modules, rejection of a tampered UKI, key-only SSH, cloud-init,
 WALinuxAgent, netplan/networkd, root growth, generalized identity,
 reboot/reconnect, and clean service health.
 
-The full release and core-validation workflows keep `x86_64` native
-acceptance on the `ubuntu-24.04` hosted runner. Their `aarch64-full` and
-`aarch64-core` legs require a repository runner matching
+The four-asset release workflow keeps both `x86_64` native acceptance legs on
+the `ubuntu-24.04` hosted runner. Its `aarch64-full` and `aarch64-core` legs
+require a repository runner matching
 `[self-hosted, Linux, ARM64, kvm]`: a native Ubuntu ARM64 host with
 passwordless `sudo`, the matching Debian architecture, and a usable KVM
 device. Each job proves `/dev/kvm` is present, readable, and writable before
 downloading the candidate, then installs `qemu-system-aarch64` and Secure
 Boot-capable AAVMF and verifies the stable KVM API version with the release
-tooling built from the accepted source. Neither workflow falls back to TCG.
+tooling built from the accepted source. The separate core-validation preflight
+mirrors the same core subset and runner contracts. Neither workflow falls back
+to TCG.
 These labels describe a dedicated native ARM64 KVM host and do not imply
 Azure nested virtualization.
 
@@ -917,24 +926,27 @@ command runs rather than skipping the smoke.
 Candidates, native results, Azure results, and a final digest-bound
 two-architecture validation manifest are uploaded only as workflow artifacts.
 The workflow has no publish job, release command, tag contract, release asset,
-or catalog mutation. Successful protected validation does not itself publish
-core images; all publication work remains explicitly deferred.
+or catalog mutation. It remains a non-publishing preflight for the core
+contracts; the release workflow independently requires its own exact four
+candidates and reruns both acceptance paths, so preflight evidence cannot
+bypass a publication gate.
 
-## Full/server release workflow
+## Four-asset release workflow
 
-`.github/workflows/ubuntu2604-release.yml` is manually dispatched from
-`main` and still publishes exactly the two full/server assets. It does not
-accept core keys or assets, and `scripts/ubuntu2604_publish.sh` is intentionally
-unchanged. Before dispatch:
+`.github/workflows/ubuntu2604-release.yml` is manually dispatched from `main`
+and publishes exactly full/core × x86_64/AArch64. Before dispatch:
 
-1. Create or retarget the required tag `Ubuntu-26.04-20260822` to the exact
+1. Create or retarget the required tag `Ubuntu-26.04-20260828` to the exact
    current `main` commit. Lightweight and annotated tags are accepted; force
    push the tag when it already exists, then verify the remote resolves to the
-   current `main` commit before dispatch.
+   current `main` commit before dispatch. Mutation is permitted only while the
+   release is being iterated on 2026-08-28; after final publication the tag,
+   assets, URLs, and digests are immutable.
 2. Register an Ubuntu ARM64 repository runner carrying
    `[self-hosted, Linux, ARM64, kvm]`, passwordless `sudo`, and a native,
-   readable/writable `/dev/kvm`. Publication cannot proceed without the real
-   `aarch64-full` Secure Boot acceptance job on this runner.
+   readable/writable `/dev/kvm`. Publication cannot proceed without both real
+   `aarch64-full` and `aarch64-core` Secure Boot acceptance jobs on this
+   runner.
 3. Configure protected environment `ubuntu2604-signing`, restricted to
    `main` and requiring reviewers, with variables
    `MIZ_AZURE_TENANT_ID`, `MIZ_AZURE_CLIENT_ID`,
@@ -957,31 +969,46 @@ read-only. Publication uses `actions: read` and `contents: write`.
 
 The prepare gate binds the run to the current remote `main` commit and tag.
 An optional `candidate_run_id` may reuse only a completed manual run on
-`main` for that same commit and exact run attempt. Both named build jobs must
-have succeeded and exactly two non-expired, nonempty candidate artifacts must
-match the commit and attempt. Reused candidates still rerun native and Azure
-acceptance.
+`main` for that same commit and exact run attempt. All four named build jobs
+must have succeeded and exactly four non-expired, nonempty candidate artifacts
+must match the commit and attempt. Reused candidates still rerun native and
+Azure acceptance.
 
-Publication requires two successful build candidates, exactly one valid
-native result for each full candidate, and two exact Azure results. Every
-native result binds the candidate key, architecture, flavor, asset name,
-source commit, virtual size, image/certificate/UKI digests, explicit success,
-complete contract set, and the current workflow attempt. Missing, duplicate,
-stale, cross-architecture, digest-mismatched, unsuccessful, or malformed
-native evidence fails before publication. The release then stages only the two QCOW2 files,
-creates or resets the release as a draft, uploads with clobber, removes stale
-assets, and verifies the remote draft has exactly the two expected names and
-sizes. It then downloads both assets and verifies their SHA-256 and size before
-making the release non-draft, followed by one final remote exact-two-asset
-check. On publication failure the release is retained as a draft; job cleanup
-removes local staging, candidates, derived VHDs, credentials, and only
-ownership-tagged Azure resources.
+The build matrix passes flavor explicitly. Full candidates retain the exact
+5 GiB virtual-size contract; core remains exactly 3584 MiB, or 3.5 GiB and 30%
+smaller. Every leg records host capacity before the build, preserves the #611
+post-failure `df`/largest-path diagnostics, and unconditionally removes
+privileged build state and signing material.
+
+Publication requires four successful build candidates, exactly one valid
+native result per candidate, and exactly one Azure result per candidate. Each
+result binds the key, architecture, flavor, asset name, source commit, virtual
+size, candidate/certificate/UKI digests, explicit success, complete
+flavor-specific contract set, and exact workflow attempt. Core native and
+Azure results must additionally carry identical public-safe Android
+provenance/runtime/bundle/config digests. Missing, extra, duplicate, stale,
+malformed, cross-key, cross-architecture, cross-digest, wrong-signer,
+wrong-UKI, wrong-source/run, unsuccessful, or core-provenance-disagreeing
+evidence fails before publication.
+
+The release stages exactly four standalone zstd QCOW2 files with no backing
+images. Publication creates or resets the release as a draft, uploads with
+clobber, deletes every stale asset outside the four-name allowlist, and
+verifies the remote draft's exact names and sizes. It then redownloads all four
+assets and verifies each size and SHA-256 before making the release non-draft,
+followed by one final exact remote allowlist check. On publication failure the
+release remains a draft; cleanup removes local staging, candidates, derived
+VHDs, credentials, and only ownership-tagged Azure resources.
 
 ## Catalog aliases
 
-`miz qemu Ubuntu` and exact Ubuntu catalog aliases are intentionally not
-present yet. They may be added only after the real published asset SHA-256
-digests and the final signing-certificate fingerprint are known and pinned.
-Do not substitute build-time guesses or copy values from another release.
-Until then, boot an explicitly supplied image path and provide its independent
-Secure Boot trust material as described in [QEMU](qemu.md).
+The full aliases from immutable release `Ubuntu-26.04-20260822` remain pinned
+exactly as documented above and are not mutated in place. After the
+`Ubuntu-26.04-20260828` workflow completes successfully, a separate catalog
+handoff must rotate the full entries and add both core entries using the real
+final asset URLs, SHA-256 digests, and signing-certificate fingerprint.
+
+Do not substitute build-time guesses, acceptance-time intermediate values, or
+digests copied from the older release. Until those final pins land,
+`miz qemu Ubuntu --model core` stays fail-closed; explicit image paths require
+independent Secure Boot trust material as described in [QEMU](qemu.md).

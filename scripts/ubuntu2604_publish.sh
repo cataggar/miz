@@ -8,7 +8,7 @@ if [[ -z ${CANDIDATES_DIR:-} || -z ${AZURE_RESULTS_DIR:-} ||
   echo "::error::Required publication configuration is incomplete"
   exit 1
 fi
-for tool in gh sha256sum; do
+for tool in date gh sha256sum; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required publication tool $tool is unavailable"
     exit 1
@@ -48,7 +48,7 @@ rm -rf -- "$assets_dir" "$verify_dir"
   --assets-dir "$assets_dir" \
   --release-tag "$RELEASE_TAG" \
   --source-commit "$SOURCE_COMMIT" >"$expected_file"
-test "$(wc -l <"$expected_file")" -eq 2
+test "$(wc -l <"$expected_file")" -eq 4
 
 release_mutated=false
 keep_draft_on_failure() {
@@ -62,6 +62,21 @@ keep_draft_on_failure() {
 }
 trap keep_draft_on_failure EXIT
 trap 'exit 130' INT TERM
+
+release_exists=false
+if release_is_draft=$(
+  gh release view "$RELEASE_TAG" \
+    --repo "$REPOSITORY" \
+    --json isDraft \
+    --jq .isDraft 2>/dev/null
+); then
+  release_exists=true
+  if [[ "$release_is_draft" != true &&
+        "$(date -u +%Y%m%d)" != "${RELEASE_TAG##*-}" ]]; then
+    echo "::error::Final release $RELEASE_TAG is immutable after its tag date"
+    exit 1
+  fi
+fi
 
 gh api "repos/$REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" --paginate >"$refs_file"
 readarray -t tag_object < <(
@@ -90,7 +105,7 @@ else
   fi
 fi
 
-if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+if [[ "$release_exists" == true ]]; then
   gh release edit "$RELEASE_TAG" \
     --repo "$REPOSITORY" \
     --verify-tag \

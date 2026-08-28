@@ -9,9 +9,15 @@
 #   variables AZURE_LOCATION_X64, AZURE_LOCATION_ARM64, AZURE_VM_SIZE_X64, and
 #   AZURE_VM_SIZE_ARM64. The acceptance app's Entra federated credential subject
 #   is `repo:cataggar/miz:environment:ubuntu2604-release`.
+# - Core native and Azure acceptance read the repository secrets
+#   ANDROID_SMOKE_X86_64_JSON and ANDROID_SMOKE_AARCH64_JSON. Each exact JSON
+#   document supplies one private HTTPS archive location plus the expected
+#   archive and provenance SHA-256 values for that architecture's external
+#   Android runtime and bundle inputs. ANDROID_ARTIFACT_TOKEN is optional.
+#   Missing, malformed, or mismatched inputs fail closed.
 # Before dispatch, create or retarget RELEASE_TAG to the exact current `main`
 # commit. The workflow accepts lightweight or annotated tags and publishes
-# exactly the two QCOW2 assets declared below.
+# exactly the four full/core QCOW2 assets declared below.
 name: Publish Ubuntu 26.04 images
 
 on:
@@ -27,12 +33,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: ubuntu2604-release-20260822
+  group: ubuntu2604-release-20260828
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: Ubuntu-26.04-20260822
-  RELEASE_TITLE: Ubuntu Server 26.04 - 20260822
+  RELEASE_TAG: Ubuntu-26.04-20260828
+  RELEASE_TITLE: Ubuntu 26.04 full and core - 20260828
 
 jobs:
   prepare:
@@ -92,7 +98,7 @@ jobs:
                 "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/artifacts?per_page=100" |
                 jq -s '[.[].artifacts[]]'
             )
-            for key in x86_64-full aarch64-full; do
+            for key in x86_64-full aarch64-full x86_64-core aarch64-core; do
               test "$(
                 jq --arg name "build/native $key" \
                   '[.[] | select(.name == $name and .conclusion == "success")] | length' \
@@ -108,10 +114,12 @@ jobs:
             test "$(
               jq '[.[] | select(
                 (.name == "build/native x86_64-full" or
-                 .name == "build/native aarch64-full") and
+                 .name == "build/native aarch64-full" or
+                 .name == "build/native x86_64-core" or
+                 .name == "build/native aarch64-core") and
                 .conclusion == "success"
               )] | length' <<<"$jobs"
-            )" = 2
+            )" = 4
             test "$(
               jq --arg suffix "-$commit-$candidate_run_attempt" \
                 '[.[] | select(
@@ -119,7 +127,7 @@ jobs:
                   (.name | endswith($suffix)) and
                   .expired == false
                 )] | length' <<<"$artifacts"
-            )" = 2
+            )" = 4
 
             candidate_run_id=$CANDIDATE_RUN_ID
             reuse_candidates=true
@@ -154,18 +162,39 @@ jobs:
         include:
           - key: x86_64-full
             architecture: x86_64
+            flavor: full
             runner: ubuntu-24.04
             asset_name: Ubuntu-26.04-x86_64.qcow2
+            virtual_size: 5368709120
+            virtual_size_label: 5 GiB
           - key: aarch64-full
             architecture: aarch64
+            flavor: full
             runner: ubuntu-24.04-arm
             asset_name: Ubuntu-26.04-aarch64.qcow2
+            virtual_size: 5368709120
+            virtual_size_label: 5 GiB
+          - key: x86_64-core
+            architecture: x86_64
+            flavor: core
+            runner: ubuntu-24.04
+            asset_name: Ubuntu-26.04-x86_64.core.qcow2
+            virtual_size: 3758096384
+            virtual_size_label: 3584 MiB
+          - key: aarch64-core
+            architecture: aarch64
+            flavor: core
+            runner: ubuntu-24.04-arm
+            asset_name: Ubuntu-26.04-aarch64.core.qcow2
+            virtual_size: 3758096384
+            virtual_size_label: 3584 MiB
     env:
       CANDIDATE_KEY: ${{ matrix.key }}
       ARCHITECTURE: ${{ matrix.architecture }}
-      FLAVOR: full
+      FLAVOR: ${{ matrix.flavor }}
       ASSET_NAME: ${{ matrix.asset_name }}
-      VIRTUAL_SIZE: 5368709120
+      VIRTUAL_SIZE: ${{ matrix.virtual_size }}
+      VIRTUAL_SIZE_LABEL: ${{ matrix.virtual_size_label }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       WORK_DIR: .scratch/ubuntu2604-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       BUNDLE_DIR: artifact-staging/candidates/${{ matrix.key }}
@@ -291,6 +320,7 @@ jobs:
           build_log="$GITHUB_WORKSPACE/$WORK_DIR/build.log"
           sudo -E "$(command -v zig)" build \
             -Dubuntu2604-arch="$ARCHITECTURE" \
+            -Dubuntu2604-flavor="$FLAVOR" \
             generalized-ubuntu2604 -- \
             --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
             --provenance-dir "$GITHUB_WORKSPACE/$BUNDLE_DIR/internal-provenance" \
@@ -304,7 +334,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" "$WORK_DIR" "$BUNDLE_DIR"
           cp "$build_log" "$BUNDLE_DIR/internal-provenance/build.log"
 
-      - name: Validate standalone zstd QCOW2 and exact 5 GiB size
+      - name: Validate standalone zstd QCOW2 and exact flavor size
         run: |
           set -euo pipefail
           asset="$BUNDLE_DIR/$ASSET_NAME"
@@ -322,7 +352,7 @@ jobs:
           "$RELEASE_TOOL" verify-image-info \
             --info "$BUNDLE_DIR/internal-provenance/image-info.json" \
             --virtual-size "$VIRTUAL_SIZE" \
-            --virtual-size-label "5 GiB"
+            --virtual-size-label "$VIRTUAL_SIZE_LABEL"
           digest=$(sha256sum "$asset" | awk '{print $1}')
           [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
           printf '%s\n' "$digest" > "$BUNDLE_DIR/internal-provenance/build-validated-digest"
@@ -414,20 +444,37 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - key: x86_64-full
             architecture: x86_64
+            flavor: full
             runner: ubuntu-24.04
             asset_name: Ubuntu-26.04-x86_64.qcow2
+            android_smoke_secret: ANDROID_SMOKE_UNUSED
           - key: aarch64-full
             architecture: aarch64
+            flavor: full
             runner: [self-hosted, Linux, ARM64, kvm]
             asset_name: Ubuntu-26.04-aarch64.qcow2
+            android_smoke_secret: ANDROID_SMOKE_UNUSED
+          - key: x86_64-core
+            architecture: x86_64
+            flavor: core
+            runner: ubuntu-24.04
+            asset_name: Ubuntu-26.04-x86_64.core.qcow2
+            android_smoke_secret: ANDROID_SMOKE_X86_64_JSON
+          - key: aarch64-core
+            architecture: aarch64
+            flavor: core
+            runner: [self-hosted, Linux, ARM64, kvm]
+            asset_name: Ubuntu-26.04-aarch64.core.qcow2
+            android_smoke_secret: ANDROID_SMOKE_AARCH64_JSON
     env:
       CANDIDATE_KEY: ${{ matrix.key }}
       ARCHITECTURE: ${{ matrix.architecture }}
-      FLAVOR: full
+      FLAVOR: ${{ matrix.flavor }}
       ASSET_NAME: ${{ matrix.asset_name }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       CANDIDATE_DIR: .release/native/${{ matrix.key }}/candidate
@@ -597,6 +644,19 @@ jobs:
           echo "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ID=$GITHUB_RUN_ID" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
+      - name: Fetch and verify digest-bound Android container smoke inputs
+        if: matrix.flavor == 'core'
+        env:
+          ANDROID_SMOKE_INPUT_VALUE: ${{ secrets[matrix.android_smoke_secret] }}
+          ANDROID_ARTIFACT_TOKEN_VALUE: ${{ secrets.ANDROID_ARTIFACT_TOKEN }}
+        run: |
+          set +x
+          set -euo pipefail
+          "$RELEASE_TOOL" prepare-android-smoke-inputs \
+            --architecture "$ARCHITECTURE" \
+            --output-dir "$GITHUB_WORKSPACE/.release/native/$CANDIDATE_KEY/android-smoke" \
+            --github-env "$GITHUB_ENV"
+
       - name: Run matching-architecture native Secure Boot acceptance
         run: |
           set -euo pipefail
@@ -640,7 +700,12 @@ jobs:
 
       - name: Remove candidate and local acceptance state
         if: always()
-        run: rm -rf -- ".release/native/$CANDIDATE_KEY" "$RESULT_DIR"
+        run: |
+          set -uo pipefail
+          status=0
+          rm -rf -- ".release/native/$CANDIDATE_KEY" || status=1
+          rm -rf -- "$RESULT_DIR" || status=1
+          exit "$status"
 
   azure_acceptance:
     name: Azure ${{ matrix.key }}
@@ -666,22 +731,41 @@ jobs:
       id-token: write
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         include:
           - key: x86_64-full
             architecture: x86_64
+            flavor: full
             asset_name: Ubuntu-26.04-x86_64.qcow2
             location_variable: AZURE_LOCATION_X64
             size_variable: AZURE_VM_SIZE_X64
+            android_smoke_secret: ANDROID_SMOKE_UNUSED
           - key: aarch64-full
             architecture: aarch64
+            flavor: full
             asset_name: Ubuntu-26.04-aarch64.qcow2
             location_variable: AZURE_LOCATION_ARM64
             size_variable: AZURE_VM_SIZE_ARM64
+            android_smoke_secret: ANDROID_SMOKE_UNUSED
+          - key: x86_64-core
+            architecture: x86_64
+            flavor: core
+            asset_name: Ubuntu-26.04-x86_64.core.qcow2
+            location_variable: AZURE_LOCATION_X64
+            size_variable: AZURE_VM_SIZE_X64
+            android_smoke_secret: ANDROID_SMOKE_X86_64_JSON
+          - key: aarch64-core
+            architecture: aarch64
+            flavor: core
+            asset_name: Ubuntu-26.04-aarch64.core.qcow2
+            location_variable: AZURE_LOCATION_ARM64
+            size_variable: AZURE_VM_SIZE_ARM64
+            android_smoke_secret: ANDROID_SMOKE_AARCH64_JSON
     env:
       CANDIDATE_KEY: ${{ matrix.key }}
       ARCHITECTURE: ${{ matrix.architecture }}
-      FLAVOR: full
+      FLAVOR: ${{ matrix.flavor }}
       ASSET_NAME: ${{ matrix.asset_name }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       CANDIDATE_DIR: .release/azure/${{ matrix.key }}/candidate
@@ -690,6 +774,7 @@ jobs:
       STATE_FILE: .release/azure/${{ matrix.key }}/resource-group
       AZURE_LOCATION: ${{ vars[matrix.location_variable] }}
       AZURE_VM_SIZE: ${{ vars[matrix.size_variable] }}
+      BINDER_PROBE: ${{ github.workspace }}/zig-out/bin/binder-probe-${{ matrix.key }}
     steps:
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -747,6 +832,34 @@ jobs:
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build -Doptimize=ReleaseSafe
           test -x zig-out/bin/miz
+
+      - name: Build Binder device usability probe
+        if: matrix.flavor == 'core'
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build-exe \
+            -target "$ARCHITECTURE-linux" \
+            -O ReleaseSmall \
+            -static \
+            tests/binder_probe.zig \
+            -femit-bin="$BINDER_PROBE" \
+            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          test -x "$BINDER_PROBE"
+
+      - name: Fetch and verify digest-bound Android container smoke inputs
+        if: matrix.flavor == 'core'
+        env:
+          ANDROID_SMOKE_INPUT_VALUE: ${{ secrets[matrix.android_smoke_secret] }}
+          ANDROID_ARTIFACT_TOKEN_VALUE: ${{ secrets.ANDROID_ARTIFACT_TOKEN }}
+        run: |
+          set +x
+          set -euo pipefail
+          "$RELEASE_TOOL" prepare-android-smoke-inputs \
+            --architecture "$ARCHITECTURE" \
+            --output-dir "$GITHUB_WORKSPACE/.release/azure/$CANDIDATE_KEY/android-smoke" \
+            --github-env "$GITHUB_ENV"
 
       - name: Log in to Azure with protected-environment OIDC
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
@@ -813,10 +926,15 @@ jobs:
 
       - name: Remove derived VHD and local credentials
         if: always()
-        run: rm -rf -- ".release/azure/$CANDIDATE_KEY" "$RESULT_DIR"
+        run: |
+          set -uo pipefail
+          status=0
+          rm -rf -- ".release/azure/$CANDIDATE_KEY" || status=1
+          rm -rf -- "$RESULT_DIR" || status=1
+          exit "$status"
 
   publish:
-    name: verify complete two-candidate gate and publish
+    name: verify complete four-candidate gate and publish
     needs: [prepare, build, native_qemu, azure_acceptance]
     if: >-
       ${{
@@ -903,7 +1021,7 @@ jobs:
           path: ${{ env.AZURE_RESULTS_DIR }}
           merge-multiple: false
 
-      - name: Validate exact two-architecture release gate
+      - name: Validate exact four-candidate release gate
         env:
           RUN_ID_VALUE: ${{ github.run_id }}
           RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
@@ -923,7 +1041,7 @@ jobs:
             --run-id "$RUN_ID_VALUE" \
             --run-attempt "$RUN_ATTEMPT_VALUE"
 
-      - name: Publish exactly two accepted Ubuntu assets
+      - name: Publish exactly four accepted Ubuntu assets
         run: scripts/ubuntu2604_publish.sh
 
       - name: Remove publication staging
