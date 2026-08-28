@@ -1831,7 +1831,11 @@ fn checkReleaseAssets(
 /// Overwrites the stack the callee just released. A helper that hands back a
 /// slice into its own frame still compares equal by luck; it does not survive
 /// a comparison taken after this.
-fn clobberStack() void {
+///
+/// `noinline` because the guard is the write, not the call: inlined into the
+/// caller this would get its own live storage rather than reusing the frame
+/// the callee gave back, and the regression it exists to catch would pass.
+noinline fn clobberStack() void {
     var scratch: [8192]u8 = undefined;
     for (&scratch, 0..) |*byte, index| byte.* = @truncate(index +% 0x5a);
     std.mem.doNotOptimizeAway(&scratch);
@@ -2578,4 +2582,264 @@ test "prepare-android-smoke-inputs never writes the secret or token anywhere" {
         try std.testing.expect(std.mem.indexOf(u8, bytes, private_url) == null);
         try std.testing.expect(std.mem.indexOf(u8, bytes, private_token) == null);
     }
+}
+
+// ---- staged and downloaded allowlists ----
+
+/// Runs `publish-expected` over a real staged directory, returning the
+/// allowlist it printed. The caller owns `diagnostic` for the same reason
+/// `checkReleaseAssets`'s does.
+fn publishExpected(
+    subject: *const Tree,
+    out: *std.Io.Writer,
+    diagnostic: *support.Diagnostic,
+) !bool {
+    const manifest_path = try subject.path("staged/publish-manifest.json", .{});
+    defer allocator.free(manifest_path);
+    const staged = try subject.path("staged", .{});
+    defer allocator.free(staged);
+    release_workflow.publishExpected(
+        allocator,
+        io,
+        out,
+        manifest_path,
+        staged,
+        "Ubuntu-26.04-20260822",
+        fixture.source_commit,
+        diagnostic,
+    ) catch |err| switch (err) {
+        error.Failed => return false,
+        else => return err,
+    };
+    return true;
+}
+
+/// A staged tree whose `publish-expected` allowlist has already been accepted,
+/// so any later rejection is caused by what the test changed.
+fn stagedSubject() !Tree {
+    var subject = try tree();
+    errdefer subject.deinit();
+    try makeAll(&subject);
+    try stage(&subject, "Ubuntu-26.04-20260822");
+    return subject;
+}
+
+fn expectStagedAccepted(subject: *const Tree) ![]u8 {
+    var buffer: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    var diagnostic: support.Diagnostic = .{};
+    if (!try publishExpected(subject, &out, &diagnostic)) {
+        std.debug.print("unexpected rejection: {s}\n", .{diagnostic.message()});
+        return error.UnexpectedRejection;
+    }
+    return allocator.dupe(u8, out.buffered());
+}
+
+fn expectStagedRejected(subject: *const Tree, expected_message: []const u8) !void {
+    var buffer: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    var diagnostic: support.Diagnostic = .{};
+    if (try publishExpected(subject, &out, &diagnostic)) {
+        return error.ExpectedRejection;
+    }
+    clobberStack();
+    try std.testing.expectEqualStrings(expected_message, diagnostic.message());
+}
+
+test "publish-expected counts a symlinked staged asset as a staged file" {
+    var subject = try stagedSubject();
+    defer subject.deinit();
+
+    const allowlist = try expectStagedAccepted(&subject);
+    defer allocator.free(allowlist);
+    try std.testing.expectEqual(
+        contracts.release_order.len,
+        std.mem.count(u8, allowlist, "\n"),
+    );
+
+    // An extra entry that `readdir` reports as a symlink is a file to
+    // `is_file()`, so it is an unallowlisted staged asset and not something
+    // the scan may skip on the strength of its dirent kind.
+    const staged = try subject.path("staged", .{});
+    defer allocator.free(staged);
+    var directory = try Dir.cwd().openDir(io, staged, .{ .iterate = true });
+    defer directory.close(io);
+    try directory.symLink(
+        io,
+        contracts.lookup(contracts.release_order[0]).?.asset_name,
+        "SHA256SUMS",
+        .{},
+    );
+    try expectStagedRejected(
+        &subject,
+        "staged release allowlist mismatch: SHA256SUMS",
+    );
+}
+
+test "publish-expected ignores staged entries that are not regular files" {
+    var subject = try stagedSubject();
+    defer subject.deinit();
+
+    const staged = try subject.path("staged", .{});
+    defer allocator.free(staged);
+    var directory = try Dir.cwd().openDir(io, staged, .{ .iterate = true });
+    defer directory.close(io);
+    // A directory, a symlink to one, and a broken symlink are all "not a
+    // file" to `is_file()`, whatever their dirent kinds say.
+    try directory.createDirPath(io, "scratch");
+    try directory.symLink(io, "scratch", "linked-scratch", .{});
+    try directory.symLink(io, "removed.qcow2", "dangling", .{});
+
+    const allowlist = try expectStagedAccepted(&subject);
+    defer allocator.free(allowlist);
+    try std.testing.expectEqual(
+        contracts.release_order.len,
+        std.mem.count(u8, allowlist, "\n"),
+    );
+}
+
+test "publish-expected still refuses a staged file the manifest never named" {
+    var subject = try stagedSubject();
+    defer subject.deinit();
+
+    const extra = try subject.path("staged/SHA256SUMS", .{});
+    defer allocator.free(extra);
+    try Dir.cwd().writeFile(io, .{ .sub_path = extra, .data = "digest\n" });
+    try expectStagedRejected(
+        &subject,
+        "staged release allowlist mismatch: SHA256SUMS",
+    );
+}
+
+fn checkDownloaded(
+    subject: *const Tree,
+    expected_lines: []const u8,
+    diagnostic: *support.Diagnostic,
+) !bool {
+    const expected_path = try subject.path("downloaded-expected.tsv", .{});
+    defer allocator.free(expected_path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = expected_path,
+        .data = expected_lines,
+    });
+    const root = try subject.path("downloaded", .{});
+    defer allocator.free(root);
+    release_workflow.releaseDownloaded(
+        allocator,
+        io,
+        root,
+        expected_path,
+        diagnostic,
+    ) catch |err| switch (err) {
+        error.Failed => return false,
+        else => return err,
+    };
+    return true;
+}
+
+const downloaded_payload = "downloaded release asset\n";
+
+/// A download directory holding exactly the allowlisted assets, plus the
+/// allowlist that describes them.
+fn downloadedSubject(subject: *const Tree) ![]u8 {
+    const root = try subject.path("downloaded", .{});
+    defer allocator.free(root);
+    try Dir.cwd().createDirPath(io, root);
+
+    var expected: std.ArrayList(u8) = .empty;
+    errdefer expected.deinit(allocator);
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(downloaded_payload, &digest, .{});
+    for (contracts.release_order) |key| {
+        const name = contracts.lookup(key).?.asset_name;
+        const path = try subject.path("downloaded/{s}", .{name});
+        defer allocator.free(path);
+        try Dir.cwd().writeFile(io, .{
+            .sub_path = path,
+            .data = downloaded_payload,
+        });
+        try expected.print(allocator, "{s}\t{s}\t{d}\n", .{
+            name,
+            &std.fmt.bytesToHex(digest, .lower),
+            downloaded_payload.len,
+        });
+    }
+    return expected.toOwnedSlice(allocator);
+}
+
+test "github-release-downloaded counts a symlinked download as a file" {
+    var subject = try tree();
+    defer subject.deinit();
+    const expected = try downloadedSubject(&subject);
+    defer allocator.free(expected);
+
+    var accepted: support.Diagnostic = .{};
+    try std.testing.expect(try checkDownloaded(&subject, expected, &accepted));
+
+    const root = try subject.path("downloaded", .{});
+    defer allocator.free(root);
+    var directory = try Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer directory.close(io);
+    try directory.symLink(
+        io,
+        contracts.lookup(contracts.release_order[0]).?.asset_name,
+        "SHA256SUMS",
+        .{},
+    );
+
+    var diagnostic: support.Diagnostic = .{};
+    try std.testing.expect(!try checkDownloaded(&subject, expected, &diagnostic));
+    clobberStack();
+    try std.testing.expectEqualStrings(
+        "downloaded release allowlist mismatch: SHA256SUMS",
+        diagnostic.message(),
+    );
+}
+
+test "github-release-downloaded ignores entries that are not regular files" {
+    var subject = try tree();
+    defer subject.deinit();
+    const expected = try downloadedSubject(&subject);
+    defer allocator.free(expected);
+
+    const root = try subject.path("downloaded", .{});
+    defer allocator.free(root);
+    var directory = try Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer directory.close(io);
+    try directory.createDirPath(io, "scratch");
+    try directory.symLink(io, "scratch", "linked-scratch", .{});
+    try directory.symLink(io, "removed.qcow2", "dangling", .{});
+
+    var diagnostic: support.Diagnostic = .{};
+    try std.testing.expect(try checkDownloaded(&subject, expected, &diagnostic));
+}
+
+test "github-release-downloaded refuses a missing asset and a wrong one" {
+    var subject = try tree();
+    defer subject.deinit();
+    const expected = try downloadedSubject(&subject);
+    defer allocator.free(expected);
+
+    const first = contracts.lookup(contracts.release_order[0]).?.asset_name;
+    const path = try subject.path("downloaded/{s}", .{first});
+    defer allocator.free(path);
+    try Dir.cwd().deleteFile(io, path);
+
+    var missing: support.Diagnostic = .{};
+    try std.testing.expect(!try checkDownloaded(&subject, expected, &missing));
+    clobberStack();
+    try std.testing.expectEqualStrings(
+        "downloaded release allowlist mismatch: 1 files",
+        missing.message(),
+    );
+
+    // Restoring it with different bytes keeps the name set exact and moves the
+    // rejection to the digest, so the count check has not swallowed it.
+    try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "tampered\n" });
+    var tampered: support.Diagnostic = .{};
+    try std.testing.expect(!try checkDownloaded(&subject, expected, &tampered));
+    clobberStack();
+    const message = tampered.message();
+    try std.testing.expect(std.mem.endsWith(u8, message, ": downloaded size mismatch"));
+    try std.testing.expect(std.mem.startsWith(u8, message, first));
 }

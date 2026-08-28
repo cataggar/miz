@@ -408,8 +408,7 @@ pub fn listFiles(
     defer walker.deinit();
     while (try walker.next(io)) |entry| {
         if (entry.kind == .directory) continue;
-        const stat = entry.dir.statFile(io, entry.basename, .{}) catch continue;
-        if (stat.kind != .file) continue;
+        if (!entryIsFile(io, entry.dir, entry.basename)) continue;
         const relative = try allocator.dupe(u8, entry.path);
         errdefer allocator.free(relative);
         try results.append(allocator, relative);
@@ -552,6 +551,20 @@ pub fn joinPath(
 
 pub fn isRegularFile(io: Io, path: []const u8) bool {
     const stat = Dir.cwd().statFile(io, path, .{}) catch return false;
+    return stat.kind == .file;
+}
+
+/// `Path.is_file()` for one entry of an open directory.
+///
+/// The kind `readdir` reports is a hint, never the answer. A symlink to a
+/// regular file is a file to `is_file()`, so filtering on the raw dirent kind
+/// would let a symlinked asset slip past an "exactly these names" check; and a
+/// filesystem is free to report `.unknown` for every entry it returns, which
+/// would make the same filter drop everything. The verdict therefore always
+/// comes from a `stat` that follows links, exactly as the Python's `is_file()`
+/// did -- including its answer for an entry that cannot be stat'ed at all.
+pub fn entryIsFile(io: Io, directory: Dir, name: []const u8) bool {
+    const stat = directory.statFile(io, name, .{}) catch return false;
     return stat.kind == .file;
 }
 
@@ -796,6 +809,48 @@ test "resolvePath canonicalizes the existing prefix and keeps the missing tail" 
         "/real/absent/deeper.json",
     ));
     try std.testing.expect(std.mem.indexOf(u8, resolved, "/link/") == null);
+}
+
+test "entryIsFile answers from the stat, not from what readdir reported" {
+    const io = std.testing.io;
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var root_buffer: [TempTree.max_path_len]u8 = undefined;
+    const root = tree.path(&root_buffer, "entries");
+    try Dir.cwd().createDirPath(io, root);
+
+    var directory = try Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer directory.close(io);
+    try directory.writeFile(io, .{ .sub_path = "asset.qcow2", .data = "payload" });
+    try directory.createDirPath(io, "nested");
+    try directory.symLink(io, "asset.qcow2", "linked.qcow2", .{});
+    try directory.symLink(io, "nested", "linked-directory", .{});
+    try directory.symLink(io, "absent", "dangling", .{});
+
+    // A symlink to a regular file is a file, which is what makes an "exactly
+    // these names" check see an extra staged asset rather than skip it.
+    try std.testing.expect(entryIsFile(io, directory, "asset.qcow2"));
+    try std.testing.expect(entryIsFile(io, directory, "linked.qcow2"));
+    try std.testing.expect(!entryIsFile(io, directory, "nested"));
+    try std.testing.expect(!entryIsFile(io, directory, "linked-directory"));
+    try std.testing.expect(!entryIsFile(io, directory, "dangling"));
+    try std.testing.expect(!entryIsFile(io, directory, "never-created"));
+
+    // The same verdicts hold whatever kind the directory iteration reported,
+    // which is what makes the callers correct on a filesystem that answers
+    // `.unknown` for every entry.
+    var iterator = directory.iterate();
+    var files: usize = 0;
+    var disagreements: usize = 0;
+    while (try iterator.next(io)) |item| {
+        const is_file = entryIsFile(io, directory, item.name);
+        if (is_file) files += 1;
+        if ((item.kind == .file) != is_file) disagreements += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), files);
+    // `linked.qcow2` is reported as a symlink and is nonetheless a file: the
+    // dirent kind and the answer are not the same question.
+    try std.testing.expectEqual(@as(usize, 1), disagreements);
 }
 
 test "canonicalDigest hashes the compact sorted encoding" {

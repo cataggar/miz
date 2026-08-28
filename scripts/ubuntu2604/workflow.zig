@@ -2334,7 +2334,9 @@ pub fn publishExpected(
         "staged release allowlist mismatch: cannot list {s}",
         .{assets_root},
     )) |item| {
-        if (item.kind != .file) continue;
+        // `readdir`'s kind is a hint: a symlinked asset is a file to
+        // `is_file()`, and a filesystem may report every entry as unknown.
+        if (!support.entryIsFile(io, directory, item.name)) continue;
         actual += 1;
         if (std.mem.eql(u8, item.name, "publish-manifest.json")) continue;
         var known = false;
@@ -2471,7 +2473,7 @@ pub fn releaseDownloaded(
         "downloaded release allowlist mismatch: cannot list {s}",
         .{root},
     )) |item| {
-        if (item.kind != .file) continue;
+        if (!support.entryIsFile(io, directory, item.name)) continue;
         actual += 1;
         if (expected.find(item.name) == null) return fail(
             diagnostic,
