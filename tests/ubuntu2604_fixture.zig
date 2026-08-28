@@ -128,6 +128,7 @@ pub const Options = struct {
     /// signed by different certificates.
     certificate: []const u8 = certificate_der,
     signing_certificate_sha256: []const u8 = signing_certificate_sha256,
+    asset_bytes: ?[]const u8 = null,
 };
 
 pub const NativeResultOptions = struct {
@@ -151,9 +152,12 @@ pub fn makeBundle(tree: *const Tree, key: []const u8, options: Options) !void {
 
     const asset = try tree.assetPath(key);
     defer allocator.free(asset);
-    const asset_bytes = try std.fmt.allocPrint(allocator, "{s}\n", .{key});
-    defer allocator.free(asset_bytes);
-    try Dir.cwd().writeFile(io, .{ .sub_path = asset, .data = asset_bytes });
+    const default_asset_bytes = try std.fmt.allocPrint(allocator, "{s}\n", .{key});
+    defer allocator.free(default_asset_bytes);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = asset,
+        .data = options.asset_bytes orelse default_asset_bytes,
+    });
 
     const provenance = try tree.provenanceDir(key);
     defer allocator.free(provenance);

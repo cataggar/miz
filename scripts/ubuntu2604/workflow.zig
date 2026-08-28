@@ -1141,7 +1141,8 @@ fn requireUniqueNativeDigests(
     incomplete_message: []const u8,
     diagnostic: *Diagnostic,
 ) Error!void {
-    var first_digest: ?[]const u8 = null;
+    var seen: [index.len][]const u8 = undefined;
+    var seen_count: usize = 0;
     for (index) |position_value| {
         const position = position_value orelse return fail(
             diagnostic,
@@ -1163,15 +1164,15 @@ fn requireUniqueNativeDigests(
             "native candidate digest",
             diagnostic,
         );
-        if (first_digest) |seen| {
-            if (std.mem.eql(u8, seen, digest)) return fail(
+        for (seen[0..seen_count]) |previous| {
+            if (std.mem.eql(u8, previous, digest)) return fail(
                 diagnostic,
                 "duplicate native acceptance digest",
                 .{},
             );
-        } else {
-            first_digest = digest;
         }
+        seen[seen_count] = digest;
+        seen_count += 1;
     }
 }
 

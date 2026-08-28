@@ -106,14 +106,16 @@ fn makeReleaseEvidence(subject: *const Tree) !void {
     }
 }
 
-fn releaseGate(subject: *const Tree) !void {
+fn releaseGateWithDiagnostic(
+    subject: *const Tree,
+    diagnostic: *support.Diagnostic,
+) !void {
     const candidates = try subject.candidates();
     defer allocator.free(candidates);
     const native = try subject.native();
     defer allocator.free(native);
     const azure = try subject.azure();
     defer allocator.free(azure);
-    var diagnostic: support.Diagnostic = .{};
     try release_workflow.releaseGate(allocator, io, .{
         .candidates = candidates,
         .native_results = native,
@@ -123,7 +125,12 @@ fn releaseGate(subject: *const Tree) !void {
         .candidate_run_attempt = "1",
         .run_id = "100",
         .run_attempt = "1",
-    }, &diagnostic);
+    }, diagnostic);
+}
+
+fn releaseGate(subject: *const Tree) !void {
+    var diagnostic: support.Diagnostic = .{};
+    try releaseGateWithDiagnostic(subject, &diagnostic);
 }
 
 fn expectReleaseGateRejected(subject: *const Tree) !void {
@@ -216,6 +223,54 @@ test "the release gate rejects missing, duplicate, extra, and unexpected native 
         );
         try expectReleaseGateRejected(&subject);
     }
+}
+
+test "the release gate rejects duplicate digests in two non-first native results" {
+    var subject = try tree();
+    defer subject.deinit();
+    try fixture.makeBundle(&subject, "x86_64-full", .{});
+    try fixture.makeBundle(&subject, "aarch64-full", .{});
+    const shared_core_bytes = "shared core candidate bytes\n";
+    try fixture.makeBundle(
+        &subject,
+        "x86_64-core",
+        .{ .asset_bytes = shared_core_bytes },
+    );
+    try fixture.makeBundle(
+        &subject,
+        "aarch64-core",
+        .{ .asset_bytes = shared_core_bytes },
+    );
+    for (contracts.release_order) |key| {
+        try fixture.makeNativeResult(&subject, key, .{});
+    }
+
+    const first_asset = try subject.assetPath("x86_64-full");
+    defer allocator.free(first_asset);
+    const first_digest = try support.hashArtifact(io, first_asset);
+    const x86_core_asset = try subject.assetPath("x86_64-core");
+    defer allocator.free(x86_core_asset);
+    const x86_core_digest = try support.hashArtifact(io, x86_core_asset);
+    const arm_core_asset = try subject.assetPath("aarch64-core");
+    defer allocator.free(arm_core_asset);
+    const arm_core_digest = try support.hashArtifact(io, arm_core_asset);
+
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &first_digest.hex,
+        &x86_core_digest.hex,
+    ));
+    try std.testing.expectEqualStrings(&x86_core_digest.hex, &arm_core_digest.hex);
+
+    var diagnostic: support.Diagnostic = .{};
+    try std.testing.expectError(
+        error.Failed,
+        releaseGateWithDiagnostic(&subject, &diagnostic),
+    );
+    try std.testing.expectEqualStrings(
+        "duplicate native acceptance digest",
+        diagnostic.message(),
+    );
 }
 
 test "the release gate rejects missing, duplicate, and extra candidate or Azure evidence" {
