@@ -831,14 +831,14 @@ fn writeNotes(
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
     try text.print(allocator,
-        \\Ubuntu 26.04 full/server and core/appliance generalized Gen2 images built from the accepted source commit `{s}`. Every published QCOW2 passed hosted structural validation, native KVM acceptance on a matching architecture, and Azure Trusted Launch acceptance.
+        \\Ubuntu 26.04 full/server and core/appliance generalized Gen2 images built from the accepted source commit `{s}`. Every published QCOW2 passed hosted structural validation, same-architecture QEMU acceptance (x86_64 KVM; AArch64 TCG), and Azure Trusted Launch acceptance.
         \\
         \\## Highlights
         \\
         \\- Exact four-asset matrix: full and core for x86_64 and AArch64.
         \\- Full remains 5 GiB with systemd, cloud-init, WALinuxAgent, and `sshd.service`.
         \\- Core is 3584 MiB (3.5 GiB), 30% smaller, with mizinit, azagent, and supervised OpenSSH.
-        \\- Every asset is digest-bound across build, native KVM, Azure Trusted Launch, staging, upload, and redownload verification.
+        \\- Every asset is digest-bound across build, accelerator-bound QEMU acceptance, Azure Trusted Launch, staging, upload, and redownload verification.
         \\
         \\All UKIs are trusted through enrolled leaf SHA-256 `{s}`.
         \\Artifact Signing leaf certificate SHA-256: `{s}`.
@@ -875,7 +875,7 @@ fn writeNotes(
         \\
         \\Full images have an exact 5 GiB virtual disk and boot systemd with cloud-init, WALinuxAgent, and `sshd.service`. Core images are exactly 3584 MiB (3.5 GiB), 30% smaller, and use `mizinit` as PID 1 with `azagent` plus directly supervised OpenSSH instead of systemd, cloud-init, or WALinuxAgent.
         \\
-        \\All four candidates required signed UKIs, matching-architecture KVM with no TCG fallback, Azure Trusted Launch with Secure Boot and vTPM, the exact signer in UEFI db, kernel lockdown, module trust, key-only SSH, provisioning, runtime Ubuntu identity, root growth, disk-policy enforcement, persistent and unique identity, and reboot/reconnect. Core additionally required mizinit PID-1 and SSH supervision, azagent provisioning, resource and managed-data-disk contracts, Binder, and matching digest-bound Android container provenance in native and Azure acceptance. Candidate and derived-VHD hashes were checked at every handoff; temporary VHDs and Azure resources were deleted.
+        \\All four candidates required signed UKIs and same-architecture QEMU with an exact accelerator identity: x86_64 used explicit KVM with `/dev/kvm`, the stable KVM API, `q35`, and `host`; AArch64 used explicit multi-threaded TCG with `virt` and `max`, with no accelerator probing or fallback. Azure Trusted Launch remained mandatory for both architectures with Secure Boot and vTPM, the exact signer in UEFI db, kernel lockdown, module trust, key-only SSH, provisioning, runtime Ubuntu identity, root growth, disk-policy enforcement, persistent and unique identity, and reboot/reconnect. Core additionally required mizinit PID-1 and SSH supervision, azagent provisioning, resource and managed-data-disk contracts, Binder, and matching digest-bound Android container provenance in QEMU and Azure acceptance. Candidate and derived-VHD hashes were checked at every handoff; temporary VHDs and Azure resources were deleted.
         \\
         \\Publication is an exact four-asset transaction: standalone zstd QCOW2 files with no backing images, verified remote names and sizes, and a redownloaded SHA-256 check before the draft becomes final. After the tag date, a finalized release is immutable.
         \\

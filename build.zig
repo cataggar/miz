@@ -1926,10 +1926,15 @@ pub fn build(b: *std.Build) void {
         );
         azurelinux_acceptance_step.dependOn(&run_azurelinux_acceptance_tests.step);
 
-        // Opt-in native-QEMU acceptance for exactly one finalized Ubuntu
+        // Opt-in same-architecture QEMU acceptance for one finalized Ubuntu
         // 26.04 full or core candidate. The runtime image and signing identity
         // are supplied externally.
         const ubuntu2604_acceptance_options = b.addOptions();
+        const ubuntu2604_execution_mod = b.createModule(.{
+            .root_source_file = b.path("scripts/ubuntu2604/execution.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        });
         ubuntu2604_acceptance_options.addOption(
             []const u8,
             "ubuntu2604_architecture",
@@ -1940,7 +1945,7 @@ pub fn build(b: *std.Build) void {
             "ubuntu2604_flavor",
             @tagName(ubuntu2604_flavor),
         );
-        // Binder device usability is a core-only native acceptance contract,
+        // Binder device usability is a core-only QEMU acceptance contract,
         // so the probe is only cross-built for the core flavor; the option
         // resolves to an empty path otherwise and the acceptance test never
         // reads it in that case.
@@ -1964,6 +1969,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "build_options", .module = ubuntu2604_acceptance_options.createModule() },
+                    .{ .name = "ubuntu2604_execution", .module = ubuntu2604_execution_mod },
                     .{ .name = "qemu_host", .module = host_qemu_host_mod },
                     .{ .name = "qmp", .module = host_qmp_mod },
                     .{ .name = "miz", .module = host_miz_mod },
@@ -1975,7 +1981,7 @@ pub fn build(b: *std.Build) void {
         );
         const ubuntu2604_acceptance_step = b.step(
             "test-ubuntu2604-acceptance",
-            "Run native-QEMU acceptance for one finalized Ubuntu 26.04 full or core QCOW2",
+            "Run same-architecture QEMU acceptance for one finalized Ubuntu 26.04 full or core QCOW2",
         );
         ubuntu2604_acceptance_step.dependOn(&run_ubuntu2604_acceptance_tests.step);
 

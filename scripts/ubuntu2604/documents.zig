@@ -13,6 +13,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const azure_vhd = @import("../azure_vhd.zig");
 const contracts = @import("contracts.zig");
+const execution = @import("execution.zig");
 const keys = @import("keys.zig");
 const provenance = @import("provenance.zig");
 const support = @import("support.zig");
@@ -552,13 +553,52 @@ pub fn validateNativeResult(
 
 pub fn nativeResultSchema(flavor: contracts.Flavor) i64 {
     return switch (flavor) {
-        // Schema 2 adds the complete candidate identity, explicit success,
-        // and the exact workflow attempt to the original full result.
-        .full => 2,
-        // Schema 6 applies the same binding to the core result introduced at
-        // schema 5, retaining its Android smoke provenance.
-        .core => 6,
+        // Schema 3 adds the exact QEMU execution identity to the complete
+        // candidate, success, and workflow binding introduced at schema 2.
+        .full => 3,
+        // Schema 7 adds the same execution identity to core while retaining
+        // the Android smoke provenance introduced in the earlier schemas.
+        .core => 7,
     };
+}
+
+fn validateQemuExecution(
+    value: ?std.json.Value,
+    architecture: []const u8,
+    key: []const u8,
+    diagnostic: *Diagnostic,
+) Error!void {
+    const object = support.objectOf(value);
+    const profile = execution.forName(architecture);
+    if (object == null or profile == null or
+        !support.hasExactFields(object.?, &execution.identity_fields))
+    {
+        return fail(
+            diagnostic,
+            "{s}: QEMU execution identity is malformed",
+            .{key},
+        );
+    }
+    const expected = profile.?;
+    if (!support.stringIs(
+        object.?.get("accelerator"),
+        @tagName(expected.accelerator),
+    ) or
+        !support.stringIs(object.?.get("cpu"), expected.cpu) or
+        !support.stringIs(object.?.get("emulator"), expected.emulator) or
+        !support.stringIs(object.?.get("guest_architecture"), architecture) or
+        !support.stringIs(object.?.get("machine"), expected.machine) or
+        !support.stringIs(
+            object.?.get("runner_architecture"),
+            expected.runner_architecture,
+        ))
+    {
+        return fail(
+            diagnostic,
+            "{s}: QEMU execution identity is invalid",
+            .{key},
+        );
+    }
 }
 
 pub fn validateNativeResultDocument(
@@ -594,6 +634,12 @@ pub fn validateNativeResultDocument(
     {
         return fail(diagnostic, "{s}: native acceptance identity is invalid", .{key});
     }
+    try validateQemuExecution(
+        result.get("execution"),
+        candidate.identity.architecture,
+        key,
+        diagnostic,
+    );
     if (flavor == .core) {
         try requireAndroidSmoke(
             result.get("android_smoke"),

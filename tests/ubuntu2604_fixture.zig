@@ -275,6 +275,7 @@ pub fn makeNativeResult(
     const io = tree.io;
     const entry = contracts.lookup(key).?;
     const flavor = contracts.parseFlavor(entry.flavor).?;
+    const qemu = release.execution.forName(entry.architecture).?;
 
     const manifest = try tree.manifestPath(key);
     defer allocator.free(manifest);
@@ -305,6 +306,14 @@ pub fn makeNativeResult(
                 .certificate_sha256 = signing.get("certificate_sha256").?.string,
                 .fallback_uki_sha256 = signing.get("fallback_uki_sha256").?.string,
                 .status = options.status,
+                .execution = .{
+                    .accelerator = @tagName(qemu.accelerator),
+                    .cpu = qemu.cpu,
+                    .emulator = qemu.emulator,
+                    .guest_architecture = entry.architecture,
+                    .machine = qemu.machine,
+                    .runner_architecture = qemu.runner_architecture,
+                },
                 .contracts = contracts.full_native_contracts,
                 .workflow = .{
                     .run_id = options.run_id,
@@ -328,6 +337,14 @@ pub fn makeNativeResult(
                 .certificate_sha256 = signing.get("certificate_sha256").?.string,
                 .fallback_uki_sha256 = signing.get("fallback_uki_sha256").?.string,
                 .status = options.status,
+                .execution = .{
+                    .accelerator = @tagName(qemu.accelerator),
+                    .cpu = qemu.cpu,
+                    .emulator = qemu.emulator,
+                    .guest_architecture = entry.architecture,
+                    .machine = qemu.machine,
+                    .runner_architecture = qemu.runner_architecture,
+                },
                 .contracts = contracts.core_native_contracts,
                 .workflow = .{
                     .run_id = options.run_id,

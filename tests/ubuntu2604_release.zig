@@ -382,6 +382,52 @@ test "the release gate rejects stale or invalid native evidence" {
     try expectReleaseGateRejected(&subject);
 }
 
+test "the release gate rejects wrong QEMU accelerator and runner architecture" {
+    var subject = try tree();
+    defer subject.deinit();
+    try makeReleaseEvidence(&subject);
+
+    const cases = [_]struct {
+        key: []const u8,
+        field: []const u8,
+        value: []const u8,
+    }{
+        .{ .key = "x86_64-full", .field = "accelerator", .value = "tcg" },
+        .{ .key = "aarch64-full", .field = "accelerator", .value = "kvm" },
+        .{ .key = "aarch64-core", .field = "accelerator", .value = "auto" },
+        .{ .key = "aarch64-core", .field = "accelerator", .value = "unknown" },
+        .{
+            .key = "aarch64-core",
+            .field = "runner_architecture",
+            .value = "x86_64",
+        },
+    };
+    for (cases) |case| {
+        const result = try subject.nativeResultPath(case.key);
+        defer allocator.free(result);
+        try fixture.patchString(
+            allocator,
+            io,
+            result,
+            &.{ .{ .key = "execution" }, .{ .key = case.field } },
+            case.value,
+        );
+        var diagnostic: support.Diagnostic = .{};
+        try std.testing.expectError(
+            error.Failed,
+            releaseGateWithDiagnostic(&subject, &diagnostic),
+        );
+        const expected = try std.fmt.allocPrint(
+            allocator,
+            "{s}: QEMU execution identity is invalid",
+            .{case.key},
+        );
+        defer allocator.free(expected);
+        try std.testing.expectEqualStrings(expected, diagnostic.message());
+        try fixture.makeNativeResult(&subject, case.key, .{});
+    }
+}
+
 test "the release gate retains candidate and Azure fail-closed validation" {
     {
         var subject = try tree();
@@ -514,7 +560,9 @@ test "a successful stage publishes exactly four full and core assets" {
         "mizinit, azagent, supervised OpenSSH",
         "exact 5 GiB",
         "3584 MiB (3.5 GiB), 30% smaller",
-        "native KVM",
+        "same-architecture QEMU acceptance (x86_64 KVM; AArch64 TCG)",
+        "explicit multi-threaded TCG",
+        "no accelerator probing or fallback",
         "Azure Trusted Launch",
         "matching digest-bound Android container provenance",
         "standalone zstd QCOW2 files with no backing images",
@@ -714,7 +762,7 @@ test "the full native result binds complete candidate and workflow identity" {
     var result = try fixture.read(allocator, io, native_path);
     defer result.deinit();
     const object = result.value.object;
-    try std.testing.expectEqual(@as(i64, 2), object.get("schema").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), object.get("schema").?.integer);
     try std.testing.expectEqualStrings(key, object.get("key").?.string);
     try std.testing.expectEqualStrings(
         "x86_64",
@@ -734,13 +782,29 @@ test "the full native result binds complete candidate and workflow identity" {
         object.get("contracts"),
         &contracts.full_native_contracts,
     ));
+    const qemu = object.get("execution").?.object;
+    try std.testing.expectEqualStrings("kvm", qemu.get("accelerator").?.string);
+    try std.testing.expectEqualStrings("host", qemu.get("cpu").?.string);
+    try std.testing.expectEqualStrings(
+        "/usr/bin/qemu-system-x86_64",
+        qemu.get("emulator").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "x86_64",
+        qemu.get("guest_architecture").?.string,
+    );
+    try std.testing.expectEqualStrings("q35", qemu.get("machine").?.string);
+    try std.testing.expectEqualStrings(
+        "x86_64",
+        qemu.get("runner_architecture").?.string,
+    );
 
     const virtual_size = object.get("virtual_size").?.integer;
     const mutations = [_]struct {
         steps: []const Step,
         change: fixture.Change,
     }{
-        .{ .steps = &.{.{ .key = "schema" }}, .change = .{ .set = .{ .integer = 1 } } },
+        .{ .steps = &.{.{ .key = "schema" }}, .change = .{ .set = .{ .integer = 2 } } },
         .{
             .steps = &.{.{ .key = "key" }},
             .change = .{ .set = .{ .string = "aarch64-full" } },
@@ -777,6 +841,38 @@ test "the full native result binds complete candidate and workflow identity" {
         .{
             .steps = &.{.{ .key = "status" }},
             .change = .{ .set = .{ .string = "failure" } },
+        },
+        .{
+            .steps = &.{ .{ .key = "execution" }, .{ .key = "accelerator" } },
+            .change = .{ .set = .{ .string = "auto" } },
+        },
+        .{
+            .steps = &.{ .{ .key = "execution" }, .{ .key = "runner_architecture" } },
+            .change = .{ .set = .{ .string = "aarch64" } },
+        },
+        .{
+            .steps = &.{ .{ .key = "execution" }, .{ .key = "emulator" } },
+            .change = .{ .set = .{ .string = "/usr/bin/qemu-system-aarch64" } },
+        },
+        .{
+            .steps = &.{ .{ .key = "execution" }, .{ .key = "guest_architecture" } },
+            .change = .{ .set = .{ .string = "aarch64" } },
+        },
+        .{
+            .steps = &.{ .{ .key = "execution" }, .{ .key = "machine" } },
+            .change = .{ .set = .{ .string = "virt" } },
+        },
+        .{
+            .steps = &.{ .{ .key = "execution" }, .{ .key = "cpu" } },
+            .change = .{ .set = .{ .string = "max" } },
+        },
+        .{
+            .steps = &.{ .{ .key = "execution" }, .{ .key = "mode" } },
+            .change = .{ .set = .{ .string = "auto" } },
+        },
+        .{
+            .steps = &.{ .{ .key = "execution" }, .{ .key = "accelerator" } },
+            .change = .remove,
         },
         .{
             .steps = &.{ .{ .key = "workflow" }, .{ .key = "run_id" } },
@@ -817,17 +913,37 @@ test "the core native result binds the candidate identity and contracts" {
         "core",
         result.value.object.get("flavor").?.string,
     );
+    try std.testing.expectEqual(
+        @as(i64, 7),
+        result.value.object.get("schema").?.integer,
+    );
     try std.testing.expect(support.hasExactContracts(
         result.value.object.get("contracts"),
         &contracts.core_native_contracts,
     ));
+    const qemu = result.value.object.get("execution").?.object;
+    try std.testing.expectEqualStrings("tcg", qemu.get("accelerator").?.string);
+    try std.testing.expectEqualStrings("max", qemu.get("cpu").?.string);
+    try std.testing.expectEqualStrings(
+        "/usr/bin/qemu-system-aarch64",
+        qemu.get("emulator").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "aarch64",
+        qemu.get("guest_architecture").?.string,
+    );
+    try std.testing.expectEqualStrings("virt", qemu.get("machine").?.string);
+    try std.testing.expectEqualStrings(
+        "aarch64",
+        qemu.get("runner_architecture").?.string,
+    );
 
     const virtual_size = candidate.value.object.get("virtual_size").?.integer;
     const mutations = [_]struct {
         steps: []const Step,
         change: fixture.Change,
     }{
-        .{ .steps = &.{.{ .key = "schema" }}, .change = .{ .set = .{ .integer = 5 } } },
+        .{ .steps = &.{.{ .key = "schema" }}, .change = .{ .set = .{ .integer = 6 } } },
         .{
             .steps = &.{.{ .key = "key" }},
             .change = .{ .set = .{ .string = "x86_64-core" } },
@@ -856,6 +972,14 @@ test "the core native result binds the candidate identity and contracts" {
         .{
             .steps = &.{ .{ .key = "workflow" }, .{ .key = "run_attempt" } },
             .change = .{ .set = .{ .string = "" } },
+        },
+        .{
+            .steps = &.{ .{ .key = "execution" }, .{ .key = "accelerator" } },
+            .change = .{ .set = .{ .string = "kvm" } },
+        },
+        .{
+            .steps = &.{ .{ .key = "execution" }, .{ .key = "runner_architecture" } },
+            .change = .{ .set = .{ .string = "x86_64" } },
         },
         .{
             .steps = &.{ .{ .key = "android_smoke" }, .{ .key = "architecture" } },
@@ -950,11 +1074,11 @@ test "the contract sets cover the acceptance each flavor actually performs" {
             "gpt-layout",
             "kernel-lockdown",
             "key-only-ssh",
-            "matching-architecture-native-kvm",
             "module-signatures",
             "netplan-networkd",
             "reboot-reconnect",
             "root-growth",
+            "same-architecture-qemu",
             "secure-boot",
             "signed-uki",
             "standalone-zstd-qcow2",
@@ -981,7 +1105,6 @@ test "the contract sets cover the acceptance each flavor actually performs" {
             "kernel-lockdown",
             "key-only-ssh",
             "local-ovf-azagent-skip-ready",
-            "matching-architecture-native-kvm",
             "mizinit-pid1",
             "mizinit-sshd-supervision",
             "module-signatures",
@@ -990,6 +1113,7 @@ test "the contract sets cover the acceptance each flavor actually performs" {
             "persistent-provisioned-state",
             "reboot-reconnect",
             "root-growth",
+            "same-architecture-qemu",
             "secure-boot",
             "signed-binder-module",
             "signed-uki",

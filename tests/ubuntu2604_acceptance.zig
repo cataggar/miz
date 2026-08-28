@@ -1,12 +1,14 @@
-//! Opt-in native-QEMU acceptance for finalized Ubuntu 26.04 QCOW2 images.
+//! Opt-in same-architecture QEMU acceptance for finalized Ubuntu 26.04 images.
 //!
 //! The selected build options and `MIZ_UBUNTU2604_IMAGE` must agree on one
-//! full or core candidate. This deliberately refuses TCG: acceptance is run
-//! only by a native x86_64 or AArch64 matrix entry.
+//! full or core candidate. x86_64 is pinned to KVM; AArch64 is pinned to
+//! multi-threaded TCG on a native Arm64 host. Neither path probes or falls back
+//! to another accelerator.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const execution = @import("ubuntu2604_execution");
 const qemu_host = @import("qemu_host");
 const qmp = @import("qmp");
 const miz = @import("miz");
@@ -16,7 +18,6 @@ const Dir = std.Io.Dir;
 const Io = std.Io;
 
 const admin_username = "miztest";
-const boot_timeout_seconds: i64 = 8 * 60;
 const serial_limit: usize = 2 * 1024 * 1024;
 const mib: u64 = 1024 * 1024;
 const gib: u64 = 1024 * mib;
@@ -119,11 +120,11 @@ const Architecture = enum {
                 "q35,accel=kvm,smm=on"
             else
                 "q35,accel=kvm,smm=off",
-            .aarch64 => "virt,accel=kvm",
+            .aarch64 => "virt",
         };
     }
 
-    fn nativeCpu(self: Architecture) std.Target.Cpu.Arch {
+    fn runnerCpu(self: Architecture) std.Target.Cpu.Arch {
         return switch (self) {
             .x86_64 => .x86_64,
             .aarch64 => .aarch64,
@@ -139,7 +140,7 @@ const Architecture = enum {
 };
 
 const full_contracts = [_][]const u8{
-    "matching-architecture-native-kvm",
+    "same-architecture-qemu",
     "standalone-zstd-qcow2",
     "gpt-layout",
     "secure-boot",
@@ -160,7 +161,7 @@ const full_contracts = [_][]const u8{
 };
 
 const core_contracts = [_][]const u8{
-    "matching-architecture-native-kvm",
+    "same-architecture-qemu",
     "standalone-zstd-qcow2",
     "gpt-layout",
     "secure-boot",
@@ -217,7 +218,7 @@ const core_policy: FlavorPolicy = .{
     .x86_64_file_name = "Ubuntu-26.04-x86_64.core.qcow2",
     .aarch64_file_name = "Ubuntu-26.04-aarch64.core.qcow2",
     .virtual_size = 3584 * mib,
-    .result_schema = 6,
+    .result_schema = 7,
     .contracts = &core_contracts,
 };
 
@@ -225,7 +226,7 @@ const full_policy: FlavorPolicy = .{
     .x86_64_file_name = "Ubuntu-26.04-x86_64.qcow2",
     .aarch64_file_name = "Ubuntu-26.04-aarch64.qcow2",
     .virtual_size = 5 * gib,
-    .result_schema = 2,
+    .result_schema = 3,
     .contracts = &full_contracts,
 };
 
@@ -260,6 +261,10 @@ const Candidate = struct {
 
     fn contracts(self: Candidate) []const []const u8 {
         return self.flavor.policy().contracts;
+    }
+
+    fn executionProfile(self: Candidate) *const execution.Profile {
+        return execution.forName(@tagName(self.architecture)).?;
     }
 };
 
@@ -320,6 +325,7 @@ const CoreProvisionedState = struct {
 const Instance = struct {
     label: []const u8,
     port: u16,
+    execution_profile: *const execution.Profile,
     work_path: []u8,
     overlay_path: []u8,
     vars_path: []u8,
@@ -342,6 +348,7 @@ const Instance = struct {
         parent_path: []const u8,
         label: []const u8,
         port: u16,
+        execution_profile: *const execution.Profile,
     ) !void {
         const work_path = try std.fs.path.join(allocator, &.{ parent_path, label });
         errdefer allocator.free(work_path);
@@ -372,6 +379,7 @@ const Instance = struct {
         self.* = .{
             .label = label,
             .port = port,
+            .execution_profile = execution_profile,
             .work_path = work_path,
             .overlay_path = overlay_path,
             .vars_path = vars_path,
@@ -531,48 +539,164 @@ fn requireImageAlloc(
     return image_path;
 }
 
-fn validateNativeKvmPrerequisites(
+fn validateQemuPrerequisites(
     host_is_linux: bool,
     host_architecture: std.Target.Cpu.Arch,
-    kvm_available: bool,
+    kvm_available: ?bool,
     candidate: Candidate,
 ) !void {
+    const profile = candidate.executionProfile();
     if (!host_is_linux) {
         std.debug.print(
-            "Ubuntu 26.04 acceptance requires a Linux host for native KVM QEMU\n",
+            "Ubuntu 26.04 acceptance requires a Linux host for same-architecture QEMU\n",
             .{},
         );
-        return error.NativeKvmRequiresLinux;
+        return error.QemuRequiresLinux;
     }
-    if (host_architecture != candidate.architecture.nativeCpu()) {
+    if (host_architecture != candidate.architecture.runnerCpu()) {
         std.debug.print(
-            "Ubuntu 26.04 acceptance requires a native {s} runner; TCG is forbidden\n",
-            .{@tagName(candidate.architecture.nativeCpu())},
+            "Ubuntu 26.04 acceptance requires a same-architecture {s} runner\n",
+            .{@tagName(candidate.architecture.runnerCpu())},
         );
-        return error.NativeKvmRequiresMatchingHostArchitecture;
+        return error.QemuRequiresMatchingHostArchitecture;
     }
-    if (!kvm_available) {
-        std.debug.print(
-            "Ubuntu 26.04 acceptance requires readable and writable /dev/kvm; TCG is forbidden\n",
-            .{},
-        );
-        return error.KvmUnavailable;
+    switch (profile.accelerator) {
+        .kvm => if (!(kvm_available orelse false)) {
+            std.debug.print(
+                "Ubuntu 26.04 x86_64 acceptance requires readable and writable /dev/kvm\n",
+                .{},
+            );
+            return error.KvmUnavailable;
+        },
+        .tcg => if (kvm_available != null)
+            return error.UnexpectedKvmCheckForTcg,
     }
 }
 
-fn requireNativeKvm(io: Io, candidate: Candidate) !void {
+const ConfiguredExecution = struct {
+    profile: *const execution.Profile,
+    qemu_path: []u8,
+
+    fn deinit(self: *ConfiguredExecution, allocator: Allocator) void {
+        allocator.free(self.qemu_path);
+        self.* = undefined;
+    }
+};
+
+fn requireExactExecutionEnvironment(
+    allocator: Allocator,
+    profile: *const execution.Profile,
+) ![]u8 {
+    const expectations = [_]struct {
+        name: []const u8,
+        expected: []const u8,
+    }{
+        .{
+            .name = "MIZ_UBUNTU2604_QEMU_ACCELERATOR",
+            .expected = @tagName(profile.accelerator),
+        },
+        .{
+            .name = "MIZ_UBUNTU2604_QEMU_ACCELERATOR_ARGUMENT",
+            .expected = profile.accelerator_argument,
+        },
+        .{
+            .name = "MIZ_UBUNTU2604_QEMU_CPU",
+            .expected = profile.cpu,
+        },
+        .{
+            .name = "MIZ_UBUNTU2604_QEMU_MACHINE",
+            .expected = profile.machine,
+        },
+        .{
+            .name = "MIZ_UBUNTU2604_RUNNER_ARCHITECTURE",
+            .expected = profile.runner_architecture,
+        },
+    };
+    for (expectations) |expectation| {
+        const actual = std.testing.environ.getAlloc(
+            allocator,
+            expectation.name,
+        ) catch |err| switch (err) {
+            error.EnvironmentVariableMissing => {
+                std.debug.print(
+                    "Ubuntu 26.04 acceptance requires {s}={s}\n",
+                    .{ expectation.name, expectation.expected },
+                );
+                return err;
+            },
+            else => return err,
+        };
+        defer allocator.free(actual);
+        if (!std.mem.eql(u8, actual, expectation.expected)) {
+            std.debug.print(
+                "Ubuntu 26.04 acceptance requires {s}={s}, got {s}\n",
+                .{ expectation.name, expectation.expected, actual },
+            );
+            return error.QemuExecutionEnvironmentMismatch;
+        }
+    }
+
+    const job_timeout_text = try requireEnvAlloc(
+        allocator,
+        "MIZ_UBUNTU2604_QEMU_JOB_TIMEOUT_MINUTES",
+    );
+    defer allocator.free(job_timeout_text);
+    const job_timeout = std.fmt.parseInt(u16, job_timeout_text, 10) catch
+        return error.QemuExecutionEnvironmentMismatch;
+    if (job_timeout != profile.timeouts.job_minutes) {
+        std.debug.print(
+            "Ubuntu 26.04 acceptance requires a {d}-minute QEMU job timeout, got {s}\n",
+            .{ profile.timeouts.job_minutes, job_timeout_text },
+        );
+        return error.QemuExecutionEnvironmentMismatch;
+    }
+
+    const qemu_path = try requireEnvAlloc(allocator, "MIZ_UBUNTU2604_QEMU");
+    errdefer allocator.free(qemu_path);
+    if (!std.mem.eql(u8, qemu_path, profile.emulator)) {
+        std.debug.print(
+            "Ubuntu 26.04 acceptance requires MIZ_UBUNTU2604_QEMU={s}, got {s}\n",
+            .{ profile.emulator, qemu_path },
+        );
+        return error.QemuExecutionEnvironmentMismatch;
+    }
+    return qemu_path;
+}
+
+fn requireQemuExecutionAlloc(
+    allocator: Allocator,
+    io: Io,
+    candidate: Candidate,
+) !ConfiguredExecution {
+    const profile = candidate.executionProfile();
     const host_is_linux = builtin.os.tag == .linux;
-    const host_is_native = builtin.cpu.arch == candidate.architecture.nativeCpu();
-    const kvm_available = if (host_is_linux and host_is_native)
-        try qemu_host.pathAccessible(io, "/dev/kvm", .{ .read = true, .write = true })
-    else
-        false;
-    try validateNativeKvmPrerequisites(
+    const host_is_native = builtin.cpu.arch == candidate.architecture.runnerCpu();
+    const kvm_available: ?bool = switch (profile.accelerator) {
+        .kvm => if (host_is_linux and host_is_native)
+            try qemu_host.pathAccessible(io, "/dev/kvm", .{
+                .read = true,
+                .write = true,
+            })
+        else
+            false,
+        .tcg => null,
+    };
+    try validateQemuPrerequisites(
         host_is_linux,
         builtin.cpu.arch,
         kvm_available,
         candidate,
     );
+    const qemu_path = try requireExactExecutionEnvironment(allocator, profile);
+    errdefer allocator.free(qemu_path);
+    if (!try qemu_host.pathAccessible(io, qemu_path, .{ .execute = true })) {
+        std.debug.print(
+            "Ubuntu 26.04 acceptance requires executable native QEMU at {s}\n",
+            .{qemu_path},
+        );
+        return error.RequiredQemuNotExecutable;
+    }
+    return .{ .profile = profile, .qemu_path = qemu_path };
 }
 
 fn requireFoundTool(path: ?[]u8, name: []const u8) ![]u8 {
@@ -1531,8 +1655,16 @@ fn startInstance(
     try qemu_args.appendSlice(allocator, &.{
         "-machine",
         candidate.architecture.machineArg(secure_boot),
+    });
+    if (instance.execution_profile.accelerator == .tcg) {
+        try qemu_args.appendSlice(allocator, &.{
+            "-accel",
+            instance.execution_profile.accelerator_argument,
+        });
+    }
+    try qemu_args.appendSlice(allocator, &.{
         "-cpu",
-        "host",
+        instance.execution_profile.cpu,
         "-smp",
         "2",
         "-m",
@@ -1579,7 +1711,9 @@ fn startInstance(
     instance.spawned = try qmp.spawnAndConnect(allocator, io, .{
         .binary = qemu_path,
         .qmp_socket_path = instance.qmp_socket_path,
-        .connect_timeout = .fromSeconds(30),
+        .connect_timeout = .fromSeconds(
+            instance.execution_profile.timeouts.qmp_connect_seconds,
+        ),
         .extra_args = qemu_args.items,
         .stdout = .ignore,
         .stderr = .inherit,
@@ -1591,12 +1725,21 @@ fn commandSucceeded(
     io: Io,
     argv: []const []const u8,
 ) !bool {
+    return commandSucceededWithin(allocator, io, argv, 20);
+}
+
+fn commandSucceededWithin(
+    allocator: Allocator,
+    io: Io,
+    argv: []const []const u8,
+    timeout_seconds: i64,
+) !bool {
     const result = std.process.run(allocator, io, .{
         .argv = argv,
         .stdout_limit = .limited(512 * 1024),
         .stderr_limit = .limited(16 * 1024),
         .timeout = .{ .duration = .{
-            .raw = .fromSeconds(20),
+            .raw = .fromSeconds(timeout_seconds),
             .clock = .awake,
         } },
     }) catch return false;
@@ -1615,9 +1758,33 @@ fn sshSucceeded(
     instance: *const Instance,
     command: []const u8,
 ) !bool {
+    return sshSucceededWithin(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        command,
+        instance.execution_profile.timeouts.ssh_command_seconds,
+    );
+}
+
+fn sshSucceededWithin(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+    command: []const u8,
+    timeout_seconds: i64,
+) !bool {
     const port_text = try std.fmt.allocPrint(allocator, "{d}", .{instance.port});
     defer allocator.free(port_text);
-    return commandSucceeded(allocator, io, &.{
+    const connect_timeout = try std.fmt.allocPrint(
+        allocator,
+        "ConnectTimeout={d}",
+        .{instance.execution_profile.timeouts.ssh_connect_seconds},
+    );
+    defer allocator.free(connect_timeout);
+    return commandSucceededWithin(allocator, io, &.{
         ssh_path,
         "-i",
         instance.private_key_path,
@@ -1626,7 +1793,7 @@ fn sshSucceeded(
         "-o",
         "BatchMode=yes",
         "-o",
-        "ConnectTimeout=5",
+        connect_timeout,
         "-o",
         "ConnectionAttempts=1",
         "-o",
@@ -1645,7 +1812,7 @@ fn sshSucceeded(
         "UserKnownHostsFile=/dev/null",
         admin_username ++ "@127.0.0.1",
         command,
-    });
+    }, timeout_seconds);
 }
 
 fn normalizeSshRunError(err: anyerror) anyerror {
@@ -1659,8 +1826,32 @@ fn sshOutputAlloc(
     instance: *const Instance,
     command: []const u8,
 ) ![]u8 {
+    return sshOutputAllocWithin(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        command,
+        instance.execution_profile.timeouts.ssh_command_seconds,
+    );
+}
+
+fn sshOutputAllocWithin(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+    command: []const u8,
+    timeout_seconds: i64,
+) ![]u8 {
     const port_text = try std.fmt.allocPrint(allocator, "{d}", .{instance.port});
     defer allocator.free(port_text);
+    const connect_timeout = try std.fmt.allocPrint(
+        allocator,
+        "ConnectTimeout={d}",
+        .{instance.execution_profile.timeouts.ssh_connect_seconds},
+    );
+    defer allocator.free(connect_timeout);
     const result = std.process.run(allocator, io, .{
         .argv = &.{
             ssh_path,
@@ -1671,7 +1862,7 @@ fn sshOutputAlloc(
             "-o",
             "BatchMode=yes",
             "-o",
-            "ConnectTimeout=5",
+            connect_timeout,
             "-o",
             "ConnectionAttempts=1",
             "-o",
@@ -1694,7 +1885,7 @@ fn sshOutputAlloc(
         .stdout_limit = .limited(512 * 1024),
         .stderr_limit = .limited(16 * 1024),
         .timeout = .{ .duration = .{
-            .raw = .fromSeconds(20),
+            .raw = .fromSeconds(timeout_seconds),
             .clock = .awake,
         } },
     }) catch |err| return normalizeSshRunError(err);
@@ -1938,6 +2129,12 @@ fn sshWithStdinAlloc(
 ) ![]u8 {
     const port_text = try std.fmt.allocPrint(allocator, "{d}", .{instance.port});
     defer allocator.free(port_text);
+    const connect_timeout = try std.fmt.allocPrint(
+        allocator,
+        "ConnectTimeout={d}",
+        .{instance.execution_profile.timeouts.ssh_connect_seconds},
+    );
+    defer allocator.free(connect_timeout);
     var child = try std.process.spawn(io, .{
         .argv = &.{
             ssh_path,
@@ -1948,7 +2145,7 @@ fn sshWithStdinAlloc(
             "-o",
             "BatchMode=yes",
             "-o",
-            "ConnectTimeout=5",
+            connect_timeout,
             "-o",
             "ConnectionAttempts=1",
             "-o",
@@ -2173,8 +2370,6 @@ const android_smoke_abilist_property = "ro.product.cpu.abilist";
 const android_smoke_binderfs_mount_destination = "/dev/binderfs";
 const android_smoke_dma_heap_mount_prefix = "/dev/dma_heap";
 const android_smoke_poll_interval_seconds: u32 = 5;
-const android_smoke_boot_timeout_seconds: u32 = 240;
-const android_smoke_stop_timeout_seconds: u32 = 60;
 const android_smoke_diagnostics_byte_limit: usize = 8192;
 
 // Fully comptime-known guest commands, named so their exact contents are
@@ -2310,8 +2505,8 @@ fn classifyAndroidBootPoll(
     timeout_seconds: u32,
 ) AndroidBootPollOutcome {
     const trimmed = std.mem.trim(u8, boot_completed_property, " \t\r\n");
-    if (std.mem.eql(u8, trimmed, "1")) return .boot_completed;
     if (elapsed_seconds >= timeout_seconds) return .timed_out;
+    if (std.mem.eql(u8, trimmed, "1")) return .boot_completed;
     return .retry;
 }
 
@@ -2467,17 +2662,32 @@ fn pollAndroidBootCompleted(
     instance: *const Instance,
     architecture: Architecture,
 ) !void {
-    var elapsed_seconds: u32 = 0;
+    const timeout_seconds = instance.execution_profile.timeouts.android_boot_seconds;
+    const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(timeout_seconds));
     while (true) {
-        const output = sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_boot_poll_command) catch
-            try allocator.dupe(u8, "");
+        const output = sshOutputAllocWithin(
+            allocator,
+            io,
+            ssh_path,
+            instance,
+            android_smoke_boot_poll_command,
+            instance.execution_profile.timeouts.ssh_poll_seconds,
+        ) catch try allocator.dupe(u8, "");
         defer allocator.free(output);
-        switch (classifyAndroidBootPoll(output, elapsed_seconds, android_smoke_boot_timeout_seconds)) {
+        const elapsed_seconds: u32 = if (Io.Clock.awake.now(io).nanoseconds >=
+            deadline.nanoseconds)
+            timeout_seconds
+        else
+            0;
+        switch (classifyAndroidBootPoll(
+            output,
+            elapsed_seconds,
+            timeout_seconds,
+        )) {
             .boot_completed => break,
             .timed_out => return error.AndroidContainerBootTimedOut,
             .retry => {
                 try Io.sleep(io, .fromSeconds(android_smoke_poll_interval_seconds), .awake);
-                elapsed_seconds += android_smoke_poll_interval_seconds;
             },
         }
     }
@@ -2502,10 +2712,11 @@ fn stopAndroidContainerGracefully(
         else => return err,
     }
 
-    const max_attempts = android_smoke_stop_timeout_seconds / android_smoke_poll_interval_seconds;
-    var attempt: u32 = 0;
+    const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(
+        instance.execution_profile.timeouts.android_stop_seconds,
+    ));
     var stopped = false;
-    while (attempt < max_attempts) : (attempt += 1) {
+    while (Io.Clock.awake.now(io).nanoseconds < deadline.nanoseconds) {
         // A failed state query (permission error, transient SSH failure, the
         // runtime itself erroring out, ...) is captured here and folded into
         // empty output, exactly like a transient boot-poll failure above.
@@ -2514,8 +2725,14 @@ fn stopAndroidContainerGracefully(
         // read as confirmation the container stopped, and this loop keeps
         // polling within its bounded timeout instead of aborting early or
         // fabricating a "stopped" result.
-        const state_output = sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_state_command) catch
-            try allocator.dupe(u8, "");
+        const state_output = sshOutputAllocWithin(
+            allocator,
+            io,
+            ssh_path,
+            instance,
+            android_smoke_state_command,
+            instance.execution_profile.timeouts.ssh_poll_seconds,
+        ) catch try allocator.dupe(u8, "");
         defer allocator.free(state_output);
         const status = extractAndroidContainerStatusAlloc(allocator, state_output) catch null;
         defer if (status) |value| allocator.free(value);
@@ -2589,7 +2806,14 @@ fn verifyGuestAndroidContainerSmoke(
         smoke.bundle_sha256,
     );
 
-    const extract_output = try sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_extract_command);
+    const extract_output = try sshOutputAllocWithin(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        android_smoke_extract_command,
+        instance.execution_profile.timeouts.ssh_long_command_seconds,
+    );
     allocator.free(extract_output);
 
     const config_json = try sshOutputAlloc(allocator, io, ssh_path, instance, android_smoke_config_command);
@@ -2687,9 +2911,18 @@ fn waitForSsh(
     ssh_path: []const u8,
     instance: *const Instance,
 ) !void {
-    const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(boot_timeout_seconds));
+    const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(
+        instance.execution_profile.timeouts.guest_ready_seconds,
+    ));
     while (Io.Clock.awake.now(io).nanoseconds < deadline.nanoseconds) {
-        if (try sshSucceeded(allocator, io, ssh_path, instance, "true")) return;
+        if (try sshSucceededWithin(
+            allocator,
+            io,
+            ssh_path,
+            instance,
+            "true",
+            instance.execution_profile.timeouts.ssh_poll_seconds,
+        )) return;
         if (!try qemuRunning(instance, deadline)) return error.QemuExitedEarly;
         try Io.sleep(io, .fromSeconds(2), .awake);
     }
@@ -2756,14 +2989,20 @@ fn verifyKeyOnlySsh(
 ) !void {
     const port_text = try std.fmt.allocPrint(allocator, "{d}", .{instance.port});
     defer allocator.free(port_text);
-    if (try commandSucceeded(allocator, io, &.{
+    const connect_timeout = try std.fmt.allocPrint(
+        allocator,
+        "ConnectTimeout={d}",
+        .{instance.execution_profile.timeouts.ssh_connect_seconds},
+    );
+    defer allocator.free(connect_timeout);
+    if (try commandSucceededWithin(allocator, io, &.{
         ssh_path,
         "-p",
         port_text,
         "-o",
         "BatchMode=yes",
         "-o",
-        "ConnectTimeout=5",
+        connect_timeout,
         "-o",
         "PreferredAuthentications=none",
         "-o",
@@ -2778,7 +3017,8 @@ fn verifyKeyOnlySsh(
         "UserKnownHostsFile=/dev/null",
         admin_username ++ "@127.0.0.1",
         "true",
-    })) return error.SshAcceptedWithoutKey;
+    }, instance.execution_profile.timeouts.ssh_command_seconds))
+        return error.SshAcceptedWithoutKey;
     if (!try sshSucceeded(
         allocator,
         io,
@@ -3023,12 +3263,13 @@ fn verifyFlavorRuntime(
     switch (candidate.flavor) {
         .core => _ = try readCoreSshdPid(allocator, io, ssh_path, instance),
         .full => {
-            const output = sshOutputAlloc(
+            const output = sshOutputAllocWithin(
                 allocator,
                 io,
                 ssh_path,
                 instance,
                 full_checks,
+                instance.execution_profile.timeouts.ssh_long_command_seconds,
             ) catch |err| switch (err) {
                 error.SshCommandFailed => return error.FullServiceContractFailed,
                 else => return err,
@@ -3054,7 +3295,9 @@ fn verifyCoreSshdRestart(
     defer allocator.free(kill_command);
     _ = sshSucceeded(allocator, io, ssh_path, instance, kill_command) catch false;
 
-    const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(boot_timeout_seconds));
+    const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(
+        instance.execution_profile.timeouts.guest_ready_seconds,
+    ));
     while (Io.Clock.awake.now(io).nanoseconds < deadline.nanoseconds) {
         if (readCoreSshdPid(allocator, io, ssh_path, instance)) |new_pid| {
             if (new_pid != initial_pid) {
@@ -3219,7 +3462,9 @@ fn rebootAndReadIdentity(
         "sudo -n /sbin/reboot",
     ) catch false;
 
-    const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(boot_timeout_seconds));
+    const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(
+        instance.execution_profile.timeouts.guest_ready_seconds,
+    ));
     while (Io.Clock.awake.now(io).nanoseconds < deadline.nanoseconds) {
         if (readGuestIdentityAlloc(allocator, io, ssh_path, instance)) |identity| {
             if (!std.mem.eql(u8, identity.boot_id, before.boot_id))
@@ -3238,7 +3483,9 @@ fn rebootAndReadIdentity(
 
 fn waitForQemuExit(io: Io, instance: *Instance) !std.process.Child.Term {
     const spawned = &(instance.spawned orelse return error.QemuNotStarted);
-    const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(boot_timeout_seconds));
+    const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(
+        instance.execution_profile.timeouts.guest_ready_seconds,
+    ));
     while (Io.Clock.awake.now(io).nanoseconds < deadline.nanoseconds) {
         if (!try spawned.client.queryRunningUntil(deadline)) {
             var reply = try spawned.client.executeUntil("quit", null, deadline);
@@ -3302,8 +3549,19 @@ fn writeAcceptanceResult(
     certificate_sha256: miz.artifact_pipeline.Digest,
     uki_sha256: miz.artifact_pipeline.Digest,
     identity: *const AcceptanceResultIdentity,
+    execution_profile: *const execution.Profile,
+    qemu_path: []const u8,
     android_smoke: ?*const AndroidSmokeInputs,
 ) !void {
+    if (!std.mem.eql(
+        u8,
+        @tagName(execution_profile.architecture),
+        @tagName(candidate.architecture),
+    ) or
+        !std.mem.eql(u8, qemu_path, execution_profile.emulator))
+    {
+        return error.QemuExecutionIdentityMismatch;
+    }
     const source_sha256_hex = miz.artifact_pipeline.formatSha256(source_sha256);
     const certificate_sha256_hex = miz.artifact_pipeline.formatSha256(
         certificate_sha256,
@@ -3329,6 +3587,14 @@ fn writeAcceptanceResult(
                     .certificate_sha256 = &certificate_sha256_hex,
                     .fallback_uki_sha256 = &uki_sha256_hex,
                     .status = "success",
+                    .execution = .{
+                        .accelerator = @tagName(execution_profile.accelerator),
+                        .cpu = execution_profile.cpu,
+                        .emulator = qemu_path,
+                        .guest_architecture = @tagName(candidate.architecture),
+                        .machine = execution_profile.machine,
+                        .runner_architecture = execution_profile.runner_architecture,
+                    },
                     .contracts = candidate.contracts(),
                     .workflow = .{
                         .run_id = identity.run_id,
@@ -3365,6 +3631,14 @@ fn writeAcceptanceResult(
                     .certificate_sha256 = &certificate_sha256_hex,
                     .fallback_uki_sha256 = &uki_sha256_hex,
                     .status = "success",
+                    .execution = .{
+                        .accelerator = @tagName(execution_profile.accelerator),
+                        .cpu = execution_profile.cpu,
+                        .emulator = qemu_path,
+                        .guest_architecture = @tagName(candidate.architecture),
+                        .machine = execution_profile.machine,
+                        .runner_architecture = execution_profile.runner_architecture,
+                    },
                     .android_smoke = .{
                         .provenance_sha256 = &provenance_sha256_hex,
                         .runtime_sha256 = &runtime_sha256_hex,
@@ -3661,8 +3935,8 @@ test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
     try std.testing.expectEqual(@as(u64, 5 * gib), full.expectedVirtualSize());
     try std.testing.expectEqual(@as(u64, 3584 * mib), core.expectedVirtualSize());
     try std.testing.expect(core.expectedVirtualSize() < full.expectedVirtualSize());
-    try std.testing.expectEqual(@as(u32, 2), full.flavor.policy().result_schema);
-    try std.testing.expectEqual(@as(u32, 6), core.flavor.policy().result_schema);
+    try std.testing.expectEqual(@as(u32, 3), full.flavor.policy().result_schema);
+    try std.testing.expectEqual(@as(u32, 7), core.flavor.policy().result_schema);
     try std.testing.expectEqual(@as(usize, 18), full.contracts().len);
     try std.testing.expectEqual(@as(usize, 31), core.contracts().len);
     try std.testing.expect(hasContract(core.contracts(), "mizinit-sshd-supervision"));
@@ -3707,6 +3981,22 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
     const source_digest: miz.artifact_pipeline.Digest = @splat(0x11);
     const certificate_digest: miz.artifact_pipeline.Digest = @splat(0x22);
     const uki_digest: miz.artifact_pipeline.Digest = @splat(0x33);
+    try std.testing.expectError(
+        error.QemuExecutionIdentityMismatch,
+        writeAcceptanceResult(
+            allocator,
+            io,
+            result_path,
+            candidate,
+            source_digest,
+            certificate_digest,
+            uki_digest,
+            &identity,
+            &execution.x86_64_kvm,
+            execution.x86_64_kvm.emulator,
+            null,
+        ),
+    );
     try writeAcceptanceResult(
         allocator,
         io,
@@ -3716,6 +4006,8 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
         certificate_digest,
         uki_digest,
         &identity,
+        candidate.executionProfile(),
+        candidate.executionProfile().emulator,
         null,
     );
     const text = try Dir.cwd().readFileAlloc(
@@ -3733,7 +4025,7 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
     );
     defer parsed.deinit();
     const result = parsed.value.object;
-    try std.testing.expectEqual(@as(i64, 2), result.get("schema").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), result.get("schema").?.integer);
     try std.testing.expectEqualStrings("aarch64-full", result.get("key").?.string);
     try std.testing.expectEqualStrings("aarch64", result.get("architecture").?.string);
     try std.testing.expectEqualStrings(
@@ -3742,26 +4034,55 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
     );
     try std.testing.expectEqualStrings("a" ** 40, result.get("source_commit").?.string);
     try std.testing.expectEqualStrings("success", result.get("status").?.string);
+    const qemu = result.get("execution").?.object;
+    try std.testing.expectEqualStrings("tcg", qemu.get("accelerator").?.string);
+    try std.testing.expectEqualStrings("max", qemu.get("cpu").?.string);
+    try std.testing.expectEqualStrings(
+        "/usr/bin/qemu-system-aarch64",
+        qemu.get("emulator").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "aarch64",
+        qemu.get("guest_architecture").?.string,
+    );
+    try std.testing.expectEqualStrings("virt", qemu.get("machine").?.string);
+    try std.testing.expectEqualStrings(
+        "aarch64",
+        qemu.get("runner_architecture").?.string,
+    );
     const workflow = result.get("workflow").?.object;
     try std.testing.expectEqualStrings("100", workflow.get("run_id").?.string);
     try std.testing.expectEqualStrings("2", workflow.get("run_attempt").?.string);
 }
 
-test "Ubuntu 26.04 configured acceptance prerequisites fail closed" {
-    const candidate = Candidate{ .architecture = .x86_64, .flavor = .core };
+test "Ubuntu 26.04 configured QEMU prerequisites fail closed" {
+    const x86 = Candidate{ .architecture = .x86_64, .flavor = .core };
+    const arm = Candidate{ .architecture = .aarch64, .flavor = .core };
 
     try std.testing.expectError(
-        error.NativeKvmRequiresLinux,
-        validateNativeKvmPrerequisites(false, .x86_64, false, candidate),
+        error.QemuRequiresLinux,
+        validateQemuPrerequisites(false, .x86_64, false, x86),
     );
     try std.testing.expectError(
-        error.NativeKvmRequiresMatchingHostArchitecture,
-        validateNativeKvmPrerequisites(true, .aarch64, false, candidate),
+        error.QemuRequiresMatchingHostArchitecture,
+        validateQemuPrerequisites(true, .aarch64, false, x86),
     );
     try std.testing.expectError(
         error.KvmUnavailable,
-        validateNativeKvmPrerequisites(true, .x86_64, false, candidate),
+        validateQemuPrerequisites(true, .x86_64, false, x86),
     );
+    try validateQemuPrerequisites(true, .aarch64, null, arm);
+    try std.testing.expectError(
+        error.UnexpectedKvmCheckForTcg,
+        validateQemuPrerequisites(true, .aarch64, true, arm),
+    );
+    try std.testing.expectEqual(execution.Accelerator.kvm, x86.executionProfile().accelerator);
+    try std.testing.expectEqual(execution.Accelerator.tcg, arm.executionProfile().accelerator);
+    try std.testing.expectEqualStrings(
+        "tcg,thread=multi",
+        arm.executionProfile().accelerator_argument,
+    );
+    try std.testing.expectEqualStrings("max", arm.executionProfile().cpu);
     try std.testing.expectError(
         error.RequiredToolNotFound,
         requireFoundTool(null, "not-a-real-ubuntu2604-acceptance-tool"),
@@ -3970,6 +4291,10 @@ test "Android boot poll classification reports completion, retry, and a bounded 
     try std.testing.expectEqual(
         AndroidBootPollOutcome.timed_out,
         classifyAndroidBootPoll("", 245, 240),
+    );
+    try std.testing.expectEqual(
+        AndroidBootPollOutcome.timed_out,
+        classifyAndroidBootPoll("1\n", 240, 240),
     );
 }
 
@@ -4304,7 +4629,7 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
     const io = std.testing.io;
     errdefer |err| {
         std.debug.print(
-            "Ubuntu 26.04 native acceptance failed: {s}\n",
+            "Ubuntu 26.04 same-architecture QEMU acceptance failed: {s}\n",
             .{@errorName(err)},
         );
         if (@errorReturnTrace()) |trace| {
@@ -4315,19 +4640,18 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
 
     const image_path = try requireImageAlloc(allocator, io, candidate);
     defer allocator.free(image_path);
-    try requireNativeKvm(io, candidate);
+    var configured_execution = try requireQemuExecutionAlloc(
+        allocator,
+        io,
+        candidate,
+    );
+    defer configured_execution.deinit(allocator);
     const absolute_image = try Dir.cwd().realPathFileAlloc(io, image_path, allocator);
     defer allocator.free(absolute_image);
     if (!std.mem.eql(u8, std.fs.path.basename(absolute_image), candidate.expectedFileName()))
         return error.UnexpectedCandidateName;
 
-    const qemu_path = try requireToolOverrideAlloc(
-        allocator,
-        io,
-        "MIZ_UBUNTU2604_QEMU",
-        qemu_host.qemuSystemName(candidate.architecture.guestArchitecture()),
-    );
-    defer allocator.free(qemu_path);
+    const qemu_path = configured_execution.qemu_path;
     const qemu_img_path = try requireToolAlloc(allocator, io, "qemu-img");
     defer allocator.free(qemu_img_path);
     const swtpm_path = try requireToolAlloc(allocator, io, "swtpm");
@@ -4473,12 +4797,26 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
     );
 
     var first: Instance = undefined;
-    try first.init(allocator, io, temporary_path, "first", 22220);
+    try first.init(
+        allocator,
+        io,
+        temporary_path,
+        "first",
+        22220,
+        configured_execution.profile,
+    );
     defer first.deinit(allocator);
     errdefer first.dumpSerial(allocator, io);
 
     var second: Instance = undefined;
-    try second.init(allocator, io, temporary_path, "second", 22221);
+    try second.init(
+        allocator,
+        io,
+        temporary_path,
+        "second",
+        22221,
+        configured_execution.profile,
+    );
     defer second.deinit(allocator);
     errdefer second.dumpSerial(allocator, io);
 
@@ -4752,7 +5090,14 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
     defer ordinary_firmware.deinit(allocator);
 
     var control: Instance = undefined;
-    try control.init(allocator, io, temporary_path, "tamper-control", 22222);
+    try control.init(
+        allocator,
+        io,
+        temporary_path,
+        "tamper-control",
+        22222,
+        configured_execution.profile,
+    );
     defer control.deinit(allocator);
     errdefer control.dumpSerial(allocator, io);
     try startInstance(
@@ -4774,12 +5119,19 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         io,
         &control,
         "Linux version",
-        90,
+        configured_execution.profile.timeouts.tamper_control_seconds,
     );
     try terminateInstance(&control);
 
     var rejected: Instance = undefined;
-    try rejected.init(allocator, io, temporary_path, "tamper-rejected", 22223);
+    try rejected.init(
+        allocator,
+        io,
+        temporary_path,
+        "tamper-rejected",
+        22223,
+        configured_execution.profile,
+    );
     defer rejected.deinit(allocator);
     errdefer rejected.dumpSerial(allocator, io);
     try startInstance(
@@ -4800,7 +5152,7 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         allocator,
         io,
         &rejected,
-        60,
+        configured_execution.profile.timeouts.tamper_refusal_seconds,
     );
     try Io.sleep(io, .fromSeconds(5), .awake);
     if (try serialContains(allocator, io, &rejected, "Linux version") or
@@ -4824,6 +5176,8 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         certificate_sha256,
         uki_sha256,
         &result_identity,
+        configured_execution.profile,
+        qemu_path,
         if (android_smoke != null) &android_smoke.? else null,
     );
 }

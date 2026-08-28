@@ -9,7 +9,7 @@
 #   variables AZURE_LOCATION_X64, AZURE_LOCATION_ARM64, AZURE_VM_SIZE_X64, and
 #   AZURE_VM_SIZE_ARM64. The acceptance app's Entra federated credential subject
 #   is `repo:cataggar/miz:environment:ubuntu2604-release`.
-# - Core native and Azure acceptance read the repository secrets
+# - Core QEMU and Azure acceptance read the repository secrets
 #   ANDROID_SMOKE_X86_64_JSON and ANDROID_SMOKE_AARCH64_JSON. Each exact JSON
 #   document supplies one private HTTPS archive location plus the expected
 #   archive and provenance SHA-256 values for that architecture's external
@@ -423,7 +423,7 @@ jobs:
           exit "$status"
 
   native_qemu:
-    name: native-QEMU ${{ matrix.key }}
+    name: same-architecture QEMU (${{ matrix.accelerator }}) ${{ matrix.key }}
     needs: [prepare, build]
     if: >-
       ${{
@@ -438,7 +438,7 @@ jobs:
         )
       }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     permissions:
       actions: read
       contents: read
@@ -451,24 +451,56 @@ jobs:
             architecture: x86_64
             flavor: full
             runner: ubuntu-24.04
+            runner_architecture: x86_64
+            debian_architecture: amd64
+            accelerator: kvm
+            accelerator_argument: kvm
+            emulator: /usr/bin/qemu-system-x86_64
+            machine: q35
+            cpu: host
+            timeout_minutes: 180
             asset_name: Ubuntu-26.04-x86_64.qcow2
             android_smoke_secret: ANDROID_SMOKE_UNUSED
           - key: aarch64-full
             architecture: aarch64
             flavor: full
-            runner: [self-hosted, Linux, ARM64, kvm]
+            runner: ubuntu-24.04-arm
+            runner_architecture: aarch64
+            debian_architecture: arm64
+            accelerator: tcg
+            accelerator_argument: tcg,thread=multi
+            emulator: /usr/bin/qemu-system-aarch64
+            machine: virt
+            cpu: max
+            timeout_minutes: 360
             asset_name: Ubuntu-26.04-aarch64.qcow2
             android_smoke_secret: ANDROID_SMOKE_UNUSED
           - key: x86_64-core
             architecture: x86_64
             flavor: core
             runner: ubuntu-24.04
+            runner_architecture: x86_64
+            debian_architecture: amd64
+            accelerator: kvm
+            accelerator_argument: kvm
+            emulator: /usr/bin/qemu-system-x86_64
+            machine: q35
+            cpu: host
+            timeout_minutes: 180
             asset_name: Ubuntu-26.04-x86_64.core.qcow2
             android_smoke_secret: ANDROID_SMOKE_X86_64_JSON
           - key: aarch64-core
             architecture: aarch64
             flavor: core
-            runner: [self-hosted, Linux, ARM64, kvm]
+            runner: ubuntu-24.04-arm
+            runner_architecture: aarch64
+            debian_architecture: arm64
+            accelerator: tcg
+            accelerator_argument: tcg,thread=multi
+            emulator: /usr/bin/qemu-system-aarch64
+            machine: virt
+            cpu: max
+            timeout_minutes: 360
             asset_name: Ubuntu-26.04-aarch64.core.qcow2
             android_smoke_secret: ANDROID_SMOKE_AARCH64_JSON
     env:
@@ -480,21 +512,33 @@ jobs:
       CANDIDATE_DIR: .release/native/${{ matrix.key }}/candidate
       RESULT_DIR: artifact-staging/native-results/${{ matrix.key }}
       RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
+      MIZ_UBUNTU2604_QEMU: ${{ matrix.emulator }}
+      MIZ_UBUNTU2604_QEMU_ACCELERATOR: ${{ matrix.accelerator }}
+      MIZ_UBUNTU2604_QEMU_ACCELERATOR_ARGUMENT: ${{ matrix.accelerator_argument }}
+      MIZ_UBUNTU2604_QEMU_CPU: ${{ matrix.cpu }}
+      MIZ_UBUNTU2604_QEMU_MACHINE: ${{ matrix.machine }}
+      MIZ_UBUNTU2604_QEMU_JOB_TIMEOUT_MINUTES: ${{ matrix.timeout_minutes }}
+      MIZ_UBUNTU2604_RUNNER_ARCHITECTURE: ${{ matrix.runner_architecture }}
     steps:
-      - name: Require matching native KVM runner
+      - name: Require x86_64 KVM runner
+        if: matrix.architecture == 'x86_64'
         run: |
           set -euo pipefail
+          test "$MIZ_UBUNTU2604_QEMU_ACCELERATOR" = kvm
+          test "$MIZ_UBUNTU2604_QEMU_ACCELERATOR_ARGUMENT" = kvm
+          test "$MIZ_UBUNTU2604_QEMU_CPU" = host
+          test "$MIZ_UBUNTU2604_QEMU_MACHINE" = q35
+          test "$MIZ_UBUNTU2604_QEMU_JOB_TIMEOUT_MINUTES" = 180
+          test "$MIZ_UBUNTU2604_QEMU" = /usr/bin/qemu-system-x86_64
+          test "$MIZ_UBUNTU2604_RUNNER_ARCHITECTURE" = x86_64
+          test "${{ matrix.debian_architecture }}" = amd64
           case "$ARCHITECTURE" in
             x86_64)
               expected_uname=x86_64
               expected_deb=amd64
               ;;
-            aarch64)
-              expected_uname=aarch64
-              expected_deb=arm64
-              ;;
             *)
-              echo "::error::Unsupported native acceptance architecture: $ARCHITECTURE"
+              echo "::error::KVM acceptance is restricted to x86_64, got $ARCHITECTURE"
               exit 1
               ;;
           esac
@@ -504,12 +548,31 @@ jobs:
           test "$(dpkg --print-architecture)" = "$expected_deb"
           sudo -n true
           if [[ ! -c /dev/kvm ]]; then
-            echo "::error::Matching-architecture native acceptance requires a KVM-capable runner with /dev/kvm"
+            echo "::error::x86_64 QEMU acceptance requires a KVM-capable runner with /dev/kvm"
             exit 1
           fi
           sudo -n chown "$(id -u):$(id -g)" /dev/kvm
           test -r /dev/kvm
           test -w /dev/kvm
+
+      - name: Require hosted Arm64 TCG runner
+        if: matrix.architecture == 'aarch64'
+        run: |
+          set -euo pipefail
+          test "$ARCHITECTURE" = aarch64
+          test "$MIZ_UBUNTU2604_QEMU_ACCELERATOR" = tcg
+          test "$MIZ_UBUNTU2604_QEMU_ACCELERATOR_ARGUMENT" = tcg,thread=multi
+          test "$MIZ_UBUNTU2604_QEMU_CPU" = max
+          test "$MIZ_UBUNTU2604_QEMU_MACHINE" = virt
+          test "$MIZ_UBUNTU2604_QEMU_JOB_TIMEOUT_MINUTES" = 360
+          test "$MIZ_UBUNTU2604_QEMU" = /usr/bin/qemu-system-aarch64
+          test "$MIZ_UBUNTU2604_RUNNER_ARCHITECTURE" = aarch64
+          test "${{ matrix.debian_architecture }}" = arm64
+          source /etc/os-release
+          test "${ID:-}" = ubuntu
+          test "$(uname -m)" = aarch64
+          test "$(dpkg --print-architecture)" = arm64
+          sudo -n true
 
       - name: Check out accepted source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -534,7 +597,7 @@ jobs:
           tools: |
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-      - name: Install native KVM, QEMU, firmware, and vTPM tooling
+      - name: Install same-architecture QEMU, firmware, and vTPM tooling
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -556,7 +619,7 @@ jobs:
               uefi_vars=/usr/share/AAVMF/AAVMF_VARS.ms.fd
               ;;
             *)
-              echo "::error::Unsupported native acceptance architecture: $ARCHITECTURE"
+              echo "::error::Unsupported QEMU acceptance architecture: $ARCHITECTURE"
               exit 1
               ;;
           esac
@@ -574,7 +637,7 @@ jobs:
           for tool in qemu-img sbverify ssh ssh-keygen swtpm; do
             command -v "$tool" >/dev/null
           done
-          command -v "$qemu" >/dev/null
+          test "$(command -v "$qemu")" = "$MIZ_UBUNTU2604_QEMU"
 
       - name: Build accepted-source release tooling
         run: |
@@ -586,10 +649,11 @@ jobs:
           zig build install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
 
-      # The runner's /dev/kvm was proven present and writable before the
-      # checkout; this proves it speaks the stable KVM ABI the acceptance
-      # harness targets, using the tooling built from the accepted source.
+      # The x86_64 runner's /dev/kvm was proven present and writable before
+      # checkout. The condition excludes Arm TCG entirely; this then proves
+      # the x86 device speaks the stable KVM ABI using accepted-source tooling.
       - name: Require the stable KVM API version
+        if: matrix.architecture == 'x86_64'
         run: |
           set -euo pipefail
           "$RELEASE_TOOL" kvm-api-version
@@ -618,7 +682,7 @@ jobs:
             --test-filter "privileged offline namespace"
           sudo chown -R "$(id -u):$(id -g)" .zig-cache .zig-global-cache 2>/dev/null || true
 
-      - name: Verify candidate and bind native acceptance inputs
+      - name: Verify candidate and bind QEMU acceptance inputs
         run: |
           set -euo pipefail
           mkdir -p "$RESULT_DIR"
@@ -657,7 +721,7 @@ jobs:
             --output-dir "$GITHUB_WORKSPACE/.release/native/$CANDIDATE_KEY/android-smoke" \
             --github-env "$GITHUB_ENV"
 
-      - name: Run matching-architecture native Secure Boot acceptance
+      - name: Run same-architecture Secure Boot QEMU acceptance
         run: |
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
@@ -670,7 +734,7 @@ jobs:
             test-ubuntu2604-acceptance
           test -s "$MIZ_UBUNTU2604_ACCEPTANCE_RESULT"
 
-      - name: Validate exact native acceptance evidence
+      - name: Validate exact QEMU acceptance evidence
         run: |
           set -euo pipefail
           "$RELEASE_TOOL" verify-native-result \
@@ -680,7 +744,7 @@ jobs:
             --key "$CANDIDATE_KEY" \
             --source-commit "$SOURCE_COMMIT"
 
-      - name: Upload native acceptance failure diagnostics
+      - name: Upload QEMU acceptance failure diagnostics
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -689,7 +753,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 1
 
-      - name: Upload exact native acceptance result
+      - name: Upload exact QEMU acceptance result
         if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -1007,7 +1071,7 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ needs.prepare.outputs.candidate_run_id }}
 
-      - name: Download all native-QEMU acceptance results
+      - name: Download all accelerator-bound QEMU acceptance results
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: ubuntu2604-native-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}

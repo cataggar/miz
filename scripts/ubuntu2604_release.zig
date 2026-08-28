@@ -23,6 +23,7 @@ pub const cli = @import("ubuntu2604/cli.zig");
 pub const commands = @import("ubuntu2604/commands.zig");
 pub const contracts = @import("ubuntu2604/contracts.zig");
 pub const documents = @import("ubuntu2604/documents.zig");
+pub const execution = @import("ubuntu2604/execution.zig");
 pub const android = @import("ubuntu2604/android.zig");
 pub const archive = @import("ubuntu2604/archive.zig");
 pub const keys = @import("ubuntu2604/keys.zig");
@@ -46,7 +47,7 @@ const usage_text =
     \\                                container smoke inputs
     \\  candidate                     bind a built QCOW2 to its provenance tree
     \\  verify-candidate              re-verify a candidate against its asset
-    \\  verify-native-result          verify native acceptance against a candidate
+    \\  verify-native-result          verify same-architecture QEMU acceptance
     \\  verify-vhd                    validate a derived upload VHD
     \\  azure-contracts               print the Azure contracts for a flavor
     \\  azure-result                  record an Azure acceptance result
