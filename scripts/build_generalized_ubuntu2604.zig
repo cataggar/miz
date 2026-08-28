@@ -315,6 +315,11 @@ const full_debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
 const core_debz_packages = [_][]const u8{
     "ubuntu-minimal",
     "linux-azure",
+    // The versioned Azure kernel only recommends `dracut |
+    // linux-initramfs-tool`; recommends are outside the exact debz closure.
+    // Name the generator that customization executes instead of assuming the
+    // kernel transaction supplied `/usr/sbin/update-initramfs`.
+    "initramfs-tools",
     "openssh-server",
     "sudo",
 };
@@ -353,10 +358,9 @@ const baremetal_debz_packages = [_][]const u8{
     "ubuntu-minimal",
     baremetal_image_package,
     baremetal_modules_package,
-    // The generator this flavor configures and then runs. The core flavor gets
-    // it transitively through the linux-azure meta-package, but a bare
-    // linux-image binary package pulls in no initramfs tool of its own, so
-    // bare-metal has to name it or `update-initramfs` is simply absent.
+    // The generator this flavor configures and then runs. Kernel packages only
+    // recommend an initramfs implementation, so every fresh-root flavor names
+    // the implementation it executes.
     "initramfs-tools",
     "openssh-server",
     "sudo",
@@ -371,6 +375,7 @@ const max_debz_packages = baremetal_debz_packages.len;
 const core_required_packages = [_][]const u8{
     "ubuntu-minimal",
     "linux-azure",
+    "initramfs-tools",
     "openssh-server",
     "openssh-client",
     "sudo",
@@ -5923,6 +5928,28 @@ test "bare metal is named apart from core and requires exactly one administrator
     try std.testing.expectEqualStrings(azure_kernel_suffix, Flavor.core.kernelSuffix());
 }
 
+test "fresh-root package roots explicitly install the initramfs generator" {
+    for ([_][]const []const u8{ &core_debz_packages, &baremetal_debz_packages }) |packages| {
+        var found = false;
+        for (packages) |package| {
+            if (std.mem.eql(u8, package, "initramfs-tools")) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+
+    var required = false;
+    for (&core_required_packages) |package| {
+        if (std.mem.eql(u8, package, "initramfs-tools")) {
+            required = true;
+            break;
+        }
+    }
+    try std.testing.expect(required);
+}
+
 test "bare-metal access resizes root best-effort before starting sshd" {
     try std.testing.expectEqualStrings(
         "#!/bin/sh\n" ++
@@ -6730,6 +6757,7 @@ test "core initramfs validation requires the packaged Binder module" {
 test "core package policy rejects Anbox DKMS shadow packages" {
     const inventory =
         "ca-certificates\t1\tall\n" ++
+        "initramfs-tools\t0.151\tall\n" ++
         "linux-azure\t7.0\tamd64\n" ++
         "openssh-client\t10.2\tamd64\n" ++
         "openssh-server\t10.2\tamd64\n" ++
@@ -6790,6 +6818,7 @@ test "exact lock requires coherent Azure and provisioning packages" {
 test "core package policy rejects server agents foreign packages and closure drift" {
     const inventory =
         "ca-certificates\t1\tall\n" ++
+        "initramfs-tools\t0.151\tall\n" ++
         "linux-azure\t7.0\tamd64\n" ++
         "openssh-client\t10.2\tamd64\n" ++
         "openssh-server\t10.2\tamd64\n" ++
@@ -6804,6 +6833,7 @@ test "core package policy rejects server agents foreign packages and closure dri
     const exact_lock =
         \\{"target_architecture":"amd64","packages":[
         \\{"name":"ca-certificates","version":"1","architecture":"all"},
+        \\{"name":"initramfs-tools","version":"0.151","architecture":"all"},
         \\{"name":"linux-azure","version":"7.0","architecture":"amd64"},
         \\{"name":"openssh-client","version":"10.2","architecture":"amd64"},
         \\{"name":"openssh-server","version":"10.2","architecture":"amd64"},
