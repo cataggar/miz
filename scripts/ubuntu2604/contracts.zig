@@ -330,6 +330,7 @@ pub const core_debz_packages = [_][]const u8{
     "initramfs-tools",
     "openssh-server",
     "sudo",
+    "ca-certificates",
 };
 
 pub fn debzPackages(flavor: Flavor) []const []const u8 {

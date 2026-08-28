@@ -322,6 +322,9 @@ const core_debz_packages = [_][]const u8{
     "initramfs-tools",
     "openssh-server",
     "sudo",
+    // No required dependency above supplies the TLS trust store. Keep it a
+    // package root so the finished image's HTTPS clients are usable.
+    "ca-certificates",
 };
 
 // The official in-tree module name Ubuntu packages Android Binder support
@@ -364,10 +367,8 @@ const baremetal_debz_packages = [_][]const u8{
     "initramfs-tools",
     "openssh-server",
     "sudo",
-    // The trust store. Core resolves it transitively from its own roots, but
-    // nothing bare-metal installs pulls it in, so naming it here is the only
-    // thing standing between the finished root and an image whose every HTTPS
-    // client fails for want of a CA bundle.
+    // The trust store is explicit for every fresh root: none of their required
+    // package dependencies supplies it.
     "ca-certificates",
 };
 const max_debz_packages = baremetal_debz_packages.len;
@@ -5928,26 +5929,30 @@ test "bare metal is named apart from core and requires exactly one administrator
     try std.testing.expectEqualStrings(azure_kernel_suffix, Flavor.core.kernelSuffix());
 }
 
-test "fresh-root package roots explicitly install the initramfs generator" {
+test "fresh-root package roots explicitly install runtime requirements" {
     for ([_][]const []const u8{ &core_debz_packages, &baremetal_debz_packages }) |packages| {
-        var found = false;
-        for (packages) |package| {
-            if (std.mem.eql(u8, package, "initramfs-tools")) {
-                found = true;
+        for ([_][]const u8{ "initramfs-tools", "ca-certificates" }) |expected| {
+            var found = false;
+            for (packages) |package| {
+                if (std.mem.eql(u8, package, expected)) {
+                    found = true;
+                    break;
+                }
+            }
+            try std.testing.expect(found);
+        }
+    }
+
+    for ([_][]const u8{ "initramfs-tools", "ca-certificates" }) |expected| {
+        var required = false;
+        for (&core_required_packages) |package| {
+            if (std.mem.eql(u8, package, expected)) {
+                required = true;
                 break;
             }
         }
-        try std.testing.expect(found);
+        try std.testing.expect(required);
     }
-
-    var required = false;
-    for (&core_required_packages) |package| {
-        if (std.mem.eql(u8, package, "initramfs-tools")) {
-            required = true;
-            break;
-        }
-    }
-    try std.testing.expect(required);
 }
 
 test "bare-metal access resizes root best-effort before starting sshd" {
@@ -7224,7 +7229,7 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
     ));
     // Right count, wrong package: the last transaction names something core
     // never installs, which a count-only check would have accepted.
-    evidence[core_debz_packages.len - 1].package = "ca-certificates";
+    evidence[core_debz_packages.len - 1].package = "cloud-init";
     try std.testing.expectError(error.InvalidDebzEvidence, writeFreshRootProvenance(
         std.testing.allocator,
         std.testing.io,
