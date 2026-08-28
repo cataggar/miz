@@ -108,7 +108,7 @@ const inventory = [_]Entry{
     .{
         .path = "scripts/azure_vhd.py",
         .kind = .source,
-        .note = "superseded by scripts/azure_vhd.zig; callers still run the Python",
+        .note = "superseded by scripts/azure_vhd.zig; no caller runs the Python",
     },
     .{
         .path = "scripts/ubuntu2604_azure_acceptance.sh",

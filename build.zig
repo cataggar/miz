@@ -921,7 +921,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "miz", .module = host_miz_mod },
-            .{ .name = "release", .module = release_support_mod },
         },
     });
     const azure_vhd_exe = b.addExecutable(.{

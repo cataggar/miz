@@ -19,8 +19,11 @@
 
 const std = @import("std");
 const miz = @import("miz");
-const release = @import("release");
-const TempTree = release.testing.TempTree;
+// Imported by relative path, not by module name: this file is itself imported
+// by path from other release tools, and a named import would make every one of
+// them declare the foundation module before it could compile.
+const release = @import("release/root.zig");
+const TempTree = @import("release/testing.zig").TempTree;
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
