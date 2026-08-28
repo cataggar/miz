@@ -327,6 +327,7 @@ pub const full_debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
 pub const core_debz_packages = [_][]const u8{
     "ubuntu-minimal",
     "linux-azure",
+    "initramfs-tools",
     "openssh-server",
     "sudo",
 };

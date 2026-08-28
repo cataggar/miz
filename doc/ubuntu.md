@@ -72,7 +72,9 @@ root from packages.
 For core, the same signed cloud disk is used only as the pinned Gen2 GPT and
 EFI-system-partition substrate. The server root is discarded and a fresh root
 is assembled from an empty debz baseline with exact package roots, in stable
-order: `ubuntu-minimal`, `linux-azure`, `openssh-server`, and `sudo`. The
+order: `ubuntu-minimal`, `linux-azure`, `initramfs-tools`, `openssh-server`,
+and `sudo`. The initramfs implementation is explicit because the kernel only
+recommends one and debz's exact closure does not install recommendations. The
 resolved closure must also contain `openssh-client` and `ca-certificates`, and
 must not contain cloud-init, WALinuxAgent, `ubuntu-server`, or
 `ubuntu-server-minimal`. This source/package decision is part of core
