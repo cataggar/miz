@@ -383,6 +383,14 @@ pub fn lessThanPath(_: void, left: []const u8, right: []const u8) bool {
 /// `sorted(root.rglob("*"))` sorts them. A `root` that is not a directory
 /// yields `error.NotADirectory`; a directory that cannot be walked is an error
 /// rather than an empty list, so an unreadable tree never looks empty.
+///
+/// "Regular file" is decided the way Python's `Path.is_file()` decides it:
+/// by following the entry. A symlink to a regular file is therefore a file
+/// here, which is what keeps the private-key scan and the provenance allowlist
+/// looking at the same set -- a symlink that the walker's raw directory-entry
+/// type alone would have skipped is exactly the one that could otherwise carry
+/// key material into a published bundle. Symlinked directories are still not
+/// descended into, matching `rglob`.
 pub fn listFiles(
     allocator: Allocator,
     io: Io,
@@ -399,7 +407,9 @@ pub fn listFiles(
     var walker = try directory.walk(allocator);
     defer walker.deinit();
     while (try walker.next(io)) |entry| {
-        if (entry.kind != .file) continue;
+        if (entry.kind == .directory) continue;
+        const stat = entry.dir.statFile(io, entry.basename, .{}) catch continue;
+        if (stat.kind != .file) continue;
         const relative = try allocator.dupe(u8, entry.path);
         errdefer allocator.free(relative);
         try results.append(allocator, relative);
@@ -613,6 +623,38 @@ test "listFiles walks recursively and skips directories" {
     defer freePaths(std.testing.allocator, named);
     try std.testing.expectEqual(@as(usize, 1), named.len);
     try std.testing.expectEqualStrings("nested/inner.json", named[0]);
+}
+
+test "listFiles follows symlinks the way Path.is_file does" {
+    const io = std.testing.io;
+    var tree = TempTree.create();
+    defer tree.deinit();
+    var root_buffer: [TempTree.max_path_len]u8 = undefined;
+    const root = tree.path(&root_buffer, "linked");
+    try Dir.cwd().createDirPath(io, root);
+
+    var target_buffer: [TempTree.max_path_len]u8 = undefined;
+    const target = tree.path(&target_buffer, "outside.pem");
+    try Dir.cwd().writeFile(io, .{ .sub_path = target, .data = "secret" });
+
+    var directory = try Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer directory.close(io);
+    // A symlink to a regular file outside the tree is still a file, so it is
+    // enumerated and therefore scanned and attested rather than invisible.
+    try directory.symLink(io, "../outside.pem", "linked.pem", .{});
+    // A dangling symlink resolves to nothing and is skipped, exactly as
+    // `is_file()` reports False for it.
+    try directory.symLink(io, "../absent", "dangling", .{});
+    // A symlinked directory is neither a file nor descended into.
+    var nested_buffer: [TempTree.max_path_len]u8 = undefined;
+    const nested = tree.path(&nested_buffer, "elsewhere");
+    try Dir.cwd().createDirPath(io, nested);
+    try directory.symLink(io, "../elsewhere", "directory", .{});
+
+    const files = try listFiles(std.testing.allocator, io, root);
+    defer freePaths(std.testing.allocator, files);
+    try std.testing.expectEqual(@as(usize, 1), files.len);
+    try std.testing.expectEqualStrings("linked.pem", files[0]);
 }
 
 test "canonicalDigest hashes the compact sorted encoding" {

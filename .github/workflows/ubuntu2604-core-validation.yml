@@ -511,7 +511,7 @@ jobs:
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           zig build --fetch \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-          zig build -Doptimize=ReleaseSafe install-ubuntu2604-release
+          zig build install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
 
       # The runner's /dev/kvm was proven present and writable before the

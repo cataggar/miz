@@ -494,7 +494,7 @@ jobs:
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           zig build --fetch \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-          zig build -Doptimize=ReleaseSafe
+          zig build install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
 
       - name: Provision privileged offline-root containment fixture
@@ -818,7 +818,7 @@ jobs:
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           zig build --fetch \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-          zig build -Doptimize=ReleaseSafe
+          zig build -Doptimize=ReleaseSafe install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
 
       - name: Download all build-validated candidates

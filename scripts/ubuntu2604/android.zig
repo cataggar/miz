@@ -99,6 +99,10 @@ pub fn parseSecret(
             .{},
         ),
     };
+    // The caller owns `parsed` only once this returns successfully; every
+    // rejection below frees it here so a failing secret cannot leak the
+    // document it was parsed from.
+    errdefer parsed.deinit();
     const object = support.objectOf(parsed.value);
     if (object == null or !support.hasExactFields(object.?, &secret_fields)) {
         return fail(
@@ -656,7 +660,6 @@ test "the secret must be exactly three fields with a private HTTPS URL" {
         std.testing.allocator,
         &diagnostic,
     ));
-    parsed.deinit();
     try std.testing.expectEqualStrings(
         "architecture-specific Android smoke input secret has unexpected fields",
         diagnostic.message(),
@@ -673,7 +676,6 @@ test "the secret must be exactly three fields with a private HTTPS URL" {
         std.testing.allocator,
         &diagnostic,
     ));
-    parsed.deinit();
     try std.testing.expectEqualStrings(
         "Android smoke artifact URL is not an HTTPS URL",
         diagnostic.message(),
