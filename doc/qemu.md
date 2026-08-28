@@ -1,11 +1,10 @@
 # QEMU
 
-Use `miz qemu` to acquire and boot cataloged Azure Linux and FreeBSD images
-with architecture-matched QEMU and firmware. See
+Use `miz qemu` to acquire and boot cataloged Azure Linux, Ubuntu, and FreeBSD
+images with architecture-matched QEMU and firmware. See
 [Azure Linux images](azure-linux.md) for the full/core image comparison and
 release security model. Ubuntu 26.04 images and their release workflow are
-documented in [Ubuntu 26.04 images](ubuntu.md), but Ubuntu catalog aliases are
-not added until the published asset digests and signer fingerprint are final.
+documented in [Ubuntu 26.04 images](ubuntu.md).
 
 The same installation is what the `vm` customization backend runs guests in,
 including guests of an architecture the host cannot execute: one
@@ -36,6 +35,8 @@ Then run the command from the directory where the VM disk should live:
 miz qemu AzureLinux
 miz qemu AzureLinux --model core
 miz qemu AzureLinux-4.0-x86_64
+miz qemu Ubuntu
+miz qemu Ubuntu --arch aarch64
 miz qemu FreeBSD
 miz qemu FreeBSD --arch x86_64
 ```
@@ -49,12 +50,15 @@ pinned `AzureLinux-4.0-20260814` release asset.
 The `FreeBSD` alias similarly selects the host-native FreeBSD 15.1 image from
 release `FreeBSD-15.1-20260724`; on an AArch64 host it downloads
 `FreeBSD-15.1-aarch64.qcow2`.
+The `Ubuntu` alias selects the host-native full Ubuntu 26.04 image from release
+`Ubuntu-26.04-20260822`; use `--arch` to override it. Ubuntu core catalog
+selection remains unsupported until #627.
 Existing images are never refreshed or overwritten. QEMU and its matching
 EDK2 firmware are resolved from the `cataggar/qemu` ghr installation first,
 then from a system QEMU/UEFI installation. Directory-prefixed aliases such as
 `miz qemu images/AzureLinux` or
-`miz qemu images/AzureLinux-4.0-x86_64` place the downloaded disk and
-firmware under that directory.
+`miz qemu images/Ubuntu-26.04-aarch64` place the downloaded disk and firmware
+under that directory.
 
 `FreeBSD` selects the pinned FreeBSD 15.1 release asset for the requested
 architecture. It defaults to the host architecture; for example, an ARM64 host
@@ -70,12 +74,13 @@ acceptance configuration.
 The seed is a deterministic native ISO9660 `CIDATA` volume; no host ISO
 authoring tool is required for either x86_64 or AArch64 guests.
 
-The published Azure Linux images use the signed direct UKI boot path described in
-[Azure Linux images](azure-linux.md). Secure Boot is opt-in:
+The published Azure Linux and Ubuntu images use the signed direct UKI boot
+path described in their image documentation. Secure Boot is opt-in:
 
 ```text
 miz qemu AzureLinux --secure-boot
 miz qemu AzureLinux-4.0-aarch64 --secure-boot
+miz qemu Ubuntu --secure-boot
 ```
 
 This mode requires only architecture-appropriate Secure-Boot-capable OVMF or
@@ -106,10 +111,10 @@ Secure Boot mode so they cannot replace the machine or firmware contract.
 
 `--architecture x86_64|aarch64` selects q35/OVMF or virt/AAVMF respectively;
 `--arch` is its shorter alias. `--architecture auto` requires an unambiguous
-architecture-bearing GPT root/USR GUID or UKI PE header. `AzureLinux` and
-`FreeBSD` select host-native catalog images by default; an explicit `--arch`
-selects that architecture instead. Exact catalog aliases select their
-corresponding architecture.
+architecture-bearing GPT root/USR GUID or UKI PE header. `AzureLinux`,
+`Ubuntu`, and `FreeBSD` select host-native catalog images by default; an
+explicit `--arch` selects that architecture instead. Exact catalog aliases
+select their corresponding architecture.
 
 Inside a full image, equivalent manual checks are `mokutil --sb-state`, `mokutil --db`, `mokutil --dbx`, `cat /sys/kernel/security/lockdown`, and `sudo dmesg | grep -Ei 'secure boot|lockdown|module verification'`. Release acceptance parses the EFI variables directly so the core image does not need `mokutil`.
 
@@ -169,8 +174,9 @@ miz qemu AzureLinux --accel tcg
 
 An explicit image path must already exist. Without an architecture option it
 keeps the x86_64 default; exact Azure Linux catalog filenames select their
-corresponding architecture, `FreeBSD` selects the requested catalog
-architecture, and `aarch64` or `auto` can be used for other Arm64 images:
+corresponding architecture, `Ubuntu` and `FreeBSD` select the requested
+catalog architecture, and `aarch64` or `auto` can be used for other Arm64
+images:
 
 ```text
 miz qemu ./AzureLinux-4.0-x86_64.qcow2
@@ -211,19 +217,26 @@ short-lived hybrid `cidata` ISO containing NoCloud metadata/user-data, Azure
 `ovf-env.xml`, and the explicit `miz-local-provisioning` marker, then removes
 the seed and temporary launch state when QEMU exits.
 
-This command is intentionally a focused launcher for cataloged Azure Linux and
-FreeBSD Gen2 images plus compatible explicit disks, not a general VM
-configuration manager.
+This command is intentionally a focused launcher for cataloged Azure Linux,
+Ubuntu, and FreeBSD Gen2 images plus compatible explicit disks, not a general
+VM configuration manager.
 
-Until Ubuntu catalog bindings are finalized, launch an Ubuntu image only by
-explicit path. Secure Boot also requires the independently verified release
-certificate and its canonical-DER SHA-256:
+The Ubuntu aliases are immutable bindings to release
+`Ubuntu-26.04-20260822`:
 
 ```text
-miz qemu ./Ubuntu-26.04-x86_64.qcow2 --secure-boot \
-  --secure-boot-certificate release.pem \
-  --secure-boot-certificate-sha256 <canonical-DER-SHA-256>
+miz qemu Ubuntu
+miz qemu Ubuntu-26.04-x86_64
+miz qemu Ubuntu-26.04-aarch64
 ```
+
+Their image SHA-256 values are
+`23116f2a4fb508d1beb60fae673c95636c3540ad3ab8f42f6966367ef86e0511`
+and
+`f78fb8f8fc54af4bc26ac97f7cb1fd9750abdf4f24e62f7cffffeb2daef4b175`,
+respectively. Secure Boot pins the canonical-DER certificate SHA-256
+`08796d5bf0e16eb1731408be816bbbc014e9a81d91c7afbf34bf8c9e4617ae19`.
+`--model core` is rejected for Ubuntu until #627 publishes core assets.
 
 ## Shared firmware resolution
 

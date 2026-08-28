@@ -16,7 +16,39 @@ alone, because the machines it exists for are.
 Only the two full images are currently release assets. Core candidates are
 built, signed, and accepted by a separate protected validation workflow, but
 are retained only as short-lived workflow artifacts. Core publication,
-release assets, tags, and catalog aliases are deferred to a follow-up.
+release assets, tags, and catalog aliases remain deferred to #627.
+
+## QEMU catalog aliases
+
+Release [`Ubuntu-26.04-20260822`](https://github.com/cataggar/miz/releases/tag/Ubuntu-26.04-20260822)
+publishes the immutable full-image catalog entries:
+
+| Alias | Release asset SHA-256 |
+| --- | --- |
+| `Ubuntu-26.04-x86_64` | `23116f2a4fb508d1beb60fae673c95636c3540ad3ab8f42f6966367ef86e0511` |
+| `Ubuntu-26.04-aarch64` | `f78fb8f8fc54af4bc26ac97f7cb1fd9750abdf4f24e62f7cffffeb2daef4b175` |
+
+`miz qemu Ubuntu` selects the x86_64 asset on x86_64 hosts and the AArch64
+asset on AArch64 hosts. Override that host-native choice with
+`--arch x86_64` or `--arch aarch64`. The architecture-specific aliases are
+exact, and a directory prefix controls where the catalog download and firmware
+bundle are placed:
+
+```text
+miz qemu Ubuntu
+miz qemu Ubuntu --arch aarch64
+miz qemu Ubuntu-26.04-x86_64
+miz qemu images/Ubuntu-26.04-aarch64
+```
+
+The catalog pins both immutable release asset URLs and the digests above.
+Secure Boot additionally pins the validated release leaf certificate's
+canonical-DER SHA-256,
+`08796d5bf0e16eb1731408be816bbbc014e9a81d91c7afbf34bf8c9e4617ae19`.
+An existing image is reused and is never refreshed or overwritten.
+
+Only the full model is cataloged. `miz qemu Ubuntu --model core` is rejected
+until the core release and catalog work in #627 is complete.
 
 ## Immutable source and package provenance
 

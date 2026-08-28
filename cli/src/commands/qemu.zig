@@ -32,7 +32,18 @@ const ImageModel = enum {
     }
 };
 
+const ImageFamily = enum {
+    azure_linux,
+    ubuntu,
+    freebsd,
+
+    fn supportsModel(self: ImageFamily) bool {
+        return self == .azure_linux;
+    }
+};
+
 const KnownImage = struct {
+    family: ImageFamily,
     alias: []const u8,
     disk_name: []const u8,
     release_spec: []const u8,
@@ -41,14 +52,16 @@ const KnownImage = struct {
     certificate_sha256: ?[]const u8,
     provisioning_media: ProvisioningMedia = .cdrom,
     model: ImageModel = .full,
-    supports_model: bool = false,
 };
 
 const release_certificate_sha256 =
     "2d8105e245806574d3129b37165ffd6715d9c3eb9b763b0af7efaffd22243177";
+const ubuntu_release_certificate_sha256 =
+    "08796d5bf0e16eb1731408be816bbbc014e9a81d91c7afbf34bf8c9e4617ae19";
 
 const known_images = [_]KnownImage{
     .{
+        .family = .azure_linux,
         .alias = "AzureLinux-4.0-x86_64",
         .disk_name = "AzureLinux-4.0-x86_64.qcow2",
         .release_spec = "cataggar/miz/AzureLinux-4.0-x86_64.qcow2@AzureLinux-4.0-20260814",
@@ -56,9 +69,9 @@ const known_images = [_]KnownImage{
         .image_sha256 = "e7b79748bc994f55c20b48d07323d4fb2695703380c7a8abc068d39f46711ce3",
         .certificate_sha256 = release_certificate_sha256,
         .model = .full,
-        .supports_model = true,
     },
     .{
+        .family = .azure_linux,
         .alias = "AzureLinux-4.0-aarch64",
         .disk_name = "AzureLinux-4.0-aarch64.qcow2",
         .release_spec = "cataggar/miz/AzureLinux-4.0-aarch64.qcow2@AzureLinux-4.0-20260814",
@@ -66,9 +79,9 @@ const known_images = [_]KnownImage{
         .image_sha256 = "590c6eddbbbc952ff21c8d9a026ae16e10f22ad71e940dc87c10e5e8016ef544",
         .certificate_sha256 = release_certificate_sha256,
         .model = .full,
-        .supports_model = true,
     },
     .{
+        .family = .azure_linux,
         .alias = "AzureLinux-4.0-x86_64",
         .disk_name = "AzureLinux-4.0-x86_64.core.qcow2",
         .release_spec = "cataggar/miz/AzureLinux-4.0-x86_64.core.qcow2@AzureLinux-4.0-20260814",
@@ -76,9 +89,9 @@ const known_images = [_]KnownImage{
         .image_sha256 = "44992c857178e95b3a3d2c2c1c2008791d3e5a704f845f4500cc6e86a0baadc6",
         .certificate_sha256 = release_certificate_sha256,
         .model = .core,
-        .supports_model = true,
     },
     .{
+        .family = .azure_linux,
         .alias = "AzureLinux-4.0-aarch64",
         .disk_name = "AzureLinux-4.0-aarch64.core.qcow2",
         .release_spec = "cataggar/miz/AzureLinux-4.0-aarch64.core.qcow2@AzureLinux-4.0-20260814",
@@ -86,9 +99,9 @@ const known_images = [_]KnownImage{
         .image_sha256 = "ff294c8655ea80f890a41a7c6dc545d997da498dc5f5f03fd3aee8dea81b0f65",
         .certificate_sha256 = release_certificate_sha256,
         .model = .core,
-        .supports_model = true,
     },
     .{
+        .family = .freebsd,
         .alias = "FreeBSD-15.1-x86_64",
         .disk_name = "FreeBSD-15.1-x86_64.qcow2",
         .release_spec = "cataggar/miz/FreeBSD-15.1-x86_64.qcow2@FreeBSD-15.1-20260724",
@@ -98,6 +111,7 @@ const known_images = [_]KnownImage{
         .provisioning_media = .virtio_block,
     },
     .{
+        .family = .freebsd,
         .alias = "FreeBSD-15.1-aarch64",
         .disk_name = "FreeBSD-15.1-aarch64.qcow2",
         .release_spec = "cataggar/miz/FreeBSD-15.1-aarch64.qcow2@FreeBSD-15.1-20260724",
@@ -105,6 +119,24 @@ const known_images = [_]KnownImage{
         .image_sha256 = "28f2138af20c4ede674f18922b216ad673816882e6270414f2bae5c6feff4b1e",
         .certificate_sha256 = null,
         .provisioning_media = .virtio_block,
+    },
+    .{
+        .family = .ubuntu,
+        .alias = "Ubuntu-26.04-x86_64",
+        .disk_name = "Ubuntu-26.04-x86_64.qcow2",
+        .release_spec = "cataggar/miz/Ubuntu-26.04-x86_64.qcow2@Ubuntu-26.04-20260822",
+        .architecture = .x86_64,
+        .image_sha256 = "23116f2a4fb508d1beb60fae673c95636c3540ad3ab8f42f6966367ef86e0511",
+        .certificate_sha256 = ubuntu_release_certificate_sha256,
+    },
+    .{
+        .family = .ubuntu,
+        .alias = "Ubuntu-26.04-aarch64",
+        .disk_name = "Ubuntu-26.04-aarch64.qcow2",
+        .release_spec = "cataggar/miz/Ubuntu-26.04-aarch64.qcow2@Ubuntu-26.04-20260822",
+        .architecture = .aarch64,
+        .image_sha256 = "f78fb8f8fc54af4bc26ac97f7cb1fd9750abdf4f24e62f7cffffeb2daef4b175",
+        .certificate_sha256 = ubuntu_release_certificate_sha256,
     },
 };
 
@@ -131,6 +163,9 @@ const help_text =
     \\  AzureLinux
     \\  AzureLinux-4.0-x86_64
     \\  AzureLinux-4.0-aarch64
+    \\  Ubuntu
+    \\  Ubuntu-26.04-x86_64
+    \\  Ubuntu-26.04-aarch64
     \\  FreeBSD
     \\  FreeBSD-15.1-x86_64
     \\  FreeBSD-15.1-aarch64
@@ -141,7 +176,8 @@ const help_text =
     \\
     \\Options:
     \\  --snapshot          Discard guest disk and UEFI variable changes on exit.
-    \\  --model <m>         AzureLinux alias model: full (default) or core.
+    \\  --model <m>         AzureLinux alias model: full (default) or core;
+    \\                      Ubuntu core catalog support is not yet available.
     \\  --architecture <a>  Guest architecture: auto, x86_64, or aarch64.
     \\  --arch <a>          Alias for --architecture.
     \\  --admin-username <n> Provision this administrator account (requires a key).
@@ -482,7 +518,7 @@ fn runVm(
                 .{ @tagName(options.image_model), options.image_path },
             ),
             error.ImageModelRequiresAlias => std.debug.print(
-                "qemu: --model only applies to AzureLinux aliases, not explicit image '{s}'\n",
+                "qemu: --model only applies to AzureLinux aliases; image '{s}' does not support model selection\n",
                 .{options.image_path},
             ),
             else => std.debug.print("qemu: failed to resolve image: {s}\n", .{@errorName(err)}),
@@ -958,7 +994,7 @@ fn resolveImageAlloc(
     if (!options.image_was_explicit)
         return resolvedKnownImageAlloc(
             allocator,
-            knownImageForArchitectureAndModel(.x86_64, options.image_model),
+            imageForFamilyAndArchitecture(.azure_linux, .x86_64, options.image_model),
             null,
             true,
         );
@@ -968,7 +1004,8 @@ fn resolveImageAlloc(
     if (std.mem.eql(u8, basename, "AzureLinux"))
         return resolvedKnownImageAlloc(
             allocator,
-            knownImageForArchitectureAndModel(
+            imageForFamilyAndArchitecture(
+                .azure_linux,
                 catalogArchitecture(options),
                 options.image_model,
             ),
@@ -979,16 +1016,33 @@ fn resolveImageAlloc(
         if (options.model_was_explicit) return error.ImageModelRequiresAlias;
         return resolvedKnownImageAlloc(
             allocator,
-            freebsdImage(catalogArchitecture(options)),
+            imageForFamilyAndArchitecture(
+                .freebsd,
+                catalogArchitecture(options),
+                .full,
+            ),
+            std.fs.path.dirname(argument),
+            true,
+        );
+    }
+    if (std.mem.eql(u8, basename, "Ubuntu")) {
+        if (options.model_was_explicit) return error.ImageModelRequiresAlias;
+        return resolvedKnownImageAlloc(
+            allocator,
+            imageForFamilyAndArchitecture(
+                .ubuntu,
+                catalogArchitecture(options),
+                .full,
+            ),
             std.fs.path.dirname(argument),
             true,
         );
     }
     for (known_images) |known| {
         if (!std.mem.eql(u8, basename, known.alias)) continue;
-        if (options.model_was_explicit and !known.supports_model)
+        if (options.model_was_explicit and !known.family.supportsModel())
             return error.ImageModelRequiresAlias;
-        if (!known.supports_model or known.model == options.image_model)
+        if (!known.family.supportsModel() or known.model == options.image_model)
             return resolvedKnownImageAlloc(
                 allocator,
                 known,
@@ -1000,7 +1054,7 @@ fn resolveImageAlloc(
     for (known_images) |known| {
         if (std.mem.eql(u8, basename, known.disk_name)) {
             if (options.model_was_explicit) {
-                if (!known.supports_model) return error.ImageModelRequiresAlias;
+                if (!known.family.supportsModel()) return error.ImageModelRequiresAlias;
                 if (options.image_model != known.model) return error.ImageModelMismatch;
             }
             return resolvedDiskImageAlloc(
@@ -1033,14 +1087,15 @@ fn resolveImageAlloc(
     );
 }
 
-fn knownImageForArchitectureAndModel(
+fn imageForFamilyAndArchitecture(
+    family: ImageFamily,
     architecture: GuestArchitecture,
     model: ImageModel,
 ) KnownImage {
     for (known_images) |known| {
-        if (known.supports_model and
+        if (known.family == family and
             known.architecture == architecture and
-            known.model == model)
+            (!family.supportsModel() or known.model == model))
         {
             return known;
         }
@@ -1049,6 +1104,7 @@ fn knownImageForArchitectureAndModel(
 }
 
 fn knownImageForHostArchitecture(
+    family: ImageFamily,
     host_arch: std.Target.Cpu.Arch,
     model: ImageModel,
 ) KnownImage {
@@ -1056,7 +1112,7 @@ fn knownImageForHostArchitecture(
         .aarch64 => .aarch64,
         else => .x86_64,
     };
-    return knownImageForArchitectureAndModel(architecture, model);
+    return imageForFamilyAndArchitecture(family, architecture, model);
 }
 
 fn hostArchitecture(host_arch: std.Target.Cpu.Arch) GuestArchitecture {
@@ -1073,13 +1129,6 @@ fn catalogArchitecture(options: Options) GuestArchitecture {
         .aarch64 => .aarch64,
         .auto => hostArchitecture(builtin.cpu.arch),
     };
-}
-
-fn freebsdImage(architecture: GuestArchitecture) KnownImage {
-    for (known_images) |known| {
-        if (!known.supports_model and known.architecture == architecture) return known;
-    }
-    unreachable;
 }
 
 fn validateImageSelection(options: Options, image_exists: bool) !void {
@@ -3077,6 +3126,17 @@ test "qemu parser recognizes help" {
     try std.testing.expect(parsed.options.help);
 }
 
+test "qemu help lists finalized Ubuntu aliases and core deferral" {
+    for ([_][]const u8{
+        "Ubuntu\n",
+        "Ubuntu-26.04-x86_64",
+        "Ubuntu-26.04-aarch64",
+        "Ubuntu core catalog support is not yet available",
+    }) |text| {
+        try std.testing.expect(std.mem.indexOf(u8, help_text, text) != null);
+    }
+}
+
 test "qemu parser reports missing values" {
     const flags = [_][]const u8{
         "--model",
@@ -3138,7 +3198,7 @@ test "qemu resolves known aliases and explicit image paths" {
         .image_was_explicit = true,
     });
     defer short_alias.deinit(allocator);
-    const host_image = knownImageForHostArchitecture(builtin.cpu.arch, .full);
+    const host_image = knownImageForHostArchitecture(.azure_linux, builtin.cpu.arch, .full);
     try std.testing.expectEqualStrings(host_image.disk_name, short_alias.disk_path);
     if (host_image.architecture == .aarch64) {
         try std.testing.expectEqualStrings("AzureLinux-4.0-aarch64.code.fd", short_alias.code_path);
@@ -3167,7 +3227,7 @@ test "qemu resolves known aliases and explicit image paths" {
         .model_was_explicit = true,
     });
     defer short_core.deinit(allocator);
-    const host_core = knownImageForHostArchitecture(builtin.cpu.arch, .core);
+    const host_core = knownImageForHostArchitecture(.azure_linux, builtin.cpu.arch, .core);
     try std.testing.expectEqualStrings(host_core.disk_name, short_core.disk_path);
     try std.testing.expectEqual(host_core.architecture, short_core.architecture);
     try std.testing.expect(short_core.download_allowed);
@@ -3319,27 +3379,27 @@ test "qemu rejects model selection for conflicting or custom explicit images" {
 test "qemu short alias selects host-native full and core catalog images" {
     try std.testing.expectEqualStrings(
         "AzureLinux-4.0-x86_64.qcow2",
-        knownImageForHostArchitecture(.x86_64, .full).disk_name,
+        knownImageForHostArchitecture(.azure_linux, .x86_64, .full).disk_name,
     );
     try std.testing.expectEqualStrings(
         "AzureLinux-4.0-aarch64.qcow2",
-        knownImageForHostArchitecture(.aarch64, .full).disk_name,
+        knownImageForHostArchitecture(.azure_linux, .aarch64, .full).disk_name,
     );
     try std.testing.expectEqualStrings(
         "AzureLinux-4.0-x86_64.core.qcow2",
-        knownImageForHostArchitecture(.x86_64, .core).disk_name,
+        knownImageForHostArchitecture(.azure_linux, .x86_64, .core).disk_name,
     );
     try std.testing.expectEqualStrings(
         "AzureLinux-4.0-aarch64.core.qcow2",
-        knownImageForHostArchitecture(.aarch64, .core).disk_name,
+        knownImageForHostArchitecture(.azure_linux, .aarch64, .core).disk_name,
     );
     try std.testing.expectEqual(
         GuestArchitecture.x86_64,
-        knownImageForHostArchitecture(.x86_64, .full).architecture,
+        knownImageForHostArchitecture(.azure_linux, .x86_64, .full).architecture,
     );
     try std.testing.expectEqual(
         GuestArchitecture.aarch64,
-        knownImageForHostArchitecture(.aarch64, .core).architecture,
+        knownImageForHostArchitecture(.azure_linux, .aarch64, .core).architecture,
     );
 }
 
@@ -3351,7 +3411,11 @@ test "qemu resolves FreeBSD aliases to host-native release images" {
         .image_was_explicit = true,
     });
     defer short_alias.deinit(allocator);
-    const host_image = freebsdImage(hostArchitecture(builtin.cpu.arch));
+    const host_image = imageForFamilyAndArchitecture(
+        .freebsd,
+        hostArchitecture(builtin.cpu.arch),
+        .full,
+    );
     try std.testing.expectEqualStrings(host_image.disk_name, short_alias.disk_path);
     try std.testing.expectEqual(host_image.architecture, short_alias.architecture);
     try std.testing.expect(short_alias.expected_image_sha256 != null);
@@ -3379,6 +3443,96 @@ test "qemu resolves FreeBSD aliases to host-native release images" {
     try std.testing.expect(exact.download_allowed);
 }
 
+test "qemu resolves Ubuntu aliases for both host architectures" {
+    try std.testing.expectEqualStrings(
+        "Ubuntu-26.04-x86_64.qcow2",
+        knownImageForHostArchitecture(.ubuntu, .x86_64, .full).disk_name,
+    );
+    try std.testing.expectEqualStrings(
+        "Ubuntu-26.04-aarch64.qcow2",
+        knownImageForHostArchitecture(.ubuntu, .aarch64, .full).disk_name,
+    );
+
+    const allocator = std.testing.allocator;
+    var host_alias = try resolveImageAlloc(allocator, .{
+        .image_path = "Ubuntu",
+        .image_was_explicit = true,
+    });
+    defer host_alias.deinit(allocator);
+    const expected_host = knownImageForHostArchitecture(
+        .ubuntu,
+        builtin.cpu.arch,
+        .full,
+    );
+    try std.testing.expectEqualStrings(expected_host.disk_name, host_alias.disk_path);
+    try std.testing.expectEqual(expected_host.architecture, host_alias.architecture);
+    try std.testing.expect(host_alias.download_allowed);
+
+    var x86 = try resolveImageAlloc(allocator, .{
+        .image_path = "images/Ubuntu",
+        .image_was_explicit = true,
+        .architecture_request = .x86_64,
+        .architecture_was_explicit = true,
+    });
+    defer x86.deinit(allocator);
+    try std.testing.expectEqualStrings("images/Ubuntu-26.04-x86_64.qcow2", x86.disk_path);
+    try std.testing.expectEqual(GuestArchitecture.x86_64, x86.architecture);
+
+    var arm = try resolveImageAlloc(allocator, .{
+        .image_path = "images/Ubuntu",
+        .image_was_explicit = true,
+        .architecture_request = .aarch64,
+        .architecture_was_explicit = true,
+    });
+    defer arm.deinit(allocator);
+    try std.testing.expectEqualStrings("images/Ubuntu-26.04-aarch64.qcow2", arm.disk_path);
+    try std.testing.expectEqual(GuestArchitecture.aarch64, arm.architecture);
+}
+
+test "qemu resolves exact and directory-prefixed Ubuntu aliases" {
+    const allocator = std.testing.allocator;
+    var x86 = try resolveImageAlloc(allocator, .{
+        .image_path = "Ubuntu-26.04-x86_64",
+        .image_was_explicit = true,
+    });
+    defer x86.deinit(allocator);
+    try std.testing.expectEqualStrings("Ubuntu-26.04-x86_64.qcow2", x86.disk_path);
+    try std.testing.expectEqual(GuestArchitecture.x86_64, x86.architecture);
+    try std.testing.expect(x86.expected_certificate_sha256 != null);
+    try std.testing.expect(x86.download_allowed);
+
+    var arm = try resolveImageAlloc(allocator, .{
+        .image_path = "downloads/Ubuntu-26.04-aarch64",
+        .image_was_explicit = true,
+    });
+    defer arm.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "downloads/Ubuntu-26.04-aarch64.qcow2",
+        arm.disk_path,
+    );
+    try std.testing.expectEqualStrings(
+        "downloads/Ubuntu-26.04-aarch64.code.fd",
+        arm.code_path,
+    );
+    try std.testing.expectEqualStrings(
+        "downloads/Ubuntu-26.04-aarch64.vars.fd",
+        arm.vars_path,
+    );
+    try std.testing.expectEqual(GuestArchitecture.aarch64, arm.architecture);
+    try std.testing.expect(arm.expected_certificate_sha256 != null);
+    try std.testing.expect(arm.download_allowed);
+
+    var exact_disk = try resolveImageAlloc(allocator, .{
+        .image_path = "./Ubuntu-26.04-aarch64.qcow2",
+        .image_was_explicit = true,
+    });
+    defer exact_disk.deinit(allocator);
+    try std.testing.expectEqual(GuestArchitecture.aarch64, exact_disk.architecture);
+    try std.testing.expect(exact_disk.expected_image_sha256 != null);
+    try std.testing.expect(exact_disk.expected_certificate_sha256 != null);
+    try std.testing.expect(!exact_disk.download_allowed);
+}
+
 test "qemu rejects model selection for FreeBSD aliases" {
     try std.testing.expectError(error.ImageModelRequiresAlias, resolveImageAlloc(
         std.testing.allocator,
@@ -3397,6 +3551,24 @@ test "qemu rejects model selection for FreeBSD aliases" {
             .model_was_explicit = true,
         },
     ));
+}
+
+test "qemu rejects model selection for Ubuntu until core is cataloged" {
+    for ([_][]const u8{
+        "Ubuntu",
+        "Ubuntu-26.04-x86_64",
+        "Ubuntu-26.04-aarch64.qcow2",
+    }) |image_path| {
+        try std.testing.expectError(error.ImageModelRequiresAlias, resolveImageAlloc(
+            std.testing.allocator,
+            .{
+                .image_path = image_path,
+                .image_was_explicit = true,
+                .image_model = .core,
+                .model_was_explicit = true,
+            },
+        ));
+    }
 }
 
 test "qemu image selection keeps the implicit x86 default downloadable" {
@@ -4573,9 +4745,31 @@ test "qemu release download specs remain pinned to validated releases" {
         "cataggar/miz/FreeBSD-15.1-aarch64.qcow2@FreeBSD-15.1-20260724",
         known_images[5].release_spec,
     );
+    try std.testing.expectEqualStrings(
+        "cataggar/miz/Ubuntu-26.04-x86_64.qcow2@Ubuntu-26.04-20260822",
+        known_images[6].release_spec,
+    );
+    try std.testing.expectEqualStrings(
+        "23116f2a4fb508d1beb60fae673c95636c3540ad3ab8f42f6966367ef86e0511",
+        known_images[6].image_sha256,
+    );
+    try std.testing.expectEqualStrings(
+        "cataggar/miz/Ubuntu-26.04-aarch64.qcow2@Ubuntu-26.04-20260822",
+        known_images[7].release_spec,
+    );
+    try std.testing.expectEqualStrings(
+        "f78fb8f8fc54af4bc26ac97f7cb1fd9750abdf4f24e62f7cffffeb2daef4b175",
+        known_images[7].image_sha256,
+    );
     for (known_images[0..4]) |known| {
         try std.testing.expectEqualStrings(
             release_certificate_sha256,
+            known.certificate_sha256.?,
+        );
+    }
+    for (known_images[6..8]) |known| {
+        try std.testing.expectEqualStrings(
+            ubuntu_release_certificate_sha256,
             known.certificate_sha256.?,
         );
     }
@@ -4644,6 +4838,58 @@ test "qemu FreeBSD image download argv is exact" {
         "--output",
         "images/FreeBSD-15.1-aarch64.qcow2",
     }, &argv);
+}
+
+test "qemu Ubuntu image download argv is exact" {
+    const allocator = std.testing.allocator;
+    var image = try resolveImageAlloc(allocator, .{
+        .image_path = "images/Ubuntu-26.04-aarch64",
+        .image_was_explicit = true,
+    });
+    defer image.deinit(allocator);
+    const digest_hex = std.fmt.bytesToHex(image.expected_image_sha256.?, .lower);
+    const argv = ghrDownloadArgv(image, &digest_hex);
+    try expectArgv(&.{
+        "ghr",
+        "download",
+        "cataggar/miz/Ubuntu-26.04-aarch64.qcow2@Ubuntu-26.04-20260822",
+        "--sha256",
+        "f78fb8f8fc54af4bc26ac97f7cb1fd9750abdf4f24e62f7cffffeb2daef4b175",
+        "--output",
+        "images/Ubuntu-26.04-aarch64.qcow2",
+    }, &argv);
+}
+
+test "qemu existing Ubuntu catalog image is reused without download" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "Ubuntu-26.04-x86_64.qcow2",
+        .data = "existing image",
+    });
+    const alias_path = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(alias_path);
+    const prefixed_alias = try std.fs.path.join(allocator, &.{ alias_path, "Ubuntu" });
+    defer allocator.free(prefixed_alias);
+    var image = try resolveImageAlloc(allocator, .{
+        .image_path = prefixed_alias,
+        .image_was_explicit = true,
+        .architecture_request = .x86_64,
+        .architecture_was_explicit = true,
+    });
+    defer image.deinit(allocator);
+
+    try ensureImage(io, image);
+    const contents = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        image.disk_path,
+        allocator,
+        .limited(64),
+    );
+    defer allocator.free(contents);
+    try std.testing.expectEqualStrings("existing image", contents);
 }
 
 test "qemu parses ghr metadata into package binary and data paths" {
