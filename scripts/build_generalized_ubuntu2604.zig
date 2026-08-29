@@ -454,6 +454,10 @@ const full_service_policy = [_]miz.os_customization.Service{
     .{ .name = "grub-initrd-fallback.service", .state = .disabled },
 };
 
+const full_networkd_dispatcher_override =
+    "[Unit]\n" ++
+    "After=chrony.service network-online.target\n";
+
 const core_ssh_config =
     "PasswordAuthentication no\n" ++
     "KbdInteractiveAuthentication no\n" ++
@@ -2391,10 +2395,12 @@ fn customizeOfflineRoot(
                 .{ .create_directory = .{ .path = "/etc/ssh/sshd_config.d", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/etc/cloud/cloud.cfg.d", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/etc/netplan", .mode = 0o755 } },
+                .{ .create_directory = .{ .path = "/etc/systemd/system/networkd-dispatcher.service.d", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/var/lib/miz", .mode = 0o755 } },
                 .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-miz-generalized.conf", .source = .{ .inline_bytes = ssh_config } } },
                 .{ .write_file = .{ .path = "/etc/cloud/cloud.cfg.d/90-azure.cfg", .source = .{ .inline_bytes = cloud_config } } },
                 .{ .write_file = .{ .path = "/etc/netplan/50-cloud-init.yaml", .source = .{ .inline_bytes = netplan } } },
+                .{ .write_file = .{ .path = "/etc/systemd/system/networkd-dispatcher.service.d/10-miz-startup-order.conf", .source = .{ .inline_bytes = full_networkd_dispatcher_override } } },
                 .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = waagent } } },
                 .{ .replace_symlink = .{ .path = "/etc/resolv.conf", .target = "/run/systemd/resolve/stub-resolv.conf" } },
             });
@@ -5696,6 +5702,14 @@ test "full service policy disables the obsolete GRUB fallback helper" {
         found = true;
     }
     try std.testing.expect(found);
+}
+
+test "full network dispatcher waits for startup-trigger dependencies" {
+    try std.testing.expectEqualStrings(
+        "[Unit]\n" ++
+            "After=chrony.service network-online.target\n",
+        full_networkd_dispatcher_override,
+    );
 }
 
 test "durable native recovery is disposed before QCOW2 publication" {
