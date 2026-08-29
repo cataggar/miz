@@ -307,6 +307,38 @@ test "core contract checks are explicit and the full checks are preserved" {
     try source.expectContainsIn(full, "/proc/1/exe -ef /usr/lib/systemd/systemd", "full");
     try source.expectContainsIn(full, "cloud-init status --wait", "full");
     try source.expectContainsIn(full, "walinuxagent.service", "full");
+    try source.expectContainsIn(full, "networkd-dispatcher.service", "full");
+    try source.expectContainsIn(
+        full,
+        "check udisks2-installed package_installed udisks2",
+        "full",
+    );
+    try source.expectContainsIn(full, "Name=org.freedesktop.UDisks2", "full");
+    try source.expectContainsIn(full, "SystemdService=udisks2.service", "full");
+    try source.expectContainsIn(
+        full,
+        "udisks2-graphical-eager-start-absent",
+        "full",
+    );
+    try source.expectContainsIn(
+        full,
+        "failed_units=$(systemctl --failed --no-legend --plain)",
+        "full",
+    );
+    try source.expectContainsIn(full, "test -z \"$failed_units\"", "full");
+    try source.expectContainsIn(
+        full,
+        "systemctl show --no-pager --property=Id,LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,TimeoutStartUSec",
+        "full",
+    );
+    try source.expectContainsIn(
+        full,
+        "journalctl --no-pager --boot=0 --unit \"$unit\" --identifier=systemd --priority=warning..emerg --lines=80",
+        "full",
+    );
+    try source.expectContainsIn(full, "head -c 49152", "full");
+    try source.expectContainsIn(full, "head -n 8", "full");
+    try source.expectOmitsIn(full, "--property=Environment", "full");
     try source.expectContainsIn(full, "validate_conventional_resource_disk", "full");
     try source.expectContainsIn(full, "mountpoint -q /mnt || return 1", "full");
     try source.expectContainsIn(full, "\"$resource_disk\" != \"$root_disk\"", "full");
@@ -315,6 +347,9 @@ test "core contract checks are explicit and the full checks are preserved" {
         full,
         "conventional-resource-disk-not-mounted not_mountpoint /mnt",
         "full",
+    );
+    try script.expectOmits(
+        "test \"$(systemctl --failed --no-legend --plain | wc -l)\" -eq 0",
     );
 }
 

@@ -807,6 +807,10 @@ test "QEMU acceptance pins x86 KVM and hosted Arm TCG without fallback" {
     );
     try execution_source.expectContains(".cpu = \"max\"");
     try execution_source.expectContains(".job_minutes = 360");
+    try execution_source.expectContains(
+        ".initial_guest_launch = .serial_until_ready",
+    );
+    try execution_source.expectContains(".initial_guest_launch = .concurrent");
     try execution_source.expectOmits("accel=auto");
 
     var acceptance = try Source.open(
@@ -821,6 +825,15 @@ test "QEMU acceptance pins x86 KVM and hosted Arm TCG without fallback" {
     try acceptance.expectContains("\"-accel\"");
     try acceptance.expectContains(
         "instance.execution_profile.accelerator_argument",
+    );
+    try acceptance.expectContains(
+        "configured_execution.profile.initial_guest_launch",
+    );
+    try acceptance.expectContains(
+        ".serial_until_ready => .{\n            .start_first,\n            .first_ready,\n            .start_second",
+    );
+    try acceptance.expectContains(
+        ".concurrent => .{\n            .start_first,\n            .start_second,\n            .first_ready",
     );
     try acceptance.expectOmits("\"virt,accel=kvm\"");
     try acceptance.expectOmits("accel=auto");
@@ -960,6 +973,11 @@ test "Ubuntu documentation states the intentional Arm TCG contract" {
         "Azure Trusted\nLaunch acceptance remains mandatory for all four candidates",
         "[#626](https://github.com/cataggar/miz/issues/626)",
         "[#627](https://github.com/cataggar/miz/issues/627)",
+        "first Arm TCG guest\nreaches and passes",
+        "before the second guest is launched",
+        "KVM rows continue to launch both\ninitial guests concurrently",
+        "`udisks2` remains installed and D-Bus activatable",
+        "`graphical.target.wants/udisks2.service`",
     }) |needle| try document.expectContains(needle);
     try document.expectOmits("[self-hosted, Linux, ARM64, kvm]");
 }

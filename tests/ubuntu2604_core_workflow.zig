@@ -294,6 +294,31 @@ test "core build and acceptance contracts are explicit" {
     for ([_][]const u8{ "/dev/kvm", "kvm-api-version", "fallback", "auto" }) |needle| {
         try source.expectOmitsIn(arm_capability, needle, workflow_path);
     }
+
+    var execution_source = try Source.open(
+        std.testing.allocator,
+        "scripts/ubuntu2604/execution.zig",
+    );
+    defer execution_source.deinit();
+    try execution_source.expectContains(".initial_guest_launch = .concurrent");
+    try execution_source.expectContains(
+        ".initial_guest_launch = .serial_until_ready",
+    );
+
+    var acceptance = try Source.open(
+        std.testing.allocator,
+        "tests/ubuntu2604_acceptance.zig",
+    );
+    defer acceptance.deinit();
+    try acceptance.expectContains(
+        "configured_execution.profile.initial_guest_launch",
+    );
+    try acceptance.expectContains(
+        ".serial_until_ready => .{\n            .start_first,\n            .first_ready,\n            .start_second",
+    );
+    try acceptance.expectContains(
+        ".concurrent => .{\n            .start_first,\n            .start_second,\n            .first_ready",
+    );
     try source.expectOrder(
         native,
         "sudo apt-get install -y --no-install-recommends \"${packages[@]}\"",

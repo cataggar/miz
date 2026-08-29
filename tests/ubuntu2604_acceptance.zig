@@ -583,6 +583,32 @@ const ConfiguredExecution = struct {
     }
 };
 
+const InitialGuestLaunchStep = enum {
+    start_first,
+    first_ready,
+    start_second,
+    second_ready,
+};
+
+fn initialGuestLaunchOrder(
+    policy: execution.InitialGuestLaunchPolicy,
+) [4]InitialGuestLaunchStep {
+    return switch (policy) {
+        .concurrent => .{
+            .start_first,
+            .start_second,
+            .first_ready,
+            .second_ready,
+        },
+        .serial_until_ready => .{
+            .start_first,
+            .first_ready,
+            .start_second,
+            .second_ready,
+        },
+    };
+}
+
 fn requireExactExecutionEnvironment(
     allocator: Allocator,
     profile: *const execution.Profile,
@@ -3119,16 +3145,35 @@ const full_checks =
     \\    return "$status"
     \\  fi
     \\}
+    \\diagnose_unit() {
+    \\  unit=$1
+    \\  {
+    \\    printf '%s\n' "--- bounded diagnostics for $unit ---"
+    \\    systemctl show --no-pager --property=Id,LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,TimeoutStartUSec "$unit"
+    \\    journalctl --no-pager --boot=0 --unit "$unit" --identifier=systemd --priority=warning..emerg --lines=80 --output=short-monotonic
+    \\  } 2>&1 | head -c 49152 >&2 || true
+    \\  printf '\n' >&2
+    \\}
+    \\diagnose_failed_units() {
+    \\  printf '%s\n' "$failed_units" |
+    \\    awk 'NF { print $1 }' |
+    \\    head -n 8 |
+    \\    while IFS= read -r unit; do diagnose_unit "$unit"; done
+    \\}
     \\check_service() {
     \\  unit=$1
     \\  check "service-active:$unit" systemctl is-active --quiet "$unit" || {
-    \\    systemctl status --no-pager -l "$unit" >&2 || true
+    \\    diagnose_unit "$unit"
     \\    return 1
     \\  }
     \\  check "service-enabled:$unit" systemctl is-enabled --quiet "$unit" || {
-    \\    systemctl is-enabled "$unit" >&2 || true
+    \\    diagnose_unit "$unit"
     \\    return 1
     \\  }
+    \\}
+    \\package_installed() {
+    \\  package=$1
+    \\  test "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null)" = installed
     \\}
     \\check pid1-systemd sudo -n /usr/bin/test /proc/1/exe -ef /usr/lib/systemd/systemd
     \\check mizinit-sbin-absent test ! -e /sbin/mizinit
@@ -3137,9 +3182,15 @@ const full_checks =
     \\. /etc/os-release
     \\check os-id-ubuntu test "$ID" = ubuntu
     \\check os-version-26.04 test "$VERSION_ID" = 26.04
-    \\for unit in cloud-init-local.service cloud-init-network.service cloud-config.service cloud-final.service walinuxagent.service ssh.service systemd-networkd.service; do
+    \\for unit in cloud-init-local.service cloud-init-network.service cloud-config.service cloud-final.service walinuxagent.service ssh.service systemd-networkd.service networkd-dispatcher.service; do
     \\  check_service "$unit"
     \\done
+    \\check udisks2-installed package_installed udisks2
+    \\check udisks2-dbus-service test -r /usr/share/dbus-1/system-services/org.freedesktop.UDisks2.service
+    \\check udisks2-dbus-name grep -Fxq 'Name=org.freedesktop.UDisks2' /usr/share/dbus-1/system-services/org.freedesktop.UDisks2.service
+    \\check udisks2-systemd-activation grep -Fxq 'SystemdService=udisks2.service' /usr/share/dbus-1/system-services/org.freedesktop.UDisks2.service
+    \\check udisks2-unit-loaded test "$(systemctl show --property=LoadState --value udisks2.service)" = loaded
+    \\check udisks2-graphical-eager-start-absent test ! -e /etc/systemd/system/graphical.target.wants/udisks2.service
     \\check cloud-init-wait cloud-init status --wait
     \\netplan_network=$(find /run/systemd/network -maxdepth 1 -name '10-netplan-*.network' -print -quit)
     \\check netplan-network-generated test -n "$netplan_network"
@@ -3150,6 +3201,7 @@ const full_checks =
     \\failed_units=$(systemctl --failed --no-legend --plain)
     \\check no-failed-units test -z "$failed_units" || {
     \\  printf '%s\n' "$failed_units" >&2
+    \\  diagnose_failed_units
     \\  exit 1
     \\}
 ;
@@ -3278,6 +3330,19 @@ fn verifyFlavorRuntime(
             try verifyGuestCloudInitStatus(allocator, io, ssh_path, instance);
         },
     }
+}
+
+fn verifyInitialGuestReady(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    candidate: Candidate,
+    instance: *const Instance,
+) !void {
+    try waitForSsh(allocator, io, ssh_path, instance);
+    try verifyAdminLogin(allocator, io, ssh_path, instance);
+    try verifyKeyOnlySsh(allocator, io, ssh_path, instance);
+    try verifyFlavorRuntime(allocator, io, ssh_path, candidate, instance);
 }
 
 fn verifyCoreSshdRestart(
@@ -4093,6 +4158,55 @@ test "Ubuntu 26.04 configured QEMU prerequisites fail closed" {
     );
 }
 
+test "initial guest launch policy serializes Arm TCG but keeps KVM concurrent" {
+    const kvm_order = initialGuestLaunchOrder(
+        execution.x86_64_kvm.initial_guest_launch,
+    );
+    const tcg_order = initialGuestLaunchOrder(
+        execution.aarch64_tcg.initial_guest_launch,
+    );
+    try std.testing.expectEqualSlices(
+        InitialGuestLaunchStep,
+        &.{
+            .start_first,
+            .start_second,
+            .first_ready,
+            .second_ready,
+        },
+        &kvm_order,
+    );
+    try std.testing.expectEqualSlices(
+        InitialGuestLaunchStep,
+        &.{
+            .start_first,
+            .first_ready,
+            .start_second,
+            .second_ready,
+        },
+        &tcg_order,
+    );
+}
+
+test "full service checks keep dispatcher strict and udisks D-Bus-only" {
+    for ([_][]const u8{
+        "networkd-dispatcher.service",
+        "check udisks2-installed package_installed udisks2",
+        "Name=org.freedesktop.UDisks2",
+        "SystemdService=udisks2.service",
+        "udisks2-graphical-eager-start-absent",
+        "failed_units=$(systemctl --failed --no-legend --plain)",
+        "check no-failed-units test -z",
+        "systemctl show --no-pager --property=Id,LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,TimeoutStartUSec",
+        "journalctl --no-pager --boot=0 --unit \"$unit\" --identifier=systemd --priority=warning..emerg --lines=80",
+        "head -c 49152",
+        "head -n 8",
+        "diagnose_failed_units\n  exit 1",
+    }) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, full_checks, needle) != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, full_checks, "--property=Environment") == null);
+}
+
 test "EFI db parser finds the exact enrolled DER certificate" {
     const efi_cert_x509_guid = [_]u8{
         0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
@@ -4820,45 +4934,55 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
     defer second.deinit(allocator);
     errdefer second.dumpSerial(allocator, io);
 
-    // Launch both before waiting for either guest: identity generation is
-    // thereby exercised by two concurrent first boots from one source image.
-    try startInstance(
-        allocator,
-        io,
-        qemu_img_path,
-        qemu_path,
-        swtpm_path,
-        ssh_keygen_path,
-        &firmware,
-        enrolled_vars_path,
-        absolute_image,
-        candidate,
-        true,
-        &first,
-    );
-    try startInstance(
-        allocator,
-        io,
-        qemu_img_path,
-        qemu_path,
-        swtpm_path,
-        ssh_keygen_path,
-        &firmware,
-        enrolled_vars_path,
-        absolute_image,
-        candidate,
-        true,
-        &second,
-    );
-
-    try waitForSsh(allocator, io, ssh_path, &first);
-    try waitForSsh(allocator, io, ssh_path, &second);
-    try verifyAdminLogin(allocator, io, ssh_path, &first);
-    try verifyAdminLogin(allocator, io, ssh_path, &second);
-    try verifyKeyOnlySsh(allocator, io, ssh_path, &first);
-    try verifyKeyOnlySsh(allocator, io, ssh_path, &second);
-    try verifyFlavorRuntime(allocator, io, ssh_path, candidate, &first);
-    try verifyFlavorRuntime(allocator, io, ssh_path, candidate, &second);
+    // KVM still exercises two concurrent first boots. Arm TCG waits for the
+    // first independently provisioned guest to pass the same strict runtime
+    // checks before launching the second, avoiding two 2-vCPU startup bursts.
+    for (initialGuestLaunchOrder(
+        configured_execution.profile.initial_guest_launch,
+    )) |step| switch (step) {
+        .start_first => try startInstance(
+            allocator,
+            io,
+            qemu_img_path,
+            qemu_path,
+            swtpm_path,
+            ssh_keygen_path,
+            &firmware,
+            enrolled_vars_path,
+            absolute_image,
+            candidate,
+            true,
+            &first,
+        ),
+        .first_ready => try verifyInitialGuestReady(
+            allocator,
+            io,
+            ssh_path,
+            candidate,
+            &first,
+        ),
+        .start_second => try startInstance(
+            allocator,
+            io,
+            qemu_img_path,
+            qemu_path,
+            swtpm_path,
+            ssh_keygen_path,
+            &firmware,
+            enrolled_vars_path,
+            absolute_image,
+            candidate,
+            true,
+            &second,
+        ),
+        .second_ready => try verifyInitialGuestReady(
+            allocator,
+            io,
+            ssh_path,
+            candidate,
+            &second,
+        ),
+    };
     try verifyRootGrowth(allocator, io, ssh_path, &first, candidate);
     try verifyRootGrowth(allocator, io, ssh_path, &second, candidate);
     try verifyGuestSecureBoot(

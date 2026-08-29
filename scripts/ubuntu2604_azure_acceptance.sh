@@ -1038,16 +1038,35 @@ check() {
     return "$status"
   fi
 }
+diagnose_unit() {
+  unit=$1
+  {
+    printf '%s\n' "--- bounded diagnostics for $unit ---"
+    systemctl show --no-pager --property=Id,LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,TimeoutStartUSec "$unit"
+    journalctl --no-pager --boot=0 --unit "$unit" --identifier=systemd --priority=warning..emerg --lines=80 --output=short-monotonic
+  } 2>&1 | head -c 49152 >&2 || true
+  printf '\n' >&2
+}
+diagnose_failed_units() {
+  printf '%s\n' "$failed_units" |
+    awk 'NF { print $1 }' |
+    head -n 8 |
+    while IFS= read -r unit; do diagnose_unit "$unit"; done
+}
 check_service() {
   unit=$1
   check "service-active:$unit" systemctl is-active --quiet "$unit" || {
-    systemctl status --no-pager -l "$unit" >&2 || true
+    diagnose_unit "$unit"
     return 1
   }
   check "service-enabled:$unit" systemctl is-enabled --quiet "$unit" || {
-    systemctl is-enabled "$unit" >&2 || true
+    diagnose_unit "$unit"
     return 1
   }
+}
+package_installed() {
+  package=$1
+  test "$(dpkg-query -W -f='${db:Status-Status}' "$package" 2>/dev/null)" = installed
 }
 not_mountpoint() {
   ! mountpoint -q "$1"
@@ -1095,9 +1114,15 @@ check os-release-readable test -r /etc/os-release
 . /etc/os-release
 check os-id-ubuntu test "$ID" = ubuntu
 check os-version-26.04 test "$VERSION_ID" = 26.04
-for unit in cloud-init-local.service cloud-init-network.service cloud-config.service cloud-final.service walinuxagent.service ssh.service systemd-networkd.service; do
+for unit in cloud-init-local.service cloud-init-network.service cloud-config.service cloud-final.service walinuxagent.service ssh.service systemd-networkd.service networkd-dispatcher.service; do
   check_service "$unit"
 done
+check udisks2-installed package_installed udisks2
+check udisks2-dbus-service test -r /usr/share/dbus-1/system-services/org.freedesktop.UDisks2.service
+check udisks2-dbus-name grep -Fxq 'Name=org.freedesktop.UDisks2' /usr/share/dbus-1/system-services/org.freedesktop.UDisks2.service
+check udisks2-systemd-activation grep -Fxq 'SystemdService=udisks2.service' /usr/share/dbus-1/system-services/org.freedesktop.UDisks2.service
+check udisks2-unit-loaded test "$(systemctl show --property=LoadState --value udisks2.service)" = loaded
+check udisks2-graphical-eager-start-absent test ! -e /etc/systemd/system/graphical.target.wants/udisks2.service
 check cloud-init-wait cloud-init status --wait
 netplan_network=$(find /run/systemd/network -maxdepth 1 -name '10-netplan-*.network' -print -quit)
 check netplan-network-generated test -n "$netplan_network"
@@ -1115,6 +1140,7 @@ check conventional-resource-disk-policy validate_conventional_resource_disk "$ha
 failed_units=$(systemctl --failed --no-legend --plain)
 check no-failed-units test -z "$failed_units" || {
   printf '%s\n' "$failed_units" >&2
+  diagnose_failed_units
   exit 1
 }
 GUEST
@@ -1355,11 +1381,34 @@ GUEST
 else
   ssh "${ssh_options[@]}" "$ssh_target" '/usr/bin/bash -s' <<'GUEST'
 set -euo pipefail
-for unit in cloud-final.service walinuxagent.service ssh.service systemd-networkd.service; do
-  systemctl is-active --quiet "$unit"
+diagnose_unit() {
+  unit=$1
+  {
+    printf '%s\n' "--- bounded diagnostics for $unit ---"
+    systemctl show --no-pager --property=Id,LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,TimeoutStartUSec "$unit"
+    journalctl --no-pager --boot=0 --unit "$unit" --identifier=systemd --priority=warning..emerg --lines=80 --output=short-monotonic
+  } 2>&1 | head -c 49152 >&2 || true
+  printf '\n' >&2
+}
+diagnose_failed_units() {
+  printf '%s\n' "$failed_units" |
+    awk 'NF { print $1 }' |
+    head -n 8 |
+    while IFS= read -r unit; do diagnose_unit "$unit"; done
+}
+for unit in cloud-final.service walinuxagent.service ssh.service systemd-networkd.service networkd-dispatcher.service; do
+  systemctl is-active --quiet "$unit" || {
+    diagnose_unit "$unit"
+    exit 1
+  }
 done
 cloud-init status --long | grep -Eq '^status:[[:space:]]*done$'
-test "$(systemctl --failed --no-legend --plain | wc -l)" -eq 0
+failed_units=$(systemctl --failed --no-legend --plain)
+test -z "$failed_units" || {
+  printf '%s\n' "$failed_units" >&2
+  diagnose_failed_units
+  exit 1
+}
 GUEST
 fi
 test "$(az vm get-instance-view \

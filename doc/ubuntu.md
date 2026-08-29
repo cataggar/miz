@@ -156,7 +156,8 @@ trust database, keyserver, GnuPG configuration, or GnuPG executable
 dependency. It then requires exactly one signed checksum entry for the
 selected image and manifest. It separately hashes downloaded or `--source`
 image bytes. The manifest must contain the expected architecture and the
-systemd, cloud-init, cloud-guest-utils, OpenSSH, sudo, and netplan packages.
+systemd, cloud-init, cloud-guest-utils, OpenSSH, sudo, netplan, and `udisks2`
+packages.
 
 Every requested package is a separate debz transaction. Full resolves
 `linux-azure` and `walinuxagent` from the Canonical image's installed dpkg
@@ -192,6 +193,12 @@ firmware boots the signed UKI directly rather than maintaining GRUB state.
 The networkd dispatcher remains enabled, but its startup-trigger pass is
 ordered after chrony and `network-online.target` so the Arm64 TCG path cannot
 race the services those triggers call.
+`udisks2` remains installed and D-Bus activatable: its
+`org.freedesktop.UDisks2` system-bus activation descriptor and service remain
+available, and only the generated
+`graphical.target.wants/udisks2.service` eager-start link is removed. The
+service is not masked or removed, so an actual D-Bus request can still
+activate it without making every headless image boot compete for it.
 
 Firmware directly loads the signed architecture-specific UKI from the
 removable-media fallback path (`EFI/BOOT/BOOTX64.EFI` or
@@ -797,6 +804,15 @@ boot/reboot/shutdown, SSH-command, Android boot/stop, and tampered-UKI waits.
 Every bound still terminates with failure and serial, QMP, SSH, swtpm, or
 Android diagnostics rather than changing accelerator or treating an unknown
 state as success.
+
+The two initial identities are still provisioned from independent overlays,
+variable stores, seed media, and SSH keys. KVM rows continue to launch both
+initial guests concurrently. For AArch64 TCG only, the first Arm TCG guest
+reaches and passes the same SSH, key-only login, flavor runtime, required
+service, and no-failed-unit checks before the second guest is launched. This
+keeps systemd's own bounded service-start deadlines meaningful on a
+CPU-constrained hosted runner without weakening any uniqueness, persistence,
+reboot, or service-health assertion.
 
 Each QEMU result records an exact execution object containing accelerator,
 emulator, guest architecture, runner architecture, machine, and CPU. The
