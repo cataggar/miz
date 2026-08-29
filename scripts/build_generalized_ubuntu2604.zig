@@ -444,6 +444,16 @@ const core_forbidden_paths = [_][]const u8{
     "/etc/systemd/system/sockets.target.wants/ssh.socket",
 };
 
+const full_service_policy = [_]miz.os_customization.Service{
+    .{ .name = "systemd-networkd.service", .state = .enabled },
+    .{ .name = "systemd-resolved.service", .state = .enabled },
+    .{ .name = "ssh.service", .state = .enabled },
+    .{ .name = "walinuxagent.service", .state = .enabled },
+    // Firmware boots the signed UKI directly, so this GRUB state mutator has
+    // no bootloader state to maintain and can race grub2-common on reboot.
+    .{ .name = "grub-initrd-fallback.service", .state = .disabled },
+};
+
 const core_ssh_config =
     "PasswordAuthentication no\n" ++
     "KbdInteractiveAuthentication no\n" ++
@@ -2588,6 +2598,7 @@ fn removeIfPresent(filesystem: *miz.ext4_mountless.FileSystem, path: []const u8)
 const Arm64FstabLine = enum {
     unrelated,
     retired_xbootldr,
+    retired_esp,
     unexpected_boot_mount,
 };
 
@@ -2602,11 +2613,15 @@ fn classifyArm64FstabLine(line: []const u8) Arm64FstabLine {
         if (field_count < fields.len) fields[field_count] = field;
         field_count += 1;
     }
-    if (field_count < 2 or !std.mem.eql(u8, fields[1], "/boot")) {
+    if (field_count < 2 or
+        (!std.mem.eql(u8, fields[1], "/boot") and
+            !std.mem.eql(u8, fields[1], "/boot/efi")))
+    {
         return .unrelated;
     }
     if (field_count == 6 and
         std.mem.eql(u8, fields[0], "LABEL=BOOT") and
+        std.mem.eql(u8, fields[1], "/boot") and
         std.mem.eql(u8, fields[2], "ext4") and
         std.mem.eql(u8, fields[3], "defaults") and
         std.mem.eql(u8, fields[4], "0") and
@@ -2614,16 +2629,27 @@ fn classifyArm64FstabLine(line: []const u8) Arm64FstabLine {
     {
         return .retired_xbootldr;
     }
+    if (field_count == 6 and
+        std.mem.eql(u8, fields[0], "LABEL=UEFI") and
+        std.mem.eql(u8, fields[1], "/boot/efi") and
+        std.mem.eql(u8, fields[2], "vfat") and
+        std.mem.eql(u8, fields[3], "umask=0077") and
+        std.mem.eql(u8, fields[4], "0") and
+        std.mem.eql(u8, fields[5], "1"))
+    {
+        return .retired_esp;
+    }
     return .unexpected_boot_mount;
 }
 
-fn retireArm64XbootldrFstabAlloc(
+fn retireArm64BootFstabAlloc(
     allocator: Allocator,
     fstab: []const u8,
 ) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
-    var removed: usize = 0;
+    var xbootldr_removed: usize = 0;
+    var esp_removed: usize = 0;
     var offset: usize = 0;
     while (offset < fstab.len) {
         const relative_newline = std.mem.indexOfScalar(u8, fstab[offset..], '\n');
@@ -2631,34 +2657,37 @@ fn retireArm64XbootldrFstabAlloc(
         const segment_end = if (relative_newline == null) line_end else line_end + 1;
         switch (classifyArm64FstabLine(fstab[offset..line_end])) {
             .unrelated => try output.writer.writeAll(fstab[offset..segment_end]),
-            .retired_xbootldr => removed += 1,
+            .retired_xbootldr => xbootldr_removed += 1,
+            .retired_esp => esp_removed += 1,
             .unexpected_boot_mount => return error.UnexpectedArm64BootMount,
         }
         offset = segment_end;
     }
-    if (removed == 0) return error.MissingArm64XbootldrFstabEntry;
-    if (removed != 1) return error.AmbiguousArm64XbootldrFstabEntry;
+    if (xbootldr_removed == 0) return error.MissingArm64XbootldrFstabEntry;
+    if (xbootldr_removed != 1) return error.AmbiguousArm64XbootldrFstabEntry;
+    if (esp_removed == 0) return error.MissingArm64EspFstabEntry;
+    if (esp_removed != 1) return error.AmbiguousArm64EspFstabEntry;
     return output.toOwnedSlice();
 }
 
-fn validateArm64XbootldrFstabRetired(fstab: []const u8) !void {
+fn validateArm64BootFstabRetired(fstab: []const u8) !void {
     var lines = std.mem.splitScalar(u8, fstab, '\n');
     while (lines.next()) |line| {
         if (classifyArm64FstabLine(line) != .unrelated) {
-            return error.Arm64XbootldrFstabEntryRetained;
+            return error.Arm64BootFstabEntryRetained;
         }
     }
 }
 
-fn retireArm64XbootldrMount(
+fn retireArm64BootMounts(
     allocator: Allocator,
     filesystem: *miz.ext4_mountless.FileSystem,
 ) !void {
     const fstab = try filesystem.read(allocator, "/etc/fstab", 1024 * 1024);
     defer allocator.free(fstab);
-    const rewritten = try retireArm64XbootldrFstabAlloc(allocator, fstab);
+    const rewritten = try retireArm64BootFstabAlloc(allocator, fstab);
     defer allocator.free(rewritten);
-    try validateArm64XbootldrFstabRetired(rewritten);
+    try validateArm64BootFstabRetired(rewritten);
     try filesystem.write("/etc/fstab", rewritten, null);
 }
 
@@ -3188,12 +3217,7 @@ fn customizeRootWithDebz(
     try native_root.filesystem.importHostTreeWithManifest(current, .{}, &host_manifest);
     if (flavor == .full) {
         try native_root.filesystem.applyCustomization(.{
-            .services = &.{
-                .{ .name = "systemd-networkd.service", .state = .enabled },
-                .{ .name = "systemd-resolved.service", .state = .enabled },
-                .{ .name = "ssh.service", .state = .enabled },
-                .{ .name = "walinuxagent.service", .state = .enabled },
-            },
+            .services = &full_service_policy,
         }, 0);
     } else {
         try native_root.filesystem.applyCustomization(.{
@@ -3249,7 +3273,7 @@ fn customizeRootWithDebz(
         else => return error.UserCleanupIncomplete,
     }
     if (profile.architecture == .aarch64 and flavor == .full) {
-        try retireArm64XbootldrMount(allocator, &native_root.filesystem);
+        try retireArm64BootMounts(allocator, &native_root.filesystem);
     }
     const filesystem_info = try native_root.finish();
     const root_free_bytes = @as(u64, filesystem_info.free_block_count) * 4096;
@@ -4643,7 +4667,7 @@ fn buildImage(
     if (profile.architecture == .aarch64 and args.flavor == .full) {
         const fstab = try final_root.filesystem.read(allocator, "/etc/fstab", 1024 * 1024);
         defer allocator.free(fstab);
-        try validateArm64XbootldrFstabRetired(fstab);
+        try validateArm64BootFstabRetired(fstab);
     }
     if (args.flavor.freshRoot()) try validateCoreRoot(
         allocator,
@@ -5613,14 +5637,15 @@ test "guest ESP capacity translation preserves host NoSpaceLeft" {
     );
 }
 
-test "Arm64 XBOOTLDR fstab retirement removes the exact legacy mount" {
+test "Arm64 boot fstab retirement removes the exact legacy mounts" {
     const allocator = std.testing.allocator;
     const source =
         "# /etc/fstab: static file system information.\n" ++
         "LABEL=cloudimg-rootfs / ext4 defaults 0 1\n" ++
         "LABEL=BOOT\t/boot\text4\tdefaults\t0\t2\n" ++
+        "LABEL=UEFI\t/boot/efi\tvfat\tumask=0077\t0\t1\n" ++
         "UUID=swap none swap sw 0 0\n";
-    const rewritten = try retireArm64XbootldrFstabAlloc(allocator, source);
+    const rewritten = try retireArm64BootFstabAlloc(allocator, source);
     defer allocator.free(rewritten);
     try std.testing.expectEqualStrings(
         \\# /etc/fstab: static file system information.
@@ -5628,31 +5653,49 @@ test "Arm64 XBOOTLDR fstab retirement removes the exact legacy mount" {
         \\UUID=swap none swap sw 0 0
         \\
     , rewritten);
-    try validateArm64XbootldrFstabRetired(rewritten);
+    try validateArm64BootFstabRetired(rewritten);
 }
 
-test "Arm64 XBOOTLDR fstab retirement rejects unexpected boot mounts" {
+test "Arm64 boot fstab retirement rejects missing or unexpected mounts" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(
         error.UnexpectedArm64BootMount,
-        retireArm64XbootldrFstabAlloc(
+        retireArm64BootFstabAlloc(
             allocator,
             "UUID=unexpected /boot ext4 defaults 0 2\n",
         ),
     );
     try std.testing.expectError(
         error.MissingArm64XbootldrFstabEntry,
-        retireArm64XbootldrFstabAlloc(
+        retireArm64BootFstabAlloc(
             allocator,
             "LABEL=cloudimg-rootfs / ext4 defaults 0 1\n",
         ),
     );
     try std.testing.expectError(
-        error.Arm64XbootldrFstabEntryRetained,
-        validateArm64XbootldrFstabRetired(
+        error.MissingArm64EspFstabEntry,
+        retireArm64BootFstabAlloc(
+            allocator,
             "LABEL=BOOT /boot ext4 defaults 0 2\n",
         ),
     );
+    try std.testing.expectError(
+        error.Arm64BootFstabEntryRetained,
+        validateArm64BootFstabRetired(
+            "LABEL=BOOT /boot ext4 defaults 0 2\n" ++
+                "LABEL=UEFI /boot/efi vfat umask=0077 0 1\n",
+        ),
+    );
+}
+
+test "full service policy disables the obsolete GRUB fallback helper" {
+    var found = false;
+    for (&full_service_policy) |service| {
+        if (!std.mem.eql(u8, service.name, "grub-initrd-fallback.service")) continue;
+        try std.testing.expectEqual(miz.os_customization.ServiceState.disabled, service.state);
+        found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "durable native recovery is disposed before QCOW2 publication" {
