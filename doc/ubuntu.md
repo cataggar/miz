@@ -186,6 +186,9 @@ its first LBA, partition GUID, and FAT volume ID; the obsolete Canonical
 XBOOTLDR entry at `/dev/sda13` is cleared without moving the root or changing
 the disk size. The rebuilt Arm64 ESP contains only
 `EFI/BOOT/BOOTAA64.EFI`, not Canonical's stale shim/GRUB tree.
+The matching legacy `/boot` and `/boot/efi` mounts are removed from Arm64
+`fstab`, and the full image disables GRUB's initrd-fallback helper because
+firmware boots the signed UKI directly rather than maintaining GRUB state.
 
 Firmware directly loads the signed architecture-specific UKI from the
 removable-media fallback path (`EFI/BOOT/BOOTX64.EFI` or
