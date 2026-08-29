@@ -309,6 +309,7 @@ const required_manifest_packages = [_][]const u8{
     "sudo",
     "systemd",
     "netplan.io",
+    "udisks2",
 };
 
 const full_debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
@@ -372,6 +373,14 @@ const baremetal_debz_packages = [_][]const u8{
     "ca-certificates",
 };
 const max_debz_packages = baremetal_debz_packages.len;
+
+const full_required_packages = [_][]const u8{
+    "linux-azure",
+    "walinuxagent",
+    "cloud-init",
+    "openssh-server",
+    "udisks2",
+};
 
 const core_required_packages = [_][]const u8{
     "ubuntu-minimal",
@@ -445,6 +454,7 @@ const core_forbidden_paths = [_][]const u8{
 };
 
 const full_service_policy = [_]miz.os_customization.Service{
+    .{ .name = "networkd-dispatcher.service", .state = .enabled },
     .{ .name = "systemd-networkd.service", .state = .enabled },
     .{ .name = "systemd-resolved.service", .state = .enabled },
     .{ .name = "ssh.service", .state = .enabled },
@@ -457,6 +467,13 @@ const full_service_policy = [_]miz.os_customization.Service{
 const full_networkd_dispatcher_override =
     "[Unit]\n" ++
     "After=chrony.service network-online.target\n";
+
+const full_udisks2_dbus_service_path =
+    "/usr/share/dbus-1/system-services/org.freedesktop.UDisks2.service";
+
+const full_eager_service_links_to_remove = [_][]const u8{
+    "/etc/systemd/system/graphical.target.wants/udisks2.service",
+};
 
 const core_ssh_config =
     "PasswordAuthentication no\n" ++
@@ -1460,7 +1477,7 @@ const peMachine = uki_kernel_payload.peMachine;
 
 fn requiredPackages(flavor: Flavor) []const []const u8 {
     return switch (flavor) {
-        .full => &.{ "linux-azure", "walinuxagent", "cloud-init", "openssh-server" },
+        .full => &full_required_packages,
         .core => &core_required_packages,
         .baremetal => &baremetal_required_packages,
     };
@@ -2328,6 +2345,60 @@ fn validateUkiContract(
         return error.UnexpectedUkiCmdline;
 }
 
+fn containsExactLine(bytes: []const u8, expected: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, std.mem.trimEnd(u8, line, "\r"), expected))
+            return true;
+    }
+    return false;
+}
+
+fn validateUdisks2DbusActivation(bytes: []const u8) !void {
+    for (&[_][]const u8{
+        "[D-BUS Service]",
+        "Name=org.freedesktop.UDisks2",
+        "SystemdService=udisks2.service",
+    }) |line| {
+        if (!containsExactLine(bytes, line))
+            return error.Udisks2DbusActivationMissing;
+    }
+}
+
+fn applyFullUdisks2Policy(root: *offline_root.Root) !void {
+    for (&full_eager_service_links_to_remove) |path| {
+        try root.applyOne(.{ .remove = path });
+    }
+    const descriptor = root.readFile(full_udisks2_dbus_service_path) catch
+        return error.Udisks2DbusActivationMissing;
+    defer root.allocator.free(descriptor);
+    try validateUdisks2DbusActivation(descriptor);
+}
+
+fn validateFullUdisks2Policy(
+    allocator: Allocator,
+    filesystem: *const miz.ext4_mountless.FileSystem,
+) !void {
+    const descriptor = filesystem.read(
+        allocator,
+        full_udisks2_dbus_service_path,
+        64 * 1024,
+    ) catch |err| switch (err) {
+        error.PathNotFound => return error.Udisks2DbusActivationMissing,
+        else => return err,
+    };
+    defer allocator.free(descriptor);
+    try validateUdisks2DbusActivation(descriptor);
+
+    for (&full_eager_service_links_to_remove) |path| {
+        _ = filesystem.stat(path) catch |err| switch (err) {
+            error.PathNotFound => continue,
+            else => return err,
+        };
+        return error.Udisks2GraphicalEagerStartRetained;
+    }
+}
+
 fn customizeOfflineRoot(
     allocator: Allocator,
     io: Io,
@@ -2404,6 +2475,7 @@ fn customizeOfflineRoot(
                 .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = waagent } } },
                 .{ .replace_symlink = .{ .path = "/etc/resolv.conf", .target = "/run/systemd/resolve/stub-resolv.conf" } },
             });
+            try applyFullUdisks2Policy(&root);
         },
         .core => {
             try root.apply(&.{
@@ -3271,6 +3343,8 @@ fn customizeRootWithDebz(
             flavor,
             evidence[0..evidence_count],
         );
+    } else {
+        try validateFullUdisks2Policy(allocator, &native_root.filesystem);
     }
     if (native_root.filesystem.stat("/home/ubuntu")) |_| {
         return error.UserCleanupIncomplete;
@@ -4682,7 +4756,7 @@ fn buildImage(
         profile,
         args.flavor,
         debz_customization.evidence[0..debz_customization.evidence_count],
-    );
+    ) else try validateFullUdisks2Policy(allocator, &final_root.filesystem);
     if (try peMachine(signed.bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
     final_image_validation.succeed();
     if (args.raw_output) |raw_path| {
@@ -5704,12 +5778,89 @@ test "full service policy disables the obsolete GRUB fallback helper" {
     try std.testing.expect(found);
 }
 
+test "full service policy explicitly keeps the network dispatcher enabled" {
+    var found = false;
+    for (&full_service_policy) |service| {
+        if (!std.mem.eql(u8, service.name, "networkd-dispatcher.service")) continue;
+        try std.testing.expectEqual(miz.os_customization.ServiceState.enabled, service.state);
+        found = true;
+    }
+    try std.testing.expect(found);
+}
+
 test "full network dispatcher waits for startup-trigger dependencies" {
     try std.testing.expectEqualStrings(
         "[Unit]\n" ++
             "After=chrony.service network-online.target\n",
         full_networkd_dispatcher_override,
     );
+}
+
+test "full udisks policy keeps D-Bus activation without graphical eager start" {
+    try std.testing.expectEqual(@as(usize, 1), full_eager_service_links_to_remove.len);
+    try std.testing.expectEqualStrings(
+        "/etc/systemd/system/graphical.target.wants/udisks2.service",
+        full_eager_service_links_to_remove[0],
+    );
+
+    var package_required = false;
+    for (requiredPackages(.full)) |package| {
+        if (std.mem.eql(u8, package, "udisks2")) package_required = true;
+    }
+    try std.testing.expect(package_required);
+    try validateUdisks2DbusActivation(
+        "[D-BUS Service]\n" ++
+            "Name=org.freedesktop.UDisks2\n" ++
+            "SystemdService=udisks2.service\n",
+    );
+    try std.testing.expectError(
+        error.Udisks2DbusActivationMissing,
+        validateUdisks2DbusActivation(
+            "[D-BUS Service]\nName=org.freedesktop.UDisks2\n",
+        ),
+    );
+
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    var root = try offline_root.Root.init(
+        allocator,
+        io,
+        root_buffer[0..root_length],
+        .{},
+    );
+    defer root.deinit();
+    try root.apply(&.{
+        .{ .create_directory = .{
+            .path = "/usr/share/dbus-1/system-services",
+            .mode = 0o755,
+        } },
+        .{ .create_directory = .{
+            .path = "/etc/systemd/system/graphical.target.wants",
+            .mode = 0o755,
+        } },
+        .{ .write_file = .{
+            .path = full_udisks2_dbus_service_path,
+            .source = .{ .inline_bytes = "[D-BUS Service]\n" ++
+                "Name=org.freedesktop.UDisks2\n" ++
+                "SystemdService=udisks2.service\n" },
+        } },
+        .{ .replace_symlink = .{
+            .path = full_eager_service_links_to_remove[0],
+            .target = "/usr/lib/systemd/system/udisks2.service",
+        } },
+    });
+    try applyFullUdisks2Policy(&root);
+    try std.testing.expectError(
+        error.PathNotFound,
+        root.inspect(full_eager_service_links_to_remove[0]),
+    );
+    const descriptor = try root.readFile(full_udisks2_dbus_service_path);
+    defer allocator.free(descriptor);
+    try validateUdisks2DbusActivation(descriptor);
 }
 
 test "durable native recovery is disposed before QCOW2 publication" {
@@ -6160,7 +6311,7 @@ test "committed local UKI signing fixtures load and sign against the enrolled ce
 
 test "signed source manifest contract rejects missing packages and foreign architecture" {
     const good =
-        "cloud-init\t1\ncloud-guest-utils\t1\nopenssh-server\t1\nsudo\t1\nsystemd\t1\nnetplan.io\t1\nlibc6:amd64\t1\n";
+        "cloud-init\t1\ncloud-guest-utils\t1\nopenssh-server\t1\nsudo\t1\nsystemd\t1\nnetplan.io\t1\nudisks2\t1\nlibc6:amd64\t1\n";
     try validateManifest(good, profileFor(.x86_64));
     try std.testing.expectError(error.ForeignArchitecturePackage, validateManifest(
         good ++ "libc6:arm64\t1\n",
@@ -6864,6 +7015,7 @@ test "exact lock requires coherent Azure and provisioning packages" {
         "cloud-init\t26.1\tall\n" ++
         "linux-azure\t7.0\tamd64\n" ++
         "openssh-server\t10.2\tamd64\n" ++
+        "udisks2\t2.10\tamd64\n" ++
         "walinuxagent\t2.15\tall\n";
     try validateExactLock(amd64_lock, profileFor(.x86_64), .full);
     try std.testing.expectError(error.ForeignArchitecturePackage, validateExactLock(

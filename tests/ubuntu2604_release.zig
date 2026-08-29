@@ -1177,8 +1177,26 @@ test "the full Azure service contract matches Ubuntu 26.04" {
     );
     try script.expectOmits("networkctl is-online");
     try script.expectContains("FAIL %s (exit %s)");
+    try script.expectContains("networkd-dispatcher.service");
+    try script.expectContains("check udisks2-installed package_installed udisks2");
+    try script.expectContains("Name=org.freedesktop.UDisks2");
+    try script.expectContains("SystemdService=udisks2.service");
+    try script.expectContains("udisks2-graphical-eager-start-absent");
     try script.expectContains("failed_units=$(systemctl --failed --no-legend --plain)");
     try script.expectContains("check no-failed-units test -z");
+    try script.expectContains(
+        "systemctl show --no-pager --property=Id,LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,TimeoutStartUSec",
+    );
+    try script.expectContains(
+        "journalctl --no-pager --boot=0 --unit \"$unit\" --identifier=systemd --priority=warning..emerg --lines=80",
+    );
+    try script.expectContains("head -c 49152");
+    try script.expectContains("head -n 8");
+    try script.expectContains("diagnose_failed_units\n  exit 1");
+    try script.expectOmits(
+        "test \"$(systemctl --failed --no-legend --plain | wc -l)\" -eq 0",
+    );
+    try script.expectOmits("--property=Environment");
     try script.expectContains(
         "check conventional-resource-disk-policy validate_conventional_resource_disk",
     );

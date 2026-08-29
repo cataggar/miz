@@ -11,6 +11,13 @@ pub const Architecture = enum { x86_64, aarch64 };
 
 pub const Accelerator = enum { kvm, tcg };
 
+/// Controls whether the second identity-provisioning first boot may begin
+/// before the first guest has passed its flavor-specific readiness checks.
+pub const InitialGuestLaunchPolicy = enum {
+    concurrent,
+    serial_until_ready,
+};
+
 pub const TimeoutPolicy = struct {
     job_minutes: u16,
     qmp_connect_seconds: i64,
@@ -33,6 +40,7 @@ pub const Profile = struct {
     runner_architecture: []const u8,
     machine: []const u8,
     cpu: []const u8,
+    initial_guest_launch: InitialGuestLaunchPolicy,
     timeouts: TimeoutPolicy,
 };
 
@@ -44,6 +52,7 @@ pub const x86_64_kvm: Profile = .{
     .runner_architecture = "x86_64",
     .machine = "q35",
     .cpu = "host",
+    .initial_guest_launch = .concurrent,
     .timeouts = .{
         .job_minutes = 180,
         .qmp_connect_seconds = 30,
@@ -67,6 +76,7 @@ pub const aarch64_tcg: Profile = .{
     .runner_architecture = "aarch64",
     .machine = "virt",
     .cpu = "max",
+    .initial_guest_launch = .serial_until_ready,
     .timeouts = .{
         .job_minutes = 360,
         .qmp_connect_seconds = 2 * 60,
@@ -109,6 +119,10 @@ test "Ubuntu QEMU execution profiles are exact and fail closed" {
     try std.testing.expectEqualStrings("kvm", x86_64_kvm.accelerator_argument);
     try std.testing.expectEqualStrings("host", x86_64_kvm.cpu);
     try std.testing.expectEqualStrings("q35", x86_64_kvm.machine);
+    try std.testing.expectEqual(
+        InitialGuestLaunchPolicy.concurrent,
+        x86_64_kvm.initial_guest_launch,
+    );
     try std.testing.expectEqual(@as(u16, 180), x86_64_kvm.timeouts.job_minutes);
 
     try std.testing.expectEqual(Accelerator.tcg, aarch64_tcg.accelerator);
@@ -118,6 +132,10 @@ test "Ubuntu QEMU execution profiles are exact and fail closed" {
     );
     try std.testing.expectEqualStrings("max", aarch64_tcg.cpu);
     try std.testing.expectEqualStrings("virt", aarch64_tcg.machine);
+    try std.testing.expectEqual(
+        InitialGuestLaunchPolicy.serial_until_ready,
+        aarch64_tcg.initial_guest_launch,
+    );
     try std.testing.expectEqual(@as(u16, 360), aarch64_tcg.timeouts.job_minutes);
     try std.testing.expect(
         aarch64_tcg.timeouts.guest_ready_seconds >
