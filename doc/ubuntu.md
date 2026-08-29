@@ -189,6 +189,9 @@ the disk size. The rebuilt Arm64 ESP contains only
 The matching legacy `/boot` and `/boot/efi` mounts are removed from Arm64
 `fstab`, and the full image disables GRUB's initrd-fallback helper because
 firmware boots the signed UKI directly rather than maintaining GRUB state.
+The networkd dispatcher remains enabled, but its startup-trigger pass is
+ordered after chrony and `network-online.target` so the Arm64 TCG path cannot
+race the services those triggers call.
 
 Firmware directly loads the signed architecture-specific UKI from the
 removable-media fallback path (`EFI/BOOT/BOOTX64.EFI` or
