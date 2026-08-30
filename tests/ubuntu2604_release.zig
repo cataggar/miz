@@ -1263,6 +1263,17 @@ test "the full Azure service contract matches Ubuntu 26.04" {
     try script.expectContains("head -c 49152");
     try script.expectContains("head -n 8");
     try script.expectContains("diagnose_failed_units\n  exit 1");
+    const cloud_init_wait = std.mem.indexOf(
+        u8,
+        script.text,
+        "check cloud-init-wait cloud-init status --wait",
+    ).?;
+    const service_checks = std.mem.indexOf(
+        u8,
+        script.text,
+        "for unit in cloud-init-local.service",
+    ).?;
+    try std.testing.expect(cloud_init_wait < service_checks);
     try script.expectOmits(
         "test \"$(systemctl --failed --no-legend --plain | wc -l)\" -eq 0",
     );

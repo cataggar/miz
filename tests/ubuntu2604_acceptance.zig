@@ -2708,6 +2708,7 @@ const full_checks =
     \\. /etc/os-release
     \\check os-id-ubuntu test "$ID" = ubuntu
     \\check os-version-26.04 test "$VERSION_ID" = 26.04
+    \\check cloud-init-wait cloud-init status --wait
     \\for unit in cloud-init-local.service cloud-init-network.service cloud-config.service cloud-final.service walinuxagent.service ssh.service systemd-networkd.service networkd-dispatcher.service; do
     \\  check_service "$unit"
     \\done
@@ -2717,7 +2718,6 @@ const full_checks =
     \\check udisks2-systemd-activation grep -Fxq 'SystemdService=udisks2.service' /usr/share/dbus-1/system-services/org.freedesktop.UDisks2.service
     \\check udisks2-unit-loaded test "$(systemctl show --property=LoadState --value udisks2.service)" = loaded
     \\check udisks2-graphical-eager-start-absent test ! -e /etc/systemd/system/graphical.target.wants/udisks2.service
-    \\check cloud-init-wait cloud-init status --wait
     \\netplan_network=$(find /run/systemd/network -maxdepth 1 -name '10-netplan-*.network' -print -quit)
     \\check netplan-network-generated test -n "$netplan_network"
     \\check network-online systemctl is-active --quiet network-online.target
@@ -3680,6 +3680,17 @@ test "full service checks keep dispatcher strict and udisks D-Bus-only" {
     }) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, full_checks, needle) != null);
     }
+    const cloud_init_wait = std.mem.indexOf(
+        u8,
+        full_checks,
+        "check cloud-init-wait cloud-init status --wait",
+    ).?;
+    const service_checks = std.mem.indexOf(
+        u8,
+        full_checks,
+        "for unit in cloud-init-local.service",
+    ).?;
+    try std.testing.expect(cloud_init_wait < service_checks);
     try std.testing.expect(std.mem.indexOf(u8, full_checks, "--property=Environment") == null);
 }
 
