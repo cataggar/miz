@@ -1091,6 +1091,7 @@ check os-release-readable test -r /etc/os-release
 . /etc/os-release
 check os-id-ubuntu test "$ID" = ubuntu
 check os-version-26.04 test "$VERSION_ID" = 26.04
+check cloud-init-wait cloud-init status --wait
 for unit in cloud-init-local.service cloud-init-network.service cloud-config.service cloud-final.service walinuxagent.service ssh.service systemd-networkd.service networkd-dispatcher.service; do
   check_service "$unit"
 done
@@ -1100,7 +1101,6 @@ check udisks2-dbus-name grep -Fxq 'Name=org.freedesktop.UDisks2' /usr/share/dbus
 check udisks2-systemd-activation grep -Fxq 'SystemdService=udisks2.service' /usr/share/dbus-1/system-services/org.freedesktop.UDisks2.service
 check udisks2-unit-loaded test "$(systemctl show --property=LoadState --value udisks2.service)" = loaded
 check udisks2-graphical-eager-start-absent test ! -e /etc/systemd/system/graphical.target.wants/udisks2.service
-check cloud-init-wait cloud-init status --wait
 netplan_network=$(find /run/systemd/network -maxdepth 1 -name '10-netplan-*.network' -print -quit)
 check netplan-network-generated test -n "$netplan_network"
 check network-online systemctl is-active --quiet network-online.target
