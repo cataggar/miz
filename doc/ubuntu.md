@@ -961,6 +961,15 @@ digests. The raw `producer_source_commit` and immutable image reference are
 validated only inside the verifier and are never copied into public
 evidence. The artifact digests verify both extracted files and the bundle
 config. `android-bundle.tar` may be a plain tar or a gzip-, bzip2-, xz-, or
+
+The verifier also retains a narrow adapter for the already pinned
+pre-migration producer contract. It accepts only the exact legacy member set
+`runz`, `redroid-bundle.tar`, and `provenance.json` together with that
+producer's exact legacy schema, type, field set, and `sha256:`-prefixed
+digests. The runtime and bundle are normalized to the current private paths
+after the archive digest matches; they become usable only after the
+provenance digest and every nested binding also match. Mixed current/legacy
+contracts and every additional, missing, or unsafe member remain rejected. `android-bundle.tar` may be a plain tar or a gzip-, bzip2-, xz-, or
 zstd-compressed one: the producer is external, the name says nothing about the
 container, and the config digest is read from whatever the archive actually
 holds rather than from bytes assumed to be tar.
