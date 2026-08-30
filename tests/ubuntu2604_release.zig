@@ -23,7 +23,7 @@ const support = release.support;
 
 const allocator = std.testing.allocator;
 const io = std.testing.io;
-const publication_tag = "Ubuntu-26.04-20260828";
+const publication_tag = "Ubuntu-26.04-20260829";
 
 fn tree() !Tree {
     return Tree.create(allocator, io);
