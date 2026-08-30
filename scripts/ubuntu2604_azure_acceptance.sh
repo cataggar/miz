@@ -755,7 +755,7 @@ GUEST
 
 uefi_db="$RESULT_DIR/uefi-db.bin"
 ssh "${ssh_options[@]}" "$ssh_target" \
-  "sudo -n /usr/bin/cat /sys/firmware/efi/efivars/db-*" >"$uefi_db"
+  "set -eu; if ! mountpoint -q /sys/firmware/efi/efivars; then sudo -n /usr/bin/mount -t efivarfs efivarfs /sys/firmware/efi/efivars; fi; sudo -n /usr/bin/cat /sys/firmware/efi/efivars/db-*" >"$uefi_db"
 "$RELEASE_TOOL" azure-uefi-db \
   --db "$uefi_db" \
   --certificate-sha256 "$certificate_sha256"
