@@ -1249,6 +1249,9 @@ test "the full Azure service contract matches Ubuntu 26.04" {
     try script.expectContains("Name=org.freedesktop.UDisks2");
     try script.expectContains("SystemdService=udisks2.service");
     try script.expectContains("udisks2-graphical-eager-start-absent");
+    try script.expectContains(
+        "mount -t efivarfs efivarfs /sys/firmware/efi/efivars",
+    );
     try script.expectContains("failed_units=$(systemctl --failed --no-legend --plain)");
     try script.expectContains("check no-failed-units test -z");
     try script.expectContains(

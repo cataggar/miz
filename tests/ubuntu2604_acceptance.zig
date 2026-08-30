@@ -1999,6 +1999,14 @@ fn efiDbContainsCertificate(
     return false;
 }
 
+const uefi_db_command =
+    \\set -eu
+    \\if ! mountpoint -q /sys/firmware/efi/efivars; then
+    \\  sudo -n /usr/bin/mount -t efivarfs efivarfs /sys/firmware/efi/efivars
+    \\fi
+    \\sudo -n /bin/cat /sys/firmware/efi/efivars/db-*
+;
+
 fn verifyGuestSecureBoot(
     allocator: Allocator,
     io: Io,
@@ -2011,7 +2019,7 @@ fn verifyGuestSecureBoot(
         io,
         ssh_path,
         instance,
-        "sudo -n /bin/sh -c 'cat /sys/firmware/efi/efivars/db-*'",
+        uefi_db_command,
     );
     defer allocator.free(db);
     if (!efiDbContainsCertificate(db, certificate_sha256)) {
@@ -3707,6 +3715,20 @@ test "EFI db parser finds the exact enrolled DER certificate" {
     try std.testing.expect(!efiDbContainsCertificate(variable[0 .. variable.len - 1], digest));
     variable[list_offset] = 0;
     try std.testing.expect(!efiDbContainsCertificate(&variable, digest));
+}
+
+test "Secure Boot evidence mounts efivarfs before reading db" {
+    const mount_index = std.mem.indexOf(
+        u8,
+        uefi_db_command,
+        "mount -t efivarfs efivarfs /sys/firmware/efi/efivars",
+    ).?;
+    const db_index = std.mem.indexOf(
+        u8,
+        uefi_db_command,
+        "cat /sys/firmware/efi/efivars/db-*",
+    ).?;
+    try std.testing.expect(mount_index < db_index);
 }
 
 test "signed Binder module script pins the module tree and requires evidence" {
