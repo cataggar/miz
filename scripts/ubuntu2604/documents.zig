@@ -27,63 +27,6 @@ pub const candidate_type = "ubuntu2604-candidate";
 pub const azure_result_type = "ubuntu2604-azure-acceptance";
 pub const native_result_type = "ubuntu2604-local-secure-boot-acceptance";
 
-/// `ANDROID_SMOKE_FIELDS`.
-pub const android_smoke_fields = [_][]const u8{
-    "architecture",
-    "bundle_sha256",
-    "candidate_key",
-    "config_sha256",
-    "provenance_sha256",
-    "runtime_sha256",
-};
-
-/// `require_android_smoke`.
-pub fn requireAndroidSmoke(
-    value: ?std.json.Value,
-    architecture: []const u8,
-    key: []const u8,
-    label: []const u8,
-    diagnostic: *Diagnostic,
-) Error!void {
-    const object = support.objectOf(value);
-    if (object == null or !support.hasExactFields(object.?, &android_smoke_fields)) {
-        return fail(
-            diagnostic,
-            "{s}: android_smoke provenance is invalid",
-            .{label},
-        );
-    }
-    const digests = [_]struct { field: []const u8, noun: []const u8 }{
-        .{ .field = "provenance_sha256", .noun = "provenance" },
-        .{ .field = "runtime_sha256", .noun = "runtime" },
-        .{ .field = "bundle_sha256", .noun = "bundle" },
-        .{ .field = "config_sha256", .noun = "config" },
-    };
-    for (digests) |entry| {
-        var label_buffer: [256]u8 = undefined;
-        const digest_label = std.fmt.bufPrint(
-            &label_buffer,
-            "{s} android_smoke {s} digest",
-            .{ label, entry.noun },
-        ) catch label;
-        _ = try support.requireSha256(
-            object.?.get(entry.field),
-            digest_label,
-            diagnostic,
-        );
-    }
-    if (!support.stringIs(object.?.get("architecture"), architecture)) return fail(
-        diagnostic,
-        "{s}: android_smoke architecture mismatch",
-        .{label},
-    );
-    if (!support.stringIs(object.?.get("candidate_key"), key)) return fail(
-        diagnostic,
-        "{s}: android_smoke candidate key mismatch",
-        .{label},
-    );
-}
-
 pub const Identity = struct {
     key: []const u8,
     architecture: []const u8,
@@ -556,9 +499,9 @@ pub fn nativeResultSchema(flavor: contracts.Flavor) i64 {
         // Schema 3 adds the exact QEMU execution identity to the complete
         // candidate, success, and workflow binding introduced at schema 2.
         .full => 3,
-        // Schema 7 adds the same execution identity to core while retaining
-        // the Android smoke provenance introduced in the earlier schemas.
-        .core => 7,
+        // Schema 8 removes the external secret-bound smoke evidence while
+        // retaining every in-image core and QEMU execution requirement.
+        .core => 8,
     };
 }
 
@@ -640,15 +583,6 @@ pub fn validateNativeResultDocument(
         key,
         diagnostic,
     );
-    if (flavor == .core) {
-        try requireAndroidSmoke(
-            result.get("android_smoke"),
-            candidate.identity.architecture,
-            key,
-            key,
-            diagnostic,
-        );
-    }
     if (!hasWorkflowIdentity(result.get("workflow"))) return fail(
         diagnostic,
         "{s}: native workflow identity is absent",
@@ -1112,7 +1046,7 @@ pub fn validateAzureResultDocument(
         azure_result_type,
         switch (flavor) {
             .full => 1,
-            .core => 2,
+            .core => 3,
         },
         candidate.identity.key,
         support.stringOf(candidate.object().get("source_commit")).?,
@@ -1124,15 +1058,6 @@ pub fn validateAzureResultDocument(
         "{s}: Azure acceptance is not explicitly successful",
         .{key},
     );
-    if (flavor == .core) {
-        try requireAndroidSmoke(
-            result.get("android_smoke"),
-            candidate.identity.architecture,
-            key,
-            key,
-            diagnostic,
-        );
-    }
     if (!support.stringIs(result.get("qcow_sha256"), candidate.sha256) or
         !support.stringIs(result.get("azure_accepted_sha256"), candidate.sha256))
     {

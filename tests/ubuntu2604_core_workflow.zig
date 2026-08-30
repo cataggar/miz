@@ -3,9 +3,8 @@
 //! The core-validation workflow proves the appliance flavor end to end and
 //! publishes nothing. Its safety is structural in the same way the release
 //! workflow's is -- exact matrices, complete acceptance sets, least-privilege
-//! permissions -- plus one thing the release workflow does not have: the
-//! Android container smoke inputs, whose private identity must never reach a
-//! workflow value. Replaces `tests/ubuntu2604_core_workflow_test.py`.
+//! permissions, self-contained core inputs, and no publication path. Replaces
+//! `tests/ubuntu2604_core_workflow_test.py`.
 
 const std = @import("std");
 
@@ -367,13 +366,7 @@ test "core build and acceptance contracts are explicit" {
     try source.expectOrder(
         azure,
         "- name: Build accepted-source miz",
-        "- name: Fetch and verify digest-bound Android container smoke inputs",
-        workflow_path,
-    );
-    try source.expectOrder(
-        azure,
-        "- name: Fetch and verify digest-bound Android container smoke inputs",
-        "- name: Log in to Azure with protected-environment OIDC",
+        "- name: Build Binder device usability probe",
         workflow_path,
     );
     try source.expectOrder(
@@ -416,65 +409,48 @@ test "the Binder probe is built for the matching guest architecture" {
     );
 }
 
-test "Android smoke inputs are architecture-specific and stay private" {
+test "the workflow has no external secret-bound smoke input dependency" {
     var workflow = try open();
     defer workflow.deinit();
 
     const scopes = [_]struct {
         name: []const u8,
         following: []const u8,
-        private_root: []const u8,
     }{
         .{
             .name = "native_qemu",
             .following = "azure_acceptance",
-            .private_root = ".validation/native",
         },
         .{
             .name = "azure_acceptance",
             .following = "validate",
-            .private_root = ".validation/azure",
         },
     };
     for (scopes) |scope| {
         const section = try job(&workflow, scope.name, scope.following);
-        try std.testing.expectEqual(
-            @as(usize, 1),
-            std.mem.count(u8, section, "android_smoke_secret: ANDROID_SMOKE_X86_64_JSON"),
-        );
-        try std.testing.expectEqual(
-            @as(usize, 1),
-            std.mem.count(u8, section, "android_smoke_secret: ANDROID_SMOKE_AARCH64_JSON"),
-        );
-        const download_start = try source.indexOfIn(
-            section,
-            "- name: Fetch and verify digest-bound Android container smoke inputs",
-            workflow_path,
-        );
-        const rest = section[download_start..];
-        const download = rest[0 .. std.mem.indexOfPos(
-            u8,
-            rest,
-            1,
-            "\n      - name:",
-        ) orelse rest.len];
-        try source.expectContainsIn(
-            download,
-            "ANDROID_SMOKE_INPUT_VALUE: ${{ secrets[matrix.android_smoke_secret] }}",
-            workflow_path,
-        );
-        try source.expectContainsIn(download, "set +x", workflow_path);
-        try source.expectContainsIn(download, "prepare-android-smoke-inputs", workflow_path);
-        try source.expectContainsIn(download, "--architecture \"$ARCHITECTURE\"", workflow_path);
-        try source.expectContainsIn(download, scope.private_root, workflow_path);
-        try source.expectOmitsIn(download, "$RESULT_DIR/android", workflow_path);
-        const forbidden = [_][]const u8{
-            "ANDROID_RUNTIME_SOURCE_COMMIT",
-            "ANDROID_RUNTIME_URL",
-            "ANDROID_BUNDLE_URL",
-            "--oauth2-bearer",
-        };
-        for (forbidden) |needle| try source.expectOmitsIn(section, needle, scope.name);
+        for ([_][]const u8{
+            "ANDROID" ++ "_",
+            "android_" ++ "smoke_secret",
+            "prepare-" ++ "android",
+            "/android-" ++ "smoke",
+            "artifact_url",
+        }) |needle| {
+            try source.expectOmitsIn(section, needle, scope.name);
+        }
+        if (std.mem.eql(u8, scope.name, "native_qemu")) {
+            try source.expectOmitsIn(
+                section,
+                "ca-certificates curl openssh-client",
+                scope.name,
+            );
+        } else {
+            const binder = [_][]const u8{
+                "Build Binder device usability probe",
+                "tests/binder_probe.zig",
+                "test -x \"$BINDER_PROBE\"",
+            };
+            for (binder) |needle| try source.expectContainsIn(section, needle, scope.name);
+        }
     }
 }
 

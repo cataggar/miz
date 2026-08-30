@@ -9,17 +9,6 @@
 #   variables AZURE_LOCATION_X64, AZURE_LOCATION_ARM64, AZURE_VM_SIZE_X64, and
 #   AZURE_VM_SIZE_ARM64. The acceptance app's Entra federated credential subject
 #   is `repo:cataggar/miz:environment:ubuntu2604-release`.
-# - The Android container boot-completion smoke required by core acceptance
-#   reads separate, non-environment-scoped repository secrets so the
-#   same-architecture QEMU job (which needs no Azure credential) can use them
-#   without a protected-environment gate: ANDROID_SMOKE_X86_64_JSON and
-#   ANDROID_SMOKE_AARCH64_JSON. Each exact JSON document supplies one private
-#   HTTPS archive location plus the expected archive and provenance SHA-256
-#   values for that architecture's external Android runtime and bundle inputs.
-#   An optional ANDROID_ARTIFACT_TOKEN secret is used only for private
-#   downloads. Missing or malformed input fails explicitly rather than
-#   skipping the smoke; only verified local paths and public-safe SHA-256
-#   evidence leave the download step.
 # This workflow validates core candidates and uploads workflow artifacts. It
 # never creates or moves tags, creates a GitHub release, or publishes assets.
 name: Validate Ubuntu 26.04 core images
@@ -402,7 +391,6 @@ jobs:
             cpu: host
             timeout_minutes: 180
             asset_name: Ubuntu-26.04-x86_64.core.qcow2
-            android_smoke_secret: ANDROID_SMOKE_X86_64_JSON
           - key: aarch64-core
             architecture: aarch64
             runner: ubuntu-24.04-arm
@@ -415,7 +403,6 @@ jobs:
             cpu: max
             timeout_minutes: 360
             asset_name: Ubuntu-26.04-aarch64.core.qcow2
-            android_smoke_secret: ANDROID_SMOKE_AARCH64_JSON
     env:
       CANDIDATE_KEY: ${{ matrix.key }}
       ARCHITECTURE: ${{ matrix.architecture }}
@@ -515,7 +502,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           packages=(
-            ca-certificates curl openssh-client openssl qemu-utils
+            ca-certificates openssh-client openssl qemu-utils
             sbsigntool swtpm swtpm-tools
           )
           case "$ARCHITECTURE" in
@@ -620,18 +607,6 @@ jobs:
           echo "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ID=$GITHUB_RUN_ID" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
-      - name: Fetch and verify digest-bound Android container smoke inputs
-        env:
-          ANDROID_SMOKE_INPUT_VALUE: ${{ secrets[matrix.android_smoke_secret] }}
-          ANDROID_ARTIFACT_TOKEN_VALUE: ${{ secrets.ANDROID_ARTIFACT_TOKEN }}
-        run: |
-          set +x
-          set -euo pipefail
-          "$RELEASE_TOOL" prepare-android-smoke-inputs \
-            --architecture "$ARCHITECTURE" \
-            --output-dir "$GITHUB_WORKSPACE/.validation/native/$CANDIDATE_KEY/android-smoke" \
-            --github-env "$GITHUB_ENV"
-
       - name: Run same-architecture Secure Boot QEMU core acceptance
         run: |
           set -euo pipefail
@@ -713,13 +688,11 @@ jobs:
             asset_name: Ubuntu-26.04-x86_64.core.qcow2
             location_variable: AZURE_LOCATION_X64
             size_variable: AZURE_VM_SIZE_X64
-            android_smoke_secret: ANDROID_SMOKE_X86_64_JSON
           - key: aarch64-core
             architecture: aarch64
             asset_name: Ubuntu-26.04-aarch64.core.qcow2
             location_variable: AZURE_LOCATION_ARM64
             size_variable: AZURE_VM_SIZE_ARM64
-            android_smoke_secret: ANDROID_SMOKE_AARCH64_JSON
     env:
       CANDIDATE_KEY: ${{ matrix.key }}
       ARCHITECTURE: ${{ matrix.architecture }}
@@ -804,18 +777,6 @@ jobs:
             -femit-bin="$BINDER_PROBE" \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           test -x "$BINDER_PROBE"
-
-      - name: Fetch and verify digest-bound Android container smoke inputs
-        env:
-          ANDROID_SMOKE_INPUT_VALUE: ${{ secrets[matrix.android_smoke_secret] }}
-          ANDROID_ARTIFACT_TOKEN_VALUE: ${{ secrets.ANDROID_ARTIFACT_TOKEN }}
-        run: |
-          set +x
-          set -euo pipefail
-          "$RELEASE_TOOL" prepare-android-smoke-inputs \
-            --architecture "$ARCHITECTURE" \
-            --output-dir "$GITHUB_WORKSPACE/.validation/azure/$CANDIDATE_KEY/android-smoke" \
-            --github-env "$GITHUB_ENV"
 
       - name: Log in to Azure with protected-environment OIDC
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2

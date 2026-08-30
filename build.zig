@@ -1222,13 +1222,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("scripts/ubuntu2604_release.zig"),
         .target = b.graph.host,
         .optimize = optimize,
-        .imports = &.{
-            .{ .name = "miz", .module = host_miz_mod },
-            // The Android smoke bundle arrives from outside this repository
-            // and may use any container `tarfile`'s `r:*` mode accepts; bzip2
-            // is the one the standard library cannot decode on its own.
-            .{ .name = "bzip2z", .module = host_bzip2z.module("bzip2z") },
-        },
+        .imports = &.{.{ .name = "miz", .module = host_miz_mod }},
     });
     const ubuntu2604_release_exe = b.addExecutable(.{
         .name = "ubuntu2604_release",

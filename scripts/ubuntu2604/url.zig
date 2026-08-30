@@ -1,10 +1,9 @@
 //! The slice of URL syntax the Ubuntu release contracts depend on.
 //!
-//! Two checks need it. The Ubuntu snapshot binding must be the exact immutable
-//! Canonical release URL, and the Android smoke artifact URL must be a private
-//! HTTPS URL with no embedded credentials. Both were written against Python's
-//! `urllib.parse.urlsplit`, so this reproduces its component split -- including
-//! that a bad port makes the whole URL invalid rather than silently defaulting.
+//! The Ubuntu snapshot binding and bounded HTTPS downloads both need the same
+//! component parsing. This reproduces Python's `urllib.parse.urlsplit`,
+//! including that a bad port makes the whole URL invalid rather than silently
+//! defaulting.
 
 const std = @import("std");
 
@@ -29,23 +28,6 @@ pub const Parts = struct {
         }
         if (host.len == 0 or host.len > buffer.len) return null;
         return std.ascii.lowerString(buffer[0..host.len], host);
-    }
-
-    pub fn userinfo(self: Parts) ?[]const u8 {
-        const at = std.mem.lastIndexOfScalar(u8, self.netloc, '@') orelse return null;
-        return self.netloc[0..at];
-    }
-
-    pub fn username(self: Parts) ?[]const u8 {
-        const info = self.userinfo() orelse return null;
-        const colon = std.mem.indexOfScalar(u8, info, ':') orelse return info;
-        return info[0..colon];
-    }
-
-    pub fn password(self: Parts) ?[]const u8 {
-        const info = self.userinfo() orelse return null;
-        const colon = std.mem.indexOfScalar(u8, info, ':') orelse return null;
-        return info[colon + 1 ..];
     }
 
     fn hostPort(self: Parts) []const u8 {
@@ -133,46 +115,11 @@ pub fn split(value: []const u8) Parts {
     };
 }
 
-pub const PrivateHttpsError = error{NotPrivateHttps};
-
-/// `require_private_https_url`: HTTPS, a real host, no embedded credentials,
-/// no fragment, and a port that parses if one is present.
-pub fn requirePrivateHttps(value: []const u8) PrivateHttpsError!void {
-    if (value.len == 0) return error.NotPrivateHttps;
+pub fn isHttps(value: []const u8, host_buffer: []u8) bool {
     const parts = split(value);
-    _ = parts.port() catch return error.NotPrivateHttps;
-    var host_buffer: [253]u8 = undefined;
-    if (!std.mem.eql(u8, parts.scheme, "https")) return error.NotPrivateHttps;
-    if (parts.hostname(&host_buffer) == null) return error.NotPrivateHttps;
-    if (parts.username() != null) return error.NotPrivateHttps;
-    if (parts.password() != null) return error.NotPrivateHttps;
-    if (parts.fragment.len != 0) return error.NotPrivateHttps;
-}
-
-/// Scheme, host, and port of `value`, with HTTPS's default port applied. Two
-/// URLs with the same origin may carry the same `Authorization` header across
-/// a redirect; two that differ may not.
-pub const Origin = struct {
-    scheme: []const u8,
-    host: []const u8,
-    port: u16,
-
-    pub fn eql(self: Origin, other: Origin) bool {
-        return std.mem.eql(u8, self.scheme, other.scheme) and
-            std.mem.eql(u8, self.host, other.host) and
-            self.port == other.port;
-    }
-};
-
-pub fn origin(value: []const u8, host_buffer: []u8) ?Origin {
-    const parts = split(value);
-    const host = parts.hostname(host_buffer) orelse return null;
-    const explicit = parts.port() catch return null;
-    return .{
-        .scheme = parts.scheme,
-        .host = host,
-        .port = explicit orelse 443,
-    };
+    _ = parts.port() catch return false;
+    return std.mem.eql(u8, parts.scheme, "https") and
+        parts.hostname(host_buffer) != null;
 }
 
 test "split reproduces the urlsplit component boundaries" {
@@ -192,8 +139,6 @@ test "split reproduces the urlsplit component boundaries" {
     try std.testing.expectEqualStrings("/a/b", complex.path);
     try std.testing.expectEqualStrings("x=1", complex.query);
     try std.testing.expectEqualStrings("frag", complex.fragment);
-    try std.testing.expectEqualStrings("user", complex.username().?);
-    try std.testing.expectEqualStrings("pass", complex.password().?);
     var buffer: [253]u8 = undefined;
     try std.testing.expectEqualStrings("host.example", complex.hostname(&buffer).?);
     try std.testing.expectEqual(@as(?u16, 8443), try complex.port());
@@ -208,39 +153,11 @@ test "hostname lowercases and unwraps IPv6 literals" {
     try std.testing.expectEqual(@as(?u16, 8443), try ipv6.port());
 }
 
-test "requirePrivateHttps rejects every non-private spelling" {
-    try requirePrivateHttps("https://artifacts.example.invalid/artifact.zip");
-    try requirePrivateHttps("https://artifacts.example.invalid:8443/a.zip?sig=x");
-
-    const rejected = [_][]const u8{
-        "",
-        "http://artifacts.example.invalid/artifact.zip",
-        "https:///artifact.zip",
-        "https://user@artifacts.example.invalid/artifact.zip",
-        "https://user:pass@artifacts.example.invalid/artifact.zip",
-        "https://artifacts.example.invalid/artifact.zip#fragment",
-        "https://artifacts.example.invalid:notaport/artifact.zip",
-        "https://artifacts.example.invalid:0/artifact.zip",
-        "https://artifacts.example.invalid:99999/artifact.zip",
-        "file:///etc/passwd",
-        "artifact.zip",
-    };
-    for (rejected) |value| {
-        try std.testing.expectError(
-            error.NotPrivateHttps,
-            requirePrivateHttps(value),
-        );
-    }
-}
-
-test "origin applies the HTTPS default port" {
-    var first_buffer: [253]u8 = undefined;
-    var second_buffer: [253]u8 = undefined;
-    const plain = origin("https://host.example/a", &first_buffer).?;
-    const explicit = origin("https://host.example:443/b", &second_buffer).?;
-    try std.testing.expect(plain.eql(explicit));
-
-    var third_buffer: [253]u8 = undefined;
-    const other = origin("https://other.example/a", &third_buffer).?;
-    try std.testing.expect(!plain.eql(other));
+test "isHttps requires a valid HTTPS host and port" {
+    var buffer: [253]u8 = undefined;
+    try std.testing.expect(isHttps("https://host.example/a", &buffer));
+    try std.testing.expect(isHttps("https://host.example:443/b", &buffer));
+    try std.testing.expect(!isHttps("http://host.example/a", &buffer));
+    try std.testing.expect(!isHttps("https:///a", &buffer));
+    try std.testing.expect(!isHttps("https://host.example:99999/a", &buffer));
 }

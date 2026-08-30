@@ -15,7 +15,7 @@
 //!   - supervise provisioning, foreground sshd, and an optional diagnostic
 //!     serial shell as direct children, reaping every exited child
 //!   - opt-in (`mizinit.binder=required`) signed Binder boot setup for a
-//!     core Android-container image: load binder_linux, mount binderfs, and
+//!     core Binder IPC workload: load binder_linux, mount binderfs, and
 //!     create the binder/hwbinder/vndbinder control devices, failing closed
 //!     (no service startup, no readiness announcement) if that fails
 //! Root stays mounted read-only by default (matches the dm-verity/immutable
@@ -289,8 +289,8 @@ const AzurePolicy = enum {
 
 /// Whether the signed Binder boot setup below (module load, binderfs mount,
 /// binder/hwbinder/vndbinder device creation) is required for this boot.
-/// Opt-in and disabled by default: only a core Android-container image with
-/// the matching kernel and packaged module should ever set `required`.
+/// Opt-in and disabled by default: only a core image with the matching kernel
+/// and packaged module should ever set `required`.
 const BinderPolicy = enum {
     disabled,
     required,
@@ -805,11 +805,10 @@ fn loadBootModules(mode: BootMode) void {
 }
 
 // ============================== Binder boot setup ==============================
-// Opt-in via `mizinit.binder=required` (default: disabled). A core
-// Android-container image with the matching signed kernel module sets this
-// so an in-guest Binder workload has a working IPC transport before any
-// service starts: load binder_linux, mount binderfs, and create the
-// binder/hwbinder/vndbinder control devices.
+// Opt-in via `mizinit.binder=required` (default: disabled). A core image with
+// the matching signed kernel module sets this so an in-guest Binder workload
+// has a working IPC transport before any service starts: load binder_linux,
+// mount binderfs, and create the binder/hwbinder/vndbinder control devices.
 //
 // This is deliberately not built on loadModuleAt() above: that path only
 // ever handles a raw, uncompressed-after-decompress `.ko.xz` and a plain
@@ -820,7 +819,7 @@ fn loadBootModules(mode: BootMode) void {
 // file (CONFIG_MODULE_DECOMPRESS) before running its normal
 // signature-verified load path, so mizinit never touches -- and so never
 // risks corrupting -- the signed bytes.
-const android_binder_module_name = "binder_linux";
+const binder_module_name = "binder_linux";
 const binderfs_mount_point = "/dev/binderfs";
 const binder_control_path = binderfs_mount_point ++ "/binder-control";
 
@@ -874,8 +873,8 @@ const BinderModuleCandidate = struct {
 /// binder_linux that way instead.
 fn binderModuleCandidates() [2]BinderModuleCandidate {
     return .{
-        .{ .rel_path = "kernel/drivers/android/" ++ android_binder_module_name ++ ".ko.zst", .flags = MODULE_INIT_COMPRESSED_FILE },
-        .{ .rel_path = "kernel/drivers/android/" ++ android_binder_module_name ++ ".ko", .flags = 0 },
+        .{ .rel_path = "kernel/drivers/android/" ++ binder_module_name ++ ".ko.zst", .flags = MODULE_INIT_COMPRESSED_FILE },
+        .{ .rel_path = "kernel/drivers/android/" ++ binder_module_name ++ ".ko", .flags = 0 },
     };
 }
 
@@ -922,7 +921,7 @@ fn servicesAllowedAfterBinderSetup(base_allowed: bool, outcome: BinderSetupOutco
 }
 
 fn binderModuleAlreadyLoaded() bool {
-    return linux.errno(linux.access("/sys/module/" ++ android_binder_module_name, linux.F_OK)) == .SUCCESS;
+    return linux.errno(linux.access("/sys/module/" ++ binder_module_name, linux.F_OK)) == .SUCCESS;
 }
 
 fn finitModuleAt(release: []const u8, rel_path: []const u8, flags: u32) linux.E {

@@ -113,14 +113,11 @@ pub const full_azure_contracts = [_][]const u8{
 
 pub const core_azure_contracts = [_][]const u8{
     "agent-ready",
-    "android-container-abi-matched",
-    "android-container-boot-completed",
-    "android-container-graceful-stop",
-    "android-smoke-provenance-bound",
     "azagent-provisioning",
     "binder-devices-usable",
     "binder-module-signed",
     "binderfs-mounted",
+    "dma-heap-device",
     "identity-persistence",
     "kernel-lockdown",
     "key-only-ssh",
@@ -168,15 +165,12 @@ pub const full_native_contracts = [_][]const u8{
 };
 
 pub const core_native_contracts = [_][]const u8{
-    "android-container-abi-match",
-    "android-container-boot-completed",
-    "android-smoke-artifact-provenance",
-    "android-smoke-graceful-stop",
     "azagent-provisioning",
     "binder-boot-required",
     "binder-device-usability",
     "binderfs-dynamic-devices",
     "clean-service-health",
+    "dma-heap-device",
     "generalized-identity",
     "gpt-layout",
     "kernel-lockdown",
@@ -235,8 +229,8 @@ pub const candidate_fields = [_][]const u8{
     "workflow",
 };
 
-/// The full-flavor native result binds the complete candidate identity, the
-/// accepted workflow attempt, and the exact signed bytes and contract set.
+/// Native results bind the complete candidate identity, accepted workflow
+/// attempt, and exact signed bytes and flavor-specific contract set.
 pub const native_result_fields = [_][]const u8{
     "architecture",
     "asset_name",
@@ -255,20 +249,11 @@ pub const native_result_fields = [_][]const u8{
     "workflow",
 };
 
-/// Core native acceptance carries the same public identity plus the
-/// architecture-specific Android smoke provenance.
-pub const core_native_result_fields = [_][]const u8{
-    "android_smoke",
-} ++ native_result_fields;
-
-pub fn nativeResultFields(flavor: Flavor) []const []const u8 {
-    return switch (flavor) {
-        .full => &native_result_fields,
-        .core => &core_native_result_fields,
-    };
+pub fn nativeResultFields(_: Flavor) []const []const u8 {
+    return &native_result_fields;
 }
 
-/// `AZURE_RESULT_FIELDS`: the exact top-level key set of a full-flavor Azure
+/// `AZURE_RESULT_FIELDS`: the exact top-level key set of every Azure
 /// acceptance result.
 pub const azure_result_fields = [_][]const u8{
     "architecture",
@@ -294,19 +279,8 @@ pub const azure_result_fields = [_][]const u8{
     "workflow",
 };
 
-/// The core flavor's Azure result additionally binds `android_smoke`
-/// provenance. Requiring the field exactly for core -- and never for full --
-/// keeps a result recorded before this contract existed from ever satisfying
-/// the current core Azure contract set.
-pub const core_azure_result_fields = [_][]const u8{
-    "android_smoke",
-} ++ azure_result_fields;
-
-pub fn azureResultFields(flavor: Flavor) []const []const u8 {
-    return switch (flavor) {
-        .full => &azure_result_fields,
-        .core => &core_azure_result_fields,
-    };
+pub fn azureResultFields(_: Flavor) []const []const u8 {
+    return &azure_result_fields;
 }
 
 /// `PRIVATE_KEY_PEM_MARKERS`.
@@ -361,9 +335,7 @@ test "contract and field sets are stored sorted and duplicate-free" {
         &core_native_contracts,
         &candidate_fields,
         &native_result_fields,
-        &core_native_result_fields,
         &azure_result_fields,
-        &core_azure_result_fields,
     };
     for (sets) |set| {
         var index: usize = 1;
@@ -371,12 +343,4 @@ test "contract and field sets are stored sorted and duplicate-free" {
             try std.testing.expect(std.mem.lessThan(u8, set[index - 1], set[index]));
         }
     }
-    try std.testing.expectEqual(
-        azure_result_fields.len + 1,
-        core_azure_result_fields.len,
-    );
-    try std.testing.expectEqual(
-        native_result_fields.len + 1,
-        core_native_result_fields.len,
-    );
 }

@@ -24,8 +24,6 @@ pub const commands = @import("ubuntu2604/commands.zig");
 pub const contracts = @import("ubuntu2604/contracts.zig");
 pub const documents = @import("ubuntu2604/documents.zig");
 pub const execution = @import("ubuntu2604/execution.zig");
-pub const android = @import("ubuntu2604/android.zig");
-pub const archive = @import("ubuntu2604/archive.zig");
 pub const keys = @import("ubuntu2604/keys.zig");
 pub const provenance = @import("ubuntu2604/provenance.zig");
 pub const support = @import("ubuntu2604/support.zig");
@@ -43,8 +41,6 @@ const usage_text =
     \\Validate and bind Ubuntu 26.04 release artifacts across workflow jobs.
     \\
     \\commands:
-    \\  prepare-android-smoke-inputs  fetch and verify the external Android
-    \\                                container smoke inputs
     \\  candidate                     bind a built QCOW2 to its provenance tree
     \\  verify-candidate              re-verify a candidate against its asset
     \\  verify-native-result          verify same-architecture QEMU acceptance
@@ -70,8 +66,6 @@ const usage_text =
     \\  azure-gallery-verify          check the final gallery image-version
     \\  azure-vm-security             check Trusted Launch, Secure Boot, and vTPM
     \\  azure-uefi-db                 check the signer is enrolled in UEFI db
-    \\  android-bundle-config         check the Android bundle config mounts
-    \\  android-container-status      print a container status read from stdin
     \\  cloud-init-status             print the cloud-init status read from stdin
     \\  publish-expected              print the expected published asset table
     \\  github-tag-object             print the tag ref object identity
@@ -115,7 +109,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var context: Context = .{ .allocator = allocator, .io = io, .out = out };
-    dispatch(&context, argv[1], argv[2..], init) catch |err| switch (err) {
+    dispatch(&context, argv[1], argv[2..]) catch |err| switch (err) {
         error.Usage => {
             try err_out.writeAll(usage_text);
             try err_out.flush();
@@ -135,46 +129,10 @@ fn dispatch(
     context: *Context,
     command: []const u8,
     argv: []const []const u8,
-    init: std.process.Init,
 ) !void {
     const allocator = context.allocator;
     const io = context.io;
     const diagnostic = &context.diagnostic;
-
-    if (std.mem.eql(u8, command, "prepare-android-smoke-inputs")) {
-        var options = try cli.parse(allocator, argv, &.{
-            "--architecture",
-            "--output-dir",
-            "--github-env",
-        });
-        defer options.deinit();
-        const architecture = try options.require("--architecture");
-        if (contracts.parseArchitecture(architecture) == null) return error.Usage;
-        // The secret and the bearer token are read here and nowhere else, and
-        // they never leave this call.
-        const secret = std.process.Environ.getAlloc(
-            init.minimal.environ,
-            allocator,
-            android.input_env,
-        ) catch null;
-        defer if (secret) |value| allocator.free(value);
-        const token_value = std.process.Environ.getAlloc(
-            init.minimal.environ,
-            allocator,
-            android.token_env,
-        ) catch null;
-        defer if (token_value) |value| allocator.free(value);
-        return android.prepare(allocator, io, .{
-            .architecture = architecture,
-            .output_dir = try options.require("--output-dir"),
-            .github_env = try options.require("--github-env"),
-            .secret = secret,
-            .token = if (token_value) |value|
-                (if (value.len == 0) null else value)
-            else
-                null,
-        }, diagnostic);
-    }
 
     if (std.mem.eql(u8, command, "candidate")) {
         var options = try cli.parse(allocator, argv, &.{
@@ -321,10 +279,6 @@ fn dispatch(
             "--image-version-id",
             "--uefi-request",
             "--uefi-response",
-            "--android-smoke-provenance-sha256",
-            "--android-smoke-runtime-sha256",
-            "--android-smoke-bundle-sha256",
-            "--android-smoke-config-sha256",
             "--contracts",
             "--run-id",
             "--run-attempt",
@@ -345,18 +299,6 @@ fn dispatch(
             .image_version_id = try options.require("--image-version-id"),
             .uefi_request = try options.require("--uefi-request"),
             .uefi_response = try options.require("--uefi-response"),
-            .android_smoke_provenance_sha256 = options.get(
-                "--android-smoke-provenance-sha256",
-            ),
-            .android_smoke_runtime_sha256 = options.get(
-                "--android-smoke-runtime-sha256",
-            ),
-            .android_smoke_bundle_sha256 = options.get(
-                "--android-smoke-bundle-sha256",
-            ),
-            .android_smoke_config_sha256 = options.get(
-                "--android-smoke-config-sha256",
-            ),
             .contracts = try options.require("--contracts"),
             .run_id = try options.require("--run-id"),
             .run_attempt = try options.require("--run-attempt"),
@@ -435,8 +377,6 @@ fn writeJoined(out: *std.Io.Writer, items: []const std.json.Value) !void {
 }
 
 test {
-    _ = @import("ubuntu2604/android.zig");
-    _ = @import("ubuntu2604/archive.zig");
     _ = @import("ubuntu2604/cli.zig");
     _ = @import("ubuntu2604/commands.zig");
     _ = @import("ubuntu2604/contracts.zig");
