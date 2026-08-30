@@ -360,9 +360,9 @@ test "native and Azure cleanup is unconditional for every matrix leg" {
 test "the release identifier uses one calendar date everywhere" {
     var workflow = try open();
     defer workflow.deinit();
-    try workflow.expectContains("group: ubuntu2604-release-20260828");
-    try workflow.expectContains("RELEASE_TAG: Ubuntu-26.04-20260828");
-    try workflow.expectContains("RELEASE_TITLE: Ubuntu 26.04 full and core - 20260828");
+    try workflow.expectContains("group: ubuntu2604-release-20260829");
+    try workflow.expectContains("RELEASE_TAG: Ubuntu-26.04-20260829");
+    try workflow.expectContains("RELEASE_TITLE: Ubuntu 26.04 full and core - 20260829");
     try workflow.expectContains("create or retarget RELEASE_TAG");
 }
 

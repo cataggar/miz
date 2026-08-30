@@ -17,7 +17,7 @@ The protected release contract is now defined to publish an exact four-asset
 matrix: full and core for both architectures. The existing
 [`Ubuntu-26.04-20260822`](https://github.com/cataggar/miz/releases/tag/Ubuntu-26.04-20260822)
 release remains immutable and full-only. The four-asset workflow uses the new
-tag `Ubuntu-26.04-20260828`; that tag and release do not become final until all
+tag `Ubuntu-26.04-20260829`; that tag and release do not become final until all
 four candidates pass digest-bound same-architecture QEMU acceptance
 (x86_64 KVM and AArch64 TCG), Azure Trusted Launch acceptance, and publication
 redownload verification.
@@ -930,11 +930,11 @@ bypass a publication gate.
 `.github/workflows/ubuntu2604-release.yml` is manually dispatched from `main`
 and publishes exactly full/core × x86_64/AArch64. Before dispatch:
 
-1. Create or retarget the required tag `Ubuntu-26.04-20260828` to the exact
+1. Create or retarget the required tag `Ubuntu-26.04-20260829` to the exact
    current `main` commit. Lightweight and annotated tags are accepted; force
    push the tag when it already exists, then verify the remote resolves to the
    current `main` commit before dispatch. Mutation is permitted only while the
-   release is being iterated on 2026-08-28; after final publication the tag,
+   release is being iterated on 2026-08-29; after final publication the tag,
    assets, URLs, and digests are immutable.
 2. Confirm the exact GitHub-hosted `ubuntu-24.04-arm` label is available.
    Publication cannot proceed without both `aarch64-full` and `aarch64-core`
@@ -999,7 +999,7 @@ VHDs, credentials, and only ownership-tagged Azure resources.
 
 The full aliases from immutable release `Ubuntu-26.04-20260822` remain pinned
 exactly as documented above and are not mutated in place. After the
-`Ubuntu-26.04-20260828` workflow completes successfully, a separate catalog
+`Ubuntu-26.04-20260829` workflow completes successfully, a separate catalog
 handoff must rotate the full entries and add both core entries using the real
 final asset URLs, SHA-256 digests, and signing-certificate fingerprint.
 
