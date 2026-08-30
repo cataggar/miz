@@ -253,11 +253,13 @@ separate instances must not inherit them from the candidate.
 
 ### Signed Binder boot
 
-Core's kernel is checked against four `/boot/config-<release>` lines:
+Core's kernel is checked against six `/boot/config-<release>` lines:
 `CONFIG_ANDROID_BINDER_IPC=m` and `CONFIG_ANDROID_BINDERFS=m` so Binder ships
 as the loadable, signed `binder_linux` module rather than builtin or absent;
 `CONFIG_ANDROID_BINDER_DEVICES=""` so the kernel creates no binder device on
-its own, leaving device creation entirely to mizinit through binderfs; and
+its own, leaving device creation entirely to mizinit through binderfs;
+`CONFIG_DMABUF_HEAPS=y` and `CONFIG_DMABUF_HEAPS_SYSTEM=y` so the system
+DMA heap is present at `/dev/dma_heap/system`; and
 `CONFIG_MODULE_DECOMPRESS=y`, which is what lets the kernel decompress and
 verify the packaged, signed `.ko.zst` on mizinit's behalf.
 
@@ -800,9 +802,9 @@ leg.
 The KVM profile retains its existing 180-minute job ceiling and per-operation
 wait limits.
 Only the TCG rows receive a bounded 360-minute job ceiling and larger QMP,
-boot/reboot/shutdown, SSH-command, Android boot/stop, and tampered-UKI waits.
-Every bound still terminates with failure and serial, QMP, SSH, swtpm, or
-Android diagnostics rather than changing accelerator or treating an unknown
+boot/reboot/shutdown, SSH-command, and tampered-UKI waits. Every bound still
+terminates with failure and serial, QMP, SSH, or swtpm diagnostics rather
+than changing accelerator or treating an unknown
 state as success.
 
 The two initial identities are still provisioned from independent overlays,
@@ -820,13 +822,13 @@ canonical validator requires `/usr/bin/qemu-system-x86_64`, x86_64, `q35`,
 `host`, and `kvm` for x86_64; and `/usr/bin/qemu-system-aarch64`, AArch64,
 `virt`, `max`, and `tcg` for Arm. Missing, stale, malformed, swapped,
 `auto`, or unknown execution identities cannot satisfy either validation
-gate. This binding is full-result schema 3 and core-result schema 7.
+gate. This binding is full-result schema 3 and core-result schema 8.
 
 Both profiles enroll the exact candidate leaf in UEFI `db` and assert the
 standalone GPT image, Secure Boot, signed UKI, vTPM, lockdown, signed modules,
 rejection of a tampered UKI, key-only SSH, provisioning, root growth,
 generalized and persistent unique identity, service/SSH supervision,
-reboot/reconnect, shutdown, and the flavor-specific Binder and Android
+reboot/reconnect, shutdown, and the flavor-specific Binder and DMA-heap
 contracts.
 
 Per-instance Secure Boot variable stores are created natively by
@@ -878,43 +880,17 @@ proves real device usability by transferring a small static probe binary
 SSH, verifying its checksum, and using it to query the fixed devices and
 allocate and query a new dynamic Binder device through `binder-control`.
 
-### Android container boot-completion smoke
+### Self-contained Binder and DMA-heap acceptance
 
-Core acceptance -- both same-architecture QEMU (x86_64 KVM or AArch64 TCG)
-and Azure -- additionally runs a minimal
-Android container boot-completion smoke, in both cases on top of the Binder
-workload contracts above. The core image never embeds an Android OCI runtime
-or bundle: both are required, digest-bound external inputs supplied only at
-acceptance time, transferred over SSH, and verified by checksum before use.
-Missing or malformed inputs fail the acceptance run closed; there is no
-success-shaped fallback that skips the contract.
-
-Acceptance pushes the externally supplied runtime binary and bundle archive
-to the guest, extracts the bundle, verifies the extracted `config.json`
-against its own pinned digest, and confirms the bundle requests both a
-BinderFS and a DMA-heap mount before launching anything. The container is
-then launched detached, and acceptance polls `/system/bin/getprop
-sys.boot_completed` on a bounded interval until it reports `1` or a bounded
-timeout elapses; on either outcome it captures size-limited container-state
-and `dmesg` diagnostics rather than an unbounded log. Once booted,
-`ro.product.cpu.abilist` is checked against the ABI required for the
-candidate's own architecture (`x86_64` or `arm64-v8a`), so a container built
-for the wrong architecture fails the contract instead of merely appearing to
-boot. Acceptance then stops the container gracefully -- signal, then a
-bounded poll for a `stopped` state -- and only then deletes it; it never
-force-removes a container that has not confirmed it stopped.
-
-The SHA-256 of the complete external provenance manifest plus the runtime,
-bundle, and config digests are bound into the acceptance result the same way
-every other core-only input is. Producer-private identity fields remain
-inside that manifest: they are never copied to results, summaries, logs, or
-uploaded validation artifacts. A QEMU or Azure result missing the
-public-safe digest evidence fails validation, and the core result schemas
-were bumped so an older result cannot satisfy the current contract. Native
-and Azure acceptance run this smoke independently, require identical
-architecture-specific provenance evidence, and use differently worded
-contract names for the same behavior, matching the existing QEMU/Azure
-Binder contract split above.
+Core QEMU and Azure acceptance directly require the signed in-tree
+`binder_linux` module, BinderFS, usable fixed and dynamically allocated Binder
+devices, and the `/dev/dma_heap/system` character device. These checks use only
+the candidate image and public in-repository probe source. Acceptance does not
+fetch, transfer, unpack, execute, or attest any external runtime or bundle
+input, and it requires no repository secret for these core device contracts.
+The self-contained contract is QEMU core result schema 8, Azure core result
+schema 3, and core validation manifest schema 3. Exact-field validation
+rejects older documents that carry removed smoke evidence.
 
 ## Core validation workflow
 
@@ -933,56 +909,13 @@ artifacts.
 
 The final gate accepts exactly two candidates, two candidate-key-and-digest
 bound QEMU results, and two Azure results. Its validation manifest records
-non-null QEMU-result digests and the matching public-safe Android
-provenance/runtime/bundle/config digests for both `x86_64-core` and
-`aarch64-core`; missing, duplicate, cross-key, cross-architecture, or
-cross-digest evidence fails closed.
+the candidate manifest, QEMU result, and Azure result digests for both
+`x86_64-core` and `aarch64-core`; missing, duplicate, cross-key,
+cross-architecture, or cross-digest evidence fails closed.
 
 The core Azure acceptance jobs also build the Binder device usability probe
 from source for the matching guest architecture before running acceptance,
 so no prebuilt probe binary is stored or published.
-
-Both the same-architecture QEMU and Azure matrices select one of two plain
-repository secrets before acceptance: `ANDROID_SMOKE_X86_64_JSON` or
-`ANDROID_SMOKE_AARCH64_JSON`. Each secret is an exact JSON object with
-`artifact_url`, `artifact_sha256`, and `provenance_sha256`. The location must
-be HTTPS and both digests must be lowercase SHA-256. The complete archive
-digest is verified before extraction. Its ZIP member set must then be
-exactly `android-runtime`, `android-bundle.tar`, and `provenance.json`, with no
-directories, links, duplicate or additional entries, traversal names,
-encrypted entries, or non-regular file types.
-
-The extracted manifest digest is verified before the document is parsed.
-The manifest must use schema `android-smoke-provenance.v1`, type
-`application/vnd.android-smoke.v1+json`, and the exact field set enforced by
-`ubuntu2604_release prepare-android-smoke-inputs`. It must match the selected architecture and
-provide valid runtime, bundle, source manifest, and extracted `config.json`
-digests. The raw `producer_source_commit` and immutable image reference are
-validated only inside the verifier and are never copied into public
-evidence. The artifact digests verify both extracted files and the bundle
-config. `android-bundle.tar` may be a plain tar or a gzip-, bzip2-, xz-, or
-
-The verifier also retains a narrow adapter for the already pinned
-pre-migration producer contract. It accepts only the exact legacy member set
-`runz`, `redroid-bundle.tar`, and `provenance.json` together with that
-producer's exact legacy schema, type, field set, and `sha256:`-prefixed
-digests. The runtime and bundle are normalized to the current private paths
-after the archive digest matches; they become usable only after the
-provenance digest and every nested binding also match. Mixed current/legacy
-contracts and every additional, missing, or unsafe member remain rejected. `android-bundle.tar` may be a plain tar or a gzip-, bzip2-, xz-, or
-zstd-compressed one: the producer is external, the name says nothing about the
-container, and the config digest is read from whatever the archive actually
-holds rather than from bytes assumed to be tar.
-
-These secrets are deliberately not scoped to the `ubuntu2604-release`
-environment, so the same-architecture QEMU job -- which needs no Azure
-credential -- can read them without gaining a protected-environment grant. An
-optional `ANDROID_ARTIFACT_TOKEN` is used only while downloading. Secret JSON,
-URLs, and producer-private manifest contents are never written to `GITHUB_ENV`,
-printed, or uploaded; only verified local paths and public-safe SHA-256
-evidence leave the download step. Missing, malformed, cross-architecture, or
-digest-mismatched input fails before any Azure resource is created or guest
-command runs rather than skipping the smoke.
 
 Candidates, QEMU results, Azure results, and a final digest-bound
 two-architecture validation manifest are uploaded only as workflow artifacts.
@@ -1048,12 +981,10 @@ result binds the key, architecture, flavor, asset name, source commit, virtual
 size, candidate/certificate/UKI digests, explicit success, complete
 flavor-specific contract set, exact
 accelerator/emulator/guest/runner/machine/CPU identity, and exact workflow
-attempt. Core QEMU and Azure results must additionally carry identical
-public-safe Android provenance/runtime/bundle/config digests. Missing, extra,
-duplicate, stale,
-malformed, cross-key, cross-architecture, cross-digest, wrong-signer,
-wrong-UKI, wrong-source/run, unsuccessful, or core-provenance-disagreeing
-evidence fails before publication.
+attempt. Missing, extra, duplicate, stale, malformed, cross-key,
+cross-architecture, cross-digest, wrong-signer, wrong-UKI, wrong-source/run,
+or unsuccessful evidence fails before publication. Core result schemas are
+versioned independently so documents carrying removed fields fail closed.
 
 The release stages exactly four standalone zstd QCOW2 files with no backing
 images. Publication creates or resets the release as a draft, uploads with

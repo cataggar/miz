@@ -328,26 +328,22 @@ const core_debz_packages = [_][]const u8{
     "ca-certificates",
 };
 
-// The official in-tree module name Ubuntu packages Android Binder support
-// as. `linux-azure` pulls it in transitively through
+// The official in-tree Binder module name Ubuntu packages. `linux-azure`
+// pulls it in transitively through
 // `linux-modules-extra-*-azure`, so no additional debz package root is
 // needed -- only validating that the module, its kernel config, and its
 // signature are what core actually ships.
-const android_binder_module_name = "binder_linux";
+const binder_module_name = "binder_linux";
 
-// The `linux-azure` kernel config lines core's signed Binder support depends
-// on. `CONFIG_ANDROID_BINDER_IPC`/`CONFIG_ANDROID_BINDERFS` must be built as
-// modules (not builtin, not absent) so `binder_linux` ships as the loadable,
-// signed module mizinit loads; `CONFIG_ANDROID_BINDER_DEVICES=""` keeps the
-// kernel from creating any binder device itself, since device creation is
-// mizinit's job through binderfs, not a kernel command-line default; and
-// `CONFIG_MODULE_DECOMPRESS=y` is what lets mizinit ask the kernel to
-// decompress and verify the packaged `.ko.zst` through `finit_module()`
-// without ever touching the signed bytes itself.
+// The `linux-azure` kernel config lines core's Binder and DMA-heap support
+// depends on. Binder must ship as the signed loadable module mizinit loads,
+// while the system DMA heap is built in and exposes `/dev/dma_heap/system`.
 const core_required_kernel_config = [_][]const u8{
     "CONFIG_ANDROID_BINDER_IPC=m",
     "CONFIG_ANDROID_BINDERFS=m",
     "CONFIG_ANDROID_BINDER_DEVICES=\"\"",
+    "CONFIG_DMABUF_HEAPS=y",
+    "CONFIG_DMABUF_HEAPS_SYSTEM=y",
     "CONFIG_MODULE_DECOMPRESS=y",
 };
 
@@ -490,12 +486,12 @@ const core_azagent_config =
     "DataDisk.Mount=y\n";
 
 // Requests `binder_linux` explicitly rather than relying on `MODULES=most`'s
-// heuristics: an Android-container Binder workload needs it in the initramfs
-// module set `update-initramfs` builds, and this is checked below by both
+// heuristics: the required Binder workload needs it in the initramfs module
+// set `update-initramfs` builds, and this is checked below by both
 // `validateCoreKernelModules` (against the tree's `modules.dep`) and
 // `requireInitramfsModules` (against the generated initramfs itself, once it
 // exists).
-const core_initramfs_modules = android_binder_module_name ++ "\n";
+const core_initramfs_modules = binder_module_name ++ "\n";
 
 // An Azure VM's root is virtio or SCSI and its NIC is netvsc, so a
 // dependency-pruned initramfs built in that context carries neither the NVMe
@@ -2222,7 +2218,7 @@ fn validateCoreKernelModules(
     // Binder is an Azure-kernel-only capability: bare metal boots the NVIDIA
     // BaseOS kernel and never claims Binder support, so this stays scoped to
     // `.core` rather than joining the shared list above.
-    if (flavor == .core and std.mem.indexOf(u8, modules_dep, android_binder_module_name ++ ".ko") == null)
+    if (flavor == .core and std.mem.indexOf(u8, modules_dep, binder_module_name ++ ".ko") == null)
         return error.CoreKernelModuleMissing;
 }
 
@@ -2242,7 +2238,7 @@ fn hasModuleSignatureMarker(bytes: []const u8) bool {
 /// used both to fail the build if it is missing, out-of-tree-shadowed, or
 /// unsigned, and to extend the boot-input evidence document with something
 /// checkable about it.
-const AndroidBinderModuleEvidence = struct {
+const BinderModuleEvidence = struct {
     path: []u8,
     sha256: [64]u8,
     signed: bool,
@@ -2255,11 +2251,11 @@ const AndroidBinderModuleEvidence = struct {
 /// does not decompress `.ko.zst` bytes for anything other than this
 /// structural check: the packaged bytes are exactly what get evidenced here
 /// and what mizinit's `finit_module()` hands the kernel unmodified at boot.
-fn validateAndroidBinderModule(
+fn validateBinderModule(
     allocator: Allocator,
     root: *offline_root.Root,
     release_name: []const u8,
-) !AndroidBinderModuleEvidence {
+) !BinderModuleEvidence {
     const modules_path = try kernelModulesPath(allocator, root, release_name);
     defer allocator.free(modules_path);
 
@@ -2272,14 +2268,14 @@ fn validateAndroidBinderModule(
     defer root.freeFound(shadow);
     if (shadow.len != 0) return error.ShadowBinderModulePresent;
 
-    const android_dir = try std.fmt.allocPrint(allocator, "{s}/kernel/drivers/android", .{modules_path});
-    defer allocator.free(android_dir);
-    const found = root.discover(android_dir, android_binder_module_name ++ ".ko*") catch |err| switch (err) {
-        error.FileNotFound, error.NotDirectory => return error.AndroidBinderModuleMissing,
+    const binder_driver_dir = try std.fmt.allocPrint(allocator, "{s}/kernel/drivers/android", .{modules_path});
+    defer allocator.free(binder_driver_dir);
+    const found = root.discover(binder_driver_dir, binder_module_name ++ ".ko*") catch |err| switch (err) {
+        error.FileNotFound, error.NotDirectory => return error.BinderModuleMissing,
         else => return err,
     };
     defer root.freeFound(found);
-    if (found.len != 1) return error.AndroidBinderModuleMissing;
+    if (found.len != 1) return error.BinderModuleMissing;
 
     const module_path = try allocator.dupe(u8, found[0].path);
     errdefer allocator.free(module_path);
@@ -2288,11 +2284,11 @@ fn validateAndroidBinderModule(
     const sha256 = artifact_pipeline.formatSha256(artifact_pipeline.sha256Bytes(packaged));
 
     const signed = if (std.mem.endsWith(u8, module_path, ".zst")) signed: {
-        const decoded = miz.zstd.decodeAlloc(allocator, packaged) catch return error.AndroidBinderModuleUnreadable;
+        const decoded = miz.zstd.decodeAlloc(allocator, packaged) catch return error.BinderModuleUnreadable;
         defer allocator.free(decoded.bytes);
         break :signed hasModuleSignatureMarker(decoded.bytes);
     } else hasModuleSignatureMarker(packaged);
-    if (!signed) return error.AndroidBinderModuleUnsigned;
+    if (!signed) return error.BinderModuleUnsigned;
 
     return .{ .path = module_path, .sha256 = sha256, .signed = signed };
 }
@@ -2509,11 +2505,11 @@ fn customizeOfflineRoot(
     try validateKernelModuleArtifacts(allocator, &root, release_name);
     if (flavor.freshRoot()) try validateCoreKernelModules(allocator, &root, release_name, flavor);
 
-    var binder_evidence: ?AndroidBinderModuleEvidence = null;
+    var binder_evidence: ?BinderModuleEvidence = null;
     defer if (binder_evidence) |*evidence| allocator.free(evidence.path);
     if (flavor == .core) {
         try validateCoreKernelConfig(allocator, &root, release_name);
-        binder_evidence = try validateAndroidBinderModule(allocator, &root, release_name);
+        binder_evidence = try validateBinderModule(allocator, &root, release_name);
     }
 
     var initramfs = try runOfflineCommand(&executor, .{ .update_initramfs = release_name });
@@ -3759,10 +3755,10 @@ fn extractNativeBootInputs(
 /// identical from outside and are diagnosable only at the BMC console.
 const baremetal_required_initramfs_modules = [_][]const u8{ "nvme", "r8152" };
 
-/// The Android-container Binder driver core's boot depends on. Bare metal
-/// has no such requirement -- it boots no Binder workload at all -- so this
-/// stays a `.core`-only list rather than joining the one above.
-const core_required_initramfs_modules = [_][]const u8{android_binder_module_name};
+/// The Binder driver core's boot depends on. Bare metal has no such
+/// requirement -- it boots no Binder workload at all -- so this stays a
+/// `.core`-only list rather than joining the one above.
+const core_required_initramfs_modules = [_][]const u8{binder_module_name};
 
 /// The gzip header mkinitramfs falls back to, as it appears on disk.
 const initramfs_gzip_magic: u16 = 0x8b1f;
@@ -6733,7 +6729,7 @@ test "the initramfs is validated as a generated artifact, not an unpacked one" {
     try validateNativeBootArtifacts(allocator, &root, kernel_release);
 }
 
-test "core kernel config validation requires every Binder-enabling line" {
+test "core kernel config validation requires Binder and DMA-heap support" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const cwd = try std.process.currentPathAlloc(io, allocator);
@@ -6756,6 +6752,8 @@ test "core kernel config validation requires every Binder-enabling line" {
         \\CONFIG_ANDROID_BINDER_IPC=m
         \\CONFIG_ANDROID_BINDERFS=m
         \\CONFIG_ANDROID_BINDER_DEVICES=""
+        \\CONFIG_DMABUF_HEAPS=y
+        \\CONFIG_DMABUF_HEAPS_SYSTEM=y
         \\CONFIG_MODULE_DECOMPRESS=y
         \\
         },
@@ -6770,6 +6768,8 @@ test "core kernel config validation requires every Binder-enabling line" {
         \\CONFIG_ANDROID_BINDER_IPC=y
         \\CONFIG_ANDROID_BINDERFS=m
         \\CONFIG_ANDROID_BINDER_DEVICES=""
+        \\CONFIG_DMABUF_HEAPS=y
+        \\CONFIG_DMABUF_HEAPS_SYSTEM=y
         \\CONFIG_MODULE_DECOMPRESS=y
         \\
         },
@@ -6787,6 +6787,26 @@ test "core kernel config validation requires every Binder-enabling line" {
         \\CONFIG_ANDROID_BINDER_IPC=m
         \\CONFIG_ANDROID_BINDERFS=m
         \\CONFIG_ANDROID_BINDER_DEVICES="binder,hwbinder,vndbinder"
+        \\CONFIG_DMABUF_HEAPS=y
+        \\CONFIG_DMABUF_HEAPS_SYSTEM=y
+        \\CONFIG_MODULE_DECOMPRESS=y
+        \\
+        },
+    });
+    try std.testing.expectError(
+        error.CoreKernelConfigMissing,
+        validateCoreKernelConfig(allocator, &root, kernel_release),
+    );
+
+    // The system DMA heap is a core runtime requirement independent of any
+    // userspace workload.
+    try root.writeFile(.{
+        .path = "/boot/config-" ++ kernel_release,
+        .source = .{ .inline_bytes =
+        \\CONFIG_ANDROID_BINDER_IPC=m
+        \\CONFIG_ANDROID_BINDERFS=m
+        \\CONFIG_ANDROID_BINDER_DEVICES=""
+        \\CONFIG_DMABUF_HEAPS=y
         \\CONFIG_MODULE_DECOMPRESS=y
         \\
         },
@@ -6797,12 +6817,12 @@ test "core kernel config validation requires every Binder-enabling line" {
     );
 }
 
-test "the packaged Android Binder module must be present signed and never DKMS-shadowed" {
+test "the packaged Binder module must be present signed and never DKMS-shadowed" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const cwd = try std.process.currentPathAlloc(io, allocator);
     defer allocator.free(cwd);
-    const root_path = try std.fs.path.join(allocator, &.{ cwd, ".scratch/ubuntu-android-binder-module" });
+    const root_path = try std.fs.path.join(allocator, &.{ cwd, ".scratch/ubuntu-binder-module" });
     defer allocator.free(root_path);
     Io.Dir.cwd().deleteTree(io, root_path) catch {};
     defer Io.Dir.cwd().deleteTree(io, root_path) catch {};
@@ -6810,29 +6830,29 @@ test "the packaged Android Binder module must be present signed and never DKMS-s
     var root = try offline_root.Root.init(allocator, io, root_path, .{});
     defer root.deinit();
     const kernel_release = "7.0.0-1001-azure";
-    const android_dir = "/usr/lib/modules/" ++ kernel_release ++ "/kernel/drivers/android";
-    try root.createDirectory(android_dir, 0o755);
+    const binder_driver_dir = "/usr/lib/modules/" ++ kernel_release ++ "/kernel/drivers/android";
+    try root.createDirectory(binder_driver_dir, 0o755);
     const signed_bytes = "binder-module-bytes" ++ module_signature_marker;
     const unsigned_bytes = "binder-module-bytes-without-a-trailer";
 
     // Nothing packaged yet: the offline root has no such module.
     try std.testing.expectError(
-        error.AndroidBinderModuleMissing,
-        validateAndroidBinderModule(allocator, &root, kernel_release),
+        error.BinderModuleMissing,
+        validateBinderModule(allocator, &root, kernel_release),
     );
 
     // The plain, uncompressed shape: signed and accepted.
     try root.writeFile(.{
-        .path = android_dir ++ "/binder_linux.ko",
+        .path = binder_driver_dir ++ "/binder_linux.ko",
         .source = .{ .inline_bytes = signed_bytes },
     });
     {
-        const evidence = try validateAndroidBinderModule(allocator, &root, kernel_release);
+        const evidence = try validateBinderModule(allocator, &root, kernel_release);
         defer allocator.free(evidence.path);
-        try std.testing.expectEqualStrings(android_dir ++ "/binder_linux.ko", evidence.path);
+        try std.testing.expectEqualStrings(binder_driver_dir ++ "/binder_linux.ko", evidence.path);
         try std.testing.expect(evidence.signed);
     }
-    try root.remove(android_dir ++ "/binder_linux.ko", false);
+    try root.remove(binder_driver_dir ++ "/binder_linux.ko", false);
 
     // Signed, but Ubuntu-shaped: zstd-compressed, with the marker recovered
     // only once the kernel-decompressed bytes are inspected.
@@ -6841,46 +6861,46 @@ test "the packaged Android Binder module must be present signed and never DKMS-s
         defer compressed.deinit();
         try miz.zstd.writeRawFrameForSlice(&compressed.writer, signed_bytes, null);
         try root.writeFile(.{
-            .path = android_dir ++ "/binder_linux.ko.zst",
+            .path = binder_driver_dir ++ "/binder_linux.ko.zst",
             .source = .{ .inline_bytes = compressed.written() },
         });
     }
     {
-        const evidence = try validateAndroidBinderModule(allocator, &root, kernel_release);
+        const evidence = try validateBinderModule(allocator, &root, kernel_release);
         defer allocator.free(evidence.path);
-        try std.testing.expectEqualStrings(android_dir ++ "/binder_linux.ko.zst", evidence.path);
+        try std.testing.expectEqualStrings(binder_driver_dir ++ "/binder_linux.ko.zst", evidence.path);
         try std.testing.expect(evidence.signed);
     }
 
     // Two candidates at once is exactly as unresolvable as none: which one
     // mizinit would load is not this builder's call to make silently.
     try root.writeFile(.{
-        .path = android_dir ++ "/binder_linux.ko",
+        .path = binder_driver_dir ++ "/binder_linux.ko",
         .source = .{ .inline_bytes = signed_bytes },
     });
     try std.testing.expectError(
-        error.AndroidBinderModuleMissing,
-        validateAndroidBinderModule(allocator, &root, kernel_release),
+        error.BinderModuleMissing,
+        validateBinderModule(allocator, &root, kernel_release),
     );
-    try root.remove(android_dir ++ "/binder_linux.ko", false);
-    try root.remove(android_dir ++ "/binder_linux.ko.zst", false);
+    try root.remove(binder_driver_dir ++ "/binder_linux.ko", false);
+    try root.remove(binder_driver_dir ++ "/binder_linux.ko.zst", false);
 
     // A packaged module missing the kernel's own signing trailer: structurally
     // unsigned, regardless of what the build otherwise believes about it.
     try root.writeFile(.{
-        .path = android_dir ++ "/binder_linux.ko",
+        .path = binder_driver_dir ++ "/binder_linux.ko",
         .source = .{ .inline_bytes = unsigned_bytes },
     });
     try std.testing.expectError(
-        error.AndroidBinderModuleUnsigned,
-        validateAndroidBinderModule(allocator, &root, kernel_release),
+        error.BinderModuleUnsigned,
+        validateBinderModule(allocator, &root, kernel_release),
     );
-    try root.remove(android_dir ++ "/binder_linux.ko", false);
+    try root.remove(binder_driver_dir ++ "/binder_linux.ko", false);
 
     // A DKMS-built shadow tree overriding the in-tree module: rejected even
     // when a legitimate, signed module is also present alongside it.
     try root.writeFile(.{
-        .path = android_dir ++ "/binder_linux.ko",
+        .path = binder_driver_dir ++ "/binder_linux.ko",
         .source = .{ .inline_bytes = signed_bytes },
     });
     try root.createDirectory("/usr/lib/modules/" ++ kernel_release ++ "/updates/dkms", 0o755);
@@ -6890,7 +6910,7 @@ test "the packaged Android Binder module must be present signed and never DKMS-s
     });
     try std.testing.expectError(
         error.ShadowBinderModulePresent,
-        validateAndroidBinderModule(allocator, &root, kernel_release),
+        validateBinderModule(allocator, &root, kernel_release),
     );
 }
 

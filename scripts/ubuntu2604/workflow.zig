@@ -10,11 +10,8 @@
 //! written in shell because the shell was where the document happened to be.
 //!
 //! Two rules hold throughout. A query that fails is never turned into a
-//! success-shaped default: an unreadable or malformed document is a failure,
-//! and the one place that deliberately yields an empty string
-//! (`android-container-status`) is the place whose caller treats "not
-//! confirmed stopped" as "keep waiting". And every check re-reads the file it
-//! judges rather than trusting a value passed alongside it.
+//! success-shaped default, and every check re-reads the file it judges rather
+//! than trusting a value passed alongside it.
 
 const std = @import("std");
 
@@ -492,56 +489,10 @@ pub fn dispatch(
             diagnostic,
         );
     }
-    if (std.mem.eql(u8, command, "android-bundle-config")) {
-        var options = try parse(allocator, argv, &.{"--config"});
-        defer options.deinit();
-        var document = try support.readObject(
-            allocator,
-            io,
-            try options.require("--config"),
-            diagnostic,
-        );
-        defer document.deinit();
-        const mounts = support.arrayOf(document.get("mounts")) orelse return fail(
-            diagnostic,
-            "Android bundle config has no mounts array",
-            .{},
-        );
-        var has_binderfs = false;
-        var has_dma_heap = false;
-        for (mounts) |mount| {
-            const entry = support.objectOf(mount) orelse continue;
-            const destination = support.stringOf(entry.get("destination")) orelse
-                continue;
-            if (std.mem.eql(u8, destination, "/dev/binderfs")) has_binderfs = true;
-            if (std.mem.startsWith(u8, destination, "/dev/dma_heap")) {
-                has_dma_heap = true;
-            }
-        }
-        if (!has_binderfs) return fail(
-            diagnostic,
-            "Android bundle config does not mount /dev/binderfs",
-            .{},
-        );
-        if (!has_dma_heap) return fail(
-            diagnostic,
-            "Android bundle config does not mount a DMA-heap device",
-            .{},
-        );
-        return;
-    }
-    if (std.mem.eql(u8, command, "android-container-status") or
-        std.mem.eql(u8, command, "cloud-init-status"))
-    {
+    if (std.mem.eql(u8, command, "cloud-init-status")) {
         var options = try parse(allocator, argv, &.{});
         defer options.deinit();
-        return statusFromStdin(
-            allocator,
-            io,
-            out,
-            std.mem.eql(u8, command, "cloud-init-status"),
-            diagnostic,
-        );
+        return statusFromStdin(allocator, io, out, diagnostic);
     }
     if (std.mem.eql(u8, command, "publish-expected")) {
         var options = try parse(allocator, argv, &.{
@@ -1068,16 +1019,6 @@ pub fn releaseGate(
             "Azure",
             diagnostic,
         );
-        if (candidate.flavor() == .core and !support.jsonEqual(
-            native.get("android_smoke") orelse .null,
-            azure.get("android_smoke") orelse .null,
-        )) {
-            return fail(
-                diagnostic,
-                "{s}: native and Azure Android smoke provenance differ",
-                .{key},
-            );
-        }
     }
 }
 
@@ -1434,13 +1375,6 @@ pub fn coreGate(
         );
         defer azure_document.deinit();
 
-        const native_smoke = native_result.get("android_smoke") orelse .null;
-        const azure_smoke = azure_document.get("android_smoke") orelse .null;
-        if (!support.jsonEqual(native_smoke, azure_smoke)) return fail(
-            diagnostic,
-            "{s}: native and Azure Android smoke provenance differ",
-            .{key},
-        );
         const azure_workflow = support.objectOf(azure_document.get("workflow"));
         if (azure_workflow == null or
             !support.stringIs(azure_workflow.?.get("run_id"), options.run_id) or
@@ -1487,7 +1421,6 @@ pub fn coreGate(
                 .{azure_path},
             )).hex,
         );
-        try builder.put(&record, "android_smoke", try builder.clone(native_smoke));
         try records.append(.{ .object = record });
     }
 
@@ -1503,7 +1436,7 @@ pub fn coreGate(
     try builder.putString(&validation_workflow, "run_attempt", options.run_attempt);
 
     var document = builder.object();
-    try builder.putInteger(&document, "schema", 2);
+    try builder.putInteger(&document, "schema", 3);
     try builder.putString(&document, "type", "miz-ubuntu2604-core-validation");
     try builder.putString(&document, "source_commit", options.source_commit);
     try builder.put(
@@ -2080,18 +2013,12 @@ pub fn uefiDb(
     );
 }
 
-/// Prints the `status` field of a JSON document read from standard input, and
-/// an empty line for any input that does not carry one.
-///
-/// The caller treats an empty result as "not confirmed", so a failed or
-/// malformed remote query can never be read as a terminal state. That is the
-/// whole point: this is the one command that deliberately tolerates garbage,
-/// because its caller keeps polling rather than acting on it.
+/// Prints the required `status` field of a JSON document read from standard
+/// input.
 pub fn statusFromStdin(
     allocator: Allocator,
     io: Io,
     out: *Writer,
-    strict: bool,
     diagnostic: *Diagnostic,
 ) OutError!void {
     var buffer: [64 * 1024]u8 = undefined;
@@ -2101,11 +2028,7 @@ pub fn statusFromStdin(
         .limited(support.document_max_bytes),
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            if (strict) return fail(diagnostic, "cannot read the status document", .{});
-            try out.writeAll("\n");
-            return;
-        },
+        else => return fail(diagnostic, "cannot read the status document", .{}),
     };
     defer allocator.free(bytes);
 
@@ -2116,11 +2039,7 @@ pub fn statusFromStdin(
         .{},
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => {
-            if (strict) return fail(diagnostic, "status document is malformed", .{});
-            try out.writeAll("\n");
-            return;
-        },
+        else => return fail(diagnostic, "status document is malformed", .{}),
     };
     defer parsed.deinit();
 
@@ -2129,12 +2048,12 @@ pub fn statusFromStdin(
         support.stringOf(value.get("status"))
     else
         null;
-    if (status == null and strict) return fail(
+    if (status == null) return fail(
         diagnostic,
         "status document does not carry a status",
         .{},
     );
-    try out.print("{s}\n", .{status orelse ""});
+    try out.print("{s}\n", .{status.?});
 }
 
 /// One line of the publication allowlist: name, digest, and size.

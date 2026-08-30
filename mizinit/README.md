@@ -10,9 +10,9 @@ small reference for what a from-scratch container-image init needs to do.
 - Mounts `/proc`, `/sys`, `/dev`, and `/run`. Immutable mode is the default: root stays read-only, `/var` and `/tmp` use tmpfs, and `/etc` uses a tmpfs-backed overlay. The opt-in `mizinit.mode=persistent` kernel option instead remounts root read-write, leaves `/etc`, `/var`, and `/home` persistent, and mounts only `/tmp` as tmpfs. If `/etc/machine-id` is empty after image generalization, mizinit generates and persists a new 128-bit machine ID.
 - Loads the kernel modules this appliance needs directly via a raw `init_module()` syscall (decompressing the shipped `.ko.xz` with `std.compress.xz`): `overlay` for immutable `/etc`, `hv_netvsc` for Hyper-V networking, and `crc-itu-t`/`udf`/`isofs` for Azure's provisioning DVD. There's no udev/mdev daemon to drive `request_module()` through modprobe/kmod, so mizinit loads the fixed dependency order itself.
 - The opt-in `mizinit.binder=required` kernel option (default `disabled`)
-  turns on signed Binder boot setup for an Android-container Binder
-  workload, run once the required kernel filesystems are mounted and before
-  services start. It is deliberately not the raw `.ko.xz`/`init_module()`
+  turns on signed Binder boot setup for Binder IPC workloads, run once the
+  required kernel filesystems are mounted and before services start. It is
+  deliberately not the raw `.ko.xz`/`init_module()`
   path above: the packaged module is Ubuntu's signed, zstd-compressed
   `binder_linux.ko.zst`, so mizinit calls `finit_module()` directly against
   the packaged file with `MODULE_INIT_COMPRESSED_FILE`, letting the kernel

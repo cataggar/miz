@@ -9,12 +9,6 @@
 #   variables AZURE_LOCATION_X64, AZURE_LOCATION_ARM64, AZURE_VM_SIZE_X64, and
 #   AZURE_VM_SIZE_ARM64. The acceptance app's Entra federated credential subject
 #   is `repo:cataggar/miz:environment:ubuntu2604-release`.
-# - Core QEMU and Azure acceptance read the repository secrets
-#   ANDROID_SMOKE_X86_64_JSON and ANDROID_SMOKE_AARCH64_JSON. Each exact JSON
-#   document supplies one private HTTPS archive location plus the expected
-#   archive and provenance SHA-256 values for that architecture's external
-#   Android runtime and bundle inputs. ANDROID_ARTIFACT_TOKEN is optional.
-#   Missing, malformed, or mismatched inputs fail closed.
 # Before dispatch, create or retarget RELEASE_TAG to the exact current `main`
 # commit. The workflow accepts lightweight or annotated tags and publishes
 # exactly the four full/core QCOW2 assets declared below.
@@ -460,7 +454,6 @@ jobs:
             cpu: host
             timeout_minutes: 180
             asset_name: Ubuntu-26.04-x86_64.qcow2
-            android_smoke_secret: ANDROID_SMOKE_UNUSED
           - key: aarch64-full
             architecture: aarch64
             flavor: full
@@ -474,7 +467,6 @@ jobs:
             cpu: max
             timeout_minutes: 360
             asset_name: Ubuntu-26.04-aarch64.qcow2
-            android_smoke_secret: ANDROID_SMOKE_UNUSED
           - key: x86_64-core
             architecture: x86_64
             flavor: core
@@ -488,7 +480,6 @@ jobs:
             cpu: host
             timeout_minutes: 180
             asset_name: Ubuntu-26.04-x86_64.core.qcow2
-            android_smoke_secret: ANDROID_SMOKE_X86_64_JSON
           - key: aarch64-core
             architecture: aarch64
             flavor: core
@@ -502,7 +493,6 @@ jobs:
             cpu: max
             timeout_minutes: 360
             asset_name: Ubuntu-26.04-aarch64.core.qcow2
-            android_smoke_secret: ANDROID_SMOKE_AARCH64_JSON
     env:
       CANDIDATE_KEY: ${{ matrix.key }}
       ARCHITECTURE: ${{ matrix.architecture }}
@@ -708,19 +698,6 @@ jobs:
           echo "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ID=$GITHUB_RUN_ID" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
-      - name: Fetch and verify digest-bound Android container smoke inputs
-        if: matrix.flavor == 'core'
-        env:
-          ANDROID_SMOKE_INPUT_VALUE: ${{ secrets[matrix.android_smoke_secret] }}
-          ANDROID_ARTIFACT_TOKEN_VALUE: ${{ secrets.ANDROID_ARTIFACT_TOKEN }}
-        run: |
-          set +x
-          set -euo pipefail
-          "$RELEASE_TOOL" prepare-android-smoke-inputs \
-            --architecture "$ARCHITECTURE" \
-            --output-dir "$GITHUB_WORKSPACE/.release/native/$CANDIDATE_KEY/android-smoke" \
-            --github-env "$GITHUB_ENV"
-
       - name: Run same-architecture Secure Boot QEMU acceptance
         run: |
           set -euo pipefail
@@ -804,28 +781,24 @@ jobs:
             asset_name: Ubuntu-26.04-x86_64.qcow2
             location_variable: AZURE_LOCATION_X64
             size_variable: AZURE_VM_SIZE_X64
-            android_smoke_secret: ANDROID_SMOKE_UNUSED
           - key: aarch64-full
             architecture: aarch64
             flavor: full
             asset_name: Ubuntu-26.04-aarch64.qcow2
             location_variable: AZURE_LOCATION_ARM64
             size_variable: AZURE_VM_SIZE_ARM64
-            android_smoke_secret: ANDROID_SMOKE_UNUSED
           - key: x86_64-core
             architecture: x86_64
             flavor: core
             asset_name: Ubuntu-26.04-x86_64.core.qcow2
             location_variable: AZURE_LOCATION_X64
             size_variable: AZURE_VM_SIZE_X64
-            android_smoke_secret: ANDROID_SMOKE_X86_64_JSON
           - key: aarch64-core
             architecture: aarch64
             flavor: core
             asset_name: Ubuntu-26.04-aarch64.core.qcow2
             location_variable: AZURE_LOCATION_ARM64
             size_variable: AZURE_VM_SIZE_ARM64
-            android_smoke_secret: ANDROID_SMOKE_AARCH64_JSON
     env:
       CANDIDATE_KEY: ${{ matrix.key }}
       ARCHITECTURE: ${{ matrix.architecture }}
@@ -911,19 +884,6 @@ jobs:
             -femit-bin="$BINDER_PROBE" \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           test -x "$BINDER_PROBE"
-
-      - name: Fetch and verify digest-bound Android container smoke inputs
-        if: matrix.flavor == 'core'
-        env:
-          ANDROID_SMOKE_INPUT_VALUE: ${{ secrets[matrix.android_smoke_secret] }}
-          ANDROID_ARTIFACT_TOKEN_VALUE: ${{ secrets.ANDROID_ARTIFACT_TOKEN }}
-        run: |
-          set +x
-          set -euo pipefail
-          "$RELEASE_TOOL" prepare-android-smoke-inputs \
-            --architecture "$ARCHITECTURE" \
-            --output-dir "$GITHUB_WORKSPACE/.release/azure/$CANDIDATE_KEY/android-smoke" \
-            --github-env "$GITHUB_ENV"
 
       - name: Log in to Azure with protected-environment OIDC
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2

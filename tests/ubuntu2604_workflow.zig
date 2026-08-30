@@ -662,11 +662,6 @@ test "QEMU acceptance pins x86 KVM and hosted Arm TCG without fallback" {
         "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ID=",
         "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ATTEMPT=",
         "-Dubuntu2604-flavor=\"$FLAVOR\"",
-        "if: matrix.flavor == 'core'",
-        "prepare-android-smoke-inputs",
-        "ANDROID_SMOKE_INPUT_VALUE: ${{ secrets[matrix.android_smoke_secret] }}",
-        "ANDROID_ARTIFACT_TOKEN_VALUE: ${{ secrets.ANDROID_ARTIFACT_TOKEN }}",
-        ".release/native/$CANDIDATE_KEY/android-smoke",
     };
     for (needles) |needle| try source.expectContainsIn(native, needle, workflow_path);
     try source.expectOmitsIn(native, "/usr/bin/coreutils", workflow_path);
@@ -867,23 +862,15 @@ test "QEMU acceptance pins x86 KVM and hosted Arm TCG without fallback" {
         "--source-commit \"$SOURCE_COMMIT\"",
         workflow_path,
     );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, native, "android_smoke_secret: ANDROID_SMOKE_X86_64_JSON"),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, native, "android_smoke_secret: ANDROID_SMOKE_AARCH64_JSON"),
-    );
-    try source.expectOrder(
-        native,
-        "- name: Fetch and verify digest-bound Android container smoke inputs",
-        "- name: Run same-architecture Secure Boot QEMU acceptance",
-        workflow_path,
-    );
+    for ([_][]const u8{
+        "ANDROID" ++ "_",
+        "android_" ++ "smoke_secret",
+        "prepare-" ++ "android",
+        "/android-" ++ "smoke",
+    }) |needle| try source.expectOmitsIn(native, needle, workflow_path);
 }
 
-test "Azure acceptance conditionally adds core Binder and Android validation" {
+test "Azure acceptance conditionally adds core Binder validation" {
     var workflow = try open();
     defer workflow.deinit();
     const azure = try workflow.section("  azure_acceptance:", "  publish:");
@@ -896,21 +883,15 @@ test "Azure acceptance conditionally adds core Binder and Android validation" {
         "-femit-bin=\"$BINDER_PROBE\"",
         "test -x \"$BINDER_PROBE\"",
         "if: matrix.flavor == 'core'",
-        "prepare-android-smoke-inputs",
-        "ANDROID_SMOKE_INPUT_VALUE: ${{ secrets[matrix.android_smoke_secret] }}",
-        "ANDROID_ARTIFACT_TOKEN_VALUE: ${{ secrets.ANDROID_ARTIFACT_TOKEN }}",
-        ".release/azure/$CANDIDATE_KEY/android-smoke",
         "scripts/ubuntu2604_azure_acceptance.sh run",
     };
     for (needles) |needle| try source.expectContainsIn(azure, needle, workflow_path);
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, azure, "android_smoke_secret: ANDROID_SMOKE_X86_64_JSON"),
-    );
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, azure, "android_smoke_secret: ANDROID_SMOKE_AARCH64_JSON"),
-    );
+    for ([_][]const u8{
+        "ANDROID" ++ "_",
+        "android_" ++ "smoke_secret",
+        "prepare-" ++ "android",
+        "/android-" ++ "smoke",
+    }) |needle| try source.expectOmitsIn(azure, needle, workflow_path);
     try source.expectOrder(
         azure,
         "- name: Build accepted-source miz",
@@ -920,12 +901,6 @@ test "Azure acceptance conditionally adds core Binder and Android validation" {
     try source.expectOrder(
         azure,
         "- name: Build Binder device usability probe",
-        "- name: Fetch and verify digest-bound Android container smoke inputs",
-        workflow_path,
-    );
-    try source.expectOrder(
-        azure,
-        "- name: Fetch and verify digest-bound Android container smoke inputs",
         "- name: Log in to Azure with protected-environment OIDC",
         workflow_path,
     );

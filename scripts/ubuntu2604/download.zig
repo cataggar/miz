@@ -1,16 +1,7 @@
-//! A private HTTPS fetch for the external Android container smoke archive.
+//! A bounded HTTPS fetch used for Azure boot diagnostics.
 //!
-//! The archive lives behind a bearer token in someone else's storage, so the
-//! transport rules are part of the security contract rather than an
-//! implementation detail:
-//!
-//! * only HTTPS, on the first request and after every redirect;
-//! * the `Authorization` header is dropped the moment a redirect leaves the
-//!   original origin, so the token is never presented to a host the secret did
-//!   not name;
-//! * the response is staged in a private `.partial` file and renamed only
-//!   after the whole body arrived, so a truncated download can never be
-//!   mistaken for the artifact.
+//! Only HTTPS is accepted on the first request and after every redirect, and
+//! callers can impose an exact response-size bound.
 
 const std = @import("std");
 
@@ -34,10 +25,7 @@ pub const max_redirects: usize = 10;
 const transfer_buffer_size = 64 * 1024;
 
 pub const Options = struct {
-    /// Bearer token presented to the original origin only.
-    token: ?[]const u8 = null,
-    /// Refuse a body larger than this. `null` matches the Python default of
-    /// no bound for the archive itself.
+    /// Refuse a body larger than this.
     max_bytes: ?u64 = null,
 };
 
@@ -135,8 +123,7 @@ fn appendNormalized(
     if (trailing_slash or segments.items.len == 0) try out.append(allocator, '/');
 }
 
-/// Downloads `initial_url` to `destination`, following only HTTPS redirects
-/// and never carrying the bearer token across an origin change.
+/// Downloads `initial_url` to `destination`, following only HTTPS redirects.
 pub fn fetch(
     allocator: Allocator,
     io: Io,
@@ -144,51 +131,28 @@ pub fn fetch(
     destination: []const u8,
     options: Options,
 ) Error!void {
-    var host_buffer: [253]u8 = undefined;
-    const first_origin = url.origin(initial_url, &host_buffer) orelse
-        return error.NotHttps;
-    if (!std.mem.eql(u8, first_origin.scheme, "https")) return error.NotHttps;
-
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
 
     var current = allocator.dupe(u8, initial_url) catch return error.OutOfMemory;
     defer allocator.free(current);
-    var carry_token = options.token != null;
-
     var redirects: usize = 0;
     while (true) {
         if (redirects > max_redirects) return error.TooManyRedirects;
         var current_host_buffer: [253]u8 = undefined;
-        const current_origin = url.origin(current, &current_host_buffer) orelse
-            return error.NotHttps;
-        if (!std.mem.eql(u8, current_origin.scheme, "https")) return error.NotHttps;
+        if (!url.isHttps(current, &current_host_buffer)) return error.NotHttps;
 
         const uri = std.Uri.parse(current) catch return error.NotHttps;
-        var authorization_buffer: [4096]u8 = undefined;
-        var extra: [2]std.http.Header = undefined;
-        var extra_count: usize = 0;
-        extra[extra_count] = .{
+        const extra = [_]std.http.Header{.{
             .name = "Accept",
             .value = "application/octet-stream",
-        };
-        extra_count += 1;
-        if (carry_token) {
-            const token = options.token.?;
-            const value = std.fmt.bufPrint(
-                &authorization_buffer,
-                "Bearer {s}",
-                .{token},
-            ) catch return error.RequestFailed;
-            extra[extra_count] = .{ .name = "Authorization", .value = value };
-            extra_count += 1;
-        }
+        }};
 
         var request = client.request(.GET, uri, .{
             .redirect_behavior = .unhandled,
             .keep_alive = false,
             .headers = .{ .accept_encoding = .{ .override = "identity" } },
-            .extra_headers = extra[0..extra_count],
+            .extra_headers = &extra,
         }) catch return error.RequestFailed;
         defer request.deinit();
         request.sendBodiless() catch return error.RequestFailed;
@@ -200,10 +164,7 @@ pub fn fetch(
                 return error.OutOfMemory;
             errdefer allocator.free(resolved);
             var next_host_buffer: [253]u8 = undefined;
-            const next_origin = url.origin(resolved, &next_host_buffer) orelse
-                return error.NotHttps;
-            if (!std.mem.eql(u8, next_origin.scheme, "https")) return error.NotHttps;
-            if (!next_origin.eql(current_origin)) carry_token = false;
+            if (!url.isHttps(resolved, &next_host_buffer)) return error.NotHttps;
             allocator.free(current);
             current = resolved;
             redirects += 1;

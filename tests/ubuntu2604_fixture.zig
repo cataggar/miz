@@ -262,7 +262,6 @@ pub fn makeBundle(tree: *const Tree, key: []const u8, options: Options) !void {
         .resource_group = resource_group,
         .image_version_id = image_version_id,
         .output = output,
-        .flavor = flavor,
     }), &diagnostic);
 }
 
@@ -290,84 +289,42 @@ pub fn makeNativeResult(
     const output = try tree.nativeResultPath(key);
     defer allocator.free(output);
 
-    const value = switch (flavor) {
-        .full => try std.json.Stringify.valueAlloc(
-            allocator,
-            .{
-                .schema = release.documents.nativeResultSchema(flavor),
-                .type = release.documents.native_result_type,
-                .key = key,
-                .architecture = entry.architecture,
-                .flavor = entry.flavor,
-                .asset_name = entry.asset_name,
-                .source_commit = options.source_commit,
-                .virtual_size = object.get("virtual_size").?.integer,
-                .candidate_sha256 = object.get("sha256").?.string,
-                .certificate_sha256 = signing.get("certificate_sha256").?.string,
-                .fallback_uki_sha256 = signing.get("fallback_uki_sha256").?.string,
-                .status = options.status,
-                .execution = .{
-                    .accelerator = @tagName(qemu.accelerator),
-                    .cpu = qemu.cpu,
-                    .emulator = qemu.emulator,
-                    .guest_architecture = entry.architecture,
-                    .machine = qemu.machine,
-                    .runner_architecture = qemu.runner_architecture,
-                },
-                .contracts = contracts.full_native_contracts,
-                .workflow = .{
-                    .run_id = options.run_id,
-                    .run_attempt = options.run_attempt,
-                },
+    const value = try std.json.Stringify.valueAlloc(
+        allocator,
+        .{
+            .schema = release.documents.nativeResultSchema(flavor),
+            .type = release.documents.native_result_type,
+            .key = key,
+            .architecture = entry.architecture,
+            .flavor = entry.flavor,
+            .asset_name = entry.asset_name,
+            .source_commit = options.source_commit,
+            .virtual_size = object.get("virtual_size").?.integer,
+            .candidate_sha256 = object.get("sha256").?.string,
+            .certificate_sha256 = signing.get("certificate_sha256").?.string,
+            .fallback_uki_sha256 = signing.get("fallback_uki_sha256").?.string,
+            .status = options.status,
+            .execution = .{
+                .accelerator = @tagName(qemu.accelerator),
+                .cpu = qemu.cpu,
+                .emulator = qemu.emulator,
+                .guest_architecture = entry.architecture,
+                .machine = qemu.machine,
+                .runner_architecture = qemu.runner_architecture,
             },
-            .{ .whitespace = .indent_2 },
-        ),
-        .core => try std.json.Stringify.valueAlloc(
-            allocator,
-            .{
-                .schema = release.documents.nativeResultSchema(flavor),
-                .type = release.documents.native_result_type,
-                .key = key,
-                .architecture = entry.architecture,
-                .flavor = entry.flavor,
-                .asset_name = entry.asset_name,
-                .source_commit = options.source_commit,
-                .virtual_size = object.get("virtual_size").?.integer,
-                .candidate_sha256 = object.get("sha256").?.string,
-                .certificate_sha256 = signing.get("certificate_sha256").?.string,
-                .fallback_uki_sha256 = signing.get("fallback_uki_sha256").?.string,
-                .status = options.status,
-                .execution = .{
-                    .accelerator = @tagName(qemu.accelerator),
-                    .cpu = qemu.cpu,
-                    .emulator = qemu.emulator,
-                    .guest_architecture = entry.architecture,
-                    .machine = qemu.machine,
-                    .runner_architecture = qemu.runner_architecture,
-                },
-                .contracts = contracts.core_native_contracts,
-                .workflow = .{
-                    .run_id = options.run_id,
-                    .run_attempt = options.run_attempt,
-                },
-                .android_smoke = .{
-                    .provenance_sha256 = android_provenance_sha256,
-                    .runtime_sha256 = android_runtime_sha256,
-                    .bundle_sha256 = android_bundle_sha256,
-                    .config_sha256 = android_config_sha256,
-                    .architecture = entry.architecture,
-                    .candidate_key = key,
-                },
+            .contracts = contracts.nativeContracts(flavor),
+            .workflow = .{
+                .run_id = options.run_id,
+                .run_attempt = options.run_attempt,
             },
-            .{ .whitespace = .indent_2 },
-        ),
-    };
+        },
+        .{ .whitespace = .indent_2 },
+    );
     defer allocator.free(value);
     try Dir.cwd().writeFile(io, .{ .sub_path = output, .data = value });
 }
 
-/// The argument set the Azure acceptance harness passes, with the Android
-/// smoke digests present only for the core flavor.
+/// The argument set the Azure acceptance harness passes.
 pub const AzureResultInputs = struct {
     manifest: []const u8,
     asset: []const u8,
@@ -381,18 +338,11 @@ pub const AzureResultInputs = struct {
     resource_group: []const u8,
     image_version_id: []const u8,
     output: []const u8,
-    flavor: contracts.Flavor,
 };
-
-pub const android_provenance_sha256 = "5" ** 64;
-pub const android_runtime_sha256 = "6" ** 64;
-pub const android_bundle_sha256 = "7" ** 64;
-pub const android_config_sha256 = "8" ** 64;
 
 pub fn azureResultOptions(
     inputs: AzureResultInputs,
 ) release.commands.AzureResultOptions {
-    const core = inputs.flavor == .core;
     return .{
         .manifest = inputs.manifest,
         .asset = inputs.asset,
@@ -407,10 +357,6 @@ pub fn azureResultOptions(
         .image_version_id = inputs.image_version_id,
         .uefi_request = inputs.request,
         .uefi_response = inputs.response,
-        .android_smoke_provenance_sha256 = if (core) android_provenance_sha256 else null,
-        .android_smoke_runtime_sha256 = if (core) android_runtime_sha256 else null,
-        .android_smoke_bundle_sha256 = if (core) android_bundle_sha256 else null,
-        .android_smoke_config_sha256 = if (core) android_config_sha256 else null,
         .contracts = inputs.contracts,
         .run_id = "100",
         .run_attempt = "1",

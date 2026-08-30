@@ -50,9 +50,8 @@ pub fn requireSha256Argument(
     return value;
 }
 
-/// `Path.resolve()`. Lives in `support` because the Android smoke command
-/// exports resolved paths too; re-exported here under the name the release
-/// commands and their tests use.
+/// `Path.resolve()`, re-exported under the name the release commands and their
+/// tests use.
 pub const resolvePath = support.resolvePath;
 
 pub const CandidateOptions = struct {
@@ -875,7 +874,7 @@ fn writeNotes(
         \\
         \\Full images have an exact 5 GiB virtual disk and boot systemd with cloud-init, WALinuxAgent, and `sshd.service`. Core images are exactly 3584 MiB (3.5 GiB), 30% smaller, and use `mizinit` as PID 1 with `azagent` plus directly supervised OpenSSH instead of systemd, cloud-init, or WALinuxAgent.
         \\
-        \\All four candidates required signed UKIs and same-architecture QEMU with an exact accelerator identity: x86_64 used explicit KVM with `/dev/kvm`, the stable KVM API, `q35`, and `host`; AArch64 used explicit multi-threaded TCG with `virt` and `max`, with no accelerator probing or fallback. Azure Trusted Launch remained mandatory for both architectures with Secure Boot and vTPM, the exact signer in UEFI db, kernel lockdown, module trust, key-only SSH, provisioning, runtime Ubuntu identity, root growth, disk-policy enforcement, persistent and unique identity, and reboot/reconnect. Core additionally required mizinit PID-1 and SSH supervision, azagent provisioning, resource and managed-data-disk contracts, Binder, and matching digest-bound Android container provenance in QEMU and Azure acceptance. Candidate and derived-VHD hashes were checked at every handoff; temporary VHDs and Azure resources were deleted.
+        \\All four candidates required signed UKIs and same-architecture QEMU with an exact accelerator identity: x86_64 used explicit KVM with `/dev/kvm`, the stable KVM API, `q35`, and `host`; AArch64 used explicit multi-threaded TCG with `virt` and `max`, with no accelerator probing or fallback. Azure Trusted Launch remained mandatory for both architectures with Secure Boot and vTPM, the exact signer in UEFI db, kernel lockdown, module trust, key-only SSH, provisioning, runtime Ubuntu identity, root growth, disk-policy enforcement, persistent and unique identity, and reboot/reconnect. Core additionally required mizinit PID-1 and SSH supervision, azagent provisioning, resource and managed-data-disk contracts, and signed in-tree Binder with BinderFS and DMA-heap probes in QEMU and Azure acceptance. Candidate and derived-VHD hashes were checked at every handoff; temporary VHDs and Azure resources were deleted.
         \\
         \\Publication is an exact four-asset transaction: standalone zstd QCOW2 files with no backing images, verified remote names and sizes, and a redownloaded SHA-256 check before the draft becomes final. After the tag date, a finalized release is immutable.
         \\
@@ -1047,10 +1046,6 @@ pub const AzureResultOptions = struct {
     image_version_id: []const u8,
     uefi_request: []const u8,
     uefi_response: []const u8,
-    android_smoke_provenance_sha256: ?[]const u8,
-    android_smoke_runtime_sha256: ?[]const u8,
-    android_smoke_bundle_sha256: ?[]const u8,
-    android_smoke_config_sha256: ?[]const u8,
     contracts: []const u8,
     run_id: []const u8,
     run_attempt: []const u8,
@@ -1186,56 +1181,6 @@ pub fn azureResult(
         );
     }
 
-    const android_arguments = [_]?[]const u8{
-        options.android_smoke_provenance_sha256,
-        options.android_smoke_runtime_sha256,
-        options.android_smoke_bundle_sha256,
-        options.android_smoke_config_sha256,
-    };
-    var android_smoke: ?std.json.Value = null;
-    if (flavor == .core) {
-        const labels = [_][]const u8{
-            "android_smoke provenance digest",
-            "android_smoke runtime digest",
-            "android_smoke bundle digest",
-            "android_smoke config digest",
-        };
-        const fields = [_][]const u8{
-            "provenance_sha256",
-            "runtime_sha256",
-            "bundle_sha256",
-            "config_sha256",
-        };
-        var value = builder.object();
-        for (android_arguments, labels, fields) |argument, label, field| {
-            const text = argument orelse return fail(
-                diagnostic,
-                "{s} is not a lowercase SHA-256",
-                .{label},
-            );
-            try builder.putString(
-                &value,
-                field,
-                try requireSha256Argument(text, label, diagnostic),
-            );
-        }
-        try builder.putString(
-            &value,
-            "architecture",
-            verified.identity.architecture,
-        );
-        try builder.putString(&value, "candidate_key", verified.identity.key);
-        android_smoke = .{ .object = value };
-    } else {
-        for (android_arguments) |argument| {
-            if (argument != null) return fail(
-                diagnostic,
-                "android_smoke provenance is only valid for the core flavor",
-                .{},
-            );
-        }
-    }
-
     const accepted = support.hashArtifact(io, options.asset) catch return fail(
         diagnostic,
         "{s}: exact candidate asset is missing",
@@ -1249,7 +1194,7 @@ pub fn azureResult(
     var document = builder.object();
     try builder.putInteger(&document, "schema", switch (flavor) {
         .full => 1,
-        .core => 2,
+        .core => 3,
     });
     try builder.putString(&document, "type", documents.azure_result_type);
     try builder.putString(&document, "key", verified.identity.key);
@@ -1295,9 +1240,6 @@ pub fn azureResult(
     try builder.putString(&document, "resource_group", options.resource_group);
     try builder.put(&document, "contracts", try builder.strings(provided.items));
     try builder.put(&document, "workflow", .{ .object = workflow });
-    if (android_smoke) |value| {
-        try builder.put(&document, "android_smoke", value);
-    }
 
     try support.writeDocument(
         allocator,

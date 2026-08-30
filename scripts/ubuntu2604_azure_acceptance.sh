@@ -112,35 +112,6 @@ if [[ "$FLAVOR" == core ]]; then
     echo "::error::Binder device probe binary is not executable"
     exit 1
   }
-  # The core image never embeds an Android OCI runtime or bundle; both are
-  # required, digest-bound external inputs supplied at acceptance time. A
-  # missing input fails closed here, before any Azure resource is created,
-  # rather than silently skipping the Android container smoke contract.
-  if [[ -z ${MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256:-} ||
-        -z ${MIZ_UBUNTU2604_ANDROID_RUNTIME:-} ||
-        -z ${MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256:-} ||
-        -z ${MIZ_UBUNTU2604_ANDROID_BUNDLE:-} ||
-        -z ${MIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256:-} ||
-        -z ${MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256:-} ]]; then
-    echo "::error::Core Azure acceptance requires digest-bound external Android container smoke inputs"
-    exit 1
-  fi
-  [[ "$MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256" =~ ^[0-9a-f]{64}$ ]]
-  [[ "$MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256" =~ ^[0-9a-f]{64}$ ]]
-  [[ "$MIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256" =~ ^[0-9a-f]{64}$ ]]
-  [[ "$MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256" =~ ^[0-9a-f]{64}$ ]]
-  [[ -f "$MIZ_UBUNTU2604_ANDROID_RUNTIME" ]] || {
-    echo "::error::Android container runtime artifact is absent"
-    exit 1
-  }
-  [[ -f "$MIZ_UBUNTU2604_ANDROID_BUNDLE" ]] || {
-    echo "::error::Android container bundle artifact is absent"
-    exit 1
-  }
-  android_runtime_sha256=$(sha256sum "$MIZ_UBUNTU2604_ANDROID_RUNTIME" | awk '{print $1}')
-  test "$android_runtime_sha256" = "$MIZ_UBUNTU2604_ANDROID_RUNTIME_SHA256"
-  android_bundle_sha256=$(sha256sum "$MIZ_UBUNTU2604_ANDROID_BUNDLE" | awk '{print $1}')
-  test "$android_bundle_sha256" = "$MIZ_UBUNTU2604_ANDROID_BUNDLE_SHA256"
 fi
 
 report_error() {
@@ -875,8 +846,8 @@ guest_error() {
 trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 probe=$1
 
-# binderfs must be the real dynamic Android IPC filesystem, not a fixed set
-# of legacy static device nodes.
+# binderfs must be the real dynamic Binder IPC filesystem, not a fixed set of
+# legacy static device nodes.
 binderfs_mount=/dev/binderfs
 test -d "$binderfs_mount"
 test "$(findmnt -n -o FSTYPE "$binderfs_mount")" = binder
@@ -894,6 +865,12 @@ done
 sudo -n "$probe" alloc "$binderfs_mount/binder-control" miz-acceptance-probe
 sudo -n "$probe" version "$binderfs_mount/miz-acceptance-probe"
 sudo -n /usr/bin/rm -f -- "$binderfs_mount/miz-acceptance-probe" "$probe"
+
+dma_heap=/dev/dma_heap/system
+test -d /dev/dma_heap
+sudo -n test -c "$dma_heap"
+sudo -n test -r "$dma_heap"
+sudo -n test -w "$dma_heap"
 GUEST
 fi
 
@@ -1160,173 +1137,6 @@ test "$(az vm get-instance-view \
   --query "instanceView.vmAgent.statuses[?code=='ProvisioningState/succeeded'].code | [0]" \
   --output tsv)" = ProvisioningState/succeeded
 
-# --- Android container boot-completion smoke (core flavor only) ---
-#
-# The core image never embeds an Android OCI runtime or bundle: both are
-# supplied externally, at acceptance time, as the digest-bound artifacts
-# validated above. This transfers only the two artifacts already verified,
-# launches them with the required BinderFS and DMA-heap access, and binds
-# their provenance into the Azure acceptance result. Remote paths and the
-# container id match the native acceptance harness (tests/ubuntu2604_acceptance.zig)
-# so both paths exercise the same guest-side contract.
-if [[ "$FLAVOR" == core ]]; then
-  case "$ARCHITECTURE" in
-    x86_64) android_expected_abi=x86_64 ;;
-    aarch64) android_expected_abi=arm64-v8a ;;
-    *) exit 1 ;;
-  esac
-  android_runtime_remote=/tmp/ubuntu2604-android-runtime
-  android_bundle_archive_remote=/tmp/ubuntu2604-android-bundle.tar
-  android_bundle_remote_dir=/tmp/ubuntu2604-android-bundle
-  android_container_id=miz-android-smoke
-  android_poll_interval=5
-  android_boot_timeout=240
-  android_stop_timeout=60
-
-  # Decides whether the guest-reported container state permits issuing
-  # `delete` without `--force`. Never force-removes a running container:
-  # if it never reaches "stopped" within the bounded timeout, this returns
-  # failure and the caller fails closed instead of forcing removal. The
-  # remote state query carries no `|| printf ...` success-shaped fallback:
-  # a failed query (permission error, transient SSH failure, runtime error,
-  # ...) yields no parseable "stopped" status here, so it is folded by the
-  # host-side status parser below into an empty string exactly like any
-  # other malformed or absent output, and the loop below keeps polling
-  # within its
-  # bounded timeout rather than authorizing delete on a query it could not
-  # confirm.
-  android_stop_container() {
-    ssh "${ssh_options[@]}" "$ssh_target" \
-      "sudo -n '$android_runtime_remote' kill $android_container_id TERM" \
-      >/dev/null 2>&1 || true
-    local elapsed=0 status
-    while (( elapsed < android_stop_timeout )); do
-      status=$(
-        ssh "${ssh_options[@]}" "$ssh_target" \
-          "sudo -n '$android_runtime_remote' state $android_container_id 2>/dev/null" \
-          2>/dev/null |
-          "$RELEASE_TOOL" android-container-status 2>/dev/null || true
-      )
-      if [[ "$status" == stopped ]]; then
-        ssh "${ssh_options[@]}" "$ssh_target" \
-          "sudo -n '$android_runtime_remote' delete $android_container_id"
-        return 0
-      fi
-      sleep "$android_poll_interval"
-      elapsed=$((elapsed + android_poll_interval))
-    done
-    return 1
-  }
-
-  # Bounded diagnostics only: container state plus a size-limited dmesg
-  # tail, never an unbounded capture.
-  android_capture_diagnostics() {
-    {
-      ssh "${ssh_options[@]}" "$ssh_target" \
-        "sudo -n '$android_runtime_remote' state $android_container_id 2>&1 || true"
-      ssh "${ssh_options[@]}" "$ssh_target" \
-        "sudo -n /usr/bin/dmesg 2>&1 | tail -c 8192 || true"
-    } 2>&1 | tail -c 8192
-  }
-
-  # Polls bounded `getprop sys.boot_completed`; never blocks past the
-  # bounded timeout.
-  android_wait_boot_completed() {
-    local elapsed=0 property
-    while (( elapsed < android_boot_timeout )); do
-      property=$(
-        ssh "${ssh_options[@]}" "$ssh_target" \
-          "sudo -n '$android_runtime_remote' exec $android_container_id -- /system/bin/getprop sys.boot_completed" \
-          2>/dev/null || true
-      )
-      if [[ "$(printf '%s' "$property" | tr -d '[:space:]')" == 1 ]]; then
-        return 0
-      fi
-      sleep "$android_poll_interval"
-      elapsed=$((elapsed + android_poll_interval))
-    done
-    return 1
-  }
-
-  base64 -w0 "$MIZ_UBUNTU2604_ANDROID_RUNTIME" | ssh "${ssh_options[@]}" "$ssh_target" \
-    "/usr/bin/bash -s -- '$android_runtime_remote'" <<'GUEST'
-set -euo pipefail
-remote=$1
-rm -f -- "$remote"
-umask 077
-base64 -d >"$remote"
-chmod 0755 "$remote"
-GUEST
-  android_runtime_remote_sha256=$(
-    ssh "${ssh_options[@]}" "$ssh_target" "sha256sum '$android_runtime_remote'" |
-      awk '{print $1}'
-  )
-  test "$android_runtime_remote_sha256" = "$android_runtime_sha256"
-
-  base64 -w0 "$MIZ_UBUNTU2604_ANDROID_BUNDLE" | ssh "${ssh_options[@]}" "$ssh_target" \
-    "/usr/bin/bash -s -- '$android_bundle_archive_remote'" <<'GUEST'
-set -euo pipefail
-remote=$1
-rm -f -- "$remote"
-umask 077
-base64 -d >"$remote"
-chmod 0600 "$remote"
-GUEST
-  android_bundle_remote_sha256=$(
-    ssh "${ssh_options[@]}" "$ssh_target" "sha256sum '$android_bundle_archive_remote'" |
-      awk '{print $1}'
-  )
-  test "$android_bundle_remote_sha256" = "$android_bundle_sha256"
-
-  ssh "${ssh_options[@]}" "$ssh_target" \
-    "/usr/bin/bash -s -- '$android_bundle_archive_remote' '$android_bundle_remote_dir'" <<'GUEST'
-set -euo pipefail
-archive=$1
-dir=$2
-sudo -n rm -rf -- "$dir"
-sudo -n mkdir -p -- "$dir"
-sudo -n tar -xf "$archive" -C "$dir"
-GUEST
-
-  android_config_json_file="$(dirname "$MIZ_UBUNTU2604_ANDROID_BUNDLE")/guest-config.json"
-  ssh "${ssh_options[@]}" "$ssh_target" \
-    "sudo -n cat -- '$android_bundle_remote_dir/config.json'" \
-    >"$android_config_json_file"
-  test "$(sha256sum "$android_config_json_file" | awk '{print $1}')" = \
-    "$MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256"
-  "$RELEASE_TOOL" android-bundle-config --config "$android_config_json_file"
-
-  ssh "${ssh_options[@]}" "$ssh_target" \
-    "sudo -n '$android_runtime_remote' run --id $android_container_id --bundle '$android_bundle_remote_dir' --detach"
-
-  if ! android_wait_boot_completed; then
-    echo "::error::Android container did not report sys.boot_completed within the bounded timeout"
-    echo "--- Android container smoke diagnostics ---" >&2
-    android_capture_diagnostics >&2 || true
-    echo "--- end diagnostics ---" >&2
-    android_stop_container || true
-    exit 1
-  fi
-
-  android_abilist=$(
-    ssh "${ssh_options[@]}" "$ssh_target" \
-      "sudo -n '$android_runtime_remote' exec $android_container_id -- /system/bin/getprop ro.product.cpu.abilist"
-  )
-  case ",$(printf '%s' "$android_abilist" | tr -d '[:space:]')," in
-    *",$android_expected_abi,"*) ;;
-    *)
-      echo "::error::Android container ABI list does not report $android_expected_abi"
-      android_stop_container || true
-      exit 1
-      ;;
-  esac
-
-  if ! android_stop_container; then
-    echo "::error::Android container did not stop gracefully within the bounded timeout"
-    exit 1
-  fi
-fi
-
 data_disk_size_gib=4
 az disk create \
   --resource-group "$resource_group" \
@@ -1491,15 +1301,6 @@ else
   echo "::warning::Azure managed boot diagnostics did not return a serial log"
 fi
 
-android_smoke_args=()
-if [[ "$FLAVOR" == core ]]; then
-  android_smoke_args=(
-    --android-smoke-provenance-sha256 "$MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256"
-    --android-smoke-runtime-sha256 "$android_runtime_sha256"
-    --android-smoke-bundle-sha256 "$android_bundle_sha256"
-    --android-smoke-config-sha256 "$MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256"
-  )
-fi
 "$RELEASE_TOOL" azure-result \
   --manifest "$manifest" \
   --asset "$asset" \
@@ -1517,7 +1318,6 @@ fi
   --contracts "$azure_contract_list" \
   --run-id "$GITHUB_RUN_ID" \
   --run-attempt "$GITHUB_RUN_ATTEMPT" \
-  "${android_smoke_args[@]}" \
   --output "$RESULT_DIR/azure-result.json"
 "$RELEASE_TOOL" verify-azure-result \
   --manifest "$manifest" \
@@ -1539,10 +1339,6 @@ test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
   echo "- Flavor: \`$FLAVOR\`"
   if [[ "$FLAVOR" == core ]]; then
     echo "- Binder device probe SHA-256: \`$binder_probe_sha256\`"
-    echo "- Android container smoke: provenance SHA-256 \`$MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256\`;" \
-      "runtime SHA-256 \`$android_runtime_sha256\`;" \
-      "bundle SHA-256 \`$android_bundle_sha256\`;" \
-      "config SHA-256 \`$MIZ_UBUNTU2604_ANDROID_CONFIG_SHA256\`"
   fi
   echo "- Contracts: \`$azure_contract_list\`"
 } >>"$GITHUB_STEP_SUMMARY"

@@ -3,8 +3,8 @@
 //! Two kinds of assertion live here, and both come from the Python suite this
 //! replaces.
 //!
-//! The first is structural: the harness's guest contracts, its Binder and
-//! Android smoke sections, its diagnostics, and its refusal to persist boot
+//! The first is structural: the harness's guest contracts, its Binder
+//! sections, its diagnostics, and its refusal to persist boot
 //! diagnostic SAS URIs are all expressed as shell text, so they are checked as
 //! shell text.
 //!
@@ -406,18 +406,15 @@ test "the Binder probe is required only for the core flavor" {
     try script.expectContains("base64");
 }
 
-test "the Android smoke binding is public provenance without private identity" {
+test "external secret-bound smoke inputs are absent while Binder remains mandatory" {
     var script = try open();
     defer script.deinit();
-    try script.expectContains("MIZ_UBUNTU2604_ANDROID_PROVENANCE_SHA256");
-    try script.expectContains("--android-smoke-provenance-sha256");
-    try script.expectContains(
-        "android_config_json_file=\"$(dirname \"$MIZ_UBUNTU2604_ANDROID_BUNDLE\")/guest-config.json\"",
-    );
-    try script.expectContains("provenance SHA-256");
-    try script.expectContains("config SHA-256");
-    try script.expectOmits("--android-smoke-source-commit");
-    try script.expectOmits("source commit");
+    try script.expectOmits("MIZ_UBUNTU2604_" ++ "ANDROID");
+    try script.expectOmits("android-" ++ "smoke");
+    try script.expectOmits("android_" ++ "container");
+    try script.expectOmits("guest-config.json");
+    try script.expectContains("Core Azure acceptance requires a Binder device probe binary");
+    try script.expectContains("binder_probe_sha256=$(sha256sum");
 }
 
 test "core Binder module trust rejects DKMS and Anbox evidence" {
@@ -442,7 +439,7 @@ test "core Binder module trust rejects DKMS and Anbox evidence" {
     for (needles) |needle| try source.expectContainsIn(module_block, needle, "module trust");
 }
 
-test "core BinderFS and device usability are probed" {
+test "core BinderFS, Binder devices, and DMA heap are probed" {
     var script = try open();
     defer script.deinit();
     const binder = try script.section(
@@ -463,6 +460,11 @@ test "core BinderFS and device usability are probed" {
         "sudo -n \"$probe\" version",
         "sudo -n \"$probe\" alloc \"$binderfs_mount/binder-control\"",
         "miz-acceptance-probe",
+        "dma_heap=/dev/dma_heap/system",
+        "test -d /dev/dma_heap",
+        "sudo -n test -c \"$dma_heap\"",
+        "sudo -n test -r \"$dma_heap\"",
+        "sudo -n test -w \"$dma_heap\"",
     };
     for (needles) |needle| try source.expectContainsIn(binder, needle, "binder probe");
 }
@@ -473,63 +475,10 @@ test "the Binder probe binary targets the public UAPI constants" {
     try probe.expectContains("const BINDER_VERSION: u32 = 0xc0046209;");
     try probe.expectContains("const BINDER_CTL_ADD: u32 = 0xc1086201;");
     try probe.expectContains("protocol_version");
-    // The probe speaks the upstream Binder UAPI and knows nothing about any
-    // particular Android userspace distribution.
+    // The probe speaks only the upstream Binder UAPI.
     try probe.expectOmits("anbox");
     try probe.expectOmits("Anbox");
     try probe.expectOmits("ANBOX");
-}
-
-test "the Android container state query carries no success-shaped fallback" {
-    var script = try open();
-    defer script.deinit();
-    try script.expectContains(
-        "\"sudo -n '$android_runtime_remote' state $android_container_id 2>/dev/null\" \\",
-    );
-    try script.expectOmits("state $android_container_id 2>/dev/null || printf");
-    try script.expectOmits("printf '{\\\"status\\\":\\\"stopped\\\"}'");
-    // The parser is a release-tooling subcommand whose only terminal answer is
-    // a literal "stopped" it actually read.
-    try script.expectContains("\"$RELEASE_TOOL\" android-container-status");
-}
-
-test "the container status parser never reports stopped for failed or malformed output" {
-    const non_terminal = [_][]const u8{
-        "", // the state query failed and produced no output at all
-        "\n", // whitespace-only output
-        "not json", // malformed output
-        "{}", // valid JSON with no status field
-        "{\"status\":\"running\"}",
-        "{\"status\":\"created\"}",
-        "{\"status\":\"paused\"}",
-        "{\"status\":\"error\"}",
-        "{\"status\":\"Stopped\"}", // case must match exactly
-        "{\"status\":\"stopped \"}", // trailing whitespace must not match
-    };
-    for (non_terminal) |input| {
-        const result = try runWithStdin(
-            std.testing.allocator,
-            "android-container-status",
-            input,
-        );
-        defer result.deinit(std.testing.allocator);
-        try std.testing.expect(result.succeeded());
-        // `$(...)` strips only trailing newlines, which is exactly what the
-        // harness's `[[ "$status" == stopped ]]` comparison sees.
-        const observed = std.mem.trimEnd(u8, result.stdout, "\n");
-        try std.testing.expect(!std.mem.eql(u8, observed, "stopped"));
-    }
-
-    const confirmed = try runWithStdin(
-        std.testing.allocator,
-        "android-container-status",
-        "{\"status\":\"stopped\"}",
-    );
-    defer confirmed.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings(
-        "stopped",
-        std.mem.trimEnd(u8, confirmed.stdout, "\n"),
-    );
 }
 
 test "cloud-init status is decided host-side and fails closed" {
@@ -551,8 +500,8 @@ test "cloud-init status is decided host-side and fails closed" {
         std.mem.trimEnd(u8, done.stdout, "\n"),
     );
 
-    // Unlike the container-state parser, a failed cloud-init query is an
-    // error rather than an empty answer, because nothing polls it again.
+    // A failed cloud-init query is an error rather than a success-shaped
+    // default.
     for ([_][]const u8{ "", "not json", "{}" }) |input| {
         const result = try runWithStdin(
             std.testing.allocator,
