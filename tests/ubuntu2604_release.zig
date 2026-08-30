@@ -3081,6 +3081,67 @@ test "prepare-android-smoke-inputs accepts every container tarfile accepts" {
     );
 }
 
+test "prepare-android-smoke-inputs normalizes the exact legacy producer contract" {
+    const bundle = try buildTar(&.{
+        .{ .name = "rootfs/init", .data = "binary" },
+        .{ .name = "./config.json", .data = config_json },
+    });
+    defer allocator.free(bundle);
+    const bundle_sha256 = hexDigest(bundle);
+    const runtime_sha256 = hexDigest(runtime_bytes);
+    const config_sha256 = hexDigest(config_json);
+    const legacy_provenance = try std.fmt.allocPrint(allocator,
+        \\{{"architecture": "aarch64",
+        \\ "bundle_archive_sha256": "sha256:{s}",
+        \\ "config_json_sha256": "sha256:{s}",
+        \\ "droid_source_commit": "{s}",
+        \\ "redroid_immutable_reference": "registry.invalid/android@sha256:{s}",
+        \\ "redroid_manifest_digest": "sha256:{s}",
+        \\ "runz_sha256": "sha256:{s}",
+        \\ "schema": "cataggar.droid.redroid-smoke-provenance.v1",
+        \\ "type": "application/vnd.cataggar.droid.redroid-smoke.v1+json"}}
+    , .{
+        &bundle_sha256,
+        &config_sha256,
+        "e" ** 40,
+        "d" ** 64,
+        "d" ** 64,
+        &runtime_sha256,
+    });
+    defer allocator.free(legacy_provenance);
+
+    var smoke = try Smoke.create(.{
+        .bundle = bundle,
+        .provenance_json = legacy_provenance,
+        .members = &.{
+            .{ .name = "redroid-bundle.tar", .data = bundle },
+            .{ .name = "runz", .data = runtime_bytes },
+            .{ .name = "provenance.json", .data = legacy_provenance },
+        },
+    });
+    defer smoke.deinit();
+    try smoke.prepare("aarch64");
+
+    const runtime = try smoke.subject.path("android/android-runtime", .{});
+    defer allocator.free(runtime);
+    const bundle_path = try smoke.subject.path("android/android-bundle.tar", .{});
+    defer allocator.free(bundle_path);
+    const legacy_runtime = try smoke.subject.path("android/runz", .{});
+    defer allocator.free(legacy_runtime);
+    const legacy_bundle = try smoke.subject.path("android/redroid-bundle.tar", .{});
+    defer allocator.free(legacy_bundle);
+    try std.testing.expect(support.isRegularFile(io, runtime));
+    try std.testing.expect(support.isRegularFile(io, bundle_path));
+    try std.testing.expect(!support.pathExists(io, legacy_runtime));
+    try std.testing.expect(!support.pathExists(io, legacy_bundle));
+
+    const exported = try smoke.environment();
+    defer allocator.free(exported);
+    try std.testing.expect(std.mem.indexOf(u8, exported, &runtime_sha256) != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported, &bundle_sha256) != null);
+    try std.testing.expect(std.mem.indexOf(u8, exported, "sha256:") == null);
+}
+
 test "prepare-android-smoke-inputs binds the archive to the secret's digest" {
     var smoke = try Smoke.create(.{ .archive_sha256 = "0" ** 64 });
     defer smoke.deinit();
@@ -3192,6 +3253,17 @@ test "prepare-android-smoke-inputs requires the exact archive member set" {
     });
     defer renamed.deinit();
     try renamed.expectRejected("Android smoke archive member set is not exact");
+
+    var mixed = try Smoke.create(.{
+        .bundle = bundle,
+        .members = &.{
+            .{ .name = "android-bundle.tar", .data = bundle },
+            .{ .name = "runz", .data = runtime_bytes },
+            .{ .name = "provenance.json", .data = "{}" },
+        },
+    });
+    defer mixed.deinit();
+    try mixed.expectRejected("Android smoke archive member set is not exact");
 }
 
 test "prepare-android-smoke-inputs refuses an unsafe archive member" {

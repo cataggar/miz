@@ -33,6 +33,9 @@ pub const input_env = "ANDROID_SMOKE_INPUT_VALUE";
 pub const token_env = "ANDROID_ARTIFACT_TOKEN_VALUE";
 pub const provenance_schema = "android-smoke-provenance.v1";
 pub const provenance_type = "application/vnd.android-smoke.v1+json";
+const legacy_provenance_schema = "cataggar.droid.redroid-smoke-provenance.v1";
+const legacy_provenance_type =
+    "application/vnd.cataggar.droid.redroid-smoke.v1+json";
 pub const manifest_max_bytes: u64 = 1024 * 1024;
 pub const config_max_bytes: u64 = 16 * 1024 * 1024;
 
@@ -40,6 +43,12 @@ pub const config_max_bytes: u64 = 16 * 1024 * 1024;
 pub const archive_members = [_][]const u8{
     "android-bundle.tar",
     "android-runtime",
+    "provenance.json",
+};
+
+const legacy_archive_members = [_][]const u8{
+    "redroid-bundle.tar",
+    "runz",
     "provenance.json",
 };
 
@@ -62,6 +71,59 @@ pub const provenance_fields = [_][]const u8{
     "schema",
     "type",
 };
+
+const legacy_provenance_fields = [_][]const u8{
+    "architecture",
+    "bundle_archive_sha256",
+    "config_json_sha256",
+    "droid_source_commit",
+    "redroid_immutable_reference",
+    "redroid_manifest_digest",
+    "runz_sha256",
+    "schema",
+    "type",
+};
+
+const ArtifactContract = enum {
+    current,
+    legacy_droid,
+};
+
+const ProvenanceContract = struct {
+    fields: []const []const u8,
+    schema: []const u8,
+    media_type: []const u8,
+    producer_commit_field: []const u8,
+    immutable_reference_field: []const u8,
+    manifest_digest_field: []const u8,
+    runtime_digest_field: []const u8,
+    digest_prefix: []const u8,
+};
+
+fn provenanceContract(contract: ArtifactContract) ProvenanceContract {
+    return switch (contract) {
+        .current => .{
+            .fields = &provenance_fields,
+            .schema = provenance_schema,
+            .media_type = provenance_type,
+            .producer_commit_field = "producer_source_commit",
+            .immutable_reference_field = "android_immutable_reference",
+            .manifest_digest_field = "android_manifest_digest",
+            .runtime_digest_field = "runtime_sha256",
+            .digest_prefix = "",
+        },
+        .legacy_droid => .{
+            .fields = &legacy_provenance_fields,
+            .schema = legacy_provenance_schema,
+            .media_type = legacy_provenance_type,
+            .producer_commit_field = "droid_source_commit",
+            .immutable_reference_field = "redroid_immutable_reference",
+            .manifest_digest_field = "redroid_manifest_digest",
+            .runtime_digest_field = "runz_sha256",
+            .digest_prefix = "sha256:",
+        },
+    };
+}
 
 pub const Secret = struct {
     artifact_url: []const u8,
@@ -149,21 +211,36 @@ pub fn parseProvenance(
     architecture: []const u8,
     diagnostic: *Diagnostic,
 ) Error!Provenance {
+    return parseProvenanceForContract(
+        value,
+        architecture,
+        .current,
+        diagnostic,
+    );
+}
+
+fn parseProvenanceForContract(
+    value: std.json.Value,
+    architecture: []const u8,
+    artifact_contract: ArtifactContract,
+    diagnostic: *Diagnostic,
+) Error!Provenance {
     if (contracts.parseArchitecture(architecture) == null) return fail(
         diagnostic,
         "Android smoke architecture is unsupported",
         .{},
     );
+    const contract = provenanceContract(artifact_contract);
     const object = support.objectOf(value);
-    if (object == null or !support.hasExactFields(object.?, &provenance_fields)) {
+    if (object == null or !support.hasExactFields(object.?, contract.fields)) {
         return fail(
             diagnostic,
             "Android smoke provenance manifest has unexpected fields",
             .{},
         );
     }
-    if (!support.stringIs(object.?.get("schema"), provenance_schema) or
-        !support.stringIs(object.?.get("type"), provenance_type))
+    if (!support.stringIs(object.?.get("schema"), contract.schema) or
+        !support.stringIs(object.?.get("type"), contract.media_type))
     {
         return fail(
             diagnostic,
@@ -177,38 +254,66 @@ pub fn parseProvenance(
         .{},
     );
     _ = try support.requireCommit(
-        object.?.get("producer_source_commit"),
+        object.?.get(contract.producer_commit_field),
         "Android smoke producer commit",
         diagnostic,
     );
-    const reference = support.stringOf(object.?.get("android_immutable_reference"));
+    const reference = support.stringOf(
+        object.?.get(contract.immutable_reference_field),
+    );
     if (reference == null or !isImmutableReference(reference.?)) return fail(
         diagnostic,
         "Android smoke immutable image reference is invalid",
         .{},
     );
-    _ = try support.requireSha256(
-        object.?.get("android_manifest_digest"),
+    _ = try requireContractSha256(
+        object.?.get(contract.manifest_digest_field),
         "Android smoke source manifest digest",
+        contract.digest_prefix,
         diagnostic,
     );
     return .{
-        .runtime_sha256 = try support.requireSha256(
-            object.?.get("runtime_sha256"),
+        .runtime_sha256 = try requireContractSha256(
+            object.?.get(contract.runtime_digest_field),
             "Android smoke runtime digest",
+            contract.digest_prefix,
             diagnostic,
         ),
-        .bundle_sha256 = try support.requireSha256(
+        .bundle_sha256 = try requireContractSha256(
             object.?.get("bundle_archive_sha256"),
             "Android smoke bundle digest",
+            contract.digest_prefix,
             diagnostic,
         ),
-        .config_sha256 = try support.requireSha256(
+        .config_sha256 = try requireContractSha256(
             object.?.get("config_json_sha256"),
             "Android smoke config digest",
+            contract.digest_prefix,
             diagnostic,
         ),
     };
+}
+
+fn requireContractSha256(
+    value: ?std.json.Value,
+    label: []const u8,
+    prefix: []const u8,
+    diagnostic: *Diagnostic,
+) Error![]const u8 {
+    if (prefix.len == 0) return support.requireSha256(value, label, diagnostic);
+    const text = support.stringOf(value);
+    if (text == null or !std.mem.startsWith(u8, text.?, prefix)) return fail(
+        diagnostic,
+        "{s} is not a lowercase SHA-256",
+        .{label},
+    );
+    const digest = text.?[prefix.len..];
+    if (!support.isSha256(digest)) return fail(
+        diagnostic,
+        "{s} is not a lowercase SHA-256",
+        .{label},
+    );
+    return digest;
 }
 
 /// `.+@sha256:[0-9a-f]{64}`: the image must be named by digest, so the smoke
@@ -357,7 +462,13 @@ fn prepareVerified(
         .{},
     );
 
-    try extractArchive(allocator, io, archive_path, options.output_dir, diagnostic);
+    const artifact_contract = try extractArchive(
+        allocator,
+        io,
+        archive_path,
+        options.output_dir,
+        diagnostic,
+    );
     Dir.cwd().deleteFile(io, archive_path) catch return fail(
         diagnostic,
         "Android smoke archive is malformed",
@@ -413,9 +524,10 @@ fn prepareVerified(
         ),
     };
     defer provenance_document.deinit();
-    const provenance = try parseProvenance(
+    const provenance = try parseProvenanceForContract(
         provenance_document.value,
         options.architecture,
+        artifact_contract,
         diagnostic,
     );
 
@@ -525,7 +637,7 @@ fn extractArchive(
     archive_path: []const u8,
     output_dir: []const u8,
     diagnostic: *Diagnostic,
-) Error!void {
+) Error!ArtifactContract {
     var directory = archive.readDirectory(
         allocator,
         io,
@@ -536,22 +648,17 @@ fn extractArchive(
     };
     defer directory.deinit(allocator);
 
-    if (directory.members.len != archive_members.len) return fail(
-        diagnostic,
-        "Android smoke archive member set is not exact",
-        .{},
-    );
-    for (archive_members) |name| {
-        var seen = false;
-        for (directory.members) |member| {
-            if (std.mem.eql(u8, member.name, name)) seen = true;
-        }
-        if (!seen) return fail(
-            diagnostic,
-            "Android smoke archive member set is not exact",
-            .{},
-        );
-    }
+    const artifact_contract: ArtifactContract =
+        if (hasExactMemberSet(directory.members, &archive_members))
+            .current
+        else if (hasExactMemberSet(directory.members, &legacy_archive_members))
+            .legacy_droid
+        else
+            return fail(
+                diagnostic,
+                "Android smoke archive member set is not exact",
+                .{},
+            );
     for (directory.members) |member| {
         if (member.isDirectory() or member.isEncrypted() or !member.isRegular()) {
             return fail(
@@ -562,9 +669,17 @@ fn extractArchive(
         }
     }
     for (directory.members) |member| {
+        const output_name = canonicalMemberName(
+            artifact_contract,
+            member.name,
+        ) orelse return fail(
+            diagnostic,
+            "Android smoke archive member set is not exact",
+            .{},
+        );
         const destination = try support.joinPath(
             allocator,
-            &.{ output_dir, member.name },
+            &.{ output_dir, output_name },
         );
         defer allocator.free(destination);
         archive.extractMember(
@@ -578,6 +693,41 @@ fn extractArchive(
             .{},
         );
     }
+    return artifact_contract;
+}
+
+fn hasExactMemberSet(
+    members: []const archive.Member,
+    expected: []const []const u8,
+) bool {
+    if (members.len != expected.len) return false;
+    for (expected) |name| {
+        var seen = false;
+        for (members) |member| {
+            if (std.mem.eql(u8, member.name, name)) seen = true;
+        }
+        if (!seen) return false;
+    }
+    return true;
+}
+
+fn canonicalMemberName(
+    contract: ArtifactContract,
+    name: []const u8,
+) ?[]const u8 {
+    return switch (contract) {
+        .current => for (archive_members) |current| {
+            if (std.mem.eql(u8, name, current)) break current;
+        } else null,
+        .legacy_droid => if (std.mem.eql(u8, name, "runz"))
+            "android-runtime"
+        else if (std.mem.eql(u8, name, "redroid-bundle.tar"))
+            "android-bundle.tar"
+        else if (std.mem.eql(u8, name, "provenance.json"))
+            "provenance.json"
+        else
+            null,
+    };
 }
 
 test "immutable image references must be digest-pinned" {
