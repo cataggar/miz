@@ -277,10 +277,10 @@ forbidden package is. Core's `/etc/initramfs-tools/modules` requests
 required to contain it, the same way bare metal's is checked for `nvme` and
 `r8152`.
 
-None of this runs anything at boot by itself. A Binder workload is opt-in:
-the UKI cmdline only requests it when built with `mizinit.binder=required`
-added alongside the flavor's other `mizinit.*` options. When present,
-mizinit -- after mounting the required kernel filesystems and before
+None of this runs anything at boot by itself. The core UKI cmdline requests
+the required Binder workload with `mizinit.binder=required` alongside the
+flavor's other `mizinit.*` options; bare-metal images leave it disabled. When
+present, mizinit -- after mounting the required kernel filesystems and before
 starting `sshd` or `azagent` -- loads `binder_linux` with `finit_module()`
 against the packaged, possibly `.ko.zst`-compressed module file (asking the
 kernel to decompress and verify it, never decompressing or touching the

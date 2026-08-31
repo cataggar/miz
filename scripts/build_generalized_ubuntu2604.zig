@@ -1954,7 +1954,7 @@ fn ukiCmdline(
         ),
         .core => std.fmt.allocPrint(
             allocator,
-            "root=PARTUUID={s} init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto console=tty0 {s}",
+            "root=PARTUUID={s} init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto mizinit.binder=required console=tty0 {s}",
             .{ guid.formatLower(&root_guid_text, root_guid), profile.serial_console },
         ),
         // `azure=off` rather than an omitted option: the default is `auto`,
@@ -6538,7 +6538,7 @@ test "UKI cmdline binds final root PARTUUID and native serial console" {
     );
     defer std.testing.allocator.free(core_cmdline);
     try std.testing.expectEqualStrings(
-        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto console=tty0 console=ttyAMA0,115200n8",
+        "root=PARTUUID=11111111-2222-3333-4444-555555555555 init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto mizinit.binder=required console=tty0 console=ttyAMA0,115200n8",
         core_cmdline,
     );
     try std.testing.expect(std.mem.indexOf(u8, core_cmdline, "mizinit.shell=on") == null);
