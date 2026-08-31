@@ -464,6 +464,13 @@ const full_networkd_dispatcher_override =
     "[Unit]\n" ++
     "After=chrony.service network-online.target\n";
 
+// Initial snap seeding takes about fifteen wall-clock minutes under the
+// required Arm64 TCG acceptance path. Keep the service fail-closed, but give
+// that valid first boot enough time to finish instead of marking it failed.
+const full_snapd_override =
+    "[Service]\n" ++
+    "TimeoutStartSec=30min\n";
+
 const full_udisks2_dbus_service_path =
     "/usr/share/dbus-1/system-services/org.freedesktop.UDisks2.service";
 
@@ -2463,11 +2470,13 @@ fn customizeOfflineRoot(
                 .{ .create_directory = .{ .path = "/etc/cloud/cloud.cfg.d", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/etc/netplan", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/etc/systemd/system/networkd-dispatcher.service.d", .mode = 0o755 } },
+                .{ .create_directory = .{ .path = "/etc/systemd/system/snapd.service.d", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/var/lib/miz", .mode = 0o755 } },
                 .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-miz-generalized.conf", .source = .{ .inline_bytes = ssh_config } } },
                 .{ .write_file = .{ .path = "/etc/cloud/cloud.cfg.d/90-azure.cfg", .source = .{ .inline_bytes = cloud_config } } },
                 .{ .write_file = .{ .path = "/etc/netplan/50-cloud-init.yaml", .source = .{ .inline_bytes = netplan } } },
                 .{ .write_file = .{ .path = "/etc/systemd/system/networkd-dispatcher.service.d/10-miz-startup-order.conf", .source = .{ .inline_bytes = full_networkd_dispatcher_override } } },
+                .{ .write_file = .{ .path = "/etc/systemd/system/snapd.service.d/10-miz-startup-timeout.conf", .source = .{ .inline_bytes = full_snapd_override } } },
                 .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = waagent } } },
                 .{ .replace_symlink = .{ .path = "/etc/resolv.conf", .target = "/run/systemd/resolve/stub-resolv.conf" } },
             });
@@ -5789,6 +5798,14 @@ test "full network dispatcher waits for startup-trigger dependencies" {
         "[Unit]\n" ++
             "After=chrony.service network-online.target\n",
         full_networkd_dispatcher_override,
+    );
+}
+
+test "full snap seeding retains a bounded Arm TCG startup timeout" {
+    try std.testing.expectEqualStrings(
+        "[Service]\n" ++
+            "TimeoutStartSec=30min\n",
+        full_snapd_override,
     );
 }
 
