@@ -268,10 +268,15 @@ test "the conversion attestation binds the qemu info digest" {
 test "core contract checks are explicit and the full checks are preserved" {
     var script = try open();
     defer script.deinit();
+    try script.expectContains("--run-id \"$CANDIDATE_RUN_ID\"");
+    try script.expectContains("--run-attempt \"$CANDIDATE_RUN_ATTEMPT\"");
+    try script.expectContains("readarray -t sku_storage");
+    try script.expectContains("has_conventional_resource_disk=${sku_storage[0]}");
+    try script.expectContains("has_local_temp_storage=${sku_storage[1]}");
     const core = try script.section(
         "if [[ \"$FLAVOR\" == core ]]; then\n  readarray -t core_identity",
         "\nelse\n  ssh \"${ssh_options[@]}\" \"$ssh_target\" \\\n" ++
-            "    \"/usr/bin/bash -s -- '$has_resource_disk'\" <<'GUEST'",
+            "    \"/usr/bin/bash -s -- '$has_conventional_resource_disk'\" <<'GUEST'",
     );
     const required = [_][]const u8{
         "/proc/1/exe -ef /sbin/mizinit",
@@ -287,6 +292,13 @@ test "core contract checks are explicit and the full checks are preserved" {
         "initial_host_key_fingerprint",
         "initial_authorized_keys_sha256",
         "initial_sentinel_sha256",
+        "test \"$has_local_temp_storage\" = true",
+        "mount_source=$(findmnt -n -o SOURCE --target /d)",
+        "test -b \"$mount_source\"",
+        "\"$resource_disk\" != \"$root_disk\"",
+        "DATALOSS_WARNING_README.txt",
+        "grep -Fq \"temporary resource disk\"",
+        "test \"$swap_disk\" != \"$resource_disk\"",
     };
     for (required) |needle| try source.expectContainsIn(core, needle, "core contracts");
     try source.expectOmitsIn(core, "systemctl is-active", "core contracts");
@@ -301,7 +313,7 @@ test "core contract checks are explicit and the full checks are preserved" {
 
     const full = try script.section(
         "\nelse\n  ssh \"${ssh_options[@]}\" \"$ssh_target\" \\\n" ++
-            "    \"/usr/bin/bash -s -- '$has_resource_disk'\" <<'GUEST'",
+            "    \"/usr/bin/bash -s -- '$has_conventional_resource_disk'\" <<'GUEST'",
         "\nfi\n",
     );
     try source.expectContainsIn(full, "/proc/1/exe -ef /usr/lib/systemd/systemd", "full");

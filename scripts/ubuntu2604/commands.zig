@@ -50,6 +50,34 @@ pub fn requireSha256Argument(
     return value;
 }
 
+fn isPositiveDecimal(value: []const u8) bool {
+    if (value.len == 0 or value[0] == '0') return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte)) return false;
+    }
+    const parsed = std.fmt.parseInt(i64, value, 10) catch return false;
+    return parsed > 0;
+}
+
+fn workflowMatchesRun(value: ?std.json.Value, run_id: []const u8) bool {
+    if (!documents.hasWorkflowIdentity(value)) return false;
+    return support.stringIs(value.?.object.get("run_id"), run_id);
+}
+
+fn workflowMatchesRunAtOrBefore(
+    value: ?std.json.Value,
+    run_id: []const u8,
+    max_attempt: i64,
+) bool {
+    if (!workflowMatchesRun(value, run_id)) return false;
+    const attempt = std.fmt.parseInt(
+        i64,
+        value.?.object.get("run_attempt").?.string,
+        10,
+    ) catch return false;
+    return attempt <= max_attempt;
+}
+
 /// `Path.resolve()`, re-exported under the name the release commands and their
 /// tests use.
 pub const resolvePath = support.resolvePath;
@@ -174,18 +202,17 @@ pub fn candidate(
         "candidate asset must not be empty",
         .{},
     );
-    const identities = [_]struct { label: []const u8, value: []const u8 }{
-        .{ .label = "runner", .value = options.runner },
-        .{ .label = "run ID", .value = options.run_id },
-        .{ .label = "run attempt", .value = options.run_attempt },
-    };
-    for (identities) |identity| {
-        if (identity.value.len == 0) return fail(
-            diagnostic,
-            "{s} is absent",
-            .{identity.label},
-        );
-    }
+    if (options.runner.len == 0) return fail(diagnostic, "runner is absent", .{});
+    if (!isPositiveDecimal(options.run_id)) return fail(
+        diagnostic,
+        "run ID is not a positive decimal",
+        .{},
+    );
+    if (!isPositiveDecimal(options.run_attempt)) return fail(
+        diagnostic,
+        "run attempt is not a positive decimal",
+        .{},
+    );
 
     var build_validation = builder.object();
     try builder.putString(&build_validation, "status", "success");
@@ -241,9 +268,13 @@ pub fn candidate(
 
 pub const StageOptions = struct {
     candidates: []const u8,
+    native_results: []const u8,
     azure_results: []const u8,
     source_commit: []const u8,
     release_tag: []const u8,
+    candidate_run_id: []const u8,
+    run_id: []const u8,
+    run_attempt: []const u8,
     output: []const u8,
     notes: []const u8,
 };
@@ -362,6 +393,9 @@ const Staged = struct {
     certificate_sha256: []const u8,
     signing_certificate_sha256: []const u8,
     fallback_uki_sha256: []const u8,
+    candidate_workflow: std.json.Value,
+    native_workflow: std.json.Value,
+    azure_workflow: std.json.Value,
     azure_location: []const u8,
     azure_vm_size: []const u8,
     azure_resource_group: []const u8,
@@ -391,12 +425,25 @@ fn stageInto(
         "release tag must be Ubuntu-26.04-YYYYMMDD",
         .{},
     );
+    if (!isPositiveDecimal(options.candidate_run_id) or
+        !isPositiveDecimal(options.run_id) or
+        !isPositiveDecimal(options.run_attempt))
+    {
+        return fail(diagnostic, "publication workflow identity is invalid", .{});
+    }
+    const publication_attempt = std.fmt.parseInt(
+        i64,
+        options.run_attempt,
+        10,
+    ) catch unreachable;
     const candidates_root = try resolvePath(allocator, io, options.candidates);
     defer allocator.free(candidates_root);
+    const native_root = try resolvePath(allocator, io, options.native_results);
+    defer allocator.free(native_root);
     const azure_root = try resolvePath(allocator, io, options.azure_results);
     defer allocator.free(azure_root);
 
-    for ([_][]const u8{ candidates_root, azure_root }) |root| {
+    for ([_][]const u8{ candidates_root, native_root, azure_root }) |root| {
         const sidecars = support.listFilesWithSuffix(
             allocator,
             io,
@@ -422,6 +469,14 @@ fn stageInto(
         diagnostic,
     );
     defer for (&candidate_documents) |*located| located.deinit(allocator);
+    var native_documents = try findDocuments(
+        allocator,
+        io,
+        native_root,
+        "native-result.json",
+        diagnostic,
+    );
+    defer for (&native_documents) |*located| located.deinit(allocator);
     var azure_documents = try findDocuments(
         allocator,
         io,
@@ -488,6 +543,37 @@ fn stageInto(
             diagnostic,
         );
         defer verified.deinit();
+        if (!workflowMatchesRun(
+            verified.object().get("workflow"),
+            options.candidate_run_id,
+        )) {
+            return fail(
+                diagnostic,
+                "{s}: candidate workflow run is not exact",
+                .{key},
+            );
+        }
+
+        const native_located = &native_documents[index];
+        var native = try documents.validateNativeResult(
+            allocator,
+            io,
+            &verified,
+            native_located.path,
+            diagnostic,
+        );
+        defer native.deinit();
+        if (!workflowMatchesRunAtOrBefore(
+            native.get("workflow"),
+            options.run_id,
+            publication_attempt,
+        )) {
+            return fail(
+                diagnostic,
+                "{s}: native workflow run is not exact",
+                .{key},
+            );
+        }
 
         const azure_located = &azure_documents[index];
         var azure = try documents.validateAzureResult(
@@ -499,8 +585,16 @@ fn stageInto(
         );
         defer azure.deinit();
         const azure_object = azure.object();
-        if (!documents.hasWorkflowIdentity(azure_object.get("workflow"))) {
-            return fail(diagnostic, "{s}: Azure workflow identity is absent", .{key});
+        if (!workflowMatchesRunAtOrBefore(
+            azure_object.get("workflow"),
+            options.run_id,
+            publication_attempt,
+        )) {
+            return fail(
+                diagnostic,
+                "{s}: Azure workflow run is not exact",
+                .{key},
+            );
         }
         if (!support.stringIs(azure_object.get("status"), "success")) return fail(
             diagnostic,
@@ -701,6 +795,11 @@ fn stageInto(
                 u8,
                 verified.fallback_uki_sha256,
             ),
+            .candidate_workflow = try builder.clone(
+                verified.object().get("workflow").?,
+            ),
+            .native_workflow = try builder.clone(native.get("workflow").?),
+            .azure_workflow = try builder.clone(azure_object.get("workflow").?),
             .azure_location = try arena.allocator().dupe(
                 u8,
                 support.stringOf(azure_object.get("location")).?,
@@ -751,6 +850,9 @@ fn stageInto(
             "fallback_uki_sha256",
             item.fallback_uki_sha256,
         );
+        try builder.put(&record, "candidate_workflow", item.candidate_workflow);
+        try builder.put(&record, "native_workflow", item.native_workflow);
+        try builder.put(&record, "azure_workflow", item.azure_workflow);
         try builder.putString(&record, "azure_location", item.azure_location);
         try builder.putString(&record, "azure_vm_size", item.azure_vm_size);
         try builder.putString(
@@ -775,7 +877,17 @@ fn stageInto(
     }
 
     var manifest = builder.object();
-    try builder.putInteger(&manifest, "schema", 1);
+    var publication_workflow = builder.object();
+    try builder.putString(&publication_workflow, "run_id", options.run_id);
+    try builder.putString(
+        &publication_workflow,
+        "run_attempt",
+        options.run_attempt,
+    );
+
+    // Schema 2 adds per-candidate and per-acceptance workflow attempts plus
+    // the publication attempt, so mixed-attempt releases remain auditable.
+    try builder.putInteger(&manifest, "schema", 2);
     try builder.putString(&manifest, "type", "miz-ubuntu2604-release");
     try builder.putString(&manifest, "release_tag", options.release_tag);
     try builder.putString(&manifest, "source_commit", source_commit);
@@ -790,6 +902,11 @@ fn stageInto(
         release_signing_certificate_sha256.?,
     );
     try builder.put(&manifest, "signing_provider", release_signing_provider.?);
+    try builder.put(
+        &manifest,
+        "publication_workflow",
+        .{ .object = publication_workflow },
+    );
     try builder.put(&manifest, "assets", .{ .array = assets });
 
     const manifest_path = try support.joinPath(
@@ -887,10 +1004,23 @@ fn writeNotes(
         \\
     );
     for (staged) |item| {
+        const candidate_workflow = item.candidate_workflow.object;
+        const native_workflow = item.native_workflow.object;
+        const azure_workflow = item.azure_workflow.object;
         try text.print(
             allocator,
-            "- `{s}`: provenance `{s}`; hosted build on `{s}`\n",
-            .{ item.asset_name, item.provenance_digest, item.build_runner },
+            "- `{s}`: provenance `{s}`; hosted build on `{s}`; candidate run `{s}` attempt `{s}`; native acceptance run `{s}` attempt `{s}`; Azure acceptance run `{s}` attempt `{s}`\n",
+            .{
+                item.asset_name,
+                item.provenance_digest,
+                item.build_runner,
+                support.stringOf(candidate_workflow.get("run_id")).?,
+                support.stringOf(candidate_workflow.get("run_attempt")).?,
+                support.stringOf(native_workflow.get("run_id")).?,
+                support.stringOf(native_workflow.get("run_attempt")).?,
+                support.stringOf(azure_workflow.get("run_id")).?,
+                support.stringOf(azure_workflow.get("run_attempt")).?,
+            },
         );
     }
 
@@ -1173,6 +1303,11 @@ pub fn azureResult(
             .{identity.label},
         );
     }
+    if (!isPositiveDecimal(options.run_id) or
+        !isPositiveDecimal(options.run_attempt))
+    {
+        return fail(diagnostic, "Azure workflow identity is invalid", .{});
+    }
     if (!std.mem.startsWith(u8, options.image_version_id, "/subscriptions/")) {
         return fail(
             diagnostic,
@@ -1192,9 +1327,10 @@ pub fn azureResult(
     try builder.putString(&workflow, "run_attempt", options.run_attempt);
 
     var document = builder.object();
+    // Full schema 2 and core schema 4 add the candidate workflow identity.
     try builder.putInteger(&document, "schema", switch (flavor) {
-        .full => 1,
-        .core => 3,
+        .full => 2,
+        .core => 4,
     });
     try builder.putString(&document, "type", documents.azure_result_type);
     try builder.putString(&document, "key", verified.identity.key);
@@ -1212,6 +1348,11 @@ pub fn azureResult(
     );
     try builder.putString(&document, "qcow_sha256", verified.sha256);
     try builder.putString(&document, "azure_accepted_sha256", &accepted.hex);
+    try builder.put(
+        &document,
+        "candidate_workflow",
+        try builder.clone(verified.object().get("workflow").?),
+    );
     try builder.put(
         &document,
         "conversion",

@@ -155,27 +155,51 @@ pub fn dispatch(
             diagnostic,
         );
     }
+    if (std.mem.eql(u8, command, "resolve-artifacts")) {
+        var options = try parse(allocator, argv, &.{
+            "--jobs",
+            "--artifacts",
+            "--kind",
+            "--run-id",
+            "--source-commit",
+            "--max-attempt",
+            "--output",
+        });
+        defer options.deinit();
+        return resolveArtifacts(allocator, io, .{
+            .jobs = try options.require("--jobs"),
+            .artifacts = try options.require("--artifacts"),
+            .kind = ArtifactKind.parse(try options.require("--kind")) orelse
+                return error.Usage,
+            .run_id = try options.require("--run-id"),
+            .source_commit = try options.require("--source-commit"),
+            .max_attempt = try options.requireInteger("--max-attempt"),
+            .output = try options.require("--output"),
+        }, diagnostic);
+    }
     if (std.mem.eql(u8, command, "release-gate")) {
         var options = try parse(allocator, argv, &.{
             "--candidates",
             "--native-results",
             "--azure-results",
+            "--candidate-selection",
+            "--native-selection",
+            "--azure-selection",
             "--source-commit",
             "--candidate-run-id",
-            "--candidate-run-attempt",
             "--run-id",
-            "--run-attempt",
         });
         defer options.deinit();
         return releaseGate(allocator, io, .{
             .candidates = try options.require("--candidates"),
             .native_results = try options.require("--native-results"),
             .azure_results = try options.require("--azure-results"),
+            .candidate_selection = try options.require("--candidate-selection"),
+            .native_selection = try options.require("--native-selection"),
+            .azure_selection = try options.require("--azure-selection"),
             .source_commit = try options.require("--source-commit"),
             .candidate_run_id = try options.require("--candidate-run-id"),
-            .candidate_run_attempt = try options.require("--candidate-run-attempt"),
             .run_id = try options.require("--run-id"),
-            .run_attempt = try options.require("--run-attempt"),
         }, diagnostic);
     }
     if (std.mem.eql(u8, command, "core-gate")) {
@@ -824,16 +848,543 @@ fn appendFile(io: Io, path: []const u8, data: []const u8) !void {
     try file.writePositionalAll(io, data, end);
 }
 
+pub const ArtifactKind = enum {
+    candidate,
+    native,
+    azure,
+
+    pub fn parse(text: []const u8) ?ArtifactKind {
+        inline for (std.meta.tags(ArtifactKind)) |kind| {
+            if (std.mem.eql(u8, text, @tagName(kind))) return kind;
+        }
+        return null;
+    }
+
+    fn artifactPrefix(self: ArtifactKind) []const u8 {
+        return switch (self) {
+            .candidate => "ubuntu2604-candidate",
+            .native => "ubuntu2604-native",
+            .azure => "ubuntu2604-azure",
+        };
+    }
+};
+
+pub const ResolveArtifactsOptions = struct {
+    jobs: []const u8,
+    artifacts: []const u8,
+    kind: ArtifactKind,
+    run_id: []const u8,
+    source_commit: []const u8,
+    max_attempt: i64,
+    output: []const u8,
+};
+
+fn isDiagnosticArtifact(kind: ArtifactKind, name: []const u8) bool {
+    return switch (kind) {
+        .candidate => false,
+        .native => std.mem.startsWith(u8, name, "ubuntu2604-native-failure-"),
+        .azure => std.mem.startsWith(u8, name, "ubuntu2604-azure-failure-"),
+    };
+}
+
+fn validateArtifactInventory(
+    kind: ArtifactKind,
+    artifacts: []const std.json.Value,
+    source_commit: []const u8,
+    max_attempt: i64,
+    diagnostic: *Diagnostic,
+) Error!void {
+    var prefix_buffer: [96]u8 = undefined;
+    const kind_prefix = std.fmt.bufPrint(
+        &prefix_buffer,
+        "{s}-",
+        .{kind.artifactPrefix()},
+    ) catch unreachable;
+
+    for (artifacts, 0..) |value, index| {
+        const artifact = support.objectOf(value) orelse return fail(
+            diagnostic,
+            "artifact selection contains a malformed artifact",
+            .{},
+        );
+        const name = support.stringOf(artifact.get("name")) orelse return fail(
+            diagnostic,
+            "artifact selection contains a malformed artifact",
+            .{},
+        );
+        if (!std.mem.startsWith(u8, name, kind_prefix) or
+            isDiagnosticArtifact(kind, name))
+        {
+            continue;
+        }
+        for (artifacts[0..index]) |earlier_value| {
+            const earlier = support.objectOf(earlier_value) orelse return fail(
+                diagnostic,
+                "artifact selection contains a malformed artifact",
+                .{},
+            );
+            if (support.stringIs(earlier.get("name"), name)) return fail(
+                diagnostic,
+                "duplicate {s} artifact: {s}",
+                .{ @tagName(kind), name },
+            );
+        }
+
+        var matched_key = false;
+        for (contracts.release_order) |key| {
+            var key_prefix_buffer: [128]u8 = undefined;
+            const key_prefix = std.fmt.bufPrint(
+                &key_prefix_buffer,
+                "{s}-{s}-",
+                .{ kind.artifactPrefix(), key },
+            ) catch unreachable;
+            if (!std.mem.startsWith(u8, name, key_prefix)) continue;
+            matched_key = true;
+
+            const suffix = name[key_prefix.len..];
+            if (suffix.len <= source_commit.len or
+                !std.mem.eql(u8, suffix[0..source_commit.len], source_commit) or
+                suffix[source_commit.len] != '-')
+            {
+                return fail(
+                    diagnostic,
+                    "{s}: {s} artifact source is not exact",
+                    .{ key, @tagName(kind) },
+                );
+            }
+            const attempt = positiveDecimal(suffix[source_commit.len + 1 ..]) orelse
+                return fail(
+                    diagnostic,
+                    "{s}: {s} artifact attempt is invalid",
+                    .{ key, @tagName(kind) },
+                );
+            if (attempt > max_attempt) return fail(
+                diagnostic,
+                "{s}: {s} artifact attempt exceeds the run",
+                .{ key, @tagName(kind) },
+            );
+            break;
+        }
+        if (!matched_key) return fail(
+            diagnostic,
+            "{s} artifact key is not recognized: {s}",
+            .{ @tagName(kind), name },
+        );
+    }
+}
+
+/// Selects the newest artifact for each release key only when the artifact and
+/// its corresponding job agree on run, attempt, source, and successful status.
+pub fn resolveArtifacts(
+    allocator: Allocator,
+    io: Io,
+    options: ResolveArtifactsOptions,
+    diagnostic: *Diagnostic,
+) Error!void {
+    const run_id = positiveDecimal(options.run_id) orelse return fail(
+        diagnostic,
+        "artifact selection run id is invalid",
+        .{},
+    );
+    if (!support.isCommit(options.source_commit)) return fail(
+        diagnostic,
+        "artifact selection source commit is invalid",
+        .{},
+    );
+    if (options.max_attempt <= 0 or options.max_attempt > 1000) return fail(
+        diagnostic,
+        "artifact selection maximum attempt is invalid",
+        .{},
+    );
+
+    var jobs_document = try readValue(allocator, io, options.jobs, diagnostic);
+    defer jobs_document.deinit();
+    const jobs = support.arrayOf(jobs_document.value) orelse return fail(
+        diagnostic,
+        "artifact selection jobs document is not an array",
+        .{},
+    );
+    var artifacts_document = try readValue(
+        allocator,
+        io,
+        options.artifacts,
+        diagnostic,
+    );
+    defer artifacts_document.deinit();
+    const artifacts = support.arrayOf(artifacts_document.value) orelse return fail(
+        diagnostic,
+        "artifact selection artifacts document is not an array",
+        .{},
+    );
+    try validateArtifactInventory(
+        options.kind,
+        artifacts,
+        options.source_commit,
+        options.max_attempt,
+        diagnostic,
+    );
+
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const builder = Builder.init(arena.allocator());
+    var selected = builder.object();
+
+    for (contracts.release_order) |key| {
+        var selected_entry: ?std.json.Value = null;
+        var attempt = options.max_attempt;
+        while (attempt > 0) : (attempt -= 1) {
+            const artifact_name = try std.fmt.allocPrint(
+                allocator,
+                "{s}-{s}-{s}-{d}",
+                .{
+                    options.kind.artifactPrefix(),
+                    key,
+                    options.source_commit,
+                    attempt,
+                },
+            );
+            defer allocator.free(artifact_name);
+
+            var artifact_match: ?std.json.ObjectMap = null;
+            var artifact_count: usize = 0;
+            for (artifacts) |value| {
+                const artifact = support.objectOf(value) orelse continue;
+                if (support.stringIs(artifact.get("name"), artifact_name)) {
+                    artifact_count += 1;
+                    artifact_match = artifact;
+                }
+            }
+            if (artifact_count > 1) return fail(
+                diagnostic,
+                "{s}: duplicate {s} artifact for attempt {d}",
+                .{ key, @tagName(options.kind), attempt },
+            );
+            if (artifact_count == 0) continue;
+
+            const artifact = artifact_match.?;
+            const artifact_id = positiveInteger(artifact.get("id")) orelse
+                return fail(
+                    diagnostic,
+                    "{s}: selected {s} artifact id is invalid",
+                    .{ key, @tagName(options.kind) },
+                );
+            const size = positiveInteger(artifact.get("size_in_bytes")) orelse
+                return fail(
+                    diagnostic,
+                    "{s}: selected {s} artifact is empty",
+                    .{ key, @tagName(options.kind) },
+                );
+            _ = size;
+            const expired = artifact.get("expired") orelse return fail(
+                diagnostic,
+                "{s}: selected {s} artifact expiry is invalid",
+                .{ key, @tagName(options.kind) },
+            );
+            if (expired != .bool or expired.bool) return fail(
+                diagnostic,
+                "{s}: selected {s} artifact is expired",
+                .{ key, @tagName(options.kind) },
+            );
+            const digest = support.stringOf(artifact.get("digest")) orelse
+                return fail(
+                    diagnostic,
+                    "{s}: selected {s} artifact digest is invalid",
+                    .{ key, @tagName(options.kind) },
+                );
+            if (!validArtifactDigest(digest)) return fail(
+                diagnostic,
+                "{s}: selected {s} artifact digest is invalid",
+                .{ key, @tagName(options.kind) },
+            );
+            const artifact_workflow = support.objectOf(
+                artifact.get("workflow_run"),
+            ) orelse return fail(
+                diagnostic,
+                "{s}: selected {s} artifact workflow is invalid",
+                .{ key, @tagName(options.kind) },
+            );
+            if (support.integerOf(artifact_workflow.get("id")) != run_id or
+                !support.stringIs(
+                    artifact_workflow.get("head_sha"),
+                    options.source_commit,
+                ))
+            {
+                return fail(
+                    diagnostic,
+                    "{s}: selected {s} artifact workflow is not exact",
+                    .{ key, @tagName(options.kind) },
+                );
+            }
+
+            const job_name = try expectedJobName(allocator, options.kind, key);
+            defer allocator.free(job_name);
+            var job_match: ?std.json.ObjectMap = null;
+            var job_count: usize = 0;
+            for (jobs) |value| {
+                const job = support.objectOf(value) orelse continue;
+                if (support.stringIs(job.get("name"), job_name) and
+                    support.integerOf(job.get("run_attempt")) == attempt)
+                {
+                    job_count += 1;
+                    job_match = job;
+                }
+            }
+            if (job_count != 1) return fail(
+                diagnostic,
+                "{s}: selected {s} artifact does not have one exact job",
+                .{ key, @tagName(options.kind) },
+            );
+            const job = job_match.?;
+            const job_id = positiveInteger(job.get("id")) orelse return fail(
+                diagnostic,
+                "{s}: selected {s} job id is invalid",
+                .{ key, @tagName(options.kind) },
+            );
+            if (!support.stringIs(job.get("status"), "completed") or
+                !support.stringIs(job.get("conclusion"), "success") or
+                support.integerOf(job.get("run_id")) != run_id or
+                !support.stringIs(job.get("head_sha"), options.source_commit))
+            {
+                return fail(
+                    diagnostic,
+                    "{s}: selected {s} job was not successful and exact",
+                    .{ key, @tagName(options.kind) },
+                );
+            }
+
+            var entry = builder.object();
+            try builder.putInteger(&entry, "artifact_id", artifact_id);
+            try builder.putString(&entry, "artifact_name", artifact_name);
+            try builder.putString(&entry, "artifact_digest", digest);
+            try builder.putInteger(&entry, "job_id", job_id);
+            try builder.putString(&entry, "job_name", job_name);
+            try builder.put(
+                &entry,
+                "run_attempt",
+                try builder.print("{d}", .{attempt}),
+            );
+            selected_entry = .{ .object = entry };
+            break;
+        }
+        const entry = selected_entry orelse return fail(
+            diagnostic,
+            "{s}: no valid {s} artifact was found",
+            .{ key, @tagName(options.kind) },
+        );
+        try builder.put(&selected, key, entry);
+    }
+
+    var document = builder.object();
+    try builder.putInteger(&document, "schema", 1);
+    try builder.putString(
+        &document,
+        "type",
+        "miz-ubuntu2604-artifact-selection",
+    );
+    try builder.putString(&document, "kind", @tagName(options.kind));
+    try builder.putString(&document, "run_id", options.run_id);
+    try builder.putString(&document, "source_commit", options.source_commit);
+    try builder.put(&document, "artifacts", .{ .object = selected });
+    try support.writeDocument(
+        allocator,
+        io,
+        options.output,
+        .{ .object = document },
+        diagnostic,
+    );
+}
+
+fn positiveDecimal(text: []const u8) ?i64 {
+    if (text.len == 0 or text[0] == '0') return null;
+    for (text) |byte| {
+        if (!std.ascii.isDigit(byte)) return null;
+    }
+    const value = std.fmt.parseInt(i64, text, 10) catch return null;
+    return if (value > 0) value else null;
+}
+
+fn positiveInteger(value: ?std.json.Value) ?i64 {
+    const number = support.integerOf(value) orelse return null;
+    return if (number > 0) number else null;
+}
+
+fn validArtifactDigest(text: []const u8) bool {
+    return std.mem.startsWith(u8, text, "sha256:") and
+        support.isSha256(text["sha256:".len..]);
+}
+
+fn expectedJobName(
+    allocator: Allocator,
+    kind: ArtifactKind,
+    key: []const u8,
+) Error![]u8 {
+    return switch (kind) {
+        .candidate => std.fmt.allocPrint(allocator, "build/native {s}", .{key}),
+        .native => std.fmt.allocPrint(
+            allocator,
+            "same-architecture QEMU ({s}) {s}",
+            .{
+                if (std.mem.startsWith(u8, key, "x86_64")) "kvm" else "tcg",
+                key,
+            },
+        ),
+        .azure => std.fmt.allocPrint(allocator, "Azure {s}", .{key}),
+    };
+}
+
 pub const ReleaseGateOptions = struct {
     candidates: []const u8,
     native_results: []const u8,
     azure_results: []const u8,
+    candidate_selection: []const u8,
+    native_selection: []const u8,
+    azure_selection: []const u8,
     source_commit: []const u8,
     candidate_run_id: []const u8,
-    candidate_run_attempt: []const u8,
     run_id: []const u8,
-    run_attempt: []const u8,
 };
+
+fn loadArtifactSelection(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    kind: ArtifactKind,
+    run_id: []const u8,
+    source_commit: []const u8,
+    diagnostic: *Diagnostic,
+) Error!std.json.Parsed(std.json.Value) {
+    var parsed = try readValue(allocator, io, path, diagnostic);
+    errdefer parsed.deinit();
+    const document = support.objectOf(parsed.value) orelse return fail(
+        diagnostic,
+        "{s} artifact selection is malformed",
+        .{@tagName(kind)},
+    );
+    if (!support.hasExactFields(document, &.{
+        "schema",
+        "type",
+        "kind",
+        "run_id",
+        "source_commit",
+        "artifacts",
+    }) or
+        support.integerOf(document.get("schema")) != 1 or
+        !support.stringIs(
+            document.get("type"),
+            "miz-ubuntu2604-artifact-selection",
+        ) or
+        !support.stringIs(document.get("kind"), @tagName(kind)) or
+        !support.stringIs(document.get("run_id"), run_id) or
+        !support.stringIs(document.get("source_commit"), source_commit))
+    {
+        return fail(
+            diagnostic,
+            "{s} artifact selection identity is not exact",
+            .{@tagName(kind)},
+        );
+    }
+    const artifacts = support.objectOf(document.get("artifacts")) orelse
+        return fail(
+            diagnostic,
+            "{s} artifact selection matrix is malformed",
+            .{@tagName(kind)},
+        );
+    if (artifacts.count() != contracts.release_order.len) return fail(
+        diagnostic,
+        "{s} artifact selection matrix is not exact",
+        .{@tagName(kind)},
+    );
+
+    var artifact_ids: [contracts.release_order.len]i64 = undefined;
+    var job_ids: [contracts.release_order.len]i64 = undefined;
+    for (contracts.release_order, 0..) |key, index| {
+        const entry = support.objectOf(artifacts.get(key)) orelse return fail(
+            diagnostic,
+            "{s}: {s} artifact selection is missing",
+            .{ key, @tagName(kind) },
+        );
+        if (!support.hasExactFields(entry, &.{
+            "artifact_id",
+            "artifact_name",
+            "artifact_digest",
+            "job_id",
+            "job_name",
+            "run_attempt",
+        })) {
+            return fail(
+                diagnostic,
+                "{s}: {s} artifact selection fields are not exact",
+                .{ key, @tagName(kind) },
+            );
+        }
+        artifact_ids[index] = positiveInteger(entry.get("artifact_id")) orelse
+            return fail(
+                diagnostic,
+                "{s}: {s} artifact selection id is invalid",
+                .{ key, @tagName(kind) },
+            );
+        job_ids[index] = positiveInteger(entry.get("job_id")) orelse return fail(
+            diagnostic,
+            "{s}: {s} job selection id is invalid",
+            .{ key, @tagName(kind) },
+        );
+        const attempt = support.stringOf(entry.get("run_attempt")) orelse
+            return fail(
+                diagnostic,
+                "{s}: {s} artifact selection attempt is invalid",
+                .{ key, @tagName(kind) },
+            );
+        _ = positiveDecimal(attempt) orelse return fail(
+            diagnostic,
+            "{s}: {s} artifact selection attempt is invalid",
+            .{ key, @tagName(kind) },
+        );
+        const expected_artifact = try std.fmt.allocPrint(
+            allocator,
+            "{s}-{s}-{s}-{s}",
+            .{ kind.artifactPrefix(), key, source_commit, attempt },
+        );
+        defer allocator.free(expected_artifact);
+        const expected_job = try expectedJobName(allocator, kind, key);
+        defer allocator.free(expected_job);
+        const digest = support.stringOf(entry.get("artifact_digest")) orelse "";
+        if (!support.stringIs(entry.get("artifact_name"), expected_artifact) or
+            !support.stringIs(entry.get("job_name"), expected_job) or
+            !validArtifactDigest(digest))
+        {
+            return fail(
+                diagnostic,
+                "{s}: {s} artifact selection binding is invalid",
+                .{ key, @tagName(kind) },
+            );
+        }
+        for (0..index) |previous| {
+            if (artifact_ids[previous] == artifact_ids[index] or
+                job_ids[previous] == job_ids[index])
+            {
+                return fail(
+                    diagnostic,
+                    "{s} artifact selection contains duplicate identities",
+                    .{@tagName(kind)},
+                );
+            }
+        }
+    }
+    return parsed;
+}
+
+fn selectionAttempt(
+    selection: std.json.Value,
+    key: []const u8,
+) []const u8 {
+    return selection.object
+        .get("artifacts").?
+        .object
+        .get(key).?
+        .object
+        .get("run_attempt").?
+        .string;
+}
 
 /// The publish job's exact four-candidate gate.
 pub fn releaseGate(
@@ -842,6 +1393,43 @@ pub fn releaseGate(
     options: ReleaseGateOptions,
     diagnostic: *Diagnostic,
 ) Error!void {
+    if (!support.isCommit(options.source_commit) or
+        positiveDecimal(options.candidate_run_id) == null or
+        positiveDecimal(options.run_id) == null)
+    {
+        return fail(diagnostic, "release workflow identity is invalid", .{});
+    }
+    var candidate_selection = try loadArtifactSelection(
+        allocator,
+        io,
+        options.candidate_selection,
+        .candidate,
+        options.candidate_run_id,
+        options.source_commit,
+        diagnostic,
+    );
+    defer candidate_selection.deinit();
+    var native_selection = try loadArtifactSelection(
+        allocator,
+        io,
+        options.native_selection,
+        .native,
+        options.run_id,
+        options.source_commit,
+        diagnostic,
+    );
+    defer native_selection.deinit();
+    var azure_selection = try loadArtifactSelection(
+        allocator,
+        io,
+        options.azure_selection,
+        .azure,
+        options.run_id,
+        options.source_commit,
+        diagnostic,
+    );
+    defer azure_selection.deinit();
+
     const candidate_paths = try collect(
         allocator,
         io,
@@ -970,7 +1558,7 @@ pub fn releaseGate(
         try requireExactWorkflow(
             candidate.object().get("workflow"),
             options.candidate_run_id,
-            options.candidate_run_attempt,
+            selectionAttempt(candidate_selection.value, key),
             key,
             "candidate",
             diagnostic,
@@ -992,7 +1580,7 @@ pub fn releaseGate(
         try requireExactWorkflow(
             native.get("workflow"),
             options.run_id,
-            options.run_attempt,
+            selectionAttempt(native_selection.value, key),
             key,
             "native",
             diagnostic,
@@ -1014,7 +1602,7 @@ pub fn releaseGate(
         try requireExactWorkflow(
             azure.get("workflow"),
             options.run_id,
-            options.run_attempt,
+            selectionAttempt(azure_selection.value, key),
             key,
             "Azure",
             diagnostic,
@@ -1054,7 +1642,7 @@ fn loadReleaseByKey(
     }
 }
 
-fn requireExactWorkflow(
+pub fn requireExactWorkflow(
     value: ?std.json.Value,
     run_id: []const u8,
     run_attempt: []const u8,
@@ -1567,7 +2155,10 @@ pub fn azureCleanupTags(
 }
 
 /// The configured VM SKU must exist, be unrestricted, match the architecture,
-/// support Gen2 and Trusted Launch, and -- on x64 -- have a resource disk.
+/// support Gen2 and Trusted Launch, and -- on x64 -- have a conventional
+/// resource volume. The two output lines report whether that conventional
+/// volume exists and whether either it or Azure local NVMe temporary storage
+/// exists.
 pub fn azureSku(
     allocator: Allocator,
     io: Io,
@@ -1626,26 +2217,76 @@ pub fn azureSku(
     var hyper_v: []const u8 = "";
     var trusted_launch_disabled: []const u8 = "";
     var resource_volume: []const u8 = "0";
-    var has_cpu_architecture = false;
+    var nvme_volume: []const u8 = "0";
+    var cpu_architecture_count: usize = 0;
+    var hyper_v_count: usize = 0;
+    var trusted_launch_count: usize = 0;
+    var resource_volume_count: usize = 0;
+    var nvme_volume_count: usize = 0;
     if (support.arrayOf(sku.get("capabilities"))) |capabilities| {
         for (capabilities) |capability| {
             const entry = support.objectOf(capability) orelse continue;
             const name = support.stringOf(entry.get("name")) orelse continue;
-            const value = support.stringOf(entry.get("value")) orelse continue;
             if (std.mem.eql(u8, name, "CpuArchitectureType")) {
+                const value = support.stringOf(entry.get("value")) orelse
+                    return fail(
+                        diagnostic,
+                        "configured Azure VM SKU has malformed capabilities",
+                        .{},
+                    );
                 cpu_architecture = value;
-                has_cpu_architecture = true;
+                cpu_architecture_count += 1;
             } else if (std.mem.eql(u8, name, "HyperVGenerations")) {
+                const value = support.stringOf(entry.get("value")) orelse
+                    return fail(
+                        diagnostic,
+                        "configured Azure VM SKU has malformed capabilities",
+                        .{},
+                    );
                 hyper_v = value;
+                hyper_v_count += 1;
             } else if (std.mem.eql(u8, name, "TrustedLaunchDisabled")) {
+                const value = support.stringOf(entry.get("value")) orelse
+                    return fail(
+                        diagnostic,
+                        "configured Azure VM SKU has malformed capabilities",
+                        .{},
+                    );
                 trusted_launch_disabled = value;
+                trusted_launch_count += 1;
             } else if (std.mem.eql(u8, name, "MaxResourceVolumeMB")) {
+                const value = support.stringOf(entry.get("value")) orelse
+                    return fail(
+                        diagnostic,
+                        "configured Azure VM SKU has malformed capabilities",
+                        .{},
+                    );
                 resource_volume = value;
+                resource_volume_count += 1;
+            } else if (std.mem.eql(u8, name, "NvmeDiskSizeInMiB")) {
+                const value = support.stringOf(entry.get("value")) orelse
+                    return fail(
+                        diagnostic,
+                        "configured Azure VM SKU has malformed capabilities",
+                        .{},
+                    );
+                nvme_volume = value;
+                nvme_volume_count += 1;
             }
         }
     }
+    if (cpu_architecture_count > 1 or hyper_v_count > 1 or
+        trusted_launch_count > 1 or resource_volume_count > 1 or
+        nvme_volume_count > 1)
+    {
+        return fail(
+            diagnostic,
+            "configured Azure VM SKU has ambiguous capabilities",
+            .{},
+        );
+    }
     if (!std.mem.eql(u8, cpu_architecture, architecture)) {
-        if (has_cpu_architecture) return fail(
+        if (cpu_architecture_count != 0) return fail(
             diagnostic,
             "SKU architecture mismatch: '{s}'",
             .{cpu_architecture},
@@ -1662,6 +2303,16 @@ pub fn azureSku(
         "configured Azure VM SKU does not support Gen2",
         .{},
     );
+    if (trusted_launch_count != 0 and
+        !std.mem.eql(u8, trusted_launch_disabled, "True") and
+        !std.mem.eql(u8, trusted_launch_disabled, "False"))
+    {
+        return fail(
+            diagnostic,
+            "configured Azure VM SKU reports an invalid Trusted Launch capability",
+            .{},
+        );
+    }
     if (std.mem.eql(u8, trusted_launch_disabled, "True")) return fail(
         diagnostic,
         "configured Azure VM SKU does not support Trusted Launch",
@@ -1672,13 +2323,36 @@ pub fn azureSku(
         "configured Azure VM SKU reports an invalid resource volume size",
         .{},
     );
-    const has_resource_disk = volume > 0;
-    if (std.mem.eql(u8, architecture, "x64") and !has_resource_disk) return fail(
+    if (volume < 0) return fail(
         diagnostic,
-        "configured Azure VM SKU has no temporary resource disk",
+        "configured Azure VM SKU reports an invalid resource volume size",
         .{},
     );
-    try out.print("{s}\n", .{if (has_resource_disk) "true" else "false"});
+    const nvme = std.fmt.parseInt(i64, nvme_volume, 10) catch return fail(
+        diagnostic,
+        "configured Azure VM SKU reports an invalid local NVMe size",
+        .{},
+    );
+    if (nvme < 0) return fail(
+        diagnostic,
+        "configured Azure VM SKU reports an invalid local NVMe size",
+        .{},
+    );
+    const has_conventional_resource_disk = volume > 0;
+    const has_local_temp_storage = has_conventional_resource_disk or nvme > 0;
+    if (std.mem.eql(u8, architecture, "x64") and
+        !has_conventional_resource_disk)
+    {
+        return fail(
+            diagnostic,
+            "configured Azure VM SKU has no temporary resource disk",
+            .{},
+        );
+    }
+    try out.print("{s}\n{s}\n", .{
+        if (has_conventional_resource_disk) "true" else "false",
+        if (has_local_temp_storage) "true" else "false",
+    });
 }
 
 pub const ConversionOptions = struct {
@@ -2174,8 +2848,20 @@ pub fn publishExpected(
     var document = try support.readObject(allocator, io, manifest_path, diagnostic);
     defer document.deinit();
     const manifest = document.object();
-    if (support.integerOf(manifest.get("schema")) != 1 or
-        !support.stringIs(manifest.get("type"), "miz-ubuntu2604-release"))
+    if (!support.hasExactFields(manifest.*, &.{
+        "schema",
+        "type",
+        "release_tag",
+        "source_commit",
+        "certificate_sha256",
+        "signing_certificate_sha256",
+        "signing_provider",
+        "publication_workflow",
+        "assets",
+    }) or
+        support.integerOf(manifest.get("schema")) != 2 or
+        !support.stringIs(manifest.get("type"), "miz-ubuntu2604-release") or
+        !documents.hasWorkflowIdentity(manifest.get("publication_workflow")))
     {
         return fail(diagnostic, "unexpected Ubuntu publish manifest schema", .{});
     }
@@ -2202,6 +2888,41 @@ pub fn publishExpected(
             "Ubuntu publication allowlist mismatch",
             .{},
         );
+        if (!support.hasExactFields(entry, &.{
+            "key",
+            "architecture",
+            "flavor",
+            "asset_name",
+            "sha256",
+            "bytes",
+            "virtual_size",
+            "build_runner",
+            "provenance_digest",
+            "certificate_sha256",
+            "signing_certificate_sha256",
+            "fallback_uki_sha256",
+            "candidate_workflow",
+            "native_workflow",
+            "azure_workflow",
+            "azure_location",
+            "azure_vm_size",
+            "azure_resource_group",
+            "conversion",
+            "derived_vhd_sha256",
+            "derived_vhd_bytes",
+            "derived_vhd_current_size",
+            "azure_image_version_id",
+        }) or
+            !documents.hasWorkflowIdentity(entry.get("candidate_workflow")) or
+            !documents.hasWorkflowIdentity(entry.get("native_workflow")) or
+            !documents.hasWorkflowIdentity(entry.get("azure_workflow")))
+        {
+            return fail(
+                diagnostic,
+                "Ubuntu publication provenance is not exact",
+                .{},
+            );
+        }
         const key = support.stringOf(entry.get("key")) orelse return fail(
             diagnostic,
             "Ubuntu publication allowlist mismatch",

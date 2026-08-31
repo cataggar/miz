@@ -85,7 +85,9 @@ if [[ "$command_name" != run ]]; then
   exit 2
 fi
 
-if [[ -z ${CANDIDATE_DIR:-} || -z ${SOURCE_COMMIT:-} || -z ${ARCHITECTURE:-} ||
+if [[ -z ${CANDIDATE_DIR:-} || -z ${SOURCE_COMMIT:-} ||
+      -z ${CANDIDATE_RUN_ID:-} || -z ${CANDIDATE_RUN_ATTEMPT:-} ||
+      -z ${ARCHITECTURE:-} ||
       -z ${FLAVOR:-} || -z ${ASSET_NAME:-} || -z ${AZURE_LOCATION:-} ||
       -z ${AZURE_VM_SIZE:-} || -z ${RESULT_DIR:-} || -z ${MIZ:-} ||
       -z ${GITHUB_STEP_SUMMARY:-} ]]; then
@@ -93,6 +95,8 @@ if [[ -z ${CANDIDATE_DIR:-} || -z ${SOURCE_COMMIT:-} || -z ${ARCHITECTURE:-} ||
   exit 1
 fi
 [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+[[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+[[ "$CANDIDATE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
 if ! ubuntu2604_validate_candidate_identity \
     "$CANDIDATE_KEY" "$ARCHITECTURE" "$FLAVOR" "$ASSET_NAME"
 then
@@ -260,7 +264,9 @@ readarray -t candidate < <(
     --manifest "$manifest" \
     --asset "$asset" \
     --key "$CANDIDATE_KEY" \
-    --source-commit "$SOURCE_COMMIT"
+    --source-commit "$SOURCE_COMMIT" \
+    --run-id "$CANDIDATE_RUN_ID" \
+    --run-attempt "$CANDIDATE_RUN_ATTEMPT"
 )
 test "${#candidate[@]}" -eq 3
 qcow_sha256=${candidate[0]}
@@ -454,13 +460,19 @@ if [[ "$ARCHITECTURE" == aarch64 ]]; then
   runtime_architecture=aarch64
   azure_image_architecture=Arm64
 fi
-has_resource_disk=$(
+readarray -t sku_storage < <(
   "$RELEASE_TOOL" azure-sku \
     --sku "$sku_json" \
     --vm-size "$AZURE_VM_SIZE" \
     --architecture "$expected_azure_architecture"
 )
-[[ "$has_resource_disk" == true || "$has_resource_disk" == false ]]
+test "${#sku_storage[@]}" -eq 2
+has_conventional_resource_disk=${sku_storage[0]}
+has_local_temp_storage=${sku_storage[1]}
+[[ "$has_conventional_resource_disk" == true ||
+   "$has_conventional_resource_disk" == false ]]
+[[ "$has_local_temp_storage" == true ||
+   "$has_local_temp_storage" == false ]]
 
 source_before=$(sha256sum "$asset" | awk '{print $1}')
 test "$source_before" = "$qcow_sha256"
@@ -870,7 +882,7 @@ fi
 if [[ "$FLAVOR" == core ]]; then
   readarray -t core_identity < <(
     ssh "${ssh_options[@]}" "$ssh_target" \
-      "/usr/bin/bash -s -- '$has_resource_disk'" <<'GUEST'
+      "/usr/bin/bash -s -- '$has_local_temp_storage'" <<'GUEST'
 set -Eeuo pipefail
 guest_error() {
   status=$1
@@ -879,7 +891,7 @@ guest_error() {
   exit "$status"
 }
 trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
-has_resource_disk=$1
+has_local_temp_storage=$1
 sudo -n /usr/bin/test /proc/1/exe -ef /sbin/mizinit
 test -x /usr/sbin/azagent
 test -s /var/lib/azagent/provisioned
@@ -936,17 +948,39 @@ grep -Eq '^[[:space:]]*ResourceDisk.MountPoint[[:space:]]*=[[:space:]]*/d[[:spac
 grep -Eq '^[[:space:]]*ResourceDisk.EnableSwap[[:space:]]*=[[:space:]]*n[[:space:]]*$' /etc/waagent.conf
 grep -Eq '^[[:space:]]*DataDisk.Mount[[:space:]]*=[[:space:]]*y[[:space:]]*$' /etc/waagent.conf
 if mountpoint -q /d; then
-  test "$has_resource_disk" = true
-  findmnt -n -o FSTYPE /d | grep -Eq '^(ext4|xfs)$'
+  test "$has_local_temp_storage" = true
+  mount_source=$(findmnt -n -o SOURCE --target /d)
+  mount_source=$(readlink -f "$mount_source")
+  mount_fstype=$(findmnt -n -o FSTYPE --target /d)
+  root_source=$(findmnt -n -o SOURCE --target /)
+  root_source=$(readlink -f "$root_source")
+  test -b "$mount_source"
+  [[ "$mount_source" == /dev/* ]]
+  resource_disk=$(lsblk -n -o PKNAME "$mount_source")
+  root_disk=$(lsblk -n -o PKNAME "$root_source")
+  [[ -n "$resource_disk" ]] || resource_disk=${mount_source##*/}
+  [[ -n "$root_disk" ]] || root_disk=${root_source##*/}
+  [[ -n "$resource_disk" && "$resource_disk" != "$root_disk" ]]
+  test -b "/dev/$resource_disk"
+  test "$(lsblk -dn -o TYPE "/dev/$resource_disk")" = disk
+  [[ "$mount_fstype" == ext4 || "$mount_fstype" == xfs ]]
   test -f /d/DATALOSS_WARNING_README.txt
+  grep -Fq "temporary resource disk" /d/DATALOSS_WARNING_README.txt
   while read -r swap_path _; do
     test "$swap_path" = Filename && continue
     case "$swap_path" in
       /d|/d/*) exit 1 ;;
     esac
+    swap_source=$(readlink -f "$swap_path" 2>/dev/null || true)
+    test "$swap_source" != "$mount_source"
+    if [[ "$swap_source" == /dev/* ]]; then
+      swap_disk=$(lsblk -n -o PKNAME "$swap_source")
+      [[ -n "$swap_disk" ]] || swap_disk=${swap_source##*/}
+      test "$swap_disk" != "$resource_disk"
+    fi
   done </proc/swaps
 else
-  test "$has_resource_disk" = false
+  test "$has_local_temp_storage" = false
 fi
 ! mountpoint -q /mnt
 test -s /etc/machine-id
@@ -994,9 +1028,9 @@ GUEST
     --output tsv)" = 0
 else
   ssh "${ssh_options[@]}" "$ssh_target" \
-    "/usr/bin/bash -s -- '$has_resource_disk'" <<'GUEST'
+    "/usr/bin/bash -s -- '$has_conventional_resource_disk'" <<'GUEST'
 set -euo pipefail
-has_resource_disk=$1
+has_conventional_resource_disk=$1
 check() {
   label=$1
   shift
@@ -1102,7 +1136,7 @@ check waagent-resource-disk-format grep -Eq '^[[:space:]]*ResourceDisk.Format[[:
 check waagent-resource-disk-swap grep -Eq '^[[:space:]]*ResourceDisk.EnableSwap[[:space:]]*=[[:space:]]*n[[:space:]]*$' /etc/waagent.conf
 check cloud-init-instance-state test -s /var/lib/cloud/instance/obj.pkl
 check resource-disk-not-mounted not_mountpoint /d
-check conventional-resource-disk-policy validate_conventional_resource_disk "$has_resource_disk" || {
+check conventional-resource-disk-policy validate_conventional_resource_disk "$has_conventional_resource_disk" || {
   findmnt -n -o SOURCE,FSTYPE,OPTIONS --target /mnt >&2 || true
   lsblk -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS >&2 || true
   exit 1

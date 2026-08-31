@@ -229,12 +229,14 @@ pub const candidate_fields = [_][]const u8{
     "workflow",
 };
 
-/// Native results bind the complete candidate identity, accepted workflow
-/// attempt, and exact signed bytes and flavor-specific contract set.
+/// Native results bind the complete candidate identity, its originating
+/// workflow attempt, the acceptance attempt, and the exact signed bytes and
+/// flavor-specific contract set.
 pub const native_result_fields = [_][]const u8{
     "architecture",
     "asset_name",
     "candidate_sha256",
+    "candidate_workflow",
     "certificate_sha256",
     "contracts",
     "execution",
@@ -259,6 +261,7 @@ pub const azure_result_fields = [_][]const u8{
     "architecture",
     "asset_name",
     "azure_accepted_sha256",
+    "candidate_workflow",
     "certificate_sha256",
     "contracts",
     "conversion",

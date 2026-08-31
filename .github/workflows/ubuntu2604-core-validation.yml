@@ -409,6 +409,8 @@ jobs:
       FLAVOR: core
       ASSET_NAME: ${{ matrix.asset_name }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      CANDIDATE_RUN_ID: ${{ needs.prepare.outputs.candidate_run_id }}
+      CANDIDATE_RUN_ATTEMPT: ${{ needs.prepare.outputs.candidate_run_attempt }}
       CANDIDATE_DIR: .validation/native/${{ matrix.key }}/candidate
       RESULT_DIR: artifact-staging/core-native-results/${{ matrix.key }}
       RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
@@ -592,7 +594,9 @@ jobs:
             --manifest "$manifest" \
             --asset "$asset" \
             --key "$CANDIDATE_KEY" \
-            --source-commit "$SOURCE_COMMIT"
+            --source-commit "$SOURCE_COMMIT" \
+            --run-id "$CANDIDATE_RUN_ID" \
+            --run-attempt "$CANDIDATE_RUN_ATTEMPT"
           "$RELEASE_TOOL" candidate-signing-env \
             --manifest "$manifest" \
             --certificate "$RESULT_DIR/signing-certificate.der" \
@@ -604,6 +608,8 @@ jobs:
           echo "MIZ_UBUNTU2604_SIGNING_CERTIFICATE=$GITHUB_WORKSPACE/$RESULT_DIR/signing-certificate.pem" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_ACCEPTANCE_RESULT=$GITHUB_WORKSPACE/$RESULT_DIR/native-result.json" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_ENV"
+          echo "MIZ_UBUNTU2604_CANDIDATE_RUN_ID=$CANDIDATE_RUN_ID" >> "$GITHUB_ENV"
+          echo "MIZ_UBUNTU2604_CANDIDATE_RUN_ATTEMPT=$CANDIDATE_RUN_ATTEMPT" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ID=$GITHUB_RUN_ID" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 

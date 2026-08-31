@@ -301,6 +301,10 @@ pub fn makeNativeResult(
             .source_commit = options.source_commit,
             .virtual_size = object.get("virtual_size").?.integer,
             .candidate_sha256 = object.get("sha256").?.string,
+            .candidate_workflow = .{
+                .run_id = object.get("workflow").?.object.get("run_id").?.string,
+                .run_attempt = object.get("workflow").?.object.get("run_attempt").?.string,
+            },
             .certificate_sha256 = signing.get("certificate_sha256").?.string,
             .fallback_uki_sha256 = signing.get("fallback_uki_sha256").?.string,
             .status = options.status,

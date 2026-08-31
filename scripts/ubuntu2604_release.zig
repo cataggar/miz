@@ -51,6 +51,7 @@ const usage_text =
     \\  stage                         stage the exact published asset set
     \\  verify-image-info             check a miz image-info document
     \\  candidate-signing-env         export the candidate signing bindings
+    \\  resolve-artifacts             select exact successful workflow artifacts
     \\  release-gate                  check the exact four-candidate release gate
     \\  core-gate                     check and record the core validation gate
     \\  kvm-api-version               check the host KVM API version
@@ -58,7 +59,7 @@ const usage_text =
     \\  azure-disk-access             print a disk write-access SAS URL
     \\  azure-boot-artifact           download a bounded boot diagnostic
     \\  azure-failure-diagnostics     write the failure diagnostics document
-    \\  azure-sku                     check the VM SKU and report its resource disk
+    \\  azure-sku                     check the VM SKU and report temporary storage
     \\  azure-conversion-attestation  write the VHD conversion attestation
     \\  azure-gallery-request         write the gallery image-version request
     \\  azure-gallery-accepted        check the create response UEFI settings
@@ -172,6 +173,8 @@ fn dispatch(
             "--asset",
             "--key",
             "--source-commit",
+            "--run-id",
+            "--run-attempt",
         });
         defer options.deinit();
         var verified = try documents.verifyCandidate(
@@ -184,6 +187,16 @@ fn dispatch(
             diagnostic,
         );
         defer verified.deinit();
+        if (options.get("--run-id") != null or options.get("--run-attempt") != null) {
+            try workflow.requireExactWorkflow(
+                verified.object().get("workflow"),
+                try options.require("--run-id"),
+                try options.require("--run-attempt"),
+                try options.require("--key"),
+                "candidate",
+                diagnostic,
+            );
+        }
         try context.out.print("{s}\n{d}\n{d}\n", .{
             verified.sha256,
             verified.bytes,
@@ -344,18 +357,26 @@ fn dispatch(
     if (std.mem.eql(u8, command, "stage")) {
         var options = try cli.parse(allocator, argv, &.{
             "--candidates",
+            "--native-results",
             "--azure-results",
             "--source-commit",
             "--release-tag",
+            "--candidate-run-id",
+            "--run-id",
+            "--run-attempt",
             "--output",
             "--notes",
         });
         defer options.deinit();
         return commands.stage(allocator, io, .{
             .candidates = try options.require("--candidates"),
+            .native_results = try options.require("--native-results"),
             .azure_results = try options.require("--azure-results"),
             .source_commit = try options.require("--source-commit"),
             .release_tag = try options.require("--release-tag"),
+            .candidate_run_id = try options.require("--candidate-run-id"),
+            .run_id = try options.require("--run-id"),
+            .run_attempt = try options.require("--run-attempt"),
             .output = try options.require("--output"),
             .notes = try options.require("--notes"),
         }, diagnostic);
