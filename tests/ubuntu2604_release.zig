@@ -1306,6 +1306,26 @@ test "Azure Secure Boot loads required modules and accepts only in-tree Binder" 
     try script.expectContains("test \"$module_sig_id\" = \"PKCS#7\"");
 }
 
+test "Azure Binder probe transfer has exactly one SSH stdin source" {
+    var script = try @import("ubuntu2604_source.zig").Source.open(
+        allocator,
+        "scripts/ubuntu2604_azure_acceptance.sh",
+    );
+    defer script.deinit();
+    try script.expectContains(
+        "base64 -w0 \"$BINDER_PROBE\" | ssh \"${ssh_options[@]}\" \"$ssh_target\"",
+    );
+    try script.expectContains(
+        "base64 -d >'$binder_probe_remote'; chmod 0700 '$binder_probe_remote'",
+    );
+    try script.expectOmits(
+        "\"/usr/bin/bash -s -- '$binder_probe_remote'\" <<'GUEST'\nset -euo pipefail\nremote=$1",
+    );
+    try script.expectContains(
+        "test \"$binder_probe_remote_sha256\" = \"$binder_probe_sha256\"",
+    );
+}
+
 test "an Azure result whose contracts are not the candidate's is rejected" {
     var subject = try tree();
     defer subject.deinit();

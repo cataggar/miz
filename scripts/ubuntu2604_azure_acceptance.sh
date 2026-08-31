@@ -820,14 +820,7 @@ if [[ "$FLAVOR" == core ]]; then
   binder_probe_remote=/home/miztest/.miz-binder-probe
   binder_probe_sha256=$(sha256sum "$BINDER_PROBE" | awk '{print $1}')
   base64 -w0 "$BINDER_PROBE" | ssh "${ssh_options[@]}" "$ssh_target" \
-    "/usr/bin/bash -s -- '$binder_probe_remote'" <<'GUEST'
-set -euo pipefail
-remote=$1
-rm -f -- "$remote"
-umask 077
-base64 -d >"$remote"
-chmod 0700 "$remote"
-GUEST
+    "set -eu; rm -f -- '$binder_probe_remote'; umask 077; base64 -d >'$binder_probe_remote'; chmod 0700 '$binder_probe_remote'"
   binder_probe_remote_sha256=$(
     ssh "${ssh_options[@]}" "$ssh_target" "sha256sum '$binder_probe_remote'" |
       awk '{print $1}'
