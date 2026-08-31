@@ -1287,6 +1287,25 @@ test "the full Azure service contract matches Ubuntu 26.04" {
     try script.expectContains("instanceView.bootDiagnostics.serialConsoleLogBlobUri");
 }
 
+test "Azure Secure Boot loads required modules and accepts only in-tree Binder" {
+    var script = try @import("ubuntu2604_source.zig").Source.open(
+        allocator,
+        "scripts/ubuntu2604_azure_acceptance.sh",
+    );
+    defer script.deinit();
+    try script.expectContains(
+        "if ! test -d \"/sys/module/$module\"; then\n    sudo -n /usr/sbin/modprobe \"$module\"",
+    );
+    try script.expectOmits(
+        "if ! test -d \"/sys/module/$module\" && [[ \"$flavor\" == full ]]",
+    );
+    try script.expectContains(
+        "/lib/modules/*/kernel/*|/usr/lib/modules/*/kernel/*",
+    );
+    try script.expectContains("test -n \"$module_signer\"");
+    try script.expectContains("test \"$module_sig_id\" = \"PKCS#7\"");
+}
+
 test "an Azure result whose contracts are not the candidate's is rejected" {
     var subject = try tree();
     defer subject.deinit();
