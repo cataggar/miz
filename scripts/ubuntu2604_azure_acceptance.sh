@@ -772,7 +772,7 @@ grep -Eq '\[(integrity|confidentiality)\]' /sys/kernel/security/lockdown
 test -c /dev/tpm0
 test -c /dev/tpmrm0
 for module in hv_netvsc crc_itu_t udf isofs; do
-  if ! test -d "/sys/module/$module" && [[ "$flavor" == full ]]; then
+  if ! test -d "/sys/module/$module"; then
     sudo -n /usr/sbin/modprobe "$module"
   fi
   test -d "/sys/module/$module"
@@ -788,7 +788,7 @@ if [[ "$flavor" == core ]]; then
   module_sig_id=$(printf '%s\n' "$module_info" | awk -F': +' '/^sig_id:/{print $2; exit}')
   # Official in-tree module only: reject a DKMS/out-of-tree build path.
   case "$module_filename" in
-    /lib/modules/*/kernel/*) ;;
+    /lib/modules/*/kernel/*|/usr/lib/modules/*/kernel/*) ;;
     *) exit 1 ;;
   esac
   case "$module_filename" in
