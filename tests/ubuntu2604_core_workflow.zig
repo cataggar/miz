@@ -146,6 +146,9 @@ test "candidate reuse is bound to the exact source, run, and attempt" {
     );
     try source.expectContainsIn(gate, "--run-id \"$RUN_ID_VALUE\"", workflow_path);
     try source.expectContainsIn(gate, "--run-attempt \"$RUN_ATTEMPT_VALUE\"", workflow_path);
+    try workflow.expectContains(
+        "MIZ_UBUNTU2604_CANDIDATE_RUN_ATTEMPT=$CANDIDATE_RUN_ATTEMPT",
+    );
 }
 
 test "permissions and protected environments are least privilege" {

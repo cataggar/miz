@@ -215,7 +215,7 @@ const core_policy: FlavorPolicy = .{
     .x86_64_file_name = "Ubuntu-26.04-x86_64.core.qcow2",
     .aarch64_file_name = "Ubuntu-26.04-aarch64.core.qcow2",
     .virtual_size = 3584 * mib,
-    .result_schema = 8,
+    .result_schema = 9,
     .contracts = &core_contracts,
 };
 
@@ -223,7 +223,7 @@ const full_policy: FlavorPolicy = .{
     .x86_64_file_name = "Ubuntu-26.04-x86_64.qcow2",
     .aarch64_file_name = "Ubuntu-26.04-aarch64.qcow2",
     .virtual_size = 5 * gib,
-    .result_schema = 3,
+    .result_schema = 4,
     .contracts = &full_contracts,
 };
 
@@ -435,11 +435,15 @@ fn optionalEnvAlloc(allocator: Allocator, comptime name: []const u8) !?[]u8 {
 
 const AcceptanceResultIdentity = struct {
     source_commit: []u8,
+    candidate_run_id: []u8,
+    candidate_run_attempt: []u8,
     run_id: []u8,
     run_attempt: []u8,
 
     fn deinit(self: *AcceptanceResultIdentity, allocator: Allocator) void {
         allocator.free(self.source_commit);
+        allocator.free(self.candidate_run_id);
+        allocator.free(self.candidate_run_attempt);
         allocator.free(self.run_id);
         allocator.free(self.run_attempt);
         self.* = undefined;
@@ -470,6 +474,16 @@ fn requireAcceptanceResultIdentityAlloc(
         "MIZ_UBUNTU2604_SOURCE_COMMIT",
     );
     errdefer allocator.free(source_commit);
+    const candidate_run_id = try requireEnvAlloc(
+        allocator,
+        "MIZ_UBUNTU2604_CANDIDATE_RUN_ID",
+    );
+    errdefer allocator.free(candidate_run_id);
+    const candidate_run_attempt = try requireEnvAlloc(
+        allocator,
+        "MIZ_UBUNTU2604_CANDIDATE_RUN_ATTEMPT",
+    );
+    errdefer allocator.free(candidate_run_attempt);
     const run_id = try requireEnvAlloc(
         allocator,
         "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ID",
@@ -481,10 +495,18 @@ fn requireAcceptanceResultIdentityAlloc(
     );
     errdefer allocator.free(run_attempt);
     if (!isLowerHexCommit(source_commit)) return error.InvalidSourceCommit;
+    if (!isPositiveDecimal(candidate_run_id)) {
+        return error.InvalidCandidateRunId;
+    }
+    if (!isPositiveDecimal(candidate_run_attempt)) {
+        return error.InvalidCandidateRunAttempt;
+    }
     if (!isPositiveDecimal(run_id)) return error.InvalidAcceptanceRunId;
     if (!isPositiveDecimal(run_attempt)) return error.InvalidAcceptanceRunAttempt;
     return .{
         .source_commit = source_commit,
+        .candidate_run_id = candidate_run_id,
+        .candidate_run_attempt = candidate_run_attempt,
         .run_id = run_id,
         .run_attempt = run_attempt,
     };
@@ -3171,6 +3193,10 @@ fn writeAcceptanceResult(
             .source_commit = identity.source_commit,
             .virtual_size = candidate.expectedVirtualSize(),
             .candidate_sha256 = &source_sha256_hex,
+            .candidate_workflow = .{
+                .run_id = identity.candidate_run_id,
+                .run_attempt = identity.candidate_run_attempt,
+            },
             .certificate_sha256 = &certificate_sha256_hex,
             .fallback_uki_sha256 = &uki_sha256_hex,
             .status = "success",
@@ -3468,8 +3494,8 @@ test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
     try std.testing.expectEqual(@as(u64, 5 * gib), full.expectedVirtualSize());
     try std.testing.expectEqual(@as(u64, 3584 * mib), core.expectedVirtualSize());
     try std.testing.expect(core.expectedVirtualSize() < full.expectedVirtualSize());
-    try std.testing.expectEqual(@as(u32, 3), full.flavor.policy().result_schema);
-    try std.testing.expectEqual(@as(u32, 8), core.flavor.policy().result_schema);
+    try std.testing.expectEqual(@as(u32, 4), full.flavor.policy().result_schema);
+    try std.testing.expectEqual(@as(u32, 9), core.flavor.policy().result_schema);
     try std.testing.expectEqual(@as(usize, 18), full.contracts().len);
     try std.testing.expectEqual(@as(usize, 28), core.contracts().len);
     try std.testing.expect(hasContract(core.contracts(), "mizinit-sshd-supervision"));
@@ -3508,6 +3534,8 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
     const candidate = Candidate{ .architecture = .aarch64, .flavor = .full };
     var identity: AcceptanceResultIdentity = .{
         .source_commit = try allocator.dupe(u8, "a" ** 40),
+        .candidate_run_id = try allocator.dupe(u8, "90"),
+        .candidate_run_attempt = try allocator.dupe(u8, "1"),
         .run_id = try allocator.dupe(u8, "100"),
         .run_attempt = try allocator.dupe(u8, "2"),
     };
@@ -3566,7 +3594,7 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
     );
     defer parsed.deinit();
     const result = parsed.value.object;
-    try std.testing.expectEqual(@as(i64, 3), result.get("schema").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), result.get("schema").?.integer);
     try std.testing.expectEqualStrings("aarch64-full", result.get("key").?.string);
     try std.testing.expectEqualStrings("aarch64", result.get("architecture").?.string);
     try std.testing.expectEqualStrings(
@@ -3575,6 +3603,15 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
     );
     try std.testing.expectEqualStrings("a" ** 40, result.get("source_commit").?.string);
     try std.testing.expectEqualStrings("success", result.get("status").?.string);
+    const candidate_workflow = result.get("candidate_workflow").?.object;
+    try std.testing.expectEqualStrings(
+        "90",
+        candidate_workflow.get("run_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "1",
+        candidate_workflow.get("run_attempt").?.string,
+    );
     const qemu = result.get("execution").?.object;
     try std.testing.expectEqualStrings("tcg", qemu.get("accelerator").?.string);
     try std.testing.expectEqualStrings("max", qemu.get("cpu").?.string);

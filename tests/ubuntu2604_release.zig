@@ -24,6 +24,8 @@ const support = release.support;
 const allocator = std.testing.allocator;
 const io = std.testing.io;
 const publication_tag = "Ubuntu-26.04-20260829";
+const Attempts = [contracts.release_order.len][]const u8;
+const attempt_one: Attempts = @splat("1");
 
 fn tree() !Tree {
     return Tree.create(allocator, io);
@@ -72,6 +74,8 @@ fn expectAzureRejected(subject: *const Tree, key: []const u8) !void {
 fn stage(subject: *const Tree, release_tag: []const u8) !void {
     const candidates = try subject.candidates();
     defer allocator.free(candidates);
+    const native = try subject.native();
+    defer allocator.free(native);
     const azure = try subject.azure();
     defer allocator.free(azure);
     const output = try subject.path("staged", .{});
@@ -81,9 +85,13 @@ fn stage(subject: *const Tree, release_tag: []const u8) !void {
     var diagnostic: support.Diagnostic = .{};
     try commands.stage(allocator, io, .{
         .candidates = candidates,
+        .native_results = native,
         .azure_results = azure,
         .source_commit = fixture.source_commit,
         .release_tag = release_tag,
+        .candidate_run_id = "100",
+        .run_id = "100",
+        .run_attempt = "3",
         .output = output,
         .notes = notes,
     }, &diagnostic);
@@ -96,14 +104,302 @@ fn expectStageRejected(subject: *const Tree) !void {
 fn makeAll(subject: *const Tree) !void {
     for (contracts.release_order) |key| {
         try fixture.makeBundle(subject, key, .{});
+        try fixture.makeNativeResult(subject, key, .{});
     }
 }
 
 fn makeReleaseEvidence(subject: *const Tree) !void {
     try makeAll(subject);
-    for (contracts.release_order) |key| {
-        try fixture.makeNativeResult(subject, key, .{});
+}
+
+fn artifactPrefix(kind: release.workflow.ArtifactKind) []const u8 {
+    return switch (kind) {
+        .candidate => "ubuntu2604-candidate",
+        .native => "ubuntu2604-native",
+        .azure => "ubuntu2604-azure",
+    };
+}
+
+fn artifactJobName(
+    subject_allocator: Allocator,
+    kind: release.workflow.ArtifactKind,
+    key: []const u8,
+) ![]u8 {
+    return switch (kind) {
+        .candidate => std.fmt.allocPrint(
+            subject_allocator,
+            "build/native {s}",
+            .{key},
+        ),
+        .native => std.fmt.allocPrint(
+            subject_allocator,
+            "same-architecture QEMU ({s}) {s}",
+            .{
+                if (std.mem.startsWith(u8, key, "x86_64")) "kvm" else "tcg",
+                key,
+            },
+        ),
+        .azure => std.fmt.allocPrint(subject_allocator, "Azure {s}", .{key}),
+    };
+}
+
+fn writeSelection(
+    subject: *const Tree,
+    kind: release.workflow.ArtifactKind,
+    run_id: []const u8,
+    attempts: Attempts,
+) ![]u8 {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const builder = support.Builder.init(arena.allocator());
+    var artifacts = builder.object();
+    for (contracts.release_order, 0..) |key, index| {
+        const artifact_name = try std.fmt.allocPrint(
+            allocator,
+            "{s}-{s}-{s}-{s}",
+            .{ artifactPrefix(kind), key, fixture.source_commit, attempts[index] },
+        );
+        defer allocator.free(artifact_name);
+        const job_name = try artifactJobName(allocator, kind, key);
+        defer allocator.free(job_name);
+        var entry = builder.object();
+        try builder.putInteger(
+            &entry,
+            "artifact_id",
+            1000 + @as(i64, @intCast(index)),
+        );
+        try builder.putString(&entry, "artifact_name", artifact_name);
+        try builder.putString(
+            &entry,
+            "artifact_digest",
+            "sha256:" ++ "a" ** 64,
+        );
+        try builder.putInteger(
+            &entry,
+            "job_id",
+            2000 + @as(i64, @intCast(index)),
+        );
+        try builder.putString(&entry, "job_name", job_name);
+        try builder.putString(&entry, "run_attempt", attempts[index]);
+        try builder.put(&artifacts, key, .{ .object = entry });
     }
+    var document = builder.object();
+    try builder.putInteger(&document, "schema", 1);
+    try builder.putString(
+        &document,
+        "type",
+        "miz-ubuntu2604-artifact-selection",
+    );
+    try builder.putString(&document, "kind", @tagName(kind));
+    try builder.putString(&document, "run_id", run_id);
+    try builder.putString(&document, "source_commit", fixture.source_commit);
+    try builder.put(&document, "artifacts", .{ .object = artifacts });
+    const path = try subject.path("selection-{s}.json", .{@tagName(kind)});
+    errdefer allocator.free(path);
+    var diagnostic: support.Diagnostic = .{};
+    try support.writeDocument(
+        allocator,
+        io,
+        path,
+        .{ .object = document },
+        &diagnostic,
+    );
+    return path;
+}
+
+const EvidenceFault = enum {
+    none,
+    missing,
+    duplicate,
+    expired,
+    empty,
+    wrong_source,
+    wrong_workflow,
+    wrong_key,
+    unsuccessful_job,
+    missing_job,
+    duplicate_job,
+};
+
+fn resolveEvidenceWithAttempts(
+    subject: *const Tree,
+    kind: release.workflow.ArtifactKind,
+    fault: EvidenceFault,
+    attempts: Attempts,
+    max_attempt: i64,
+) !void {
+    const target_index: usize = 2;
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const builder = support.Builder.init(arena.allocator());
+    var jobs = builder.array();
+    var artifacts = builder.array();
+
+    for (contracts.release_order, 0..) |key, index| {
+        const selected_attempt = try std.fmt.parseInt(i64, attempts[index], 10);
+        var attempt: i64 = 1;
+        while (attempt <= max_attempt) : (attempt += 1) {
+            if (fault == .missing_job and index == target_index and
+                attempt == selected_attempt)
+            {
+                continue;
+            }
+            const job_name = try artifactJobName(allocator, kind, key);
+            defer allocator.free(job_name);
+            var job = builder.object();
+            try builder.putInteger(
+                &job,
+                "id",
+                attempt * 100 + @as(i64, @intCast(index)) + 1,
+            );
+            try builder.putString(&job, "name", job_name);
+            try builder.putInteger(&job, "run_attempt", attempt);
+            try builder.putInteger(&job, "run_id", 100);
+            try builder.putString(&job, "head_sha", fixture.source_commit);
+            try builder.putString(&job, "status", "completed");
+            try builder.putString(
+                &job,
+                "conclusion",
+                if (fault == .unsuccessful_job and index == target_index and
+                    attempt == selected_attempt)
+                    "failure"
+                else
+                    "success",
+            );
+            const job_value: std.json.Value = .{ .object = job };
+            try jobs.append(job_value);
+            if (fault == .duplicate_job and index == target_index and
+                attempt == selected_attempt)
+            {
+                try jobs.append(job_value);
+            }
+        }
+
+        if (fault == .missing and index == target_index) continue;
+        const artifact_key = if (fault == .wrong_key and index == target_index)
+            "riscv64-core"
+        else
+            key;
+        const artifact_source = if (fault == .wrong_source and index == target_index)
+            "b" ** 40
+        else
+            fixture.source_commit;
+        const artifact_name = try std.fmt.allocPrint(
+            allocator,
+            "{s}-{s}-{s}-{s}",
+            .{ artifactPrefix(kind), artifact_key, artifact_source, attempts[index] },
+        );
+        defer allocator.free(artifact_name);
+        var workflow_identity = builder.object();
+        try builder.putInteger(&workflow_identity, "id", 100);
+        try builder.putString(
+            &workflow_identity,
+            "head_sha",
+            if (fault == .wrong_workflow and index == target_index)
+                "b" ** 40
+            else
+                fixture.source_commit,
+        );
+        var artifact = builder.object();
+        try builder.putInteger(
+            &artifact,
+            "id",
+            1000 + @as(i64, @intCast(index)),
+        );
+        try builder.putString(&artifact, "name", artifact_name);
+        try builder.putInteger(
+            &artifact,
+            "size_in_bytes",
+            if (fault == .empty and index == target_index) 0 else 100,
+        );
+        try builder.put(
+            &artifact,
+            "expired",
+            .{ .bool = fault == .expired and index == target_index },
+        );
+        try builder.putString(
+            &artifact,
+            "digest",
+            "sha256:" ++ "a" ** 64,
+        );
+        try builder.put(
+            &artifact,
+            "workflow_run",
+            .{ .object = workflow_identity },
+        );
+        const artifact_value: std.json.Value = .{ .object = artifact };
+        try artifacts.append(artifact_value);
+        if (fault == .duplicate and index == target_index) {
+            try artifacts.append(artifact_value);
+        }
+    }
+
+    const jobs_path = try subject.path("jobs-{s}.json", .{@tagName(kind)});
+    defer allocator.free(jobs_path);
+    const artifacts_path = try subject.path(
+        "artifacts-{s}.json",
+        .{@tagName(kind)},
+    );
+    defer allocator.free(artifacts_path);
+    const output = try subject.path("resolved-{s}.json", .{@tagName(kind)});
+    defer allocator.free(output);
+    var diagnostic: support.Diagnostic = .{};
+    try support.writeDocument(
+        allocator,
+        io,
+        jobs_path,
+        .{ .array = jobs },
+        &diagnostic,
+    );
+    try support.writeDocument(
+        allocator,
+        io,
+        artifacts_path,
+        .{ .array = artifacts },
+        &diagnostic,
+    );
+    try release_workflow.resolveArtifacts(allocator, io, .{
+        .jobs = jobs_path,
+        .artifacts = artifacts_path,
+        .kind = kind,
+        .run_id = "100",
+        .source_commit = fixture.source_commit,
+        .max_attempt = max_attempt,
+        .output = output,
+    }, &diagnostic);
+}
+
+fn resolveEvidence(subject: *const Tree, fault: EvidenceFault) !void {
+    return resolveEvidenceWithAttempts(
+        subject,
+        .candidate,
+        fault,
+        .{ "1", "1", "2", "1" },
+        2,
+    );
+}
+
+fn azureSkuOutput(
+    subject: *const Tree,
+    document: []const u8,
+    architecture: []const u8,
+    diagnostic: *support.Diagnostic,
+) ![]u8 {
+    const path = try subject.path("sku.json", .{});
+    defer allocator.free(path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = document });
+    var buffer: [128]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buffer);
+    try release_workflow.azureSku(
+        allocator,
+        io,
+        &out,
+        path,
+        "Standard_D2pds_v6",
+        architecture,
+        diagnostic,
+    );
+    return allocator.dupe(u8, out.buffered());
 }
 
 fn releaseGateWithDiagnostic(
@@ -116,15 +412,37 @@ fn releaseGateWithDiagnostic(
     defer allocator.free(native);
     const azure = try subject.azure();
     defer allocator.free(azure);
+    const candidate_selection = try writeSelection(
+        subject,
+        .candidate,
+        "100",
+        attempt_one,
+    );
+    defer allocator.free(candidate_selection);
+    const native_selection = try writeSelection(
+        subject,
+        .native,
+        "100",
+        attempt_one,
+    );
+    defer allocator.free(native_selection);
+    const azure_selection = try writeSelection(
+        subject,
+        .azure,
+        "100",
+        attempt_one,
+    );
+    defer allocator.free(azure_selection);
     try release_workflow.releaseGate(allocator, io, .{
         .candidates = candidates,
         .native_results = native,
         .azure_results = azure,
+        .candidate_selection = candidate_selection,
+        .native_selection = native_selection,
+        .azure_selection = azure_selection,
         .source_commit = fixture.source_commit,
         .candidate_run_id = "100",
-        .candidate_run_attempt = "1",
         .run_id = "100",
-        .run_attempt = "1",
     }, diagnostic);
 }
 
@@ -167,6 +485,381 @@ test "the release gate requires valid native and Azure results for all four cand
     defer subject.deinit();
     try makeReleaseEvidence(&subject);
     try releaseGate(&subject);
+}
+
+test "artifact selection resolves each candidate from its newest successful attempt" {
+    var subject = try tree();
+    defer subject.deinit();
+    try resolveEvidence(&subject, .none);
+    const output = try subject.path("resolved-candidate.json", .{});
+    defer allocator.free(output);
+    var selection = try fixture.read(allocator, io, output);
+    defer selection.deinit();
+    const artifacts = selection.value.object.get("artifacts").?.object;
+    try std.testing.expectEqualStrings(
+        "1",
+        artifacts.get("x86_64-full").?.object.get("run_attempt").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "2",
+        artifacts.get("x86_64-core").?.object.get("run_attempt").?.string,
+    );
+}
+
+test "artifact selection resolves native and Azure result attempts" {
+    for ([_]release.workflow.ArtifactKind{ .native, .azure }) |kind| {
+        var subject = try tree();
+        defer subject.deinit();
+        try resolveEvidenceWithAttempts(
+            &subject,
+            kind,
+            .none,
+            .{ "2", "1", "2", "1" },
+            2,
+        );
+        const output = try subject.path("resolved-{s}.json", .{@tagName(kind)});
+        defer allocator.free(output);
+        var selection = try fixture.read(allocator, io, output);
+        defer selection.deinit();
+        try std.testing.expectEqualStrings(
+            @tagName(kind),
+            selection.value.object.get("kind").?.string,
+        );
+        try std.testing.expectEqualStrings(
+            "2",
+            selection.value.object
+                .get("artifacts").?
+                .object
+                .get("x86_64-full").?
+                .object
+                .get("run_attempt").?
+                .string,
+        );
+    }
+}
+
+test "artifact selection rejects incomplete or untrusted evidence" {
+    const faults = [_]EvidenceFault{
+        .missing,
+        .duplicate,
+        .expired,
+        .empty,
+        .wrong_source,
+        .wrong_workflow,
+        .wrong_key,
+        .unsuccessful_job,
+        .missing_job,
+        .duplicate_job,
+    };
+    for (faults) |fault| {
+        var subject = try tree();
+        defer subject.deinit();
+        try std.testing.expectError(error.Failed, resolveEvidence(&subject, fault));
+    }
+}
+
+test "artifact selection survives downstream-only reruns and prefers later full attempts" {
+    {
+        var subject = try tree();
+        defer subject.deinit();
+        try resolveEvidenceWithAttempts(
+            &subject,
+            .candidate,
+            .none,
+            .{ "1", "1", "2", "1" },
+            3,
+        );
+        const output = try subject.path("resolved-candidate.json", .{});
+        defer allocator.free(output);
+        var selection = try fixture.read(allocator, io, output);
+        defer selection.deinit();
+        const artifacts = selection.value.object.get("artifacts").?.object;
+        try std.testing.expectEqualStrings(
+            "2",
+            artifacts.get("x86_64-core").?.object.get("run_attempt").?.string,
+        );
+        try std.testing.expectEqualStrings(
+            "1",
+            artifacts.get("aarch64-core").?.object.get("run_attempt").?.string,
+        );
+    }
+    {
+        var subject = try tree();
+        defer subject.deinit();
+        try resolveEvidenceWithAttempts(
+            &subject,
+            .candidate,
+            .none,
+            @splat("3"),
+            3,
+        );
+        const output = try subject.path("resolved-candidate.json", .{});
+        defer allocator.free(output);
+        var selection = try fixture.read(allocator, io, output);
+        defer selection.deinit();
+        for (contracts.release_order) |key| {
+            try std.testing.expectEqualStrings(
+                "3",
+                selection.value.object
+                    .get("artifacts").?
+                    .object
+                    .get(key).?
+                    .object
+                    .get("run_attempt").?
+                    .string,
+            );
+        }
+    }
+}
+
+test "Azure SKU storage policy distinguishes conventional, NVMe-only, and absent storage" {
+    const cases = [_]struct {
+        architecture: []const u8,
+        capabilities: []const u8,
+        expected: []const u8,
+    }{
+        .{
+            .architecture = "x64",
+            .capabilities =
+            \\{"name":"CpuArchitectureType","value":"x64"},
+            \\{"name":"HyperVGenerations","value":"V1,V2"},
+            \\{"name":"MaxResourceVolumeMB","value":"76800"}
+            ,
+            .expected = "true\ntrue\n",
+        },
+        .{
+            .architecture = "Arm64",
+            .capabilities =
+            \\{"name":"CpuArchitectureType","value":"Arm64"},
+            \\{"name":"HyperVGenerations","value":"V2"},
+            \\{"name":"MaxResourceVolumeMB","value":"0"},
+            \\{"name":"NvmeDiskSizeInMiB","value":"112640"}
+            ,
+            .expected = "false\ntrue\n",
+        },
+        .{
+            .architecture = "Arm64",
+            .capabilities =
+            \\{"name":"CpuArchitectureType","value":"Arm64"},
+            \\{"name":"HyperVGenerations","value":"V2"},
+            \\{"name":"MaxResourceVolumeMB","value":"0"}
+            ,
+            .expected = "false\nfalse\n",
+        },
+    };
+    for (cases) |case| {
+        var subject = try tree();
+        defer subject.deinit();
+        const document = try std.fmt.allocPrint(
+            allocator,
+            "[{{\"name\":\"Standard_D2pds_v6\",\"restrictions\":[]," ++
+                "\"capabilities\":[{s}]}}]",
+            .{case.capabilities},
+        );
+        defer allocator.free(document);
+        var diagnostic: support.Diagnostic = .{};
+        const output = try azureSkuOutput(
+            &subject,
+            document,
+            case.architecture,
+            &diagnostic,
+        );
+        defer allocator.free(output);
+        try std.testing.expectEqualStrings(case.expected, output);
+    }
+}
+
+test "Azure SKU storage policy rejects missing x64 storage and malformed ambiguity" {
+    const cases = [_]struct {
+        architecture: []const u8,
+        document: []const u8,
+    }{
+        .{
+            .architecture = "x64",
+            .document =
+            \\[{"name":"Standard_D2pds_v6","restrictions":[],"capabilities":[
+            \\{"name":"CpuArchitectureType","value":"x64"},
+            \\{"name":"HyperVGenerations","value":"V2"},
+            \\{"name":"MaxResourceVolumeMB","value":"0"},
+            \\{"name":"NvmeDiskSizeInMiB","value":"112640"}]}]
+            ,
+        },
+        .{
+            .architecture = "Arm64",
+            .document =
+            \\[{"name":"Standard_D2pds_v6","restrictions":[],"capabilities":[
+            \\{"name":"CpuArchitectureType","value":"Arm64"},
+            \\{"name":"HyperVGenerations","value":"V2"},
+            \\{"name":"NvmeDiskSizeInMiB","value":"invalid"}]}]
+            ,
+        },
+        .{
+            .architecture = "Arm64",
+            .document =
+            \\[{"name":"Standard_D2pds_v6","restrictions":[],"capabilities":[
+            \\{"name":"CpuArchitectureType","value":"Arm64"},
+            \\{"name":"HyperVGenerations","value":"V2"},
+            \\{"name":"NvmeDiskSizeInMiB","value":112640}]}]
+            ,
+        },
+        .{
+            .architecture = "Arm64",
+            .document =
+            \\[{"name":"Standard_D2pds_v6","restrictions":[],"capabilities":[
+            \\{"name":"CpuArchitectureType","value":"Arm64"},
+            \\{"name":"HyperVGenerations","value":"V2"},
+            \\{"name":"NvmeDiskSizeInMiB","value":"1"},
+            \\{"name":"NvmeDiskSizeInMiB","value":"2"}]}]
+            ,
+        },
+        .{
+            .architecture = "Arm64",
+            .document =
+            \\[{"name":"Standard_D2pds_v6","restrictions":[],"capabilities":[
+            \\{"name":"CpuArchitectureType","value":"Arm64"},
+            \\{"name":"HyperVGenerations","value":"V2"}]},
+            \\{"name":"Standard_D2pds_v6","restrictions":[],"capabilities":[
+            \\{"name":"CpuArchitectureType","value":"Arm64"},
+            \\{"name":"HyperVGenerations","value":"V2"}]}]
+            ,
+        },
+        .{
+            .architecture = "x64",
+            .document =
+            \\[{"name":"Standard_D2pds_v6","restrictions":[],"capabilities":[
+            \\{"name":"CpuArchitectureType","value":"x64"},
+            \\{"name":"HyperVGenerations","value":"V1"},
+            \\{"name":"MaxResourceVolumeMB","value":"76800"}]}]
+            ,
+        },
+        .{
+            .architecture = "x64",
+            .document =
+            \\[{"name":"Standard_D2pds_v6","restrictions":[],"capabilities":[
+            \\{"name":"CpuArchitectureType","value":"x64"},
+            \\{"name":"HyperVGenerations","value":"V2"},
+            \\{"name":"TrustedLaunchDisabled","value":"True"},
+            \\{"name":"MaxResourceVolumeMB","value":"76800"}]}]
+            ,
+        },
+        .{
+            .architecture = "x64",
+            .document =
+            \\[{"name":"Standard_D2pds_v6","restrictions":[],"capabilities":[
+            \\{"name":"CpuArchitectureType","value":"x64"},
+            \\{"name":"HyperVGenerations","value":"V2"},
+            \\{"name":"TrustedLaunchDisabled","value":"unknown"},
+            \\{"name":"MaxResourceVolumeMB","value":"76800"}]}]
+            ,
+        },
+    };
+    for (cases) |case| {
+        var subject = try tree();
+        defer subject.deinit();
+        var diagnostic: support.Diagnostic = .{};
+        try std.testing.expectError(
+            error.Failed,
+            azureSkuOutput(
+                &subject,
+                case.document,
+                case.architecture,
+                &diagnostic,
+            ),
+        );
+    }
+}
+
+test "the release gate accepts per-key candidate and validation attempts" {
+    const candidate_attempts: Attempts = .{ "1", "1", "2", "1" };
+    const native_attempts: Attempts = .{ "1", "2", "2", "1" };
+    const azure_attempts: Attempts = .{ "2", "1", "2", "1" };
+    var subject = try tree();
+    defer subject.deinit();
+    try makeReleaseEvidence(&subject);
+
+    for (contracts.release_order, 0..) |key, index| {
+        const manifest = try subject.manifestPath(key);
+        defer allocator.free(manifest);
+        try fixture.patchString(
+            allocator,
+            io,
+            manifest,
+            &.{ .{ .key = "workflow" }, .{ .key = "run_attempt" } },
+            candidate_attempts[index],
+        );
+        const native = try subject.nativeResultPath(key);
+        defer allocator.free(native);
+        try fixture.patchString(
+            allocator,
+            io,
+            native,
+            &.{ .{ .key = "workflow" }, .{ .key = "run_attempt" } },
+            native_attempts[index],
+        );
+        try fixture.patchString(
+            allocator,
+            io,
+            native,
+            &.{ .{ .key = "candidate_workflow" }, .{ .key = "run_attempt" } },
+            candidate_attempts[index],
+        );
+        const azure = try subject.azureResultPath(key);
+        defer allocator.free(azure);
+        try fixture.patchString(
+            allocator,
+            io,
+            azure,
+            &.{ .{ .key = "workflow" }, .{ .key = "run_attempt" } },
+            azure_attempts[index],
+        );
+        try fixture.patchString(
+            allocator,
+            io,
+            azure,
+            &.{ .{ .key = "candidate_workflow" }, .{ .key = "run_attempt" } },
+            candidate_attempts[index],
+        );
+    }
+
+    const candidates = try subject.candidates();
+    defer allocator.free(candidates);
+    const native = try subject.native();
+    defer allocator.free(native);
+    const azure = try subject.azure();
+    defer allocator.free(azure);
+    const candidate_selection = try writeSelection(
+        &subject,
+        .candidate,
+        "100",
+        candidate_attempts,
+    );
+    defer allocator.free(candidate_selection);
+    const native_selection = try writeSelection(
+        &subject,
+        .native,
+        "100",
+        native_attempts,
+    );
+    defer allocator.free(native_selection);
+    const azure_selection = try writeSelection(
+        &subject,
+        .azure,
+        "100",
+        azure_attempts,
+    );
+    defer allocator.free(azure_selection);
+    var diagnostic: support.Diagnostic = .{};
+    try release_workflow.releaseGate(allocator, io, .{
+        .candidates = candidates,
+        .native_results = native,
+        .azure_results = azure,
+        .candidate_selection = candidate_selection,
+        .native_selection = native_selection,
+        .azure_selection = azure_selection,
+        .source_commit = fixture.source_commit,
+        .candidate_run_id = "100",
+        .run_id = "100",
+    }, &diagnostic);
 }
 
 test "the release gate rejects missing, duplicate, extra, and unexpected native results" {
@@ -581,6 +1274,7 @@ test "a successful stage publishes exactly four full and core assets" {
     defer manifest.deinit();
     const document = manifest.value.object;
 
+    try std.testing.expectEqual(@as(i64, 2), document.get("schema").?.integer);
     try std.testing.expectEqualStrings(
         "miz-ubuntu2604-release",
         document.get("type").?.string,
@@ -597,6 +1291,13 @@ test "a successful stage publishes exactly four full and core assets" {
         fixture.signing_certificate_sha256,
         document.get("signing_certificate_sha256").?.string,
     );
+    try std.testing.expect(documents.hasWorkflowIdentity(
+        document.get("publication_workflow"),
+    ));
+    try std.testing.expectEqualStrings(
+        "3",
+        document.get("publication_workflow").?.object.get("run_attempt").?.string,
+    );
 
     const assets = document.get("assets").?.array.items;
     try std.testing.expectEqual(contracts.release_order.len, assets.len);
@@ -605,6 +1306,15 @@ test "a successful stage publishes exactly four full and core assets" {
             contracts.lookup(key).?.asset_name,
             asset.object.get("asset_name").?.string,
         );
+        try std.testing.expect(documents.hasWorkflowIdentity(
+            asset.object.get("candidate_workflow"),
+        ));
+        try std.testing.expect(documents.hasWorkflowIdentity(
+            asset.object.get("native_workflow"),
+        ));
+        try std.testing.expect(documents.hasWorkflowIdentity(
+            asset.object.get("azure_workflow"),
+        ));
         const staged = try subject.path(
             "staged/{s}",
             .{contracts.lookup(key).?.asset_name},
@@ -636,6 +1346,9 @@ test "a successful stage publishes exactly four full and core assets" {
         "standalone zstd QCOW2 files with no backing images",
         "finalized release is immutable",
         "separate digest-pinned handoff",
+        "candidate run `100` attempt `1`",
+        "native acceptance run `100` attempt `1`",
+        "Azure acceptance run `100` attempt `1`",
     };
     for (required_notes) |text| {
         try std.testing.expect(std.mem.indexOf(u8, notes, text) != null);
@@ -646,6 +1359,99 @@ test "a successful stage publishes exactly four full and core assets" {
         "No checksum sidecar assets are published",
     ) != null);
     try std.testing.expect(std.ascii.indexOfIgnoreCase(notes, "android container") == null);
+}
+
+test "staged publication records each candidate attempt exactly" {
+    const attempts: Attempts = .{ "1", "1", "2", "1" };
+    var subject = try tree();
+    defer subject.deinit();
+    try makeAll(&subject);
+    for (contracts.release_order, 0..) |key, index| {
+        const manifest = try subject.manifestPath(key);
+        defer allocator.free(manifest);
+        try fixture.patchString(
+            allocator,
+            io,
+            manifest,
+            &.{ .{ .key = "workflow" }, .{ .key = "run_attempt" } },
+            attempts[index],
+        );
+        for ([_][]const u8{
+            try subject.nativeResultPath(key),
+            try subject.azureResultPath(key),
+        }) |path| {
+            defer allocator.free(path);
+            try fixture.patchString(
+                allocator,
+                io,
+                path,
+                &.{ .{ .key = "candidate_workflow" }, .{ .key = "run_attempt" } },
+                attempts[index],
+            );
+        }
+    }
+    try stage(&subject, publication_tag);
+
+    const manifest_path = try subject.path("staged/publish-manifest.json", .{});
+    defer allocator.free(manifest_path);
+    var manifest = try fixture.read(allocator, io, manifest_path);
+    defer manifest.deinit();
+    for (manifest.value.object.get("assets").?.array.items, 0..) |asset, index| {
+        try std.testing.expectEqualStrings(
+            attempts[index],
+            asset.object
+                .get("candidate_workflow").?
+                .object
+                .get("run_attempt").?
+                .string,
+        );
+    }
+}
+
+test "stage rejects candidate and acceptance evidence from the wrong run" {
+    const cases = [_]struct {
+        path_kind: enum { candidate, native, azure },
+        field: []const u8,
+    }{
+        .{ .path_kind = .candidate, .field = "workflow" },
+        .{ .path_kind = .native, .field = "workflow" },
+        .{ .path_kind = .azure, .field = "workflow" },
+    };
+    for (cases) |case| {
+        var subject = try tree();
+        defer subject.deinit();
+        try makeAll(&subject);
+        const path = switch (case.path_kind) {
+            .candidate => try subject.manifestPath("x86_64-full"),
+            .native => try subject.nativeResultPath("x86_64-full"),
+            .azure => try subject.azureResultPath("x86_64-full"),
+        };
+        defer allocator.free(path);
+        try fixture.patchString(
+            allocator,
+            io,
+            path,
+            &.{ .{ .key = case.field }, .{ .key = "run_id" } },
+            "101",
+        );
+        try expectStageRejected(&subject);
+    }
+}
+
+test "stage rejects acceptance evidence from a future publication attempt" {
+    var subject = try tree();
+    defer subject.deinit();
+    try makeAll(&subject);
+    const native = try subject.nativeResultPath("x86_64-full");
+    defer allocator.free(native);
+    try fixture.patchString(
+        allocator,
+        io,
+        native,
+        &.{ .{ .key = "workflow" }, .{ .key = "run_attempt" } },
+        "4",
+    );
+    try expectStageRejected(&subject);
 }
 
 test "stage rejects stale removed smoke evidence" {
@@ -841,7 +1647,7 @@ test "the full native result binds complete candidate and workflow identity" {
     var result = try fixture.read(allocator, io, native_path);
     defer result.deinit();
     const object = result.value.object;
-    try std.testing.expectEqual(@as(i64, 3), object.get("schema").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), object.get("schema").?.integer);
     try std.testing.expectEqualStrings(key, object.get("key").?.string);
     try std.testing.expectEqualStrings(
         "x86_64",
@@ -856,6 +1662,15 @@ test "the full native result binds complete candidate and workflow identity" {
         object.get("source_commit").?.string,
     );
     try std.testing.expectEqualStrings("success", object.get("status").?.string);
+    const candidate_workflow = object.get("candidate_workflow").?.object;
+    try std.testing.expectEqualStrings(
+        "100",
+        candidate_workflow.get("run_id").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "1",
+        candidate_workflow.get("run_attempt").?.string,
+    );
     try std.testing.expect(documents.hasWorkflowIdentity(object.get("workflow")));
     try std.testing.expect(support.hasExactContracts(
         object.get("contracts"),
@@ -968,6 +1783,39 @@ test "the full native result binds complete candidate and workflow identity" {
     }
 }
 
+test "acceptance evidence rejects a mismatched candidate workflow attempt" {
+    var subject = try tree();
+    defer subject.deinit();
+    const key = "x86_64-full";
+    try fixture.makeBundle(&subject, key, .{});
+    try fixture.makeNativeResult(&subject, key, .{});
+
+    const native = try subject.nativeResultPath(key);
+    defer allocator.free(native);
+    try fixture.patchString(
+        allocator,
+        io,
+        native,
+        &.{ .{ .key = "candidate_workflow" }, .{ .key = "run_attempt" } },
+        "2",
+    );
+    try std.testing.expectError(
+        error.Failed,
+        validateNative(&subject, key, native),
+    );
+
+    const azure = try subject.azureResultPath(key);
+    defer allocator.free(azure);
+    try fixture.patchString(
+        allocator,
+        io,
+        azure,
+        &.{ .{ .key = "candidate_workflow" }, .{ .key = "run_attempt" } },
+        "2",
+    );
+    try expectAzureRejected(&subject, key);
+}
+
 test "the core native result binds the candidate identity and contracts" {
     var subject = try tree();
     defer subject.deinit();
@@ -993,7 +1841,7 @@ test "the core native result binds the candidate identity and contracts" {
         result.value.object.get("flavor").?.string,
     );
     try std.testing.expectEqual(
-        @as(i64, 8),
+        @as(i64, 9),
         result.value.object.get("schema").?.integer,
     );
     try std.testing.expect(support.hasExactContracts(
@@ -1384,8 +2232,8 @@ test "Azure result schemas reject stale removed smoke evidence" {
         schema: i64,
         stale_schema: i64,
     }{
-        .{ .key = "x86_64-full", .schema = 1, .stale_schema = 0 },
-        .{ .key = "aarch64-core", .schema = 3, .stale_schema = 2 },
+        .{ .key = "x86_64-full", .schema = 2, .stale_schema = 1 },
+        .{ .key = "aarch64-core", .schema = 4, .stale_schema = 3 },
     };
     for (cases) |case| {
         var subject = try tree();
@@ -1594,6 +2442,16 @@ test "stage requires exactly four Azure results" {
     defer subject.deinit();
     try makeAll(&subject);
     const result_path = try subject.azureResultPath("aarch64-full");
+    defer allocator.free(result_path);
+    try Dir.cwd().deleteFile(io, result_path);
+    try expectStageRejected(&subject);
+}
+
+test "stage requires exactly four native results" {
+    var subject = try tree();
+    defer subject.deinit();
+    try makeAll(&subject);
+    const result_path = try subject.nativeResultPath("aarch64-full");
     defer allocator.free(result_path);
     try Dir.cwd().deleteFile(io, result_path);
     try expectStageRejected(&subject);
@@ -2439,6 +3297,10 @@ test "the publisher is draft-first, allowlisted, and fail-safe" {
     // staged manifest, and the shell only consumes the result.
     try script.expectContains("\"$RELEASE_TOOL\" publish-expected");
     try script.expectContains("--assets-dir \"$assets_dir\"");
+    try script.expectContains("--native-results \"$NATIVE_RESULTS_DIR\"");
+    try script.expectContains("--candidate-run-id \"$CANDIDATE_RUN_ID\"");
+    try script.expectContains("--run-id \"$GITHUB_RUN_ID\"");
+    try script.expectContains("--run-attempt \"$GITHUB_RUN_ATTEMPT\"");
     try script.expectContains("--draft");
     try script.expectContains("stale-asset-ids");
     try script.expectContains("retaining $RELEASE_TAG as a draft");
@@ -2806,6 +3668,24 @@ fn expectStagedRejected(subject: *const Tree, expected_message: []const u8) !voi
     }
     clobberStack();
     try std.testing.expectEqualStrings(expected_message, diagnostic.message());
+}
+
+test "publish-expected rejects the pre-provenance manifest schema" {
+    var subject = try stagedSubject();
+    defer subject.deinit();
+    const manifest = try subject.path("staged/publish-manifest.json", .{});
+    defer allocator.free(manifest);
+    try fixture.patchInteger(
+        allocator,
+        io,
+        manifest,
+        &.{.{ .key = "schema" }},
+        1,
+    );
+    try expectStagedRejected(
+        &subject,
+        "unexpected Ubuntu publish manifest schema",
+    );
 }
 
 test "publish-expected counts a symlinked staged asset as a staged file" {

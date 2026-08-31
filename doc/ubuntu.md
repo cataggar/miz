@@ -242,12 +242,17 @@ networking, generates a machine ID and SSH host keys when absent, supervises
 
 `azagent` reads Azure's OVF provisioning media, creates the requested
 administrator with key-only SSH and passwordless sudo, persists
-`/var/lib/azagent/provisioned`, grows the root, formats the Azure resource disk
-as XFS at `/d` without swap, mounts managed data disks without formatting
-them, and reports Ready in Azure. Explicitly marked local OVF media instead
-runs `azagent --skip-ready` for same-architecture QEMU acceptance. Provisioned identity,
-authorized keys, host keys, and the sentinel must persist across reboot;
-separate instances must not inherit them from the candidate.
+`/var/lib/azagent/provisioned`, grows the root, and formats Azure temporary
+storage as XFS at `/d` without swap. That temporary storage may be the
+conventional resource volume or a supported local NVMe disk. Acceptance proves
+that `/d` is backed by a non-root block device, has a valid filesystem and the
+data-loss warning marker, and carries no swap. Full images retain the
+WALinuxAgent convention: only `MaxResourceVolumeMB` controls whether `/mnt`
+must be mounted. Managed data disks are mounted without formatting. Explicitly
+marked local OVF media instead runs `azagent --skip-ready` for
+same-architecture QEMU acceptance. Provisioned identity, authorized keys,
+host keys, and the sentinel must persist across reboot; separate instances
+must not inherit them from the candidate.
 
 `--proxy <url>` reaches the Canonical cloud image and the Ubuntu archive through an HTTP proxy, for a build host with no direct egress. It is named explicitly rather than read from `http_proxy` or `https_proxy`, so a build's egress path is a stated input like every other one and cannot change because of an ambient variable, and it is rejected before anything is downloaded if it is malformed. A proxy carrying a credential is refused, because the credential would have to travel in an argument or an environment variable to get here; debz refuses those on the same grounds. TLS is unaffected: the proxy is asked to `CONNECT`, the session is negotiated end to end with the origin, and the pinned digests and archive signatures still verify the bytes that origin served. The same value is passed to debz, so package download takes the same path the image download does.
 
@@ -964,10 +969,13 @@ read-only. Publication uses `actions: read` and `contents: write`.
 
 The prepare gate binds the run to the current remote `main` commit and tag.
 An optional `candidate_run_id` may reuse only a completed manual run on
-`main` for that same commit and exact run attempt. All four named build jobs
-must have succeeded and exactly four non-expired, nonempty candidate artifacts
-must match the commit and attempt. Reused candidates still rerun QEMU and
-Azure acceptance.
+`main` for that same commit. Candidate resolution happens after the build
+matrix, not in `prepare`: each key selects the newest attempt that has both its
+exact non-expired artifact and its corresponding successful build job. This
+allows a failed-jobs rerun to combine attempts such as `[1, 1, 2, 1]` without
+dropping attempt-qualified names. Missing, duplicate, expired, wrong-key,
+wrong-source, or unsuccessful evidence fails closed. Reused candidates still
+rerun QEMU and Azure acceptance.
 
 The build matrix passes flavor explicitly. Full candidates retain the exact
 5 GiB virtual-size contract; core remains exactly 3584 MiB, or 3.5 GiB and 30%
@@ -975,16 +983,20 @@ smaller. Every leg records host capacity before the build, preserves the #611
 post-failure `df`/largest-path diagnostics, and unconditionally removes
 privileged build state and signing material.
 
-Publication requires four successful build candidates, exactly one valid
-QEMU result per candidate, and exactly one Azure result per candidate. Each
-result binds the key, architecture, flavor, asset name, source commit, virtual
-size, candidate/certificate/UKI digests, explicit success, complete
-flavor-specific contract set, exact
-accelerator/emulator/guest/runner/machine/CPU identity, and exact workflow
-attempt. Missing, extra, duplicate, stale, malformed, cross-key,
-cross-architecture, cross-digest, wrong-signer, wrong-UKI, wrong-source/run,
-or unsuccessful evidence fails before publication. Core result schemas are
-versioned independently so documents carrying removed fields fail closed.
+Publication re-resolves candidate, QEMU, and Azure artifacts in the publication
+job itself, so a downstream-only rerun never relies on a stale global attempt.
+It requires exactly one successful artifact per key for each evidence kind.
+Each result binds the key, architecture, flavor, asset name, source commit,
+virtual size, candidate/certificate/UKI digests, the exact per-key candidate
+run and attempt, explicit success, complete flavor-specific contract set,
+exact accelerator/emulator/guest/runner/machine/CPU identity, and its own
+workflow attempt. The final publication manifest records per-asset candidate,
+native, and Azure workflow identities plus the publication workflow identity.
+Missing, extra,
+duplicate, stale, malformed, cross-key, cross-architecture, cross-digest,
+wrong-signer, wrong-UKI, wrong-source/run, expired, or unsuccessful evidence
+fails before publication. Result and publication schemas are versioned so
+ambiguous older documents fail closed.
 
 The release stages exactly four standalone zstd QCOW2 files with no backing
 images. Publication creates or resets the release as a draft, uploads with

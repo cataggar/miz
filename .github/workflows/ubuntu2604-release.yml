@@ -43,7 +43,6 @@ jobs:
     outputs:
       source_commit: ${{ steps.source.outputs.commit }}
       candidate_run_id: ${{ steps.source.outputs.candidate_run_id }}
-      candidate_run_attempt: ${{ steps.source.outputs.candidate_run_attempt }}
       reuse_candidates: ${{ steps.source.outputs.reuse_candidates }}
     steps:
       - name: Check out merged main
@@ -53,7 +52,7 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Bind release to source commit and exact candidate attempt
+      - name: Bind release to source commit and candidate run
         id: source
         env:
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
@@ -65,7 +64,6 @@ jobs:
             [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
             test "$(git rev-parse origin/main)" = "$commit"
             candidate_run_id=$GITHUB_RUN_ID
-            candidate_run_attempt=$GITHUB_RUN_ATTEMPT
             reuse_candidates=false
           else
             [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
@@ -78,50 +76,7 @@ jobs:
             test "$(jq -r .head_branch <<<"$run")" = main
             test "$(jq -r .status <<<"$run")" = completed
             commit=$(jq -r .head_sha <<<"$run")
-            candidate_run_attempt=$(jq -r .run_attempt <<<"$run")
             [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
-            [[ "$candidate_run_attempt" =~ ^[1-9][0-9]*$ ]]
-
-            jobs=$(
-              gh api --paginate \
-                "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/attempts/$candidate_run_attempt/jobs?per_page=100" |
-                jq -s '[.[].jobs[]]'
-            )
-            artifacts=$(
-              gh api --paginate \
-                "repos/$GITHUB_REPOSITORY/actions/runs/$CANDIDATE_RUN_ID/artifacts?per_page=100" |
-                jq -s '[.[].artifacts[]]'
-            )
-            for key in x86_64-full aarch64-full x86_64-core aarch64-core; do
-              test "$(
-                jq --arg name "build/native $key" \
-                  '[.[] | select(.name == $name and .conclusion == "success")] | length' \
-                  <<<"$jobs"
-              )" = 1
-              artifact="ubuntu2604-candidate-$key-$commit-$candidate_run_attempt"
-              test "$(
-                jq --arg name "$artifact" \
-                  '[.[] | select(.name == $name and .expired == false and .size_in_bytes > 0)] | length' \
-                  <<<"$artifacts"
-              )" = 1
-            done
-            test "$(
-              jq '[.[] | select(
-                (.name == "build/native x86_64-full" or
-                 .name == "build/native aarch64-full" or
-                 .name == "build/native x86_64-core" or
-                 .name == "build/native aarch64-core") and
-                .conclusion == "success"
-              )] | length' <<<"$jobs"
-            )" = 4
-            test "$(
-              jq --arg suffix "-$commit-$candidate_run_attempt" \
-                '[.[] | select(
-                  (.name | startswith("ubuntu2604-candidate-")) and
-                  (.name | endswith($suffix)) and
-                  .expired == false
-                )] | length' <<<"$artifacts"
-            )" = 4
 
             candidate_run_id=$CANDIDATE_RUN_ID
             reuse_candidates=true
@@ -134,10 +89,9 @@ jobs:
           test "$tag_commit" = "$commit"
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "candidate_run_id=$candidate_run_id" >> "$GITHUB_OUTPUT"
-          echo "candidate_run_attempt=$candidate_run_attempt" >> "$GITHUB_OUTPUT"
           echo "reuse_candidates=$reuse_candidates" >> "$GITHUB_OUTPUT"
           echo "Accepted source commit: \`$commit\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "Candidate run: \`$candidate_run_id\` attempt \`$candidate_run_attempt\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Candidate run: \`$candidate_run_id\`" >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: build/native ${{ matrix.key }}
@@ -416,8 +370,10 @@ jobs:
           rm -f -- "${UKI_SIGNING_CERTIFICATE:-}" || status=1
           exit "$status"
 
-  native_qemu:
-    name: same-architecture QEMU (${{ matrix.accelerator }}) ${{ matrix.key }}
+  # This job is downstream of the complete build matrix, so it is rerun when a
+  # failed build is retried while the successful prepare output is retained.
+  resolve_candidates:
+    name: resolve exact candidate artifacts
     needs: [prepare, build]
     if: >-
       ${{
@@ -430,6 +386,63 @@ jobs:
             needs.build.result == 'skipped'
           )
         )
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      selection: ${{ steps.resolve.outputs.selection }}
+    env:
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      CANDIDATE_RUN_ID: ${{ needs.prepare.outputs.candidate_run_id }}
+      RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out accepted source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Build accepted-source release tooling
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build --fetch \
+            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build -Doptimize=ReleaseSafe install-ubuntu2604-release
+          test -x "$RELEASE_TOOL"
+
+      - name: Resolve per-key candidate attempts
+        id: resolve
+        run: |
+          set -euo pipefail
+          selection=.release/candidate-selection.json
+          mkdir -p -- "$(dirname -- "$selection")"
+          bash scripts/ubuntu2604_resolve_artifacts.sh \
+            candidate "$CANDIDATE_RUN_ID" "$SOURCE_COMMIT" "$selection"
+          echo "selection=$(jq -c . "$selection")" >> "$GITHUB_OUTPUT"
+
+  native_qemu:
+    name: same-architecture QEMU (${{ matrix.accelerator }}) ${{ matrix.key }}
+    needs: [prepare, resolve_candidates]
+    if: >-
+      ${{
+        always() &&
+        needs.prepare.result == 'success' &&
+        needs.resolve_candidates.result == 'success'
       }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
@@ -499,6 +512,8 @@ jobs:
       FLAVOR: ${{ matrix.flavor }}
       ASSET_NAME: ${{ matrix.asset_name }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      CANDIDATE_RUN_ID: ${{ needs.prepare.outputs.candidate_run_id }}
+      CANDIDATE_RUN_ATTEMPT: ${{ fromJSON(needs.resolve_candidates.outputs.selection).artifacts[matrix.key].run_attempt }}
       CANDIDATE_DIR: .release/native/${{ matrix.key }}/candidate
       RESULT_DIR: artifact-staging/native-results/${{ matrix.key }}
       RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
@@ -573,8 +588,9 @@ jobs:
       - name: Download exact build-validated candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ubuntu2604-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ needs.prepare.outputs.candidate_run_attempt }}
+          artifact-ids: ${{ fromJSON(needs.resolve_candidates.outputs.selection).artifacts[matrix.key].artifact_id }}
           path: ${{ env.CANDIDATE_DIR }}
+          merge-multiple: true
           github-token: ${{ github.token }}
           run-id: ${{ needs.prepare.outputs.candidate_run_id }}
 
@@ -683,7 +699,9 @@ jobs:
             --manifest "$manifest" \
             --asset "$asset" \
             --key "$CANDIDATE_KEY" \
-            --source-commit "$SOURCE_COMMIT"
+            --source-commit "$SOURCE_COMMIT" \
+            --run-id "$CANDIDATE_RUN_ID" \
+            --run-attempt "$CANDIDATE_RUN_ATTEMPT"
           "$RELEASE_TOOL" candidate-signing-env \
             --manifest "$manifest" \
             --certificate "$RESULT_DIR/signing-certificate.der" \
@@ -695,6 +713,8 @@ jobs:
           echo "MIZ_UBUNTU2604_SIGNING_CERTIFICATE=$GITHUB_WORKSPACE/$RESULT_DIR/signing-certificate.pem" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_ACCEPTANCE_RESULT=$GITHUB_WORKSPACE/$RESULT_DIR/native-result.json" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_SOURCE_COMMIT=$SOURCE_COMMIT" >> "$GITHUB_ENV"
+          echo "MIZ_UBUNTU2604_CANDIDATE_RUN_ID=$CANDIDATE_RUN_ID" >> "$GITHUB_ENV"
+          echo "MIZ_UBUNTU2604_CANDIDATE_RUN_ATTEMPT=$CANDIDATE_RUN_ATTEMPT" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ID=$GITHUB_RUN_ID" >> "$GITHUB_ENV"
           echo "MIZ_UBUNTU2604_ACCEPTANCE_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
 
@@ -750,18 +770,12 @@ jobs:
 
   azure_acceptance:
     name: Azure ${{ matrix.key }}
-    needs: [prepare, build]
+    needs: [prepare, resolve_candidates]
     if: >-
       ${{
         always() &&
         needs.prepare.result == 'success' &&
-        (
-          needs.build.result == 'success' ||
-          (
-            needs.prepare.outputs.reuse_candidates == 'true' &&
-            needs.build.result == 'skipped'
-          )
-        )
+        needs.resolve_candidates.result == 'success'
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 240
@@ -805,6 +819,8 @@ jobs:
       FLAVOR: ${{ matrix.flavor }}
       ASSET_NAME: ${{ matrix.asset_name }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      CANDIDATE_RUN_ID: ${{ needs.prepare.outputs.candidate_run_id }}
+      CANDIDATE_RUN_ATTEMPT: ${{ fromJSON(needs.resolve_candidates.outputs.selection).artifacts[matrix.key].run_attempt }}
       CANDIDATE_DIR: .release/azure/${{ matrix.key }}/candidate
       RESULT_DIR: artifact-staging/azure-results/${{ matrix.key }}
       RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
@@ -822,8 +838,9 @@ jobs:
       - name: Download exact build-validated candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ubuntu2604-candidate-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ needs.prepare.outputs.candidate_run_attempt }}
+          artifact-ids: ${{ fromJSON(needs.resolve_candidates.outputs.selection).artifacts[matrix.key].artifact_id }}
           path: ${{ env.CANDIDATE_DIR }}
+          merge-multiple: true
           github-token: ${{ github.token }}
           run-id: ${{ needs.prepare.outputs.candidate_run_id }}
 
@@ -959,7 +976,7 @@ jobs:
 
   publish:
     name: verify complete four-candidate gate and publish
-    needs: [prepare, build, native_qemu, azure_acceptance]
+    needs: [prepare, build, resolve_candidates, native_qemu, azure_acceptance]
     if: >-
       ${{
         always() &&
@@ -971,6 +988,7 @@ jobs:
             needs.build.result == 'skipped'
           )
         ) &&
+        needs.resolve_candidates.result == 'success' &&
         needs.native_qemu.result == 'success' &&
         needs.azure_acceptance.result == 'success'
       }}
@@ -983,10 +1001,10 @@ jobs:
     env:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       CANDIDATE_RUN_ID: ${{ needs.prepare.outputs.candidate_run_id }}
-      CANDIDATE_RUN_ATTEMPT: ${{ needs.prepare.outputs.candidate_run_attempt }}
       CANDIDATES_DIR: .release/publication/candidates
       NATIVE_RESULTS_DIR: .release/publication/native
       AZURE_RESULTS_DIR: .release/publication/azure
+      SELECTIONS_DIR: .release/publication/selections
       STAGING_ROOT: .release/publication/staging
       RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
       UBUNTU2604_RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
@@ -1022,10 +1040,33 @@ jobs:
           zig build -Doptimize=ReleaseSafe install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
 
+      # Resolve again in the publication job itself. A "Re-run failed jobs"
+      # operation may rerun only this job, so no successful upstream output is
+      # treated as a substitute for inspecting the artifacts that still exist.
+      - name: Resolve exact publication inputs
+        id: artifacts
+        env:
+          RUN_ID_VALUE: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p -- "$SELECTIONS_DIR"
+          bash scripts/ubuntu2604_resolve_artifacts.sh \
+            candidate "$CANDIDATE_RUN_ID" "$SOURCE_COMMIT" \
+            "$SELECTIONS_DIR/candidates.json"
+          bash scripts/ubuntu2604_resolve_artifacts.sh \
+            native "$RUN_ID_VALUE" "$SOURCE_COMMIT" \
+            "$SELECTIONS_DIR/native.json"
+          bash scripts/ubuntu2604_resolve_artifacts.sh \
+            azure "$RUN_ID_VALUE" "$SOURCE_COMMIT" \
+            "$SELECTIONS_DIR/azure.json"
+          echo "candidate_ids=$(jq -r '[.artifacts[].artifact_id | tostring] | join(\",\")' "$SELECTIONS_DIR/candidates.json")" >> "$GITHUB_OUTPUT"
+          echo "native_ids=$(jq -r '[.artifacts[].artifact_id | tostring] | join(\",\")' "$SELECTIONS_DIR/native.json")" >> "$GITHUB_OUTPUT"
+          echo "azure_ids=$(jq -r '[.artifacts[].artifact_id | tostring] | join(\",\")' "$SELECTIONS_DIR/azure.json")" >> "$GITHUB_OUTPUT"
+
       - name: Download all build-validated candidates
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: ubuntu2604-candidate-*-${{ needs.prepare.outputs.source_commit }}-${{ needs.prepare.outputs.candidate_run_attempt }}
+          artifact-ids: ${{ steps.artifacts.outputs.candidate_ids }}
           path: ${{ env.CANDIDATES_DIR }}
           merge-multiple: false
           github-token: ${{ github.token }}
@@ -1034,21 +1075,24 @@ jobs:
       - name: Download all accelerator-bound QEMU acceptance results
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: ubuntu2604-native-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          artifact-ids: ${{ steps.artifacts.outputs.native_ids }}
           path: ${{ env.NATIVE_RESULTS_DIR }}
           merge-multiple: false
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
 
       - name: Download all Azure acceptance results
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: ubuntu2604-azure-*-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          artifact-ids: ${{ steps.artifacts.outputs.azure_ids }}
           path: ${{ env.AZURE_RESULTS_DIR }}
           merge-multiple: false
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
 
       - name: Validate exact four-candidate release gate
         env:
           RUN_ID_VALUE: ${{ github.run_id }}
-          RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           test "$PREPARE_RESULT" = success
@@ -1059,11 +1103,12 @@ jobs:
             --candidates "$CANDIDATES_DIR" \
             --native-results "$NATIVE_RESULTS_DIR" \
             --azure-results "$AZURE_RESULTS_DIR" \
+            --candidate-selection "$SELECTIONS_DIR/candidates.json" \
+            --native-selection "$SELECTIONS_DIR/native.json" \
+            --azure-selection "$SELECTIONS_DIR/azure.json" \
             --source-commit "$SOURCE_COMMIT" \
             --candidate-run-id "$CANDIDATE_RUN_ID" \
-            --candidate-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
-            --run-id "$RUN_ID_VALUE" \
-            --run-attempt "$RUN_ATTEMPT_VALUE"
+            --run-id "$RUN_ID_VALUE"
 
       - name: Publish exactly four accepted Ubuntu assets
         run: scripts/ubuntu2604_publish.sh

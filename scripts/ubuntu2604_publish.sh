@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -z ${CANDIDATES_DIR:-} || -z ${AZURE_RESULTS_DIR:-} ||
+if [[ -z ${CANDIDATES_DIR:-} || -z ${NATIVE_RESULTS_DIR:-} ||
+      -z ${AZURE_RESULTS_DIR:-} ||
       -z ${SOURCE_COMMIT:-} || -z ${RELEASE_TAG:-} ||
       -z ${RELEASE_TITLE:-} || -z ${REPOSITORY:-} ||
-      -z ${STAGING_ROOT:-} || -z ${GITHUB_STEP_SUMMARY:-} ]]; then
+      -z ${STAGING_ROOT:-} || -z ${GITHUB_STEP_SUMMARY:-} ||
+      -z ${CANDIDATE_RUN_ID:-} ||
+      -z ${GITHUB_RUN_ID:-} || -z ${GITHUB_RUN_ATTEMPT:-} ]]; then
   echo "::error::Required publication configuration is incomplete"
   exit 1
 fi
@@ -37,9 +40,13 @@ rm -rf -- "$assets_dir" "$verify_dir"
 
 "$RELEASE_TOOL" stage \
   --candidates "$CANDIDATES_DIR" \
+  --native-results "$NATIVE_RESULTS_DIR" \
   --azure-results "$AZURE_RESULTS_DIR" \
   --source-commit "$SOURCE_COMMIT" \
   --release-tag "$RELEASE_TAG" \
+  --candidate-run-id "$CANDIDATE_RUN_ID" \
+  --run-id "$GITHUB_RUN_ID" \
+  --run-attempt "$GITHUB_RUN_ATTEMPT" \
   --output "$assets_dir" \
   --notes "$notes_file"
 

@@ -468,16 +468,36 @@ fn hasParentComponent(relative: []const u8) bool {
     return false;
 }
 
-/// `{"run_id": <nonempty string>, "run_attempt": <nonempty string>}`.
+/// `{"run_id": <positive decimal string>,
+///   "run_attempt": <positive decimal string>}`.
 pub fn hasWorkflowIdentity(value: ?std.json.Value) bool {
     const object = support.objectOf(value) orelse return false;
     const expected = [_][]const u8{ "run_attempt", "run_id" };
     if (!support.hasExactFields(object, &expected)) return false;
     for (expected) |field| {
         const text = support.stringOf(object.get(field)) orelse return false;
-        if (text.len == 0) return false;
+        if (!isPositiveDecimal(text)) return false;
     }
     return true;
+}
+
+pub fn workflowIdentityMatches(
+    actual: ?std.json.Value,
+    expected: ?std.json.Value,
+) bool {
+    if (!hasWorkflowIdentity(actual) or !hasWorkflowIdentity(expected)) {
+        return false;
+    }
+    return support.jsonEqual(actual.?, expected.?);
+}
+
+fn isPositiveDecimal(value: []const u8) bool {
+    if (value.len == 0 or value[0] == '0') return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte)) return false;
+    }
+    const parsed = std.fmt.parseInt(i64, value, 10) catch return false;
+    return parsed > 0;
 }
 
 /// `validate_native_result`, given an already-verified candidate.
@@ -496,12 +516,11 @@ pub fn validateNativeResult(
 
 pub fn nativeResultSchema(flavor: contracts.Flavor) i64 {
     return switch (flavor) {
-        // Schema 3 adds the exact QEMU execution identity to the complete
-        // candidate, success, and workflow binding introduced at schema 2.
-        .full => 3,
-        // Schema 8 removes the external secret-bound smoke evidence while
-        // retaining every in-image core and QEMU execution requirement.
-        .core => 8,
+        // Schema 4 binds the exact candidate workflow attempt in addition to
+        // the QEMU execution and acceptance workflow identities.
+        .full => 4,
+        // Schema 9 carries the same candidate-attempt binding for core.
+        .core => 9,
     };
 }
 
@@ -564,6 +583,16 @@ pub fn validateNativeResultDocument(
         "{s}: native acceptance is not explicitly successful",
         .{key},
     );
+    if (!workflowIdentityMatches(
+        result.get("candidate_workflow"),
+        candidate.object().get("workflow"),
+    )) {
+        return fail(
+            diagnostic,
+            "{s}: native candidate workflow identity is invalid",
+            .{key},
+        );
+    }
     if (support.integerOf(result.get("virtual_size")) != candidate.virtual_size or
         !support.stringIs(result.get("candidate_sha256"), candidate.sha256) or
         !support.stringIs(
@@ -1045,8 +1074,8 @@ pub fn validateAzureResultDocument(
         result,
         azure_result_type,
         switch (flavor) {
-            .full => 1,
-            .core => 3,
+            .full => 2,
+            .core => 4,
         },
         candidate.identity.key,
         support.stringOf(candidate.object().get("source_commit")).?,
@@ -1058,6 +1087,16 @@ pub fn validateAzureResultDocument(
         "{s}: Azure acceptance is not explicitly successful",
         .{key},
     );
+    if (!workflowIdentityMatches(
+        result.get("candidate_workflow"),
+        candidate.object().get("workflow"),
+    )) {
+        return fail(
+            diagnostic,
+            "{s}: Azure candidate workflow identity is invalid",
+            .{key},
+        );
+    }
     if (!support.stringIs(result.get("qcow_sha256"), candidate.sha256) or
         !support.stringIs(result.get("azure_accepted_sha256"), candidate.sha256))
     {
@@ -1149,13 +1188,15 @@ pub fn validateAzureResultDocument(
     _ = try validateConversionSizes(conversion, candidate, diagnostic, "{s}: ");
 }
 
-test "workflow identity requires two nonempty strings" {
+test "workflow identity requires two positive decimal strings" {
     var parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
         \\{"ok": {"run_id": "1", "run_attempt": "2"},
         \\ "empty": {"run_id": "", "run_attempt": "2"},
         \\ "typed": {"run_id": 1, "run_attempt": "2"},
+        \\ "zero": {"run_id": "1", "run_attempt": "0"},
+        \\ "text": {"run_id": "run", "run_attempt": "2"},
         \\ "extra": {"run_id": "1", "run_attempt": "2", "x": "3"},
         \\ "short": {"run_id": "1"}}
     ,
@@ -1166,6 +1207,8 @@ test "workflow identity requires two nonempty strings" {
     try std.testing.expect(hasWorkflowIdentity(object.get("ok")));
     try std.testing.expect(!hasWorkflowIdentity(object.get("empty")));
     try std.testing.expect(!hasWorkflowIdentity(object.get("typed")));
+    try std.testing.expect(!hasWorkflowIdentity(object.get("zero")));
+    try std.testing.expect(!hasWorkflowIdentity(object.get("text")));
     try std.testing.expect(!hasWorkflowIdentity(object.get("extra")));
     try std.testing.expect(!hasWorkflowIdentity(object.get("short")));
     try std.testing.expect(!hasWorkflowIdentity(null));

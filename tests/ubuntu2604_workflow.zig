@@ -87,19 +87,75 @@ test "each matrix carries the exact four published candidates" {
     }
 }
 
-test "candidate reuse is bound to one attempt, job, and artifact" {
+test "candidate and acceptance artifacts are resolved independently by key" {
     var workflow = try open();
     defer workflow.deinit();
-    try workflow.expectContains("/attempts/$candidate_run_attempt/jobs");
-    try workflow.expectContains("jq --arg name \"build/native $key\"");
-    try workflow.expectContains(".expired == false and .size_in_bytes > 0");
-    try workflow.expectContains(
-        "ubuntu2604-candidate-$key-$commit-$candidate_run_attempt",
+    const candidates = try workflow.section(
+        "\n  resolve_candidates:\n",
+        "\n  native_qemu:\n",
+    );
+    try source.expectContainsIn(
+        candidates,
+        "needs: [prepare, build]",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        candidates,
+        "bash scripts/ubuntu2604_resolve_artifacts.sh \\\n            candidate",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        candidates,
+        "selection: ${{ steps.resolve.outputs.selection }}",
+        workflow_path,
+    );
+    const results = try workflow.section("\n  publish:\n", null);
+    try source.expectContainsIn(
+        results,
+        "- name: Resolve exact publication inputs",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        results,
+        "native \"$RUN_ID_VALUE\" \"$SOURCE_COMMIT\"",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        results,
+        "azure \"$RUN_ID_VALUE\" \"$SOURCE_COMMIT\"",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        results,
+        "candidate \"$CANDIDATE_RUN_ID\" \"$SOURCE_COMMIT\"",
+        workflow_path,
     );
     try workflow.expectContains(
-        "for key in x86_64-full aarch64-full x86_64-core aarch64-core",
+        "fromJSON(needs.resolve_candidates.outputs.selection).artifacts[matrix.key].run_attempt",
     );
-    try workflow.expectContains(")] | length' <<<\"$jobs\"\n            )\" = 4");
+    try workflow.expectContains(
+        "MIZ_UBUNTU2604_CANDIDATE_RUN_ATTEMPT=$CANDIDATE_RUN_ATTEMPT",
+    );
+    try workflow.expectCount("artifact-ids:", 5);
+    try workflow.expectCount("merge-multiple: true", 2);
+    try workflow.expectOmits("needs.prepare.outputs.candidate_run_attempt");
+    try workflow.expectOmits("pattern: ubuntu2604-candidate-");
+    try workflow.expectOmits("pattern: ubuntu2604-native-");
+    try workflow.expectOmits("pattern: ubuntu2604-azure-");
+
+    var resolver = try Source.open(
+        std.testing.allocator,
+        "scripts/ubuntu2604_resolve_artifacts.sh",
+    );
+    defer resolver.deinit();
+    try resolver.expectContains(
+        "/actions/runs/$run_id/attempts/$attempt/jobs?filter=all&per_page=100",
+    );
+    try resolver.expectContains(
+        "\"$RELEASE_TOOL\" resolve-artifacts",
+    );
+    try resolver.expectContains("temporary_directory=\"${output}.inputs\"");
+    try resolver.expectOmits("mktemp");
 }
 
 test "publication fails closed across all three matrices" {
@@ -108,7 +164,7 @@ test "publication fails closed across all three matrices" {
     const publish = try workflow.section("  publish:", null);
     try source.expectContainsIn(
         publish,
-        "needs: [prepare, build, native_qemu, azure_acceptance]",
+        "needs: [prepare, build, resolve_candidates, native_qemu, azure_acceptance]",
         workflow_path,
     );
     try source.expectContainsIn(
@@ -147,28 +203,33 @@ test "publication fails closed across all three matrices" {
     );
     try source.expectContainsIn(
         publish,
-        "--candidate-run-attempt \"$CANDIDATE_RUN_ATTEMPT\"",
+        "--candidate-selection \"$SELECTIONS_DIR/candidates.json\"",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        publish,
+        "--native-selection \"$SELECTIONS_DIR/native.json\"",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        publish,
+        "--azure-selection \"$SELECTIONS_DIR/azure.json\"",
         workflow_path,
     );
     try source.expectContainsIn(publish, "--run-id \"$RUN_ID_VALUE\"", workflow_path);
     try source.expectContainsIn(
         publish,
-        "--run-attempt \"$RUN_ATTEMPT_VALUE\"",
+        "artifact-ids: ${{ steps.artifacts.outputs.candidate_ids }}",
         workflow_path,
     );
     try source.expectContainsIn(
         publish,
-        "pattern: ubuntu2604-candidate-*",
+        "artifact-ids: ${{ steps.artifacts.outputs.native_ids }}",
         workflow_path,
     );
     try source.expectContainsIn(
         publish,
-        "pattern: ubuntu2604-native-*",
-        workflow_path,
-    );
-    try source.expectContainsIn(
-        publish,
-        "pattern: ubuntu2604-azure-*",
+        "artifact-ids: ${{ steps.artifacts.outputs.azure_ids }}",
         workflow_path,
     );
     try source.expectContainsIn(
