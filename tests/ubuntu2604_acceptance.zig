@@ -1431,7 +1431,7 @@ fn validateFinalizedImage(
         .core => {
             const expected = try std.fmt.allocPrint(
                 allocator,
-                "{s}init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto console=tty0 {s}",
+                "{s}init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto mizinit.binder=required console=tty0 {s}",
                 .{ expected_prefix, candidate.architecture.serialConsole() },
             );
             defer allocator.free(expected);
