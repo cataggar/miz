@@ -460,9 +460,16 @@ const full_service_policy = [_]miz.os_customization.Service{
     .{ .name = "grub-initrd-fallback.service", .state = .disabled },
 };
 
+// This Python daemon comfortably reaches READY well inside the 90s systemd
+// default on hardware, but the required Arm64 TCG acceptance path emulates
+// every instruction and can push interpreter startup past that deadline, which
+// SIGTERMs a healthy service. Keep it fail-closed, but allow the slow valid
+// first boot to finish instead of marking it failed.
 const full_networkd_dispatcher_override =
     "[Unit]\n" ++
-    "After=chrony.service network-online.target\n";
+    "After=chrony.service network-online.target\n" ++
+    "[Service]\n" ++
+    "TimeoutStartSec=10min\n";
 
 // Initial snap seeding takes about fifteen wall-clock minutes under the
 // required Arm64 TCG acceptance path. Keep the service fail-closed, but give
@@ -5796,7 +5803,9 @@ test "full service policy explicitly keeps the network dispatcher enabled" {
 test "full network dispatcher waits for startup-trigger dependencies" {
     try std.testing.expectEqualStrings(
         "[Unit]\n" ++
-            "After=chrony.service network-online.target\n",
+            "After=chrony.service network-online.target\n" ++
+            "[Service]\n" ++
+            "TimeoutStartSec=10min\n",
         full_networkd_dispatcher_override,
     );
 }
