@@ -2698,7 +2698,7 @@ const full_checks =
     \\  {
     \\    printf '%s\n' "--- bounded diagnostics for $unit ---"
     \\    systemctl show --no-pager --property=Id,LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,TimeoutStartUSec "$unit"
-    \\    journalctl --no-pager --boot=0 --unit "$unit" --identifier=systemd --priority=warning..emerg --lines=80 --output=short-monotonic
+    \\    sudo -n journalctl --no-pager --boot=0 --unit "$unit" --priority=info..emerg --lines=120 --output=short-monotonic
     \\  } 2>&1 | head -c 49152 >&2 || true
     \\  printf '\n' >&2
     \\}
@@ -3710,7 +3710,7 @@ test "full service checks keep dispatcher strict and udisks D-Bus-only" {
         "failed_units=$(systemctl --failed --no-legend --plain)",
         "check no-failed-units test -z",
         "systemctl show --no-pager --property=Id,LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,TimeoutStartUSec",
-        "journalctl --no-pager --boot=0 --unit \"$unit\" --identifier=systemd --priority=warning..emerg --lines=80",
+        "sudo -n journalctl --no-pager --boot=0 --unit \"$unit\" --priority=info..emerg --lines=120",
         "head -c 49152",
         "head -n 8",
         "diagnose_failed_units\n  exit 1",

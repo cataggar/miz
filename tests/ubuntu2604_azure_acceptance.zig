@@ -345,7 +345,7 @@ test "core contract checks are explicit and the full checks are preserved" {
     );
     try source.expectContainsIn(
         full,
-        "journalctl --no-pager --boot=0 --unit \"$unit\" --identifier=systemd --priority=warning..emerg --lines=80",
+        "sudo -n journalctl --no-pager --boot=0 --unit \"$unit\" --priority=info..emerg --lines=120",
         "full",
     );
     try source.expectContainsIn(full, "head -c 49152", "full");

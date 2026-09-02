@@ -478,6 +478,21 @@ const full_snapd_override =
     "[Service]\n" ++
     "TimeoutStartSec=30min\n";
 
+// The stock unit applies the netplan configuration in ExecStart, then reloads
+// and retriggers udev from ExecStartPost so interface renames take effect.
+// `udevadm control --reload` waits for a reply from systemd-udevd and gives up
+// after its 60s default, which the saturated udev queue on the required Arm64
+// TCG acceptance path can outlast. The configuration pass itself has already
+// succeeded by then, so the boot is healthy but the unit is recorded as failed
+// and trips the no-failed-units contract. Keep both helpers fail-closed and
+// only widen the reply wait; the trigger is restated unchanged because
+// resetting ExecStartPost clears the whole list.
+const full_netplan_configure_override =
+    "[Service]\n" ++
+    "ExecStartPost=\n" ++
+    "ExecStartPost=udevadm control --timeout=300 --reload\n" ++
+    "ExecStartPost=udevadm trigger --action=add --subsystem-match=net\n";
+
 const full_udisks2_dbus_service_path =
     "/usr/share/dbus-1/system-services/org.freedesktop.UDisks2.service";
 
@@ -2478,12 +2493,14 @@ fn customizeOfflineRoot(
                 .{ .create_directory = .{ .path = "/etc/netplan", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/etc/systemd/system/networkd-dispatcher.service.d", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/etc/systemd/system/snapd.service.d", .mode = 0o755 } },
+                .{ .create_directory = .{ .path = "/etc/systemd/system/netplan-configure.service.d", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/var/lib/miz", .mode = 0o755 } },
                 .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-miz-generalized.conf", .source = .{ .inline_bytes = ssh_config } } },
                 .{ .write_file = .{ .path = "/etc/cloud/cloud.cfg.d/90-azure.cfg", .source = .{ .inline_bytes = cloud_config } } },
                 .{ .write_file = .{ .path = "/etc/netplan/50-cloud-init.yaml", .source = .{ .inline_bytes = netplan } } },
                 .{ .write_file = .{ .path = "/etc/systemd/system/networkd-dispatcher.service.d/10-miz-startup-order.conf", .source = .{ .inline_bytes = full_networkd_dispatcher_override } } },
                 .{ .write_file = .{ .path = "/etc/systemd/system/snapd.service.d/10-miz-startup-timeout.conf", .source = .{ .inline_bytes = full_snapd_override } } },
+                .{ .write_file = .{ .path = "/etc/systemd/system/netplan-configure.service.d/10-miz-udev-reply-timeout.conf", .source = .{ .inline_bytes = full_netplan_configure_override } } },
                 .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = waagent } } },
                 .{ .replace_symlink = .{ .path = "/etc/resolv.conf", .target = "/run/systemd/resolve/stub-resolv.conf" } },
             });
@@ -5816,6 +5833,26 @@ test "full snap seeding retains a bounded Arm TCG startup timeout" {
             "TimeoutStartSec=30min\n",
         full_snapd_override,
     );
+}
+
+test "full netplan configure widens only the udev reply wait" {
+    try std.testing.expectEqualStrings(
+        "[Service]\n" ++
+            "ExecStartPost=\n" ++
+            "ExecStartPost=udevadm control --timeout=300 --reload\n" ++
+            "ExecStartPost=udevadm trigger --action=add --subsystem-match=net\n",
+        full_netplan_configure_override,
+    );
+    // Resetting ExecStartPost drops the packaged list, so the reset must be
+    // followed by every command the stock unit runs.
+    try std.testing.expect(std.mem.count(u8, full_netplan_configure_override, "\nExecStartPost=") == 3);
+    // The renaming trigger stays exactly as packaged; only the reply wait moves.
+    try std.testing.expect(std.mem.containsAtLeast(
+        u8,
+        full_netplan_configure_override,
+        1,
+        "ExecStartPost=udevadm trigger --action=add --subsystem-match=net\n",
+    ));
 }
 
 test "full udisks policy keeps D-Bus activation without graphical eager start" {
