@@ -478,6 +478,23 @@ const full_snapd_override =
     "[Service]\n" ++
     "TimeoutStartSec=30min\n";
 
+// snapd.seeded.service ships with TimeoutStartSec=infinite, so systemd itself
+// never kills a slow first boot; the failure instead comes from the `snap
+// wait` command's own client-to-daemon HTTP round trip, which gives up with
+// "cannot communicate with server: timeout exceeded while waiting for
+// response" once snapd is too busy to answer in time -- exactly the kind of
+// saturation the required Arm64 TCG acceptance path already produces for
+// snapd, networkd-dispatcher, and netplan-configure. There is no documented
+// way to widen that client-side timeout, so retry the oneshot instead:
+// disable systemd's default restart rate limit so retries are not capped,
+// and let it try again a few seconds later once snapd has caught up.
+const full_snapd_seeded_override =
+    "[Unit]\n" ++
+    "StartLimitIntervalSec=0\n" ++
+    "[Service]\n" ++
+    "Restart=on-failure\n" ++
+    "RestartSec=10s\n";
+
 // The stock unit applies the netplan configuration in ExecStart, then reloads
 // and retriggers udev from ExecStartPost so interface renames take effect.
 // `udevadm control --reload` waits for a reply from systemd-udevd and gives up
@@ -2494,6 +2511,7 @@ fn customizeOfflineRoot(
                 .{ .create_directory = .{ .path = "/etc/systemd/system/networkd-dispatcher.service.d", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/etc/systemd/system/snapd.service.d", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/etc/systemd/system/netplan-configure.service.d", .mode = 0o755 } },
+                .{ .create_directory = .{ .path = "/etc/systemd/system/snapd.seeded.service.d", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/var/lib/miz", .mode = 0o755 } },
                 .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-miz-generalized.conf", .source = .{ .inline_bytes = ssh_config } } },
                 .{ .write_file = .{ .path = "/etc/cloud/cloud.cfg.d/90-azure.cfg", .source = .{ .inline_bytes = cloud_config } } },
@@ -2501,6 +2519,7 @@ fn customizeOfflineRoot(
                 .{ .write_file = .{ .path = "/etc/systemd/system/networkd-dispatcher.service.d/10-miz-startup-order.conf", .source = .{ .inline_bytes = full_networkd_dispatcher_override } } },
                 .{ .write_file = .{ .path = "/etc/systemd/system/snapd.service.d/10-miz-startup-timeout.conf", .source = .{ .inline_bytes = full_snapd_override } } },
                 .{ .write_file = .{ .path = "/etc/systemd/system/netplan-configure.service.d/10-miz-udev-reply-timeout.conf", .source = .{ .inline_bytes = full_netplan_configure_override } } },
+                .{ .write_file = .{ .path = "/etc/systemd/system/snapd.seeded.service.d/10-miz-seed-wait-retry.conf", .source = .{ .inline_bytes = full_snapd_seeded_override } } },
                 .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = waagent } } },
                 .{ .replace_symlink = .{ .path = "/etc/resolv.conf", .target = "/run/systemd/resolve/stub-resolv.conf" } },
             });
@@ -5853,6 +5872,17 @@ test "full netplan configure widens only the udev reply wait" {
         1,
         "ExecStartPost=udevadm trigger --action=add --subsystem-match=net\n",
     ));
+}
+
+test "full snap seed wait retries instead of widening an unconfigurable client timeout" {
+    try std.testing.expectEqualStrings(
+        "[Unit]\n" ++
+            "StartLimitIntervalSec=0\n" ++
+            "[Service]\n" ++
+            "Restart=on-failure\n" ++
+            "RestartSec=10s\n",
+        full_snapd_seeded_override,
+    );
 }
 
 test "full udisks policy keeps D-Bus activation without graphical eager start" {
