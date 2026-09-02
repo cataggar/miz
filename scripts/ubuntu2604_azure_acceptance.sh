@@ -315,6 +315,7 @@ uefi_response="$RESULT_DIR/gallery-version-response.json"
 vm_security_json="$RESULT_DIR/vm-security.json"
 instance_security_json="$RESULT_DIR/instance-security.json"
 conversion_attestation="$RESULT_DIR/conversion-attestation.json"
+vm_create_stderr="$RESULT_DIR/vm-create.stderr"
 mkdir -p "$(dirname -- "$STATE_FILE")"
 rm -f -- "$STATE_FILE" "${STATE_FILE}.group.json" "$vhd" "$private_key" "$private_key.pub"
 # Writes the canonical DER signing certificate next to the acceptance results
@@ -354,29 +355,38 @@ collect_failure_diagnostics() {
     rm -f -- "$failure_instance_view"
   fi
 
-  serial_console_uri=$(timeout 60s az vm get-instance-view \
-    --resource-group "$resource_group" \
-    --name "$vm_name" \
-    --query instanceView.bootDiagnostics.serialConsoleLogBlobUri \
-    --output tsv 2>/dev/null) || serial_console_uri=
-  if [[ "$serial_console_uri" == https://* ]]; then
-    if download_boot_artifact "$serial_console_uri" "$boot_log" 2>/dev/null; then
-      boot_log_status=retrieved
-    else
-      rm -f -- "$boot_log"
-    fi
-  fi
-  serial_console_uri=
+  # Managed boot diagnostics can take up to ~2 minutes to populate after a
+  # VM is created, so a single attempt right after a failure can legitimately
+  # come back empty even though the data exists; retry briefly (see #660).
+  local diagnostics_attempt=0
+  while (( diagnostics_attempt < 4 )) && [[ "$boot_log_status" != retrieved ]]; do
+    diagnostics_attempt=$((diagnostics_attempt + 1))
+    if (( diagnostics_attempt > 1 )); then sleep 20; fi
 
-  if [[ "$boot_log_status" != retrieved ]]; then
-    if timeout 90s az vm boot-diagnostics get-boot-log \
-        --resource-group "$resource_group" \
-        --name "$vm_name" >"$boot_log" 2>/dev/null; then
-      boot_log_status=retrieved
-    else
-      rm -f -- "$boot_log"
+    serial_console_uri=$(timeout 60s az vm get-instance-view \
+      --resource-group "$resource_group" \
+      --name "$vm_name" \
+      --query instanceView.bootDiagnostics.serialConsoleLogBlobUri \
+      --output tsv 2>/dev/null) || serial_console_uri=
+    if [[ "$serial_console_uri" == https://* ]]; then
+      if download_boot_artifact "$serial_console_uri" "$boot_log" 2>/dev/null; then
+        boot_log_status=retrieved
+      else
+        rm -f -- "$boot_log"
+      fi
     fi
-  fi
+    serial_console_uri=
+
+    if [[ "$boot_log_status" != retrieved ]]; then
+      if timeout 90s az vm boot-diagnostics get-boot-log \
+          --resource-group "$resource_group" \
+          --name "$vm_name" >"$boot_log" 2>/dev/null; then
+        boot_log_status=retrieved
+      else
+        rm -f -- "$boot_log"
+      fi
+    fi
+  done
 
   console_screenshot_uri=$(timeout 60s az vm get-instance-view \
     --resource-group "$resource_group" \
@@ -617,6 +627,7 @@ enable_agent=true
 if [[ "$FLAVOR" == core ]]; then
   enable_agent=false
 fi
+vm_create_status=0
 az vm create \
   --resource-group "$resource_group" \
   --name "$vm_name" \
@@ -634,7 +645,39 @@ az vm create \
   --public-ip-sku Standard \
   --nsg-rule SSH \
   --boot-diagnostics-storage "" \
-  --output json >/dev/null
+  --output json >/dev/null 2>"$vm_create_stderr" || vm_create_status=$?
+if [[ "$vm_create_status" -ne 0 ]]; then
+  cat -- "$vm_create_stderr" >&2
+  # Azure's own OSProvisioningTimedOut message says the VM "may still finish
+  # provisioning successfully" after the ARM deployment gives up waiting;
+  # that's a documented, non-fatal race under real Azure load, not a proof
+  # the guest boot failed. Poll a while longer instead of failing outright
+  # on the deployment-level timeout alone (see issue #660).
+  if [[ "$FLAVOR" == core ]] &&
+      grep -q OSProvisioningTimedOut -- "$vm_create_stderr"; then
+    echo "az vm create hit OSProvisioningTimedOut; polling for late success..." >&2
+    extra_wait_seconds=${AZURE_VM_CREATE_EXTRA_WAIT_SECONDS:-1200}
+    waited_seconds=0
+    late_provisioning_state=
+    while (( waited_seconds < extra_wait_seconds )); do
+      late_provisioning_state=$(timeout 60s az vm get-instance-view \
+        --resource-group "$resource_group" \
+        --name "$vm_name" \
+        --query "instanceView.statuses[?starts_with(code,'ProvisioningState/')].code | [-1]" \
+        --output tsv 2>/dev/null) || late_provisioning_state=
+      [[ "$late_provisioning_state" == "ProvisioningState/succeeded" ]] && break
+      sleep 30
+      waited_seconds=$((waited_seconds + 30))
+    done
+    if [[ "$late_provisioning_state" != "ProvisioningState/succeeded" ]]; then
+      echo "az vm create: OS provisioning did not recover after ${extra_wait_seconds}s of extra patience" >&2
+      exit 1
+    fi
+    echo "az vm create: OS provisioning recovered after the deployment-level timeout" >&2
+  else
+    exit "$vm_create_status"
+  fi
+fi
 az vm show \
   --resource-group "$resource_group" \
   --name "$vm_name" \
