@@ -2106,7 +2106,7 @@ test "the full Azure service contract matches Ubuntu 26.04" {
         "systemctl show --no-pager --property=Id,LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,TimeoutStartUSec",
     );
     try script.expectContains(
-        "journalctl --no-pager --boot=0 --unit \"$unit\" --identifier=systemd --priority=warning..emerg --lines=80",
+        "sudo -n journalctl --no-pager --boot=0 --unit \"$unit\" --priority=info..emerg --lines=120",
     );
     try script.expectContains("head -c 49152");
     try script.expectContains("head -n 8");

@@ -1047,7 +1047,7 @@ diagnose_unit() {
   {
     printf '%s\n' "--- bounded diagnostics for $unit ---"
     systemctl show --no-pager --property=Id,LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,TimeoutStartUSec "$unit"
-    journalctl --no-pager --boot=0 --unit "$unit" --identifier=systemd --priority=warning..emerg --lines=80 --output=short-monotonic
+    sudo -n journalctl --no-pager --boot=0 --unit "$unit" --priority=info..emerg --lines=120 --output=short-monotonic
   } 2>&1 | head -c 49152 >&2 || true
   printf '\n' >&2
 }
@@ -1223,7 +1223,7 @@ diagnose_unit() {
   {
     printf '%s\n' "--- bounded diagnostics for $unit ---"
     systemctl show --no-pager --property=Id,LoadState,ActiveState,SubState,Result,ExecMainCode,ExecMainStatus,TimeoutStartUSec "$unit"
-    journalctl --no-pager --boot=0 --unit "$unit" --identifier=systemd --priority=warning..emerg --lines=80 --output=short-monotonic
+    sudo -n journalctl --no-pager --boot=0 --unit "$unit" --priority=info..emerg --lines=120 --output=short-monotonic
   } 2>&1 | head -c 49152 >&2 || true
   printf '\n' >&2
 }
