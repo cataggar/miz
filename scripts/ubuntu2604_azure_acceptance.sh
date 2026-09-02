@@ -1352,23 +1352,10 @@ fi
 if lsblk -nr -o TYPE "$found" | tail -n +2 | grep -q '^part$'; then
   exit 1
 fi
-# A freshly attached data disk can report its final size before the block
-# layer has finished settling, so `dd` can return fewer than 512 bytes right
-# after the reboot that follows `az disk create`/`az vm disk attach`. Wait
-# for udev and retry a few times rather than failing on a transient short
-# read (issue #660).
-first_sector=
-for _ in 1 2 3 4 5 6; do
-  udevadm settle --timeout=5 2>/dev/null || true
-  candidate=$(sudo -n dd if="$found" bs=512 count=1 status=none 2>/dev/null | od -An -tx1 | tr -d ' \n') || candidate=
-  if [[ "${#candidate}" -eq 1024 ]]; then
-    first_sector=$candidate
-    break
-  fi
-  sleep 2
-done
+first_sector=$(sudo -n dd if="$found" bs=512 count=1 status=none | od -An -v -tx1 | tr -d ' \n')
 test -n "$first_sector"
 if [[ "$flavor" == core ]]; then
+  test "${#first_sector}" -eq 1024
   test -z "${first_sector//0/}"
 fi
 if findmnt -rn -S "$found" >/dev/null; then

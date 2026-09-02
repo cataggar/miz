@@ -587,22 +587,30 @@ test "core requests no VM agent and skips the vmAgent status check waagent alone
     try script.expectCount("if [[ \"$FLAVOR\" != core ]]; then\n", 2);
 }
 
-test "the data disk first-sector read settles udev and retries a transient short read" {
+test "the data disk first-sector read disables od duplicate suppression" {
     var script = try open();
     defer script.deinit();
 
-    // A freshly attached data disk can report its final size before the
-    // block layer has finished settling, so `dd` can return fewer than 512
-    // bytes right after the reboot that follows `az disk create`/`az vm disk
-    // attach` (issue #660). Require a full 512-byte read (1024 hex chars)
-    // before trusting it, retrying with `udevadm settle` in between instead
-    // of failing on the first short read.
-    try script.expectContains("udevadm settle --timeout=5");
-    try script.expectContains(
-        "if [[ \"${#candidate}\" -eq 1024 ]]; then\n    first_sector=$candidate\n    break\n  fi",
-    );
+    // Without `-v`, od collapses repeated zero rows into `*`, making a valid
+    // blank 512-byte sector appear shorter than 1024 hex characters (#666).
+    try script.expectContains("od -An -v -tx1");
+    try script.expectOmits("udevadm settle");
     try script.expectContains("test -n \"$first_sector\"");
+    try script.expectContains("test \"${#first_sector}\" -eq 1024");
     try script.expectContains("test -z \"${first_sector//0/}\"");
+
+    var result = try runProcess(
+        std.testing.allocator,
+        &.{
+            "bash",
+            "-c",
+            "dd if=/dev/zero bs=512 count=1 status=none | od -An -v -tx1 | tr -d ' \\n' | wc -c",
+        },
+        &.{},
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(result.succeeded());
+    try std.testing.expectEqualStrings("1024\n", result.stdout);
 }
 
 test "core az vm create tolerates a late OSProvisioningTimedOut instead of failing outright" {
