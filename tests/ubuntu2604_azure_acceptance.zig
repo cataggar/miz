@@ -562,6 +562,31 @@ test "the harness runs no Python and the library is syntactically valid" {
     }
 }
 
+test "core requests no VM agent and skips the vmAgent status check waagent alone can satisfy" {
+    var script = try open();
+    defer script.deinit();
+
+    // azagent deliberately never implements the VM extension/status-blob
+    // handshake real waagent uses (see azagent/main.zig, issue #112), and the
+    // core contract elsewhere in this script asserts `az vm extension list`
+    // is empty. Requesting --enable-agent true for core makes Azure's
+    // OS-provisioning wait on a handshake that never arrives
+    // (OSProvisioningTimedOut), and the vmAgent.statuses check can never
+    // succeed either, so both must be conditioned on flavor.
+    try script.expectContains("enable_agent=true\n");
+    try script.expectContains(
+        "if [[ \"$FLAVOR\" == core ]]; then\n  enable_agent=false\nfi",
+    );
+    try script.expectContains("--enable-agent \"$enable_agent\" \\");
+    try script.expectOmits("--enable-agent true \\");
+
+    try script.expectCount(
+        "instanceView.vmAgent.statuses[?code=='ProvisioningState/succeeded']",
+        2,
+    );
+    try script.expectCount("if [[ \"$FLAVOR\" != core ]]; then\n", 2);
+}
+
 // ---- process and fixture support ----
 
 const Result = struct {

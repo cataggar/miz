@@ -608,6 +608,15 @@ test "$provisioning_state" = Succeeded
 [[ "$image_version_id" == /subscriptions/* ]]
 
 ssh-keygen -q -t ed25519 -N '' -C miz-azure-acceptance -f "$private_key"
+# core ships azagent, a minimal guest agent that deliberately does not
+# implement the VM extension/status-blob handshake real waagent uses (see
+# azagent/main.zig, issue #112). Requesting --enable-agent true for core
+# makes Azure's OS-provisioning wait on that handshake and it never arrives,
+# so az vm create reliably fails with OSProvisioningTimedOut.
+enable_agent=true
+if [[ "$FLAVOR" == core ]]; then
+  enable_agent=false
+fi
 az vm create \
   --resource-group "$resource_group" \
   --name "$vm_name" \
@@ -617,7 +626,7 @@ az vm create \
   --admin-username "$admin_username" \
   --authentication-type ssh \
   --ssh-key-values "$private_key.pub" \
-  --enable-agent true \
+  --enable-agent "$enable_agent" \
   --enable-auto-update false \
   --security-type TrustedLaunch \
   --enable-secure-boot true \
@@ -1158,11 +1167,16 @@ GUEST
   )
   test "$cloud_init_status" = done
 fi
-test "$(az vm get-instance-view \
-  --resource-group "$resource_group" \
-  --name "$vm_name" \
-  --query "instanceView.vmAgent.statuses[?code=='ProvisioningState/succeeded'].code | [0]" \
-  --output tsv)" = ProvisioningState/succeeded
+if [[ "$FLAVOR" != core ]]; then
+  # core's azagent never reports through the vmAgent status-blob channel
+  # (see the --enable-agent false note above); this check only applies to
+  # full's real waagent.
+  test "$(az vm get-instance-view \
+    --resource-group "$resource_group" \
+    --name "$vm_name" \
+    --query "instanceView.vmAgent.statuses[?code=='ProvisioningState/succeeded'].code | [0]" \
+    --output tsv)" = ProvisioningState/succeeded
+fi
 
 data_disk_size_gib=4
 az disk create \
@@ -1248,11 +1262,15 @@ test -z "$failed_units" || {
 }
 GUEST
 fi
-test "$(az vm get-instance-view \
-  --resource-group "$resource_group" \
-  --name "$vm_name" \
-  --query "instanceView.vmAgent.statuses[?code=='ProvisioningState/succeeded'].code | [0]" \
-  --output tsv)" = ProvisioningState/succeeded
+if [[ "$FLAVOR" != core ]]; then
+  # See the earlier vmAgent check: only full's real waagent reports through
+  # this channel, so this is skipped for core.
+  test "$(az vm get-instance-view \
+    --resource-group "$resource_group" \
+    --name "$vm_name" \
+    --query "instanceView.vmAgent.statuses[?code=='ProvisioningState/succeeded'].code | [0]" \
+    --output tsv)" = ProvisioningState/succeeded
+fi
 
 expected_data_disk_size=$((data_disk_size_gib * 1073741824))
 data_device=$(ssh "${ssh_options[@]}" "$ssh_target" \
