@@ -605,6 +605,27 @@ test "the data disk first-sector read settles udev and retries a transient short
     try script.expectContains("test -z \"${first_sector//0/}\"");
 }
 
+test "core az vm create tolerates a late OSProvisioningTimedOut instead of failing outright" {
+    var script = try open();
+    defer script.deinit();
+
+    // Even with #658's --enable-agent false fix applied, `az vm create` can
+    // still hit Azure's ARM-deployment-level OSProvisioningTimedOut for core
+    // (issue #660): that error is documented by Azure itself as non-fatal
+    // ("The VM may still finish provisioning successfully. Please check
+    // provisioning state later."), unlike the vmAgent.statuses handshake
+    // #658 addressed. Poll a while longer for core rather than failing on
+    // the deployment's own timeout alone.
+    try script.expectContains("|| vm_create_status=$?");
+    try script.expectContains("if [[ \"$vm_create_status\" -ne 0 ]]; then");
+    try script.expectContains(
+        "if [[ \"$FLAVOR\" == core ]] &&\n      grep -q OSProvisioningTimedOut -- \"$vm_create_stderr\"; then",
+    );
+    try script.expectContains("extra_wait_seconds=${AZURE_VM_CREATE_EXTRA_WAIT_SECONDS:-1200}");
+    try script.expectContains("ProvisioningState/succeeded");
+    try script.expectContains("exit \"$vm_create_status\"");
+}
+
 // ---- process and fixture support ----
 
 const Result = struct {
