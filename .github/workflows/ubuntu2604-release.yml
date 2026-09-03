@@ -952,6 +952,7 @@ jobs:
             ${{ env.RESULT_DIR }}/*.json
             ${{ env.RESULT_DIR }}/boot.log
             ${{ env.RESULT_DIR }}/boot-screenshot.png
+            ${{ env.RESULT_DIR }}/boot-diagnostics-errors.log
             ${{ env.RESULT_DIR }}/uefi-db.bin
           if-no-files-found: warn
           retention-days: 2
