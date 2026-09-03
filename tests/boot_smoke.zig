@@ -960,6 +960,19 @@ test "build-iso opportunistically boot-smokes a regenerated LiveOS ISO as a UEFI
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
+    const skip = try getOptionalTestEnvPathAlloc(
+        allocator,
+        "MIZ_BOOT_TEST_SKIP_BUILD_ISO",
+    );
+    defer if (skip) |value| allocator.free(value);
+    if (skip != null) {
+        std.debug.print(
+            "skipping build-iso QEMU boot smoke test: MIZ_BOOT_TEST_SKIP_BUILD_ISO is set\n",
+            .{},
+        );
+        return error.SkipZigTest;
+    }
+
     // Gated on the same real fixtures as the build-image boot smokes plus
     // OVMF; skips cleanly (never fails) whenever qemu, OVMF, or the
     // MIZ_BOOT_TEST_ISO/MIZ_BOOT_TEST_OCI fixtures are unavailable. An ISO
