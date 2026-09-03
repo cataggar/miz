@@ -635,24 +635,22 @@ test "az vm create fails immediately instead of polling a terminal provisioning 
     try script.expectOmits("late_provisioning_state");
 }
 
-test "Azure boot diagnostics use an explicit owned storage account" {
+test "failed VMs use managed boot diagnostics without Storage permissions" {
     var script = try open();
     defer script.deinit();
 
-    // `--boot-diagnostics-storage ""` produced VMs for which Azure returned
-    // "Please enable boot diagnostics" (#660). An explicit account in the
-    // already-owned temporary resource group is unambiguous and is removed by
-    // the existing resource-group cleanup.
+    // The release identity has VM write permission but deliberately lacks
+    // Microsoft.Storage/storageAccounts/write. Managed boot diagnostics need
+    // no caller-owned account. A diagnostic reboot records the same startup
+    // path after a terminal provisioning failure.
+    try script.expectOmits("az storage account create");
+    try script.expectOmits("--boot-diagnostics-storage");
+    try script.expectContains("az vm boot-diagnostics enable \\");
+    try script.expectContains("--output none 2>\"$boot_diagnostics_attempt_error\"");
+    try script.expectContains("az vm restart \\");
     try script.expectContains(
-        "boot_diagnostics_storage_account=\"miz${name_seed:0:21}\"",
+        "\"enable managed boot diagnostics\" \"$boot_diagnostics_attempt_error\"",
     );
-    try script.expectContains("az storage account create \\");
-    try script.expectContains("--sku Standard_LRS \\");
-    try script.expectContains("--allow-blob-public-access false \\");
-    try script.expectContains(
-        "--boot-diagnostics-storage \"$boot_diagnostics_storage_account\" \\",
-    );
-    try script.expectOmits("--boot-diagnostics-storage \"\" \\");
 }
 
 // ---- process and fixture support ----

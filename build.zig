@@ -1313,6 +1313,12 @@ pub fn build(b: *std.Build) void {
         run_ubuntu2604_guards[guard_index] = run_guard;
         ubuntu2604_guard_step.dependOn(&run_guard.step);
     }
+    const run_zig_fetch_retry_tests = b.addSystemCommand(&.{
+        "bash",
+        "tests/zig_fetch_retry.sh",
+    });
+    run_zig_fetch_retry_tests.has_side_effects = true;
+    ubuntu2604_guard_step.dependOn(&run_zig_fetch_retry_tests.step);
 
     // ---- tests/python_inventory.zig: the temporary, explicit inventory of
     // the Python this repository still owns. It shells out to `git ls-files`

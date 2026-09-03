@@ -420,7 +420,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch \
+          bash scripts/zig_fetch_retry.sh \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build -Doptimize=ReleaseSafe install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
@@ -650,7 +650,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch \
+          bash scripts/zig_fetch_retry.sh \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
@@ -723,7 +723,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch \
+          bash scripts/zig_fetch_retry.sh \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build \
             -Dubuntu2604-arch="$ARCHITECTURE" \
@@ -882,7 +882,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch \
+          bash scripts/zig_fetch_retry.sh \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build -Doptimize=ReleaseSafe
           test -x zig-out/bin/miz
@@ -1036,7 +1036,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch \
+          bash scripts/zig_fetch_retry.sh \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build -Doptimize=ReleaseSafe install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
