@@ -300,6 +300,11 @@ data_disk_name="miz-data-${name_seed}"
 gallery_name="mizu2604${name_seed}"
 image_name="mizu2604${short_arch}${FLAVOR}"
 vm_name="miz-vm-${name_seed}"
+# Unlike the empty `az vm create --boot-diagnostics-storage ""` value, an
+# explicit account reliably enables diagnostics. Keep the globally unique
+# account name within Azure's 24-character lowercase-alphanumeric limit.
+boot_diagnostics_storage_account="miz${name_seed:0:21}"
+[[ "$boot_diagnostics_storage_account" =~ ^[a-z0-9]{3,24}$ ]]
 admin_username=miztest
 vhd="$RESULT_DIR/${CANDIDATE_KEY}.vhd"
 private_key="$RESULT_DIR/id_ed25519"
@@ -516,6 +521,17 @@ then
   exit 1
 fi
 
+az storage account create \
+  --resource-group "$resource_group" \
+  --name "$boot_diagnostics_storage_account" \
+  --location "$AZURE_LOCATION" \
+  --sku Standard_LRS \
+  --kind StorageV2 \
+  --https-only true \
+  --min-tls-version TLS1_2 \
+  --allow-blob-public-access false \
+  --output json >/dev/null
+
 az vm list-skus \
   --location "$AZURE_LOCATION" \
   --resource-type virtualMachines \
@@ -704,39 +720,14 @@ az vm create \
   --enable-vtpm true \
   --public-ip-sku Standard \
   --nsg-rule SSH \
-  --boot-diagnostics-storage "" \
+  --boot-diagnostics-storage "$boot_diagnostics_storage_account" \
   --output json >/dev/null 2>"$vm_create_stderr" || vm_create_status=$?
 if [[ "$vm_create_status" -ne 0 ]]; then
   cat -- "$vm_create_stderr" >&2
-  # Azure's own OSProvisioningTimedOut message says the VM "may still finish
-  # provisioning successfully" after the ARM deployment gives up waiting;
-  # that's a documented, non-fatal race under real Azure load, not a proof
-  # the guest boot failed. Poll a while longer instead of failing outright
-  # on the deployment-level timeout alone (see issue #660).
-  if [[ "$FLAVOR" == core ]] &&
-      grep -q OSProvisioningTimedOut -- "$vm_create_stderr"; then
-    echo "az vm create hit OSProvisioningTimedOut; polling for late success..." >&2
-    extra_wait_seconds=${AZURE_VM_CREATE_EXTRA_WAIT_SECONDS:-1200}
-    waited_seconds=0
-    late_provisioning_state=
-    while (( waited_seconds < extra_wait_seconds )); do
-      late_provisioning_state=$(timeout 60s az vm get-instance-view \
-        --resource-group "$resource_group" \
-        --name "$vm_name" \
-        --query "instanceView.statuses[?starts_with(code,'ProvisioningState/')].code | [-1]" \
-        --output tsv 2>/dev/null) || late_provisioning_state=
-      [[ "$late_provisioning_state" == "ProvisioningState/succeeded" ]] && break
-      sleep 30
-      waited_seconds=$((waited_seconds + 30))
-    done
-    if [[ "$late_provisioning_state" != "ProvisioningState/succeeded" ]]; then
-      echo "az vm create: OS provisioning did not recover after ${extra_wait_seconds}s of extra patience" >&2
-      exit 1
-    fi
-    echo "az vm create: OS provisioning recovered after the deployment-level timeout" >&2
-  else
-    exit "$vm_create_status"
-  fi
+  # Two real x86_64-core deployments remained failed throughout the former
+  # 20-minute late-success poll (#660). Fail immediately so diagnostics and
+  # targeted retry can start without adding a disproven recovery delay.
+  exit "$vm_create_status"
 fi
 az vm show \
   --resource-group "$resource_group" \

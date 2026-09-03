@@ -620,25 +620,39 @@ test "the data disk first-sector read disables od duplicate suppression" {
     try std.testing.expectEqualStrings("1024\n", result.stdout);
 }
 
-test "core az vm create tolerates a late OSProvisioningTimedOut instead of failing outright" {
+test "az vm create fails immediately instead of polling a terminal provisioning failure" {
     var script = try open();
     defer script.deinit();
 
-    // Even with #658's --enable-agent false fix applied, `az vm create` can
-    // still hit Azure's ARM-deployment-level OSProvisioningTimedOut for core
-    // (issue #660): that error is documented by Azure itself as non-fatal
-    // ("The VM may still finish provisioning successfully. Please check
-    // provisioning state later."), unlike the vmAgent.statuses handshake
-    // #658 addressed. Poll a while longer for core rather than failing on
-    // the deployment's own timeout alone.
+    // Two x86_64-core deployments remained failed throughout the former
+    // 20-minute recovery poll (#660), so retaining it only delays diagnostics
+    // and targeted retry after Azure has entered a terminal state.
     try script.expectContains("|| vm_create_status=$?");
     try script.expectContains("if [[ \"$vm_create_status\" -ne 0 ]]; then");
-    try script.expectContains(
-        "if [[ \"$FLAVOR\" == core ]] &&\n      grep -q OSProvisioningTimedOut -- \"$vm_create_stderr\"; then",
-    );
-    try script.expectContains("extra_wait_seconds=${AZURE_VM_CREATE_EXTRA_WAIT_SECONDS:-1200}");
-    try script.expectContains("ProvisioningState/succeeded");
     try script.expectContains("exit \"$vm_create_status\"");
+    try script.expectOmits("AZURE_VM_CREATE_EXTRA_WAIT_SECONDS");
+    try script.expectOmits("polling for late success");
+    try script.expectOmits("late_provisioning_state");
+}
+
+test "Azure boot diagnostics use an explicit owned storage account" {
+    var script = try open();
+    defer script.deinit();
+
+    // `--boot-diagnostics-storage ""` produced VMs for which Azure returned
+    // "Please enable boot diagnostics" (#660). An explicit account in the
+    // already-owned temporary resource group is unambiguous and is removed by
+    // the existing resource-group cleanup.
+    try script.expectContains(
+        "boot_diagnostics_storage_account=\"miz${name_seed:0:21}\"",
+    );
+    try script.expectContains("az storage account create \\");
+    try script.expectContains("--sku Standard_LRS \\");
+    try script.expectContains("--allow-blob-public-access false \\");
+    try script.expectContains(
+        "--boot-diagnostics-storage \"$boot_diagnostics_storage_account\" \\",
+    );
+    try script.expectOmits("--boot-diagnostics-storage \"\" \\");
 }
 
 // ---- process and fixture support ----
