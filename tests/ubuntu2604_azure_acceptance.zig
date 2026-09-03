@@ -384,6 +384,13 @@ test "failure diagnostics never persist boot diagnostic SAS URIs" {
     );
     try source.expectContainsIn(diagnostics, "serial_console_uri=\n", "diagnostics");
     try source.expectContainsIn(diagnostics, "console_screenshot_uri=\n", "diagnostics");
+    try script.expectContains("sed -E 's#https://[^[:space:]]+#<redacted-url>#g'");
+    try source.expectContainsIn(
+        diagnostics,
+        "record_boot_diagnostics_error",
+        "diagnostics",
+    );
+    try script.expectContains("boot-diagnostics-errors.log");
     // Only the retrieval status reaches the recorded document, never the SAS
     // URI it was fetched from.
     const document = try script.section(

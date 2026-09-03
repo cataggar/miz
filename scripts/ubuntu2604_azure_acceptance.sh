@@ -307,6 +307,8 @@ boot_log="$RESULT_DIR/boot.log"
 boot_screenshot="$RESULT_DIR/boot-screenshot.png"
 failure_diagnostics="$RESULT_DIR/failure-diagnostics.json"
 failure_instance_view="$RESULT_DIR/failure-instance-view.json"
+boot_diagnostics_errors="$RESULT_DIR/boot-diagnostics-errors.log"
+boot_diagnostics_attempt_error="$RESULT_DIR/boot-diagnostics-attempt.stderr"
 sku_json="$RESULT_DIR/sku.json"
 certificate_der="$RESULT_DIR/signing-certificate.der"
 uefi_request="$RESULT_DIR/gallery-version-request.json"
@@ -338,21 +340,43 @@ download_boot_artifact() {
   timeout 90s "$RELEASE_TOOL" azure-boot-artifact --uri "$uri" --output "$output"
 }
 
+record_boot_diagnostics_error() {
+  local operation=$1
+  local error_file=$2
+  {
+    printf '%s\n' "--- $operation ---"
+    if [[ -s "$error_file" ]]; then
+      # Azure diagnostic blob URIs carry SAS credentials. Preserve the API
+      # error while ensuring a URI can never enter the uploaded artifact.
+      sed -E 's#https://[^[:space:]]+#<redacted-url>#g' "$error_file" |
+        head -c 16384 || true
+      printf '\n'
+    else
+      printf '%s\n' '(command failed without stderr)'
+    fi
+  } >>"$boot_diagnostics_errors"
+  rm -f -- "$error_file"
+}
+
 collect_failure_diagnostics() {
   local instance_view_status=unavailable
   local boot_log_status=unavailable
   local boot_screenshot_status=unavailable
   local serial_console_uri=
   local console_screenshot_uri=
+  : >"$boot_diagnostics_errors"
+  rm -f -- "$boot_diagnostics_attempt_error"
 
   if timeout 60s az vm get-instance-view \
       --resource-group "$resource_group" \
       --name "$vm_name" \
       --query 'instanceView.{statuses:statuses[].{code:code,displayStatus:displayStatus,level:level,time:time},vmAgent:vmAgent.statuses[].{code:code,displayStatus:displayStatus,level:level,time:time}}' \
-      --output json >"$failure_instance_view" 2>/dev/null; then
+      --output json >"$failure_instance_view" 2>"$boot_diagnostics_attempt_error"; then
     instance_view_status=retrieved
+    rm -f -- "$boot_diagnostics_attempt_error"
   else
     rm -f -- "$failure_instance_view"
+    record_boot_diagnostics_error "instance view" "$boot_diagnostics_attempt_error"
   fi
 
   # Managed boot diagnostics can take up to ~2 minutes to populate after a
@@ -367,23 +391,43 @@ collect_failure_diagnostics() {
       --resource-group "$resource_group" \
       --name "$vm_name" \
       --query instanceView.bootDiagnostics.serialConsoleLogBlobUri \
-      --output tsv 2>/dev/null) || serial_console_uri=
+      --output tsv 2>"$boot_diagnostics_attempt_error") || {
+      serial_console_uri=
+      record_boot_diagnostics_error \
+        "serial console URI attempt $diagnostics_attempt" \
+        "$boot_diagnostics_attempt_error"
+    }
+    rm -f -- "$boot_diagnostics_attempt_error"
     if [[ "$serial_console_uri" == https://* ]]; then
-      if download_boot_artifact "$serial_console_uri" "$boot_log" 2>/dev/null; then
+      if download_boot_artifact \
+          "$serial_console_uri" "$boot_log" 2>"$boot_diagnostics_attempt_error"; then
         boot_log_status=retrieved
+        rm -f -- "$boot_diagnostics_attempt_error"
       else
         rm -f -- "$boot_log"
+        record_boot_diagnostics_error \
+          "serial console download attempt $diagnostics_attempt" \
+          "$boot_diagnostics_attempt_error"
       fi
+    else
+      printf '%s\n' \
+        "--- serial console URI attempt $diagnostics_attempt ---" \
+        '(instance view returned no serial-console URI)' \
+        >>"$boot_diagnostics_errors"
     fi
     serial_console_uri=
 
     if [[ "$boot_log_status" != retrieved ]]; then
       if timeout 90s az vm boot-diagnostics get-boot-log \
           --resource-group "$resource_group" \
-          --name "$vm_name" >"$boot_log" 2>/dev/null; then
+          --name "$vm_name" >"$boot_log" 2>"$boot_diagnostics_attempt_error"; then
         boot_log_status=retrieved
+        rm -f -- "$boot_diagnostics_attempt_error"
       else
         rm -f -- "$boot_log"
+        record_boot_diagnostics_error \
+          "direct boot log attempt $diagnostics_attempt" \
+          "$boot_diagnostics_attempt_error"
       fi
     fi
   done
@@ -392,14 +436,30 @@ collect_failure_diagnostics() {
     --resource-group "$resource_group" \
     --name "$vm_name" \
     --query instanceView.bootDiagnostics.consoleScreenshotBlobUri \
-    --output tsv 2>/dev/null) || console_screenshot_uri=
+    --output tsv 2>"$boot_diagnostics_attempt_error") || {
+    console_screenshot_uri=
+    record_boot_diagnostics_error \
+      "console screenshot URI" \
+      "$boot_diagnostics_attempt_error"
+  }
+  rm -f -- "$boot_diagnostics_attempt_error"
   if [[ "$console_screenshot_uri" == https://* ]]; then
     if download_boot_artifact \
-        "$console_screenshot_uri" "$boot_screenshot" 2>/dev/null; then
+        "$console_screenshot_uri" "$boot_screenshot" \
+        2>"$boot_diagnostics_attempt_error"; then
       boot_screenshot_status=retrieved
+      rm -f -- "$boot_diagnostics_attempt_error"
     else
       rm -f -- "$boot_screenshot"
+      record_boot_diagnostics_error \
+        "console screenshot download" \
+        "$boot_diagnostics_attempt_error"
     fi
+  else
+    printf '%s\n' \
+      '--- console screenshot URI ---' \
+      '(instance view returned no console-screenshot URI)' \
+      >>"$boot_diagnostics_errors"
   fi
   console_screenshot_uri=
 
