@@ -300,11 +300,6 @@ data_disk_name="miz-data-${name_seed}"
 gallery_name="mizu2604${name_seed}"
 image_name="mizu2604${short_arch}${FLAVOR}"
 vm_name="miz-vm-${name_seed}"
-# Unlike the empty `az vm create --boot-diagnostics-storage ""` value, an
-# explicit account reliably enables diagnostics. Keep the globally unique
-# account name within Azure's 24-character lowercase-alphanumeric limit.
-boot_diagnostics_storage_account="miz${name_seed:0:21}"
-[[ "$boot_diagnostics_storage_account" =~ ^[a-z0-9]{3,24}$ ]]
 admin_username=miztest
 vhd="$RESULT_DIR/${CANDIDATE_KEY}.vhd"
 private_key="$RESULT_DIR/id_ed25519"
@@ -382,6 +377,29 @@ collect_failure_diagnostics() {
   else
     rm -f -- "$failure_instance_view"
     record_boot_diagnostics_error "instance view" "$boot_diagnostics_attempt_error"
+  fi
+
+  # The protected-environment identity intentionally cannot create storage
+  # accounts. Enable Azure-managed diagnostics on the failed VM instead, then
+  # reboot once so the repeatable guest startup path is captured.
+  if timeout 120s az vm boot-diagnostics enable \
+      --resource-group "$resource_group" \
+      --name "$vm_name" \
+      --output none 2>"$boot_diagnostics_attempt_error"; then
+    rm -f -- "$boot_diagnostics_attempt_error"
+    if timeout 180s az vm restart \
+        --resource-group "$resource_group" \
+        --name "$vm_name" \
+        --output none 2>"$boot_diagnostics_attempt_error"; then
+      rm -f -- "$boot_diagnostics_attempt_error"
+      sleep 30
+    else
+      record_boot_diagnostics_error \
+        "diagnostic reboot" "$boot_diagnostics_attempt_error"
+    fi
+  else
+    record_boot_diagnostics_error \
+      "enable managed boot diagnostics" "$boot_diagnostics_attempt_error"
   fi
 
   # Managed boot diagnostics can take up to ~2 minutes to populate after a
@@ -520,17 +538,6 @@ then
   echo "::error::Failed to create the persisted temporary resource group"
   exit 1
 fi
-
-az storage account create \
-  --resource-group "$resource_group" \
-  --name "$boot_diagnostics_storage_account" \
-  --location "$AZURE_LOCATION" \
-  --sku Standard_LRS \
-  --kind StorageV2 \
-  --https-only true \
-  --min-tls-version TLS1_2 \
-  --allow-blob-public-access false \
-  --output json >/dev/null
 
 az vm list-skus \
   --location "$AZURE_LOCATION" \
@@ -720,7 +727,6 @@ az vm create \
   --enable-vtpm true \
   --public-ip-sku Standard \
   --nsg-rule SSH \
-  --boot-diagnostics-storage "$boot_diagnostics_storage_account" \
   --output json >/dev/null 2>"$vm_create_stderr" || vm_create_status=$?
 if [[ "$vm_create_status" -ne 0 ]]; then
   cat -- "$vm_create_stderr" >&2

@@ -18,6 +18,22 @@ fn open() !Source {
     return Source.open(std.testing.allocator, workflow_path);
 }
 
+test "all release dependency prefetches use the bounded retry helper" {
+    var workflow = try open();
+    defer workflow.deinit();
+    try workflow.expectOmits("zig build --fetch");
+    try workflow.expectCount("bash scripts/zig_fetch_retry.sh", 5);
+
+    var retry = try Source.open(
+        std.testing.allocator,
+        "scripts/zig_fetch_retry.sh",
+    );
+    defer retry.deinit();
+    try retry.expectContains("readonly max_attempts=4");
+    try retry.expectContains("NameServerFailure");
+    try retry.expectContains("if ! grep -Eq \"$retryable_errors\"");
+}
+
 test "each matrix carries the exact four published candidates" {
     var workflow = try open();
     defer workflow.deinit();
