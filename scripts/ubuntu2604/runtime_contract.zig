@@ -674,16 +674,115 @@ pub fn countFor(audience: Audience) usize {
     return total;
 }
 
+/// The explicit debz package roots the contract's `package` entries name, in
+/// contract (`id`) order.
+///
+/// Step 3 of #677 replaces the `ubuntu-minimal` metapackage with exactly this
+/// set. Derived rather than written down twice, because the whole point of the
+/// exercise is that a package root exists if and only if a named behavior
+/// stands on it: a root nothing in this table asks for is a convenience, and a
+/// contract package that is not a root is an unenforced promise. `build_tooling`
+/// roots are included -- `initramfs-tools` is still installed into the guest
+/// until step 4 moves initramfs generation out of it -- so the derivation
+/// describes the roots the build actually resolves today.
+pub const package_roots: [countKind(.package)][]const u8 = blk: {
+    var names: [countKind(.package)][]const u8 = undefined;
+    var next: usize = 0;
+    for (core_requirements) |entry| {
+        if (entry.kind != .package) continue;
+        names[next] = entry.target;
+        next += 1;
+    }
+    break :blk names;
+};
+
+/// Number of entries of a kind, evaluated at comptime so the derived tables
+/// above can size themselves.
+pub fn countKind(comptime kind: Kind) usize {
+    var total: usize = 0;
+    for (core_requirements) |entry| {
+        if (entry.kind == kind) total += 1;
+    }
+    return total;
+}
+
+pub fn isPackageRoot(name: []const u8) bool {
+    for (package_roots) |root| {
+        if (std.mem.eql(u8, root, name)) return true;
+    }
+    return false;
+}
+
+/// Whether `names` is the contract's package-root set, ignoring order.
+///
+/// Order is a build decision -- the kernel is resolved before the initramfs
+/// generator so the kernel transaction does not build an initramfs the builder
+/// is about to rebuild -- so callers keep their own deliberate ordering and use
+/// this to prove they kept the same members.
+pub fn isPackageRootSet(names: []const []const u8) bool {
+    if (names.len != package_roots.len) return false;
+    for (package_roots) |root| {
+        var found = false;
+        for (names) |name| {
+            if (std.mem.eql(u8, root, name)) {
+                if (found) return false;
+                found = true;
+            }
+        }
+        if (!found) return false;
+    }
+    return true;
+}
+
+/// Packages the core closure must never contain.
+///
+/// The exact-closure equality check is what actually keeps the inventory
+/// honest -- an unexpected package fails whether or not it is named here.
+/// This list exists so the regressions #677 calls out by name fail with the
+/// name of what came back: a broad metapackage, an apt client, an editor, a
+/// pager, locales, documentation, a conventional networking daemon, an init
+/// system, or a convenience tool. Every entry is a package no contract
+/// behavior stands on, which the test below re-checks against `package_roots`.
+pub const forbidden_packages = [_][]const u8{
+    "apt",
+    "cloud-init",
+    "isc-dhcp-client",
+    "locales",
+    "man-db",
+    "nano",
+    "netplan.io",
+    "network-manager",
+    "snapd",
+    "systemd",
+    "systemd-sysv",
+    "ubuntu-minimal",
+    "ubuntu-server",
+    "ubuntu-server-minimal",
+    "ubuntu-standard",
+    "unattended-upgrades",
+    "vim-tiny",
+    "walinuxagent",
+};
+
+pub fn isForbiddenPackage(name: []const u8) bool {
+    for (forbidden_packages) |forbidden| {
+        if (std.mem.eql(u8, forbidden, name)) return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Canonical serialization and digest.
 // ---------------------------------------------------------------------------
 
-/// One canonical tab-separated line per requirement, terminated by a newline.
+/// One canonical tab-separated line per requirement, then one per forbidden
+/// package, terminated by newlines.
 ///
 /// The digest over these lines is what binds a shipped image to the contract
 /// it was built against. It covers every field that changes meaning, so a
-/// reclassified audience or a relaxed expectation moves the digest even when
-/// the entry count does not.
+/// reclassified audience, a relaxed expectation, or a convenience quietly
+/// dropped from the forbidden set moves the digest even when the entry count
+/// does not.
 pub fn writeCanonical(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     for (core_requirements) |entry| {
         try writer.print("{s}\t{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n", .{
@@ -696,7 +795,15 @@ pub fn writeCanonical(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             entry.expect,
         });
     }
+    for (forbidden_packages) |name| {
+        try writer.print("{s}\t{s}\n", .{ forbidden_canonical_prefix, name });
+    }
 }
+
+/// The first field of a forbidden-package line. It is not a legal requirement
+/// `id` -- ids never contain a space -- so no requirement line can be mistaken
+/// for one, or the reverse.
+pub const forbidden_canonical_prefix = "forbidden package";
 
 pub const digest_hex_len = 64;
 
@@ -716,6 +823,11 @@ pub fn digest() [digest_hex_len]u8 {
             entry.presence.key(),
             entry.expect,
         }) catch unreachable;
+        hasher.update(writer.buffered());
+    }
+    for (forbidden_packages) |name| {
+        writer.end = 0;
+        writer.print("{s}\t{s}\n", .{ forbidden_canonical_prefix, name }) catch unreachable;
         hasher.update(writer.buffered());
     }
     var raw: [32]u8 = undefined;
@@ -1012,6 +1124,75 @@ test "ca-certificates stays an explicit package root with a validated trust stor
     try std.testing.expect(bundle.required());
 }
 
+test "the derived package roots are the contract's packages and nothing else" {
+    // #677 step 3: the explicit roots replace `ubuntu-minimal`, and the set is
+    // derived so a convenience root cannot be added without first naming the
+    // behavior that needs it.
+    try std.testing.expectEqualSlices([]const u8, &[_][]const u8{
+        "ca-certificates",
+        "initramfs-tools",
+        "linux-azure",
+        "openssh-server",
+        "sudo",
+    }, &package_roots);
+    try std.testing.expect(isPackageRoot("ca-certificates"));
+    try std.testing.expect(!isPackageRoot("ubuntu-minimal"));
+    for (core_requirements) |entry| {
+        try std.testing.expectEqual(entry.kind == .package, isPackageRoot(entry.target));
+    }
+    // The build orders its roots deliberately; only the membership is derived.
+    try std.testing.expect(isPackageRootSet(&.{
+        "linux-azure",
+        "initramfs-tools",
+        "openssh-server",
+        "sudo",
+        "ca-certificates",
+    }));
+    try std.testing.expect(!isPackageRootSet(&.{
+        "ubuntu-minimal",
+        "linux-azure",
+        "initramfs-tools",
+        "openssh-server",
+        "sudo",
+        "ca-certificates",
+    }));
+    try std.testing.expect(!isPackageRootSet(&.{
+        "linux-azure",
+        "initramfs-tools",
+        "openssh-server",
+        "sudo",
+    }));
+    // A duplicated member must not pass for the missing one it displaced.
+    try std.testing.expect(!isPackageRootSet(&.{
+        "linux-azure",
+        "linux-azure",
+        "initramfs-tools",
+        "openssh-server",
+        "sudo",
+    }));
+}
+
+test "no contract entry names a broad metapackage or a convenience tool" {
+    // The acceptance criterion of #677 is that `ubuntu-minimal` is absent from
+    // the final inventory, which starts with it being absent from the statement
+    // of what the appliance needs.
+    try std.testing.expect(isForbiddenPackage("ubuntu-minimal"));
+    try std.testing.expect(!isForbiddenPackage("ca-certificates"));
+    for (core_requirements) |entry| {
+        if (entry.kind != .package) continue;
+        try std.testing.expect(!isForbiddenPackage(entry.target));
+    }
+    for (forbidden_packages) |name| try std.testing.expect(!isPackageRoot(name));
+    var index: usize = 1;
+    while (index < forbidden_packages.len) : (index += 1) {
+        try std.testing.expect(std.mem.lessThan(
+            u8,
+            forbidden_packages[index - 1],
+            forbidden_packages[index],
+        ));
+    }
+}
+
 test "acceptance-only conveniences are never guest requirements" {
     const harness = [_][]const u8{
         "harness-base64",
@@ -1212,15 +1393,24 @@ test "canonical serialization is one stable line per requirement" {
     defer buffer.deinit();
     try writeCanonical(&buffer.writer);
     var lines: usize = 0;
+    var forbidden_lines: usize = 0;
     var iterator = std.mem.splitScalar(u8, buffer.written(), '\n');
     while (iterator.next()) |line| {
         if (line.len == 0) continue;
-        lines += 1;
         var fields: usize = 1;
         for (line) |byte| {
             if (byte == '\t') fields += 1;
         }
+        if (std.mem.startsWith(u8, line, forbidden_canonical_prefix ++ "\t")) {
+            forbidden_lines += 1;
+            try std.testing.expectEqual(@as(usize, 2), fields);
+            continue;
+        }
+        lines += 1;
         try std.testing.expectEqual(@as(usize, 7), fields);
     }
     try std.testing.expectEqual(core_requirements.len, lines);
+    // The forbidden set is not derivable from the requirements, so the digest
+    // has to carry it or a quietly relaxed exclusion would go unnoticed.
+    try std.testing.expectEqual(forbidden_packages.len, forbidden_lines);
 }

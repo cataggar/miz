@@ -437,6 +437,98 @@ test "the shipped package lock must contain every contract package" {
     );
 }
 
+test "the shipped package lock must contain no package the contract forbids" {
+    // Issue #677 step 3: `ubuntu-minimal` and the conveniences it used to drag
+    // in fail the lock by name, so a regression is attributable rather than an
+    // anonymous count mismatch.
+    var diagnostic: runtime_contract.Diagnostic = .{};
+    const allocator = std.testing.allocator;
+
+    var complete: std.ArrayList(u8) = .empty;
+    defer complete.deinit(allocator);
+    for (contract.requirements()) |requirement| {
+        if (requirement.kind != .package) continue;
+        try complete.print(allocator, "{s}\t1.0-1\tamd64\n", .{requirement.target});
+    }
+    try runtime_contract.verifyPackages(complete.items, &diagnostic);
+
+    for (contract.forbidden_packages) |forbidden| {
+        var polluted: std.ArrayList(u8) = .empty;
+        defer polluted.deinit(allocator);
+        try polluted.appendSlice(allocator, complete.items);
+        try polluted.print(allocator, "{s}\t1.0-1\tamd64\n", .{forbidden});
+        diagnostic = .{};
+        try std.testing.expectError(
+            error.Failed,
+            runtime_contract.verifyPackages(polluted.items, &diagnostic),
+        );
+        try std.testing.expect(
+            std.mem.indexOf(u8, diagnostic.message(), forbidden) != null,
+        );
+    }
+    try std.testing.expect(contract.isForbiddenPackage("ubuntu-minimal"));
+    try std.testing.expect(!contract.isForbiddenPackage("ca-certificates"));
+}
+
+test "the published contract carries the explicit roots and the forbidden set" {
+    const allocator = std.testing.allocator;
+    var subject = try Tree.init(allocator, std.testing.io, "published-closure");
+    defer subject.deinit();
+    const path = try subject.path("contract.json");
+    defer allocator.free(path);
+    var diagnostic: runtime_contract.Diagnostic = .{};
+    try runtime_contract.write(allocator, std.testing.io, path, "x86_64", "core", &diagnostic);
+
+    var parsed = try runtime_contract.readValidated(
+        allocator,
+        std.testing.io,
+        path,
+        .{ .architecture = "x86_64", .flavor = "core" },
+        &diagnostic,
+    );
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    const roots = object.get("package_roots").?.array.items;
+    try std.testing.expectEqual(contract.package_roots.len, roots.len);
+    var saw_ca_certificates = false;
+    for (roots, contract.package_roots) |published, expected| {
+        try std.testing.expectEqualStrings(expected, published.string);
+        try std.testing.expect(!std.mem.eql(u8, published.string, "ubuntu-minimal"));
+        if (std.mem.eql(u8, published.string, "ca-certificates")) saw_ca_certificates = true;
+    }
+    try std.testing.expect(saw_ca_certificates);
+    const forbidden = object.get("forbidden_packages").?.array.items;
+    try std.testing.expectEqual(contract.forbidden_packages.len, forbidden.len);
+    var saw_ubuntu_minimal = false;
+    for (forbidden) |published| {
+        if (std.mem.eql(u8, published.string, "ubuntu-minimal")) saw_ubuntu_minimal = true;
+    }
+    try std.testing.expect(saw_ubuntu_minimal);
+
+    // A candidate that quietly drops an exclusion is refused, and so is one
+    // that adds a root the contract does not name.
+    const text = try Dir.cwd().readFileAlloc(
+        std.testing.io,
+        path,
+        allocator,
+        .limited(4 * 1024 * 1024),
+    );
+    defer allocator.free(text);
+    for ([_][]const u8{ "\"ubuntu-minimal\"", "\"ca-certificates\"" }) |needle| {
+        const edited = try std.mem.replaceOwned(u8, allocator, text, needle, "\"convenient\"");
+        defer allocator.free(edited);
+        try Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = edited });
+        diagnostic = .{};
+        try std.testing.expectError(error.Failed, runtime_contract.readValidated(
+            allocator,
+            std.testing.io,
+            path,
+            .{ .architecture = "x86_64", .flavor = "core" },
+            &diagnostic,
+        ));
+    }
+}
+
 fn probeReportAlloc(allocator: Allocator, failing: ?[]const u8) ![]u8 {
     var text: std.ArrayList(u8) = .empty;
     errdefer text.deinit(allocator);

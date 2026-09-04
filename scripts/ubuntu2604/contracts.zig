@@ -11,6 +11,8 @@
 
 const std = @import("std");
 
+const runtime_contract = @import("ubuntu2604_runtime_contract");
+
 pub const Flavor = enum { full, core };
 
 pub const Architecture = enum { x86_64, aarch64 };
@@ -318,14 +320,36 @@ pub fn runtimeContractFilename(
 }
 pub const debz_api_commit = "beac3f20dd93fd98863af71e8fe621d47db663f6";
 pub const full_debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
+/// The core appliance's explicit package roots, in resolution order.
+///
+/// Issue #677 step 3 removed the `ubuntu-minimal` metapackage from this list.
+/// The *members* are derived from the runtime contract -- `runtime_contract`
+/// names exactly these five packages, and the comptime check below refuses any
+/// drift between the two -- while the *order* is a build decision this file
+/// owns: the kernel is resolved before the initramfs generator so the kernel
+/// transaction cannot build an initramfs the builder is about to rebuild from
+/// its own reviewed module list, and the first root is the one that creates the
+/// otherwise-empty debz baseline.
 pub const core_debz_packages = [_][]const u8{
-    "ubuntu-minimal",
     "linux-azure",
     "initramfs-tools",
     "openssh-server",
     "sudo",
     "ca-certificates",
 };
+
+comptime {
+    if (!runtime_contract.isPackageRootSet(&core_debz_packages))
+        @compileError(
+            "Ubuntu core package roots and the runtime contract's package " ++
+                "requirements have separated; #677 step 3 requires a root to " ++
+                "exist if and only if a contract entry names it",
+        );
+}
+
+/// Packages the core closure must never contain, published from the one place
+/// that defines them so the release tooling and the builder cannot drift.
+pub const core_forbidden_packages = runtime_contract.forbidden_packages;
 
 pub fn debzPackages(flavor: Flavor) []const []const u8 {
     return switch (flavor) {
@@ -347,6 +371,35 @@ test "candidate identity tables agree with the release order" {
     try std.testing.expect(sourceArchitecture("riscv64") == null);
 }
 
+test "core package roots are the contract's set without ubuntu-minimal" {
+    // #677 acceptance criterion: `ubuntu-minimal` is absent from the closure,
+    // starting with the roots that produce it.
+    try std.testing.expect(runtime_contract.isPackageRootSet(&core_debz_packages));
+    try std.testing.expectEqual(
+        @as(usize, runtime_contract.package_roots.len),
+        core_debz_packages.len,
+    );
+    var saw_ca_certificates = false;
+    for (core_debz_packages) |package| {
+        try std.testing.expect(!std.mem.eql(u8, package, "ubuntu-minimal"));
+        if (std.mem.eql(u8, package, "ca-certificates")) saw_ca_certificates = true;
+    }
+    try std.testing.expect(saw_ca_certificates);
+    // The kernel is resolved first so its transaction cannot build an initramfs
+    // from a generator that is not installed yet.
+    try std.testing.expectEqualStrings("linux-azure", core_debz_packages[0]);
+    try std.testing.expectEqualStrings("initramfs-tools", core_debz_packages[1]);
+}
+
+test "the forbidden set names ubuntu-minimal and no package root" {
+    var saw_ubuntu_minimal = false;
+    for (core_forbidden_packages) |forbidden| {
+        if (std.mem.eql(u8, forbidden, "ubuntu-minimal")) saw_ubuntu_minimal = true;
+        try std.testing.expect(!runtime_contract.isPackageRoot(forbidden));
+    }
+    try std.testing.expect(saw_ubuntu_minimal);
+}
+
 test "contract and field sets are stored sorted and duplicate-free" {
     const sets = [_][]const []const u8{
         &full_azure_contracts,
@@ -356,6 +409,7 @@ test "contract and field sets are stored sorted and duplicate-free" {
         &candidate_fields,
         &native_result_fields,
         &azure_result_fields,
+        &core_forbidden_packages,
     };
     for (sets) |set| {
         var index: usize = 1;

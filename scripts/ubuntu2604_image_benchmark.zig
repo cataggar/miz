@@ -67,8 +67,11 @@ pub const canonical_fingerprint = "d2eb44626fddc30b513d5bb71a5d6c4c7db87c81";
 pub const asset_name = "Ubuntu-26.04-aarch64.baremetal.qcow2";
 pub const raw_asset_name = "Ubuntu-26.04-aarch64.baremetal.raw";
 
+/// The bare-metal flavor's explicit package roots, mirroring the builder's
+/// `baremetal_debz_packages`. Issue #677 step 3 removed `ubuntu-minimal`, so
+/// the first phase this benchmark times is the kernel image transaction that
+/// creates the otherwise-empty debz baseline.
 pub const package_roots = [_][]const u8{
-    "ubuntu-minimal",
     "linux-image-7.0.0-2015-nvidia-bos-64k",
     "linux-modules-7.0.0-2015-nvidia-bos-64k",
     "initramfs-tools",

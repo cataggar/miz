@@ -315,11 +315,21 @@ jobs:
           inventory="$BUNDLE_DIR/internal-provenance/ubuntu2604-size-inventory-$FLAVOR-$ARCHITECTURE.json"
           test -f "$inventory"
           test -x "$RELEASE_TOOL"
+          # Issue #677 step 3: core is assembled from an exact closure, so every
+          # file it carries is package-owned or named by the explicit
+          # injected-file allowlist and any remainder fails the candidate. The
+          # full flavor inherits Canonical's server root, which is measured
+          # rather than gated.
+          gate=()
+          if [ "$FLAVOR" = core ]; then
+            gate=(--max-unexpected-unowned 0)
+          fi
           measured=$("$RELEASE_TOOL" size-inventory-verify \
             --report "$inventory" \
             --architecture "$ARCHITECTURE" \
             --flavor "$FLAVOR" \
-            --require-phase root_build,image_build,publication)
+            --require-phase root_build,image_build,publication \
+            "${gate[@]}")
           printf 'Size inventory `%s`: `%s`\n' "$CANDIDATE_KEY" "$measured" \
             >> "$GITHUB_STEP_SUMMARY"
 
@@ -802,7 +812,8 @@ jobs:
             --report "$first_boot" \
             --architecture "$ARCHITECTURE" \
             --flavor "$FLAVOR" \
-            --require-phase root_build,image_build,publication,first_boot)
+            --require-phase root_build,image_build,publication,first_boot \
+            --max-unexpected-unowned 0)
           printf 'First-boot size inventory `%s`: `%s`\n' "$CANDIDATE_KEY" "$measured" \
             >> "$GITHUB_STEP_SUMMARY"
 

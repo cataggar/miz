@@ -836,3 +836,135 @@ test "a validated document round-trips through the filesystem" {
     ));
     try expectContains(fixture.message(), "cannot read size inventory");
 }
+
+test "a fresh root fails closed on unowned payload outside the allowlist" {
+    // Issue #677 step 3: the fresh-root flavors are assembled from an exact
+    // closure, so every file they carry is either claimed by a package in that
+    // closure or named by an explicit injected-file rule. `/etc/unexpected.conf`
+    // is neither, so the measurement that finds it refuses the root and names
+    // the path instead of reporting a remainder nobody reads.
+    var fixture = try Fixture.create();
+    defer fixture.deinit();
+    try writeMeasuredRoot(&fixture);
+
+    try std.testing.expectError(error.Failed, size_inventory.measureRootBuild(
+        fixture.allocator(),
+        fixture.scratch(),
+        fixture.io,
+        .{
+            .root_path = fixture.root,
+            .flavor = .core,
+            .kernel_release = kernel_release,
+            .require_allowlisted_unowned = true,
+        },
+        &fixture.diagnostic,
+    ));
+    try expectContains(fixture.message(), "outside the explicit injected-file allowlist");
+    try expectContains(fixture.message(), "/etc/unexpected.conf");
+
+    // The same root measures without the gate, which is what the `full` flavor
+    // and the pre-change comparisons need.
+    const reported = try measure(&fixture, .core);
+    try std.testing.expect(count(reported, &.{ "unowned", "unexpected", "file_count" }) > 0);
+}
+
+test "an accounted fresh root passes the closed gate" {
+    var fixture = try Fixture.create();
+    defer fixture.deinit();
+    try fixture.write(size_inventory.package_lock_path, "alpha\t1.0-1\tamd64\n");
+    try fixture.write(
+        "/var/lib/dpkg/info/alpha.list",
+        "/usr\n/usr/bin\n/usr/bin/alpha\n/usr/sbin\n/etc\n/boot\n/var\n/var/lib\n" ++
+            "/var/lib/dpkg\n/var/lib/dpkg/info\n/usr/lib\n/usr/lib/modules\n" ++
+            "/boot/vmlinuz-" ++ kernel_release ++ "\n",
+    );
+    try fixture.write("/usr/bin/alpha", "owned payload");
+    try fixture.write("/boot/vmlinuz-" ++ kernel_release, "kernel image");
+    // Everything else is named by a rule: the injected PID 1, the generated
+    // initramfs, the depmod index, the package database, and the exact lock.
+    try fixture.write("/usr/sbin/mizinit", "injected pid 1");
+    try fixture.write("/boot/initrd.img-" ++ kernel_release, "initramfs");
+    try fixture.write("/usr/lib/modules/" ++ kernel_release ++ "/modules.dep", "module index");
+
+    const section = try size_inventory.measureRootBuild(
+        fixture.allocator(),
+        fixture.scratch(),
+        fixture.io,
+        .{
+            .root_path = fixture.root,
+            .flavor = .core,
+            .kernel_release = kernel_release,
+            .require_allowlisted_unowned = true,
+        },
+        &fixture.diagnostic,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        count(section, &.{ "unowned", "unexpected", "file_count" }),
+    );
+
+    // A convenience file dropped into the same root fails it.
+    try fixture.write("/usr/bin/convenient", "a tool nobody asked for");
+    try std.testing.expectError(error.Failed, size_inventory.measureRootBuild(
+        fixture.allocator(),
+        fixture.scratch(),
+        fixture.io,
+        .{
+            .root_path = fixture.root,
+            .flavor = .core,
+            .kernel_release = kernel_release,
+            .require_allowlisted_unowned = true,
+        },
+        &fixture.diagnostic,
+    ));
+    try expectContains(fixture.message(), "/usr/bin/convenient");
+}
+
+test "dpkg file lists answer who owns a path and everything under it" {
+    // What keeps #677's "nothing is installed only to be deleted later" honest:
+    // the builder asks this before it generalizes a fresh root.
+    var fixture = try Fixture.create();
+    defer fixture.deinit();
+    try fixture.write(
+        "/var/lib/dpkg/info/alpha.list",
+        "/usr\n/usr/bin\n/usr/bin/alpha\n/etc/alpha\n/etc/alpha/keep.conf\n" ++
+            "/etc/beta/keep.conf\n",
+    );
+    try fixture.write("/usr/bin/alpha", "owned payload");
+
+    var owned = try size_inventory.readOwnedPaths(
+        std.testing.allocator,
+        fixture.io,
+        fixture.root,
+    );
+    defer owned.deinit();
+    try std.testing.expect(owned.count() > 0);
+    try std.testing.expectEqualStrings("alpha", owned.owner("/usr/bin/alpha").?);
+    try std.testing.expect(owned.owner("/var/lib/azagent") == null);
+
+    // A recursive removal takes the subtree with it, so the subtree is what is
+    // asked about.
+    try std.testing.expectEqualStrings("alpha", owned.subtreeOwner("/etc/alpha").?.package);
+    // `/etc/beta` is claimed only through a file beneath it, and a recursive
+    // removal of the directory would still take that file.
+    try std.testing.expect(owned.owner("/etc/beta") == null);
+    try std.testing.expectEqualStrings(
+        "/etc/beta/keep.conf",
+        owned.subtreeOwner("/etc/beta").?.path,
+    );
+    try std.testing.expect(owned.subtreeOwner("/var/lib/azagent") == null);
+    // A prefix that is not a path component boundary is not a subtree.
+    try std.testing.expect(owned.subtreeOwner("/usr/bin/alph") == null);
+    try std.testing.expect(owned.subtreeOwner("/etc/bet") == null);
+
+    // A root with no dpkg database answers "nothing", not an error.
+    var empty_fixture = try Fixture.create();
+    defer empty_fixture.deinit();
+    var empty = try size_inventory.readOwnedPaths(
+        std.testing.allocator,
+        empty_fixture.io,
+        empty_fixture.root,
+    );
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.count());
+}

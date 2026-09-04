@@ -72,23 +72,60 @@ root from packages.
 For core, the same signed cloud disk is used only as the pinned Gen2 GPT and
 EFI-system-partition substrate. The server root is discarded and a fresh root
 is assembled from an empty debz baseline with exact package roots, in stable
-order: `ubuntu-minimal`, `linux-azure`, `initramfs-tools`, `openssh-server`,
-`sudo`, and `ca-certificates`. The initramfs implementation is explicit
-because the kernel only recommends one and debz's exact closure does not
-install recommendations; the trust store is explicit because no required
-dependency supplies it. The resolved closure must also contain
-`openssh-client`, and must not contain cloud-init, WALinuxAgent,
-`ubuntu-server`, or `ubuntu-server-minimal`. This source/package decision is
+order: `linux-azure`, `initramfs-tools`, `openssh-server`, `sudo`, and
+`ca-certificates`. Those five are not a hand-written list: they are exactly
+the `package` requirements of the runtime contract, and
+`build_generalized_ubuntu2604.zig` and `scripts/ubuntu2604/contracts.zig` both
+fail to compile if the two ever disagree, so a root exists only for a behavior
+the contract names. The order is a build decision the builder owns -- the
+kernel is first because the first root is the transaction that creates the
+empty baseline, and because installing it before the initramfs generator keeps
+the kernel postinst from building an initramfs that customization is about to
+rebuild from `/etc/initramfs-tools/modules`.
+
+Issue #677 step 3 removed the `ubuntu-minimal` metapackage from that list. It
+was what pulled an apt client, an init system, an editor, a pager, locales, a
+DHCP client, and netplan into an appliance whose PID 1 is `mizinit` and whose
+only access path is `sshd`. No base package replaces it: debz includes
+available `Essential: yes` packages in every install closure, so `bash`,
+`coreutils`, `dpkg`, and the `util-linux` that supplies the contract's `dmesg`
+arrive as part of creating a root at all. `initramfs-tools` is still a root
+because customization executes it; the contract classifies it `build_tooling`,
+and step 4 moves it out of the guest.
+
+The initramfs implementation is explicit because the kernel only recommends one
+and debz's exact closure does not install recommendations; the trust store is
+explicit because no required dependency supplies it. The resolved closure must
+also contain `openssh-client`, and must not contain `ubuntu-minimal`, apt,
+cloud-init, WALinuxAgent, `ubuntu-server`, `ubuntu-server-minimal`,
+`ubuntu-standard`, an editor, a pager, locales, documentation, a conventional
+networking daemon, an init system, or the other convenience packages
+`runtime_contract.forbidden_packages` names. This source/package decision is
 part of core provenance and is not inferred from mutable archive state.
 
-For bare metal, the root is assembled the same way, in stable order:
-`ubuntu-minimal`, the pinned NVIDIA BaseOS `linux-image` and `linux-modules`
-binary packages, `initramfs-tools`, `openssh-server`, `sudo`, and
-`ca-certificates`. The last two are named explicitly because core reached
-both through `linux-azure`, which bare metal forbids -- a second kernel in
-`/boot` would make the release the UKI is built from ambiguous. The resolved
-closure must also contain `openssh-client`, and must not contain cloud-init,
-WALinuxAgent, `ubuntu-server`, `ubuntu-server-minimal`, or `linux-azure`.
+For bare metal, the root is assembled the same way, in stable order: the
+pinned NVIDIA BaseOS `linux-image` and `linux-modules` binary packages,
+`initramfs-tools`, `openssh-server`, `sudo`, and `ca-certificates`. The last
+two are named explicitly because core reached both through `linux-azure`,
+which bare metal forbids -- a second kernel in `/boot` would make the release
+the UKI is built from ambiguous. The resolved closure must also contain
+`openssh-client`, and must not contain `linux-azure` or anything core forbids.
+
+Two checks make "exact" mean exact rather than "at least". The installed
+inventory the image carries at `/var/lib/miz/ubuntu2604-package-lock.tsv` must
+equal the final reviewed debz lock member for member, in both directions, so a
+package that arrived and a package that failed to arrive are both build
+failures. And every file a fresh root carries must be claimed by a package in
+that closure or matched by an explicit unowned-file rule that names the reason
+it exists: the builder measures the finished tree with
+`require_allowlisted_unowned`, and both Ubuntu workflows re-check the published
+inventory with `size-inventory-verify --max-unexpected-unowned 0`.
+
+Minimization removes packages, not files out of packages. The fresh-root
+generalization step reads dpkg's own file lists before it deletes anything --
+including everything a recursive removal or a wildcard cleanup would take with
+it -- and refuses a package-owned target, naming the path and its package. The
+answer to such a failure is to stop installing the package.
 
 The package-root round trip is native: the mutable QCOW2 is converted to a
 raw staging image, `miz.ext4_mountless.FileSystem` reads the selected ext4
@@ -212,18 +249,25 @@ directly into the filesystem, so those are measured from the image and
 attributed by the same rules as everything else.
 
 Unowned files are split into an explicit allowlist -- each rule carrying the
-reason it is allowed -- and a named remainder under `unowned.unexpected`. The
-remainder is what later steps of issue #677 drive to zero.
+reason it is allowed, and a `path/**` rule covering the directory it names as
+well as everything beneath it -- and a named remainder under
+`unowned.unexpected`. For the fresh-root flavors that remainder is zero and is
+enforced: measurement fails the build when a path is neither package-owned nor
+matched by a rule, and names the paths it found.
 
 Aggregates must equal their parts. `size-inventory-verify` refuses a document
 whose totals do not add up, whose sections and `phases_present` disagree, or
-which is missing a phase the caller's stage is entitled to expect:
+which is missing a phase the caller's stage is entitled to expect.
+`--max-unexpected-unowned` turns the reported remainder into a gate; the core
+workflows pass `0`, and the `full` flavor, which inherits Canonical's server
+root, is measured rather than gated:
 
 ```console
 $ ubuntu2604_release size-inventory-verify \
     --report internal-provenance/ubuntu2604-size-inventory-core-x86_64.json \
     --architecture x86_64 --flavor core \
-    --require-phase root_build,image_build,publication
+    --require-phase root_build,image_build,publication \
+    --max-unexpected-unowned 0
 ```
 
 `size-inventory-compare` reports what moved between two measured images --
@@ -257,6 +301,14 @@ enforced:
 | `audience` | `guest_runtime` (the appliance needs it), `build_tooling` (only the build needs it), or `acceptance_only` (only the test harness needs it) |
 | `presence` | `image` (already in the built root) or `runtime` (only a booted guest has it) |
 
+The contract's `package` entries are also the build's package roots: step 3 of
+issue #677 derives `core_debz_packages` from them, so `ubuntu-minimal` is gone
+and nothing can be added as a root without first naming the behavior it serves.
+The contract carries the negative statement too -- `forbidden_packages` names
+the broad metapackages, apt clients, editors, pagers, locales, documentation,
+networking daemons, init systems, and convenience tools that must never appear
+in the closure -- and the builder and the release tool both read that one list.
+
 The `audience` split is the point of the contract. `initramfs-tools` is
 `build_tooling`, so step 4 of issue #677 can remove it from the final guest
 without weakening anything; `findmnt`, `od`, `modprobe`, `modinfo`, `base64`,
@@ -265,8 +317,12 @@ because a test happened to use one. Their absence is reported, not enforced.
 
 The contract is published per core candidate as
 `internal-provenance/ubuntu2604-runtime-contract-<flavor>-<architecture>.json`,
-digest-bound from `ubuntu2604-build-provenance.json`, and re-checked against the
-contract the accepted source compiles:
+carrying the requirements, the `package_roots` the build resolved, and the
+`forbidden_packages` the closure excludes. All three are covered by
+`contract_sha256`, so an exclusion cannot be dropped without moving the digest.
+The document is digest-bound from `ubuntu2604-build-provenance.json` and
+re-checked, member for member and in order, against the contract the accepted
+source compiles:
 
 ```console
 $ ubuntu2604_release runtime-contract-verify \
@@ -277,9 +333,11 @@ $ ubuntu2604_release runtime-contract-verify \
 Enforcement happens at three stages:
 
 - **Build.** The finished root is checked against every `image`-present guest
-  requirement, and the shipped exact lock against every contract package, before
-  the image is finalized. A closure change that deletes `/usr/bin/sudo` or
-  empties the trust store fails the build that made it, naming the requirement.
+  requirement, and the shipped exact lock against every contract package and
+  against every forbidden one, before the image is finalized. A closure change
+  that deletes `/usr/bin/sudo`, empties the trust store, or brings
+  `ubuntu-minimal` back fails the build that made it, naming the requirement or
+  the returned package.
 - **QEMU and Azure acceptance.** A static probe
   (`tests/ubuntu2604_runtime_contract_probe.zig`), cross-built for the guest
   architecture and uploaded over the established SSH session, evaluates the

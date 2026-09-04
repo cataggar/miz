@@ -411,15 +411,21 @@ fn pathUsage(path: [:0]const u8) ?Usage {
 /// what makes the remainder reviewable, and the remainder is what later steps
 /// of #677 drive to zero.
 pub const UnownedRule = struct {
-    /// `path` matches exactly, `path/**` matches the subtree, and `prefix*`
-    /// matches any path with that prefix.
+    /// `path` matches exactly, `path/**` matches that directory and everything
+    /// beneath it, and `prefix*` matches any path with that prefix.
     pattern: []const u8,
     reason: []const u8,
 
     fn matches(self: UnownedRule, path: []const u8) bool {
         if (std.mem.endsWith(u8, self.pattern, "/**")) {
-            const prefix = self.pattern[0 .. self.pattern.len - 2];
-            return std.mem.startsWith(u8, path, prefix);
+            const subtree = self.pattern[0 .. self.pattern.len - 2];
+            const directory = self.pattern[0 .. self.pattern.len - 3];
+            // The directory a subtree rule names is part of the subtree it
+            // names. A root's own `/var/lib/miz` is exactly as attributable as
+            // the provenance inside it, and a rule that covered the contents
+            // but not the container would leave a directory nobody can explain.
+            return std.mem.eql(u8, directory, path) or
+                std.mem.startsWith(u8, path, subtree);
         }
         if (std.mem.endsWith(u8, self.pattern, "*")) {
             return std.mem.startsWith(u8, path, self.pattern[0 .. self.pattern.len - 1]);
@@ -431,12 +437,14 @@ pub const UnownedRule = struct {
 /// Unowned payload every flavor is allowed to carry.
 pub const shared_unowned_rules = [_]UnownedRule{
     .{ .pattern = "/etc/.pwd.lock", .reason = "dpkg account-database lock" },
+    .{ .pattern = "/etc/alternatives/**", .reason = "update-alternatives symlink farm" },
     .{ .pattern = "/etc/group*", .reason = "account database written by maintainer scripts" },
     .{ .pattern = "/etc/gshadow*", .reason = "account database written by maintainer scripts" },
     .{ .pattern = "/etc/hostname", .reason = "generalized host identity" },
     .{ .pattern = "/etc/hosts", .reason = "generalized host identity" },
     .{ .pattern = "/etc/ld.so.cache", .reason = "ldconfig-generated linker cache" },
     .{ .pattern = "/etc/machine-id", .reason = "cleared machine identity" },
+    .{ .pattern = "/etc/pam.d/common-*", .reason = "pam-auth-update generated PAM stacks" },
     .{ .pattern = "/etc/passwd*", .reason = "account database written by maintainer scripts" },
     .{ .pattern = "/etc/resolv.conf", .reason = "runtime resolver state" },
     .{ .pattern = "/etc/shadow*", .reason = "account database written by maintainer scripts" },
@@ -462,7 +470,10 @@ pub const shared_unowned_rules = [_]UnownedRule{
     .{ .pattern = "/var/cache/**", .reason = "package and tooling caches" },
     .{ .pattern = "/var/lib/dbus/**", .reason = "cleared D-Bus machine identity" },
     .{ .pattern = "/var/lib/dpkg/**", .reason = "package database and provenance" },
+    .{ .pattern = "/var/lib/initramfs-tools/**", .reason = "initramfs generation bookkeeping" },
+    .{ .pattern = "/var/lib/misc/**", .reason = "maintainer-script bookkeeping" },
     .{ .pattern = "/var/lib/miz/**", .reason = "miz provenance and exact package lock" },
+    .{ .pattern = "/var/lib/pam/**", .reason = "pam-auth-update profile bookkeeping" },
     .{ .pattern = "/var/lib/systemd/**", .reason = "cleared systemd state" },
     .{ .pattern = "/var/lib/ucf/**", .reason = "configuration-file bookkeeping" },
     .{ .pattern = "/var/log/**", .reason = "cleared log state" },
@@ -529,6 +540,15 @@ pub const RootMeasurementOptions = struct {
     /// and byte totals are always complete; only the path list is bounded, and
     /// the document says when it was truncated.
     unexpected_path_limit: usize = 512,
+    /// Whether unowned payload outside the allowlist is a build failure rather
+    /// than a reported remainder.
+    ///
+    /// Issue #677 step 3 requires the fresh roots to fail closed: every file
+    /// the finished image carries is either claimed by a package in the exact
+    /// closure or named by an explicit injected-file rule with a reason. The
+    /// `full` flavor inherits Canonical's server root and is measured, not
+    /// gated, so this stays opt-in rather than becoming the default.
+    require_allowlisted_unowned: bool = false,
 };
 
 /// One measured path that exists only in the finished image.
@@ -643,6 +663,30 @@ pub fn measureRootBuild(
     }
     try walk.run(diagnostic);
     for (options.injected) |entry| try walk.recordInjected(entry);
+
+    if (options.require_allowlisted_unowned and walk.unexpected_bucket.file_count != 0) {
+        std.mem.sort([]const u8, walk.unexpected.items, {}, lessThanPath);
+        const named = walk.unexpected.items[0..@min(walk.unexpected.items.len, 8)];
+        var buffer: [1024]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        for (named, 0..) |path, position| {
+            writer.print("{s}{s}", .{ if (position == 0) "" else " ", path }) catch break;
+        }
+        return fail(
+            diagnostic,
+            "{d} unowned path(s) totalling {d} bytes are outside the explicit " ++
+                "injected-file allowlist: {s}{s}",
+            .{
+                walk.unexpected_bucket.file_count,
+                walk.unexpected_bucket.usage.logical_bytes,
+                writer.buffered(),
+                if (named.len < walk.unexpected.items.len or walk.unexpected_truncated)
+                    " ..."
+                else
+                    "",
+            },
+        );
+    }
 
     var section = builder.object();
     try builder.putCount(&section, "package_count", packages.items.len);
@@ -842,6 +886,92 @@ fn closureDigest(allocator: Allocator, packages: []const PackageEntry) Error![64
     var hex: [64]u8 = undefined;
     _ = std.fmt.bufPrint(&hex, "{x}", .{&raw}) catch unreachable;
     return hex;
+}
+
+/// Every path dpkg's own file lists claim in a root, keyed by path.
+///
+/// Issue #677 forbids installing broad packages and then deleting what they
+/// brought: "nothing is installed only to be deleted later". The builder asks
+/// this index before it generalizes a fresh root, so a cleanup that would carve
+/// a file out of an installed package fails the build instead of producing an
+/// image whose dpkg database describes files that are not there.
+pub const OwnedPaths = struct {
+    arena: std.heap.ArenaAllocator,
+    owners: std.StringHashMapUnmanaged([]const u8) = .empty,
+
+    pub fn deinit(self: *OwnedPaths) void {
+        self.owners.deinit(self.arena.allocator());
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    pub fn count(self: *const OwnedPaths) usize {
+        return self.owners.count();
+    }
+
+    /// The package that claims `path`, if any.
+    pub fn owner(self: *const OwnedPaths, path: []const u8) ?[]const u8 {
+        return self.owners.get(path);
+    }
+
+    /// The package that claims `path` or anything beneath it. A recursive
+    /// removal deletes a subtree, so asking about the root of that subtree
+    /// alone would miss the files it takes with it.
+    pub fn subtreeOwner(self: *const OwnedPaths, path: []const u8) ?struct {
+        path: []const u8,
+        package: []const u8,
+    } {
+        if (self.owners.getEntry(path)) |entry| return .{
+            .path = entry.key_ptr.*,
+            .package = entry.value_ptr.*,
+        };
+        var iterator = self.owners.iterator();
+        while (iterator.next()) |entry| {
+            const candidate = entry.key_ptr.*;
+            if (candidate.len <= path.len) continue;
+            if (!std.mem.startsWith(u8, candidate, path)) continue;
+            if (candidate[path.len] != '/') continue;
+            return .{ .path = candidate, .package = entry.value_ptr.* };
+        }
+        return null;
+    }
+};
+
+/// Reads `root_path`'s dpkg file lists into an ownership index.
+///
+/// A root without a dpkg database yields an empty index rather than an error:
+/// the callers that use it are the fresh-root flavors, and a missing database
+/// is caught by the closure checks that read the package lock.
+pub fn readOwnedPaths(allocator: Allocator, io: Io, root_path: []const u8) Error!OwnedPaths {
+    var result: OwnedPaths = .{ .arena = .init(allocator) };
+    errdefer result.arena.deinit();
+    const arena = result.arena.allocator();
+    const info_path = std.fs.path.join(
+        arena,
+        &.{ root_path, dpkg_info_path[1..] },
+    ) catch return error.OutOfMemory;
+    var directory = Dir.cwd().openDir(io, info_path, .{ .iterate = true }) catch return result;
+    defer directory.close(io);
+    var iterator = directory.iterate();
+    while (iterator.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".list")) continue;
+        const package = try arena.dupe(u8, entry.name[0 .. entry.name.len - ".list".len]);
+        const list_path = try std.fs.path.join(arena, &.{ info_path, entry.name });
+        const contents = Dir.cwd().readFileAlloc(
+            io,
+            list_path,
+            arena,
+            .limited(64 * 1024 * 1024),
+        ) catch continue;
+        var lines = std.mem.splitScalar(u8, contents, '\n');
+        while (lines.next()) |line| {
+            const path = std.mem.trimEnd(u8, line, "\r");
+            if (path.len == 0 or path[0] != '/') continue;
+            try result.owners.put(arena, path, package);
+        }
+    }
+    return result;
 }
 
 /// Builds the path-to-package index from dpkg's per-package file lists. A list
