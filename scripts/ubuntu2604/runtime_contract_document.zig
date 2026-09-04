@@ -67,15 +67,24 @@ pub const requirement_fields = [_][]const u8{
 
 pub const document_fields = [_][]const u8{
     "architecture",
+    "build_package_roots",
     "contract_sha256",
     "counts",
     "flavor",
     "forbidden_packages",
+    "guest_package_roots",
+    "kernel_selector",
     "package_roots",
     "release",
     "requirements",
     "schema",
     "type",
+};
+
+pub const kernel_selector_fields = [_][]const u8{
+    "image_template",
+    "modules_template",
+    "selector",
 };
 
 pub const count_fields = [_][]const u8{
@@ -152,12 +161,28 @@ pub fn documentValue(
 
     // Issue #677 step 3 publishes the closure statement, not only the
     // requirement list: the explicit roots the build resolves and the
-    // convenience packages the closure must never contain.
+    // convenience packages the closure must never contain. Step 4 publishes
+    // *where* each root is resolved, because "the build needs it" and "the
+    // guest carries it" stopped being the same statement.
     var roots = builder.array();
     try roots.ensureTotalCapacity(contract.package_roots.len);
     for (contract.package_roots) |name| {
         roots.appendAssumeCapacity(.{ .string = try arena.dupe(u8, name) });
     }
+    var guest_roots = builder.array();
+    try guest_roots.ensureTotalCapacity(contract.guest_package_roots.len);
+    for (contract.guest_package_roots) |name| {
+        guest_roots.appendAssumeCapacity(.{ .string = try arena.dupe(u8, name) });
+    }
+    var build_roots = builder.array();
+    try build_roots.ensureTotalCapacity(contract.build_package_roots.len);
+    for (contract.build_package_roots) |name| {
+        build_roots.appendAssumeCapacity(.{ .string = try arena.dupe(u8, name) });
+    }
+    var kernel_selector = builder.object();
+    try builder.putString(&kernel_selector, "selector", contract.kernel_templates.selector);
+    try builder.putString(&kernel_selector, "image_template", contract.kernel_templates.image);
+    try builder.putString(&kernel_selector, "modules_template", contract.kernel_templates.modules);
     var forbidden = builder.array();
     try forbidden.ensureTotalCapacity(contract.forbidden_packages.len);
     for (contract.forbidden_packages) |name| {
@@ -180,6 +205,9 @@ pub fn documentValue(
     try builder.putString(&document, "contract_sha256", &contract_digest);
     try builder.put(&document, "counts", .{ .object = counts });
     try builder.put(&document, "package_roots", .{ .array = roots });
+    try builder.put(&document, "guest_package_roots", .{ .array = guest_roots });
+    try builder.put(&document, "build_package_roots", .{ .array = build_roots });
+    try builder.put(&document, "kernel_selector", .{ .object = kernel_selector });
     try builder.put(&document, "forbidden_packages", .{ .array = forbidden });
     try builder.put(&document, "requirements", .{ .array = entries });
     return .{ .object = document };
@@ -400,6 +428,40 @@ pub fn validateDocument(
         diagnostic,
     );
     try expectExactStrings(
+        object.get("guest_package_roots"),
+        &contract.guest_package_roots,
+        "guest package roots",
+        diagnostic,
+    );
+    try expectExactStrings(
+        object.get("build_package_roots"),
+        &contract.build_package_roots,
+        "build package roots",
+        diagnostic,
+    );
+    const kernel_selector = objectOf(object.get("kernel_selector")) orelse return fail(
+        diagnostic,
+        "runtime contract kernel selector is invalid",
+        .{},
+    );
+    if (!hasExactFields(kernel_selector, &kernel_selector_fields)) return fail(
+        diagnostic,
+        "runtime contract kernel selector has unexpected fields",
+        .{},
+    );
+    for ([_][2][]const u8{
+        .{ "selector", contract.kernel_templates.selector },
+        .{ "image_template", contract.kernel_templates.image },
+        .{ "modules_template", contract.kernel_templates.modules },
+    }) |pair| {
+        const actual = stringOf(kernel_selector.get(pair[0])) orelse "";
+        if (!std.mem.eql(u8, actual, pair[1])) return fail(
+            diagnostic,
+            "runtime contract kernel selector {s} is {s}, expected {s}",
+            .{ pair[0], actual, pair[1] },
+        );
+    }
+    try expectExactStrings(
         object.get("forbidden_packages"),
         &contract.forbidden_packages,
         "forbidden packages",
@@ -575,7 +637,26 @@ pub fn verifyRoot(
     for (contract.requirements()) |requirement| {
         if (!checkedInRoot(requirement)) continue;
         switch (requirement.kind) {
-            .command, .file => {
+            // A command is "an executable reachable at this path", and Debian's
+            // normal way to provide one is `update-alternatives`: this
+            // snapshot ships `/usr/bin/sudo` as a link into
+            // `/etc/alternatives`. Refusing that would refuse the package the
+            // contract asked for, so the link chain is followed and the thing
+            // at the end of it must be a regular file inside the same root. A
+            // `file` requirement stays strict, and a link whose *target* is the
+            // contract is what the `symlink` kind is for, so nothing is
+            // weakened by this.
+            .command => switch (try resolveCommand(
+                allocator,
+                probe,
+                requirement,
+                scratch,
+                diagnostic,
+            )) {
+                .regular => {},
+                else => return wrongKind(diagnostic, requirement, "a regular file"),
+            },
+            .file => {
                 const kind = probe.stat(requirement.target) orelse return missing(
                     diagnostic,
                     requirement,
@@ -628,6 +709,46 @@ pub fn verifyRoot(
     }
 }
 
+/// Bound on how many `update-alternatives` hops a command may take. Debian
+/// uses exactly one; anything past a handful is a loop, and a loop must fail
+/// rather than hang.
+const max_command_link_hops = 8;
+
+/// Follows a command requirement's symbolic links inside the root and reports
+/// what is actually at the end of the chain.
+fn resolveCommand(
+    allocator: Allocator,
+    probe: RootProbe,
+    requirement: contract.Requirement,
+    scratch: []u8,
+    diagnostic: *Diagnostic,
+) Error!EntryKind {
+    var current = try allocator.dupe(u8, requirement.target);
+    defer allocator.free(current);
+    var hops: usize = 0;
+    while (hops <= max_command_link_hops) : (hops += 1) {
+        const kind = probe.stat(current) orelse return missing(diagnostic, requirement);
+        if (kind != .symlink) return kind;
+        const link = probe.readLink(current, scratch) orelse return fail(
+            diagnostic,
+            "runtime contract requirement {s} ({s}) is unreadable",
+            .{ requirement.id, requirement.target },
+        );
+        const directory = std.fs.path.dirnamePosix(current) orelse "/";
+        const next = if (link.len != 0 and link[0] == '/')
+            try allocator.dupe(u8, link)
+        else
+            try std.fs.path.resolvePosix(allocator, &.{ directory, link });
+        allocator.free(current);
+        current = next;
+    }
+    return fail(
+        diagnostic,
+        "runtime contract requirement {s} ({s}) resolves through more than {d} links",
+        .{ requirement.id, requirement.target, max_command_link_hops },
+    );
+}
+
 fn missing(diagnostic: *Diagnostic, requirement: contract.Requirement) Error {
     return fail(
         diagnostic,
@@ -649,29 +770,47 @@ fn wrongKind(
 }
 
 /// Confirms the shipped exact lock carries every package the contract requires
-/// and none of the packages it forbids.
+/// of the guest, the kernel the selector chose, and none of the packages it
+/// forbids.
 ///
 /// The lock is the tab-separated `name<TAB>version<TAB>architecture` table the
-/// image carries at `/var/lib/miz/ubuntu2604-package-lock.tsv`. Both the
-/// `guest_runtime` packages and the `build_tooling` ones are required, because
-/// until #677 step 4 moves initramfs generation out of the guest the generator
-/// is genuinely installed and a lock without it is a lock that did not describe
-/// the image. Whether the closure is *exactly* the resolved set is a separate,
-/// stronger check the builder makes against the final debz lock; this one names
-/// the missing behavior or the returned convenience.
+/// image carries at `/var/lib/miz/ubuntu2604-package-lock.tsv`.
+///
+/// Issue #677 step 4 makes the audience split load-bearing here. `guest_runtime`
+/// packages must be present; `build_tooling` packages must be *absent*, because
+/// the initramfs is now generated in a staging root that is discarded, and a
+/// generator that reached the guest anyway means the separation leaked. The
+/// kernel is neither: the contract names a selector, so what is required is
+/// that some versioned image and its matching module tree are installed and
+/// that the metapackage itself is not. Whether the closure is *exactly* the
+/// resolved set is a separate, stronger check the builder makes against the
+/// final debz lock; this one names the missing behavior, the returned
+/// convenience, or the build tool that escaped its stage.
 pub fn verifyPackages(
     lock_text: []const u8,
     diagnostic: *Diagnostic,
 ) Error!void {
     for (contract.requirements()) |requirement| {
-        if (requirement.kind != .package) continue;
-        if (requirement.audience == .acceptance_only) continue;
-        if (!lockContains(lock_text, requirement.target)) return fail(
-            diagnostic,
-            "runtime contract requirement {s} (package {s}) is absent from the shipped package lock",
-            .{ requirement.id, requirement.target },
-        );
+        switch (requirement.kind) {
+            .package => {},
+            else => continue,
+        }
+        switch (requirement.audience) {
+            .guest_runtime => if (!lockContains(lock_text, requirement.target)) return fail(
+                diagnostic,
+                "runtime contract requirement {s} (package {s}) is absent from the shipped package lock",
+                .{ requirement.id, requirement.target },
+            ),
+            .build_tooling => if (lockContains(lock_text, requirement.target)) return fail(
+                diagnostic,
+                "build-only package {s} ({s}) is installed in the final guest; " ++
+                    "#677 step 4 resolves it into the initramfs build stage only",
+                .{ requirement.target, requirement.id },
+            ),
+            .acceptance_only => {},
+        }
     }
+    _ = try verifyKernelSelection(lock_text, diagnostic);
     for (contract.forbidden_packages) |forbidden| {
         if (lockContains(lock_text, forbidden)) return fail(
             diagnostic,
@@ -679,6 +818,42 @@ pub fn verifyPackages(
             .{forbidden},
         );
     }
+}
+
+/// The kernel release the shipped lock selected, or one sentence saying why the
+/// lock does not describe exactly one signed kernel and its module tree.
+pub fn verifyKernelSelection(
+    lock_text: []const u8,
+    diagnostic: *Diagnostic,
+) Error![]const u8 {
+    var selector: contract.KernelSelector = .{};
+    var lines = std.mem.splitScalar(u8, lock_text, '\n');
+    while (lines.next()) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t\r");
+        if (trimmed.len == 0) continue;
+        const end = std.mem.indexOfScalar(u8, trimmed, '\t') orelse trimmed.len;
+        selector.offer(trimmed[0..end]) catch |err| return fail(
+            diagnostic,
+            "the shipped package lock does not select one kernel: {s}",
+            .{@errorName(err)},
+        );
+    }
+    const selection = selector.finish() catch |err| return fail(
+        diagnostic,
+        "the shipped package lock does not select one kernel: {s}",
+        .{@errorName(err)},
+    );
+    if (lockContains(lock_text, contract.kernel_templates.selector)) return fail(
+        diagnostic,
+        "kernel metapackage {s} is installed; #677 step 4 resolves it to select " ++
+            "{s} and {s} and then installs only those",
+        .{
+            contract.kernel_templates.selector,
+            selection.image_package,
+            selection.modules_package,
+        },
+    );
+    return selection.release;
 }
 
 fn lockContains(lock_text: []const u8, name: []const u8) bool {

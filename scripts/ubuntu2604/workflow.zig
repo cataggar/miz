@@ -24,6 +24,7 @@ const contracts = @import("contracts.zig");
 const documents = @import("documents.zig");
 const download = @import("download.zig");
 const provenance = @import("provenance.zig");
+const runtime_contract = @import("ubuntu2604_runtime_contract");
 const runtime_contract_document = @import("runtime_contract_document.zig");
 const size_inventory = @import("size_inventory.zig");
 const support = @import("support.zig");
@@ -194,6 +195,17 @@ pub fn dispatch(
             try options.require("--contract"),
             options.get("--architecture"),
             options.get("--flavor"),
+            diagnostic,
+        );
+    }
+    if (std.mem.eql(u8, command, "build-runtime-split-verify")) {
+        var options = try parse(allocator, argv, &.{"--provenance"});
+        defer options.deinit();
+        return buildRuntimeSplitVerify(
+            allocator,
+            io,
+            out,
+            try options.require("--provenance"),
             diagnostic,
         );
     }
@@ -971,6 +983,112 @@ pub fn runtimeContractVerify(
             summary.build_tooling,
             summary.acceptance_only,
             summary.contract_sha256,
+        },
+    );
+}
+
+/// `build-runtime-split-verify`: re-checks that a published core build kept its
+/// build-time dependencies out of the final guest (issue #677 step 4).
+///
+/// The builder already refuses to publish an image that failed the split, and
+/// candidate verification already validates the whole `debz` binding. This gate
+/// exists so the separation fails in CI under its own name, with the packages
+/// that crossed the line in the message, instead of inside a generic provenance
+/// rejection that a reader has to decode.
+pub fn buildRuntimeSplitVerify(
+    allocator: Allocator,
+    io: Io,
+    out: *Writer,
+    provenance_path: []const u8,
+    diagnostic: *Diagnostic,
+) OutError!void {
+    var document = try support.readObject(allocator, io, provenance_path, diagnostic);
+    defer document.deinit();
+    const debz = support.objectOf(document.object().get("debz")) orelse return fail(
+        diagnostic,
+        "build provenance has no debz binding",
+        .{},
+    );
+    const roots = support.arrayOf(debz.get("package_roots")) orelse return fail(
+        diagnostic,
+        "build provenance has no package roots",
+        .{},
+    );
+    const selection = contracts.validateCorePackageRoots(roots) catch return fail(
+        diagnostic,
+        "build provenance package roots are not a kernel selection followed by " ++
+            "the contract's literal guest roots",
+        .{},
+    );
+
+    const selector = runtime_contract.kernel_templates.selector;
+    for (roots) |entry| {
+        const name = support.stringOf(entry) orelse "";
+        if (std.mem.eql(u8, name, selector)) return fail(
+            diagnostic,
+            "kernel metapackage {s} is a guest package root; it is resolved to " ++
+                "select {s} and must not be installed",
+            .{ selector, selection.image_package },
+        );
+    }
+
+    const stage = support.objectOf(debz.get("build_stage")) orelse return fail(
+        diagnostic,
+        "build provenance records no initramfs build stage, so the guest " ++
+            "generated its own initramfs",
+        .{},
+    );
+    const stage_roots = support.arrayOf(stage.get("package_roots")) orelse return fail(
+        diagnostic,
+        "the initramfs build stage records no package roots",
+        .{},
+    );
+    if (stage_roots.len == 0) return fail(
+        diagnostic,
+        "the initramfs build stage records no package roots",
+        .{},
+    );
+    for (stage_roots) |stage_entry| {
+        const build_root = support.stringOf(stage_entry) orelse return fail(
+            diagnostic,
+            "the initramfs build stage roots are invalid",
+            .{},
+        );
+        if (!runtime_contract.isBuildPackageRoot(build_root)) return fail(
+            diagnostic,
+            "{s} is a build-stage root the runtime contract does not classify " ++
+                "as build tooling",
+            .{build_root},
+        );
+        for (roots) |entry| {
+            const name = support.stringOf(entry) orelse "";
+            if (std.mem.eql(u8, name, build_root)) return fail(
+                diagnostic,
+                "build-only package {s} is also a guest package root",
+                .{build_root},
+            );
+        }
+    }
+
+    const initramfs = support.objectOf(stage.get("initramfs")) orelse return fail(
+        diagnostic,
+        "the initramfs build stage records no output",
+        .{},
+    );
+    if (!support.stringIs(initramfs.get("kernel_release"), selection.release)) return fail(
+        diagnostic,
+        "the staged initramfs was not built for the selected kernel {s}",
+        .{selection.release},
+    );
+
+    try out.print(
+        "kernel={s} image={s} modules={s} guest_roots={d} build_roots={d}\n",
+        .{
+            selection.release,
+            selection.image_package,
+            selection.modules_package,
+            roots.len,
+            stage_roots.len,
         },
     );
 }

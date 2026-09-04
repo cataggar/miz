@@ -320,31 +320,78 @@ pub fn runtimeContractFilename(
 }
 pub const debz_api_commit = "beac3f20dd93fd98863af71e8fe621d47db663f6";
 pub const full_debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
-/// The core appliance's explicit package roots, in resolution order.
+
+/// The literal package roots the core appliance installs into the final guest,
+/// after the selected kernel roots and in resolution order.
 ///
-/// Issue #677 step 3 removed the `ubuntu-minimal` metapackage from this list.
-/// The *members* are derived from the runtime contract -- `runtime_contract`
-/// names exactly these five packages, and the comptime check below refuses any
-/// drift between the two -- while the *order* is a build decision this file
-/// owns: the kernel is resolved before the initramfs generator so the kernel
-/// transaction cannot build an initramfs the builder is about to rebuild from
-/// its own reviewed module list, and the first root is the one that creates the
-/// otherwise-empty debz baseline.
-pub const core_debz_packages = [_][]const u8{
-    "linux-azure",
-    "initramfs-tools",
+/// Issue #677 step 3 removed the `ubuntu-minimal` metapackage; step 4 removed
+/// the initramfs generator, which is now resolved into a staging root the guest
+/// never inherits. The *members* are derived from the runtime contract -- the
+/// comptime check below refuses any drift between the two -- while the *order*
+/// is a build decision this file owns.
+pub const core_guest_package_roots = [_][]const u8{
     "openssh-server",
     "sudo",
     "ca-certificates",
 };
 
+/// The package roots resolved only into the initramfs build stage.
+pub const core_build_package_roots = [_][]const u8{"initramfs-tools"};
+
+/// How many roots a core guest publishes: the selected kernel image, its
+/// module tree, then the literal roots above.
+pub const core_kernel_root_count = 2;
+pub const core_package_root_count = core_kernel_root_count + core_guest_package_roots.len;
+
 comptime {
-    if (!runtime_contract.isPackageRootSet(&core_debz_packages))
+    if (!runtime_contract.isGuestPackageRootSet(&core_guest_package_roots))
         @compileError(
-            "Ubuntu core package roots and the runtime contract's package " ++
-                "requirements have separated; #677 step 3 requires a root to " ++
-                "exist if and only if a contract entry names it",
+            "Ubuntu core guest package roots and the runtime contract's " ++
+                "guest_runtime package requirements have separated; #677 " ++
+                "requires a root to exist if and only if a contract entry " ++
+                "names it for the guest",
         );
+    if (!runtime_contract.isBuildPackageRootSet(&core_build_package_roots))
+        @compileError(
+            "Ubuntu core build-stage package roots and the runtime contract's " ++
+                "build_tooling package requirements have separated; #677 step 4 " ++
+                "requires the build stage to resolve exactly the contract's " ++
+                "build tooling",
+        );
+}
+
+pub const CorePackageRootError = error{
+    /// The published roots are not `[image, modules, ...literal roots]`.
+    InvalidCorePackageRoots,
+};
+
+/// Validates a published core `package_roots` list and returns the kernel it
+/// selected.
+///
+/// Exact and ordered, like the literal check it replaces, except that the first
+/// two entries are matched against the contract's kernel templates rather than
+/// against a version this repository would otherwise have to keep re-pinning.
+pub fn validateCorePackageRoots(
+    roots: []const std.json.Value,
+) CorePackageRootError!runtime_contract.KernelSelection {
+    if (roots.len != core_package_root_count) return error.InvalidCorePackageRoots;
+    var names: [core_package_root_count][]const u8 = undefined;
+    for (roots, 0..) |value, index| {
+        names[index] = switch (value) {
+            .string => |text| text,
+            else => return error.InvalidCorePackageRoots,
+        };
+    }
+    const selection = runtime_contract.selectKernel(
+        names[0..core_kernel_root_count],
+    ) catch return error.InvalidCorePackageRoots;
+    if (!std.mem.eql(u8, names[0], selection.image_package) or
+        !std.mem.eql(u8, names[1], selection.modules_package))
+        return error.InvalidCorePackageRoots;
+    for (names[core_kernel_root_count..], core_guest_package_roots) |actual, expected| {
+        if (!std.mem.eql(u8, actual, expected)) return error.InvalidCorePackageRoots;
+    }
+    return selection;
 }
 
 /// Packages the core closure must never contain, published from the one place
@@ -354,7 +401,7 @@ pub const core_forbidden_packages = runtime_contract.forbidden_packages;
 pub fn debzPackages(flavor: Flavor) []const []const u8 {
     return switch (flavor) {
         .full => &full_debz_packages,
-        .core => &core_debz_packages,
+        .core => &core_guest_package_roots,
     };
 }
 
@@ -371,33 +418,67 @@ test "candidate identity tables agree with the release order" {
     try std.testing.expect(sourceArchitecture("riscv64") == null);
 }
 
-test "core package roots are the contract's set without ubuntu-minimal" {
+test "core package roots are the contract's guest set without ubuntu-minimal" {
     // #677 acceptance criterion: `ubuntu-minimal` is absent from the closure,
-    // starting with the roots that produce it.
-    try std.testing.expect(runtime_contract.isPackageRootSet(&core_debz_packages));
-    try std.testing.expectEqual(
-        @as(usize, runtime_contract.package_roots.len),
-        core_debz_packages.len,
-    );
+    // starting with the roots that produce it. Step 4 adds a second criterion:
+    // build-only tooling is absent from the final guest, so the generator is
+    // not a guest root either.
+    try std.testing.expect(runtime_contract.isGuestPackageRootSet(&core_guest_package_roots));
+    try std.testing.expect(runtime_contract.isBuildPackageRootSet(&core_build_package_roots));
     var saw_ca_certificates = false;
-    for (core_debz_packages) |package| {
+    for (core_guest_package_roots) |package| {
         try std.testing.expect(!std.mem.eql(u8, package, "ubuntu-minimal"));
+        try std.testing.expect(!std.mem.eql(u8, package, "initramfs-tools"));
         if (std.mem.eql(u8, package, "ca-certificates")) saw_ca_certificates = true;
     }
     try std.testing.expect(saw_ca_certificates);
-    // The kernel is resolved first so its transaction cannot build an initramfs
-    // from a generator that is not installed yet.
-    try std.testing.expectEqualStrings("linux-azure", core_debz_packages[0]);
-    try std.testing.expectEqualStrings("initramfs-tools", core_debz_packages[1]);
 }
 
-test "the forbidden set names ubuntu-minimal and no package root" {
+test "published core package roots must select a kernel rather than name one" {
+    const allocator = std.testing.allocator;
+    const good = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\["linux-image-7.0.0-1010-azure","linux-modules-7.0.0-1010-azure",
+        \\ "openssh-server","sudo","ca-certificates"]
+    , .{});
+    defer good.deinit();
+    const selection = try validateCorePackageRoots(good.value.array.items);
+    try std.testing.expectEqualStrings("7.0.0-1010-azure", selection.release);
+
+    for ([_][]const u8{
+        // The convenience metapackage is not a selection.
+        \\["linux-azure","linux-modules-7.0.0-1010-azure","openssh-server","sudo","ca-certificates"]
+        ,
+        // Image and modules from different kernels.
+        \\["linux-image-7.0.0-1010-azure","linux-modules-7.0.0-1004-azure","openssh-server","sudo","ca-certificates"]
+        ,
+        // The generator is a build root and must not be published as a guest one.
+        \\["linux-image-7.0.0-1010-azure","linux-modules-7.0.0-1010-azure","initramfs-tools","openssh-server","sudo","ca-certificates"]
+        ,
+        // A dropped literal root.
+        \\["linux-image-7.0.0-1010-azure","linux-modules-7.0.0-1010-azure","openssh-server","sudo"]
+        ,
+    }) |document| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, document, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(
+            error.InvalidCorePackageRoots,
+            validateCorePackageRoots(parsed.value.array.items),
+        );
+    }
+}
+
+test "the forbidden set names ubuntu-minimal and no guest package root" {
     var saw_ubuntu_minimal = false;
     for (core_forbidden_packages) |forbidden| {
         if (std.mem.eql(u8, forbidden, "ubuntu-minimal")) saw_ubuntu_minimal = true;
-        try std.testing.expect(!runtime_contract.isPackageRoot(forbidden));
+        try std.testing.expect(!runtime_contract.isGuestPackageRoot(forbidden));
     }
     try std.testing.expect(saw_ubuntu_minimal);
+    // Step 4: what the build resolves elsewhere is exactly what the guest must
+    // not contain.
+    for (core_build_package_roots) |build_root| {
+        try std.testing.expect(runtime_contract.isForbiddenPackage(build_root));
+    }
 }
 
 test "contract and field sets are stored sorted and duplicate-free" {

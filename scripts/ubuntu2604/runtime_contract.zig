@@ -93,6 +93,20 @@ pub const Audience = enum {
 pub const Kind = enum {
     /// A dpkg package that must appear in the shipped exact lock.
     package,
+    /// A metapackage that is resolved to decide which exact binary packages
+    /// the build installs, and is then never installed itself.
+    ///
+    /// Issue #677 step 4 asks for "exact versioned kernel image/module
+    /// packages over convenience metapackages". A literal version pinned into
+    /// this repository would satisfy the letter of that and break its point:
+    /// the next security kernel would need a source edit, and until someone
+    /// made it the appliance would ship a known-stale kernel. A selector keeps
+    /// Canonical's own security-update selection -- the metapackage is exactly
+    /// the statement "this is the current Azure kernel" -- while installing
+    /// only the two versioned binary packages the appliance boots on. The
+    /// `expect` field carries the comma-separated name templates the selection
+    /// must produce, `*` standing for the kernel release it resolved to.
+    package_selector,
     /// An executable file.
     command,
     /// A regular file.
@@ -133,6 +147,7 @@ pub const Kind = enum {
         return switch (self) {
             .command, .file, .directory, .symlink, .config, .trust_store => true,
             .package,
+            .package_selector,
             .mutable_path,
             .kernel_module,
             .device,
@@ -146,7 +161,7 @@ pub const Kind = enum {
 
     /// Whether the static guest probe evaluates this kind.
     pub fn probeable(self: Kind) bool {
-        return self != .package;
+        return self != .package and self != .package_selector;
     }
 };
 
@@ -405,9 +420,9 @@ pub const core_requirements = [_]Requirement{
         .target = "initramfs-tools",
         .behavior = .platform_trust,
         .audience = .build_tooling,
-        .why = "generates the initramfs the UKI embeds; step 4 of #677 moves " ++
-            "it out of the final guest, and this classification is what makes " ++
-            "that removal a contract-preserving change rather than a gamble",
+        .why = "generates the initramfs the UKI embeds; #677 step 4 resolves " ++
+            "it as a root of the initramfs build stage only, so neither it nor " ++
+            "its build-only closure is installed into the final guest",
     },
     .{
         .id = "kernel-lockdown",
@@ -419,12 +434,17 @@ pub const core_requirements = [_]Requirement{
             "module loading enforceable rather than advisory",
     },
     .{
-        .id = "linux-azure-package",
-        .kind = .package,
+        .id = "kernel-selection",
+        .kind = .package_selector,
         .target = "linux-azure",
         .behavior = .platform_trust,
+        .expect = "linux-image-*-azure,linux-modules-*-azure",
         .why = "the signed kernel, its signed module tree, and the Azure " ++
-            "storage and network drivers the appliance boots on",
+            "storage and network drivers the appliance boots on; the " ++
+            "metapackage is resolved to learn which kernel release Canonical " ++
+            "currently ships and is then not installed, because its own " ++
+            "dependencies are headers, perf tools, cloud tools, and a ZFS " ++
+            "module set no appliance behavior stands on",
     },
     .{
         .id = "machine-id",
@@ -677,19 +697,63 @@ pub fn countFor(audience: Audience) usize {
 /// The explicit debz package roots the contract's `package` entries name, in
 /// contract (`id`) order.
 ///
-/// Step 3 of #677 replaces the `ubuntu-minimal` metapackage with exactly this
+/// Step 3 of #677 replaced the `ubuntu-minimal` metapackage with exactly this
 /// set. Derived rather than written down twice, because the whole point of the
 /// exercise is that a package root exists if and only if a named behavior
 /// stands on it: a root nothing in this table asks for is a convenience, and a
-/// contract package that is not a root is an unenforced promise. `build_tooling`
-/// roots are included -- `initramfs-tools` is still installed into the guest
-/// until step 4 moves initramfs generation out of it -- so the derivation
-/// describes the roots the build actually resolves today.
+/// contract package that is not a root is an unenforced promise.
+///
+/// This is every root the *build* resolves, across both audiences. Step 4 of
+/// #677 splits where they are resolved -- see `guest_package_roots` and
+/// `build_package_roots` -- so this list is no longer the list of packages the
+/// final guest carries, and callers that mean the guest must say so.
 pub const package_roots: [countKind(.package)][]const u8 = blk: {
     var names: [countKind(.package)][]const u8 = undefined;
     var next: usize = 0;
     for (core_requirements) |entry| {
         if (entry.kind != .package) continue;
+        names[next] = entry.target;
+        next += 1;
+    }
+    break :blk names;
+};
+
+/// Number of `package` entries an audience owns, at comptime.
+pub fn countPackagesFor(comptime audience: Audience) usize {
+    var total: usize = 0;
+    for (core_requirements) |entry| {
+        if (entry.kind == .package and entry.audience == audience) total += 1;
+    }
+    return total;
+}
+
+/// The literal package roots installed into the final guest, in contract order.
+///
+/// The kernel is not here: it is selected rather than named, so
+/// `kernel_selector` describes it and `selectKernel` produces the two versioned
+/// roots the guest actually installs.
+pub const guest_package_roots: [countPackagesFor(.guest_runtime)][]const u8 = blk: {
+    var names: [countPackagesFor(.guest_runtime)][]const u8 = undefined;
+    var next: usize = 0;
+    for (core_requirements) |entry| {
+        if (entry.kind != .package or entry.audience != .guest_runtime) continue;
+        names[next] = entry.target;
+        next += 1;
+    }
+    break :blk names;
+};
+
+/// The package roots resolved only into the initramfs build stage.
+///
+/// Issue #677 step 4: these are installed into a staging root that produces the
+/// initramfs and is then discarded. A build root that turns up in the final
+/// guest inventory is a build/runtime separation failure, which is why
+/// `forbidden_packages` names every one of them.
+pub const build_package_roots: [countPackagesFor(.build_tooling)][]const u8 = blk: {
+    var names: [countPackagesFor(.build_tooling)][]const u8 = undefined;
+    var next: usize = 0;
+    for (core_requirements) |entry| {
+        if (entry.kind != .package or entry.audience != .build_tooling) continue;
         names[next] = entry.target;
         next += 1;
     }
@@ -706,6 +770,138 @@ pub fn countKind(comptime kind: Kind) usize {
     return total;
 }
 
+// ---------------------------------------------------------------------------
+// Kernel selection (issue #677 step 4).
+// ---------------------------------------------------------------------------
+
+/// The name templates a kernel selection must produce, `*` standing for the
+/// kernel release the selector resolved to.
+pub const KernelTemplates = struct {
+    /// The metapackage that is resolved and then not installed.
+    selector: []const u8,
+    image: []const u8,
+    modules: []const u8,
+};
+
+/// The contract's single `package_selector` entry, decoded.
+pub const kernel_templates: KernelTemplates = blk: {
+    var found: ?KernelTemplates = null;
+    for (core_requirements) |entry| {
+        if (entry.kind != .package_selector) continue;
+        if (found != null) @compileError("the contract names more than one package selector");
+        const comma = std.mem.indexOfScalar(u8, entry.expect, ',') orelse
+            @compileError("a package selector must name an image and a modules template");
+        found = .{
+            .selector = entry.target,
+            .image = entry.expect[0..comma],
+            .modules = entry.expect[comma + 1 ..],
+        };
+    }
+    break :blk found orelse @compileError("the contract names no package selector");
+};
+
+/// The kernel release a `prefix*suffix` template matches in `name`, or null.
+///
+/// The release is everything after the prefix -- `linux-image-*-azure` matched
+/// against `linux-image-7.0.0-1010-azure` yields `7.0.0-1010-azure`, which is
+/// the release name `/boot/vmlinuz-*`, `/usr/lib/modules/*`, and the module
+/// signature checks all use, so no caller has to reassemble it. A release is
+/// never empty, so `linux-image-azure` is not a selection: the metapackage
+/// cannot pass for the versioned package it depends on.
+pub fn templateRelease(template: []const u8, name: []const u8) ?[]const u8 {
+    const star = std.mem.indexOfScalar(u8, template, '*') orelse return null;
+    const prefix = template[0..star];
+    const suffix = template[star + 1 ..];
+    if (name.len <= prefix.len + suffix.len) return null;
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    if (!std.mem.endsWith(u8, name, suffix)) return null;
+    const release = name[prefix.len..];
+    for (release) |byte| switch (byte) {
+        '0'...'9', 'a'...'z', 'A'...'Z', '.', '+', '~', '-', '_' => {},
+        else => return null,
+    };
+    return release;
+}
+
+/// The package name a template takes for `release`, written into `buffer`.
+pub fn templateName(
+    buffer: []u8,
+    template: []const u8,
+    release: []const u8,
+) error{NoSpaceLeft}![]const u8 {
+    const star = std.mem.indexOfScalar(u8, template, '*') orelse return error.NoSpaceLeft;
+    return std.fmt.bufPrint(buffer, "{s}{s}", .{ template[0..star], release });
+}
+
+/// The versioned kernel roots a selection resolved to.
+pub const KernelSelection = struct {
+    /// The kernel release, e.g. `7.0.0-1010-azure`. It is also the name of the
+    /// module tree the UKI's initramfs and the signed module loader use.
+    release: []const u8,
+    image_package: []const u8,
+    modules_package: []const u8,
+};
+
+pub const SelectKernelError = error{
+    /// No candidate matched the image template.
+    KernelImageNotSelected,
+    /// More than one release matched, so "the kernel" is ambiguous.
+    KernelSelectionAmbiguous,
+    /// The image was selected but its module tree was not published with it.
+    KernelModulesNotSelected,
+};
+
+/// Accumulates candidate names into a single kernel selection.
+///
+/// Fail-closed by construction: zero matches, two different releases, or an
+/// image whose module tree was not published with it are all errors, because
+/// each of them would otherwise be answered by silently installing something
+/// else. Names are borrowed, so a caller may feed it slices of a lock or an
+/// inventory without allocating.
+pub const KernelSelector = struct {
+    image_release: ?[]const u8 = null,
+    image_package: ?[]const u8 = null,
+    modules_release: ?[]const u8 = null,
+    modules_package: ?[]const u8 = null,
+
+    pub fn offer(self: *KernelSelector, name: []const u8) SelectKernelError!void {
+        if (templateRelease(kernel_templates.image, name)) |release| {
+            if (self.image_release) |chosen| {
+                if (!std.mem.eql(u8, chosen, release)) return error.KernelSelectionAmbiguous;
+            } else {
+                self.image_release = release;
+                self.image_package = name;
+            }
+        }
+        if (templateRelease(kernel_templates.modules, name)) |release| {
+            if (self.modules_release) |chosen| {
+                if (!std.mem.eql(u8, chosen, release)) return error.KernelSelectionAmbiguous;
+            } else {
+                self.modules_release = release;
+                self.modules_package = name;
+            }
+        }
+    }
+
+    pub fn finish(self: KernelSelector) SelectKernelError!KernelSelection {
+        const release = self.image_release orelse return error.KernelImageNotSelected;
+        const modules = self.modules_release orelse return error.KernelModulesNotSelected;
+        if (!std.mem.eql(u8, release, modules)) return error.KernelModulesNotSelected;
+        return .{
+            .release = release,
+            .image_package = self.image_package.?,
+            .modules_package = self.modules_package.?,
+        };
+    }
+};
+
+/// Picks the versioned kernel roots out of the names a selector lock resolved.
+pub fn selectKernel(names: []const []const u8) SelectKernelError!KernelSelection {
+    var selector: KernelSelector = .{};
+    for (names) |name| try selector.offer(name);
+    return selector.finish();
+}
+
 pub fn isPackageRoot(name: []const u8) bool {
     for (package_roots) |root| {
         if (std.mem.eql(u8, root, name)) return true;
@@ -713,15 +909,23 @@ pub fn isPackageRoot(name: []const u8) bool {
     return false;
 }
 
-/// Whether `names` is the contract's package-root set, ignoring order.
-///
-/// Order is a build decision -- the kernel is resolved before the initramfs
-/// generator so the kernel transaction does not build an initramfs the builder
-/// is about to rebuild -- so callers keep their own deliberate ordering and use
-/// this to prove they kept the same members.
-pub fn isPackageRootSet(names: []const []const u8) bool {
-    if (names.len != package_roots.len) return false;
-    for (package_roots) |root| {
+pub fn isGuestPackageRoot(name: []const u8) bool {
+    for (guest_package_roots) |root| {
+        if (std.mem.eql(u8, root, name)) return true;
+    }
+    return false;
+}
+
+pub fn isBuildPackageRoot(name: []const u8) bool {
+    for (build_package_roots) |root| {
+        if (std.mem.eql(u8, root, name)) return true;
+    }
+    return false;
+}
+
+fn isSameSet(names: []const []const u8, expected: []const []const u8) bool {
+    if (names.len != expected.len) return false;
+    for (expected) |root| {
         var found = false;
         for (names) |name| {
             if (std.mem.eql(u8, root, name)) {
@@ -734,6 +938,27 @@ pub fn isPackageRootSet(names: []const []const u8) bool {
     return true;
 }
 
+/// Whether `names` is the contract's package-root set, ignoring order.
+///
+/// Order is a build decision -- the kernel is resolved first because its
+/// transaction is the one that creates the otherwise-empty baseline -- so
+/// callers keep their own deliberate ordering and use this to prove they kept
+/// the same members.
+pub fn isPackageRootSet(names: []const []const u8) bool {
+    return isSameSet(names, &package_roots);
+}
+
+/// Whether `names` is exactly the literal guest roots, ignoring order. The
+/// selected kernel roots are not literals and are checked by `selectKernel`.
+pub fn isGuestPackageRootSet(names: []const []const u8) bool {
+    return isSameSet(names, &guest_package_roots);
+}
+
+/// Whether `names` is exactly the build-stage roots, ignoring order.
+pub fn isBuildPackageRootSet(names: []const []const u8) bool {
+    return isSameSet(names, &build_package_roots);
+}
+
 /// Packages the core closure must never contain.
 ///
 /// The exact-closure equality check is what actually keeps the inventory
@@ -741,12 +966,26 @@ pub fn isPackageRootSet(names: []const []const u8) bool {
 /// This list exists so the regressions #677 calls out by name fail with the
 /// name of what came back: a broad metapackage, an apt client, an editor, a
 /// pager, locales, documentation, a conventional networking daemon, an init
-/// system, or a convenience tool. Every entry is a package no contract
-/// behavior stands on, which the test below re-checks against `package_roots`.
+/// system, a convenience tool, or -- since step 4 -- the initramfs generator
+/// and the kernel convenience metapackages that only the build needs. Every
+/// entry is a package no `guest_runtime` behavior stands on, which the test
+/// below re-checks against `guest_package_roots`.
 pub const forbidden_packages = [_][]const u8{
     "apt",
+    "busybox-initramfs",
     "cloud-init",
+    "dhcpcd-base",
+    "dracut-install",
+    "initramfs-tools",
+    "initramfs-tools-bin",
+    "initramfs-tools-core",
     "isc-dhcp-client",
+    "klibc-utils",
+    "linux-azure",
+    "linux-cloud-tools-azure",
+    "linux-headers-azure",
+    "linux-image-azure",
+    "linux-tools-azure",
     "locales",
     "man-db",
     "nano",
@@ -759,6 +998,7 @@ pub const forbidden_packages = [_][]const u8{
     "ubuntu-server",
     "ubuntu-server-minimal",
     "ubuntu-standard",
+    "udev",
     "unattended-upgrades",
     "vim-tiny",
     "walinuxagent",
@@ -1094,10 +1334,10 @@ test "requirements are sorted, unique, and fully attributed" {
         try std.testing.expect(entry.target.len != 0);
         try std.testing.expect(entry.why.len != 0);
         switch (entry.kind) {
-            .mount, .symlink, .config, .trust_store => try std.testing.expect(entry.expect.len != 0),
+            .mount, .symlink, .config, .trust_store, .package_selector => try std.testing.expect(entry.expect.len != 0),
             else => {},
         }
-        if (entry.kind == .package) {
+        if (entry.kind == .package or entry.kind == .package_selector) {
             try std.testing.expectEqual(Presence.image, entry.presence);
         }
     }
@@ -1124,25 +1364,38 @@ test "ca-certificates stays an explicit package root with a validated trust stor
     try std.testing.expect(bundle.required());
 }
 
-test "the derived package roots are the contract's packages and nothing else" {
-    // #677 step 3: the explicit roots replace `ubuntu-minimal`, and the set is
-    // derived so a convenience root cannot be added without first naming the
-    // behavior that needs it.
+test "the derived package roots split guest runtime from build tooling" {
+    // #677 step 3 replaced `ubuntu-minimal` with explicit roots; step 4 splits
+    // those roots by audience so the build's generator never reaches the guest.
     try std.testing.expectEqualSlices([]const u8, &[_][]const u8{
         "ca-certificates",
         "initramfs-tools",
-        "linux-azure",
         "openssh-server",
         "sudo",
     }, &package_roots);
+    try std.testing.expectEqualSlices([]const u8, &[_][]const u8{
+        "ca-certificates",
+        "openssh-server",
+        "sudo",
+    }, &guest_package_roots);
+    try std.testing.expectEqualSlices(
+        []const u8,
+        &[_][]const u8{"initramfs-tools"},
+        &build_package_roots,
+    );
     try std.testing.expect(isPackageRoot("ca-certificates"));
     try std.testing.expect(!isPackageRoot("ubuntu-minimal"));
+    // The kernel is selected, not named, so it is deliberately not a root.
+    try std.testing.expect(!isPackageRoot("linux-azure"));
+    try std.testing.expect(isGuestPackageRoot("ca-certificates"));
+    try std.testing.expect(!isGuestPackageRoot("initramfs-tools"));
+    try std.testing.expect(isBuildPackageRoot("initramfs-tools"));
+    try std.testing.expect(!isBuildPackageRoot("ca-certificates"));
     for (core_requirements) |entry| {
         try std.testing.expectEqual(entry.kind == .package, isPackageRoot(entry.target));
     }
     // The build orders its roots deliberately; only the membership is derived.
     try std.testing.expect(isPackageRootSet(&.{
-        "linux-azure",
         "initramfs-tools",
         "openssh-server",
         "sudo",
@@ -1150,25 +1403,70 @@ test "the derived package roots are the contract's packages and nothing else" {
     }));
     try std.testing.expect(!isPackageRootSet(&.{
         "ubuntu-minimal",
-        "linux-azure",
         "initramfs-tools",
         "openssh-server",
         "sudo",
         "ca-certificates",
     }));
     try std.testing.expect(!isPackageRootSet(&.{
-        "linux-azure",
         "initramfs-tools",
         "openssh-server",
         "sudo",
     }));
     // A duplicated member must not pass for the missing one it displaced.
     try std.testing.expect(!isPackageRootSet(&.{
-        "linux-azure",
-        "linux-azure",
+        "initramfs-tools",
         "initramfs-tools",
         "openssh-server",
         "sudo",
+    }));
+    try std.testing.expect(isGuestPackageRootSet(&.{ "openssh-server", "sudo", "ca-certificates" }));
+    try std.testing.expect(!isGuestPackageRootSet(&.{
+        "openssh-server",
+        "sudo",
+        "ca-certificates",
+        "initramfs-tools",
+    }));
+    try std.testing.expect(isBuildPackageRootSet(&.{"initramfs-tools"}));
+    try std.testing.expect(!isBuildPackageRootSet(&.{}));
+}
+
+test "the kernel is selected from a metapackage rather than pinned or installed" {
+    // #677 step 4 wants exact versioned kernel packages *and* correct security
+    // update selection. The selector is how both hold at once: the metapackage
+    // decides which release, and only the two versioned binaries are installed.
+    const entry = lookup("kernel-selection").?;
+    try std.testing.expectEqual(Kind.package_selector, entry.kind);
+    try std.testing.expectEqual(Audience.guest_runtime, entry.audience);
+    try std.testing.expectEqualStrings("linux-azure", kernel_templates.selector);
+    try std.testing.expectEqualStrings("linux-image-*-azure", kernel_templates.image);
+    try std.testing.expectEqualStrings("linux-modules-*-azure", kernel_templates.modules);
+
+    const resolved = try selectKernel(&.{
+        "linux-azure",
+        "linux-image-azure",
+        "linux-image-7.0.0-1010-azure",
+        "linux-modules-7.0.0-1010-azure",
+        "openssh-server",
+    });
+    try std.testing.expectEqualStrings("7.0.0-1010-azure", resolved.release);
+    try std.testing.expectEqualStrings("linux-image-7.0.0-1010-azure", resolved.image_package);
+    try std.testing.expectEqualStrings("linux-modules-7.0.0-1010-azure", resolved.modules_package);
+
+    // The metapackages themselves are not a selection: an empty release is not
+    // a release, so `linux-image-azure` cannot stand in for a versioned image.
+    try std.testing.expect(templateRelease(kernel_templates.image, "linux-image-azure") == null);
+    try std.testing.expectError(
+        error.KernelImageNotSelected,
+        selectKernel(&.{ "linux-azure", "linux-image-azure" }),
+    );
+    try std.testing.expectError(error.KernelSelectionAmbiguous, selectKernel(&.{
+        "linux-image-7.0.0-1010-azure",
+        "linux-image-7.0.0-1004-azure",
+    }));
+    try std.testing.expectError(error.KernelModulesNotSelected, selectKernel(&.{
+        "linux-image-7.0.0-1010-azure",
+        "linux-modules-7.0.0-1004-azure",
     }));
 }
 
@@ -1179,10 +1477,17 @@ test "no contract entry names a broad metapackage or a convenience tool" {
     try std.testing.expect(isForbiddenPackage("ubuntu-minimal"));
     try std.testing.expect(!isForbiddenPackage("ca-certificates"));
     for (core_requirements) |entry| {
-        if (entry.kind != .package) continue;
+        if (entry.kind != .package or entry.audience != .guest_runtime) continue;
         try std.testing.expect(!isForbiddenPackage(entry.target));
     }
-    for (forbidden_packages) |name| try std.testing.expect(!isPackageRoot(name));
+    // Step 4: the generator and the kernel conveniences are forbidden in the
+    // guest precisely because the build still resolves them somewhere else.
+    try std.testing.expect(isForbiddenPackage("initramfs-tools"));
+    try std.testing.expect(isForbiddenPackage("linux-azure"));
+    try std.testing.expect(isForbiddenPackage("linux-headers-azure"));
+    for (build_package_roots) |name| try std.testing.expect(isForbiddenPackage(name));
+    try std.testing.expect(isForbiddenPackage(kernel_templates.selector));
+    for (forbidden_packages) |name| try std.testing.expect(!isGuestPackageRoot(name));
     var index: usize = 1;
     while (index < forbidden_packages.len) : (index += 1) {
         try std.testing.expect(std.mem.lessThan(

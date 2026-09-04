@@ -351,6 +351,26 @@ jobs:
           printf 'Runtime contract `%s`: `%s`\n' "$CANDIDATE_KEY" "$declared" \
             >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Verify the build/runtime separation
+        run: |
+          set -euo pipefail
+          # Issue #677 step 4: the initramfs is generated in a staging root and
+          # the kernel is selected from a metapackage that is never installed,
+          # so the published provenance has to show a build stage, guest roots
+          # that share no member with it, and a staged initramfs built for the
+          # selected kernel. Failing here names the package that crossed the
+          # line instead of leaving it to a generic provenance rejection.
+          if [ "$FLAVOR" != core ]; then
+            echo "build/runtime split gate applies to core only"
+            exit 0
+          fi
+          provenance="$BUNDLE_DIR/internal-provenance/ubuntu2604-build-provenance.json"
+          test -f "$provenance"
+          test -x "$RELEASE_TOOL"
+          split=$("$RELEASE_TOOL" build-runtime-split-verify --provenance "$provenance")
+          printf 'Build/runtime split `%s`: `%s`\n' "$CANDIDATE_KEY" "$split" \
+            >> "$GITHUB_STEP_SUMMARY"
+
       - name: Create and verify exact candidate bundle
         env:
           RUNNER_NAME_VALUE: ${{ runner.name }}

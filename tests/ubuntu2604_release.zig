@@ -2826,6 +2826,175 @@ fn runtimeContractPath(subject: *const Tree, key: []const u8) ![]u8 {
     );
 }
 
+/// The build provenance the fixture wrote for a candidate.
+fn buildProvenancePath(subject: *const Tree, key: []const u8) ![]u8 {
+    return subject.path(
+        "candidates/{s}/internal-provenance/{s}",
+        .{ key, contracts.ubuntu_provenance_filename },
+    );
+}
+
+test "build-only packages cannot enter a published core guest" {
+    // Issue #677 step 4 is only true if a candidate that broke it is refused.
+    // Every mutation below is a way the separation could quietly fail: the
+    // kernel metapackage installed after all, the generator promoted to a guest
+    // root, the staging build removed entirely, or an initramfs staged for a
+    // different kernel than the one the guest boots.
+    var subject = try tree();
+    defer subject.deinit();
+    try fixture.makeBundle(&subject, "aarch64-core", .{});
+    try validateUbuntu(&subject, "aarch64-core", "aarch64", .core, fixture.virtual_size);
+
+    const provenance_path = try buildProvenancePath(&subject, "aarch64-core");
+    defer allocator.free(provenance_path);
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    var diagnostic: support.Diagnostic = .{};
+    try release.workflow.buildRuntimeSplitVerify(
+        allocator,
+        io,
+        &writer,
+        provenance_path,
+        &diagnostic,
+    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        writer.buffered(),
+        "kernel=" ++ fixture.fixture_kernel_release,
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "build_roots=1") != null);
+
+    const mutations = [_]struct {
+        steps: []const Step,
+        change: fixture.Change,
+        expect: []const u8,
+    }{
+        // The metapackage installed rather than merely resolved.
+        .{
+            .steps = &.{ .{ .key = "debz" }, .{ .key = "package_roots" }, .{ .index = 0 } },
+            .change = .{ .set = .{ .string = "linux-azure" } },
+            .expect = "package roots",
+        },
+        // The generator promoted into the guest.
+        .{
+            .steps = &.{ .{ .key = "debz" }, .{ .key = "package_roots" }, .{ .index = 2 } },
+            .change = .{ .set = .{ .string = "initramfs-tools" } },
+            .expect = "package roots",
+        },
+        // No staging build at all, which means the guest generated its own.
+        .{
+            .steps = &.{ .{ .key = "debz" }, .{ .key = "build_stage" } },
+            .change = .remove,
+            .expect = "build stage",
+        },
+        // A staging root whose roots are not the contract's build tooling.
+        .{
+            .steps = &.{
+                .{ .key = "debz" },
+                .{ .key = "build_stage" },
+                .{ .key = "package_roots" },
+                .{ .index = 0 },
+            },
+            .change = .{ .set = .{ .string = "sudo" } },
+            .expect = "build tooling",
+        },
+        // An initramfs staged for a kernel the guest does not boot.
+        .{
+            .steps = &.{
+                .{ .key = "debz" },
+                .{ .key = "build_stage" },
+                .{ .key = "initramfs" },
+                .{ .key = "kernel_release" },
+            },
+            .change = .{ .set = .{ .string = "7.0.0-1004-azure" } },
+            .expect = "selected kernel",
+        },
+    };
+    for (mutations) |mutation| {
+        var mutated = try tree();
+        defer mutated.deinit();
+        try fixture.makeBundle(&mutated, "aarch64-core", .{});
+        const path = try buildProvenancePath(&mutated, "aarch64-core");
+        defer allocator.free(path);
+        try fixture.patch(allocator, io, path, mutation.steps, mutation.change);
+        writer.end = 0;
+        diagnostic = .{};
+        try std.testing.expectError(error.Failed, release.workflow.buildRuntimeSplitVerify(
+            allocator,
+            io,
+            &writer,
+            path,
+            &diagnostic,
+        ));
+        try std.testing.expect(
+            std.mem.indexOf(u8, diagnostic.message(), mutation.expect) != null,
+        );
+        // The same mutation also fails the whole provenance tree, so the gate
+        // is a second reading of the contract rather than the only one.
+        try expectUbuntuRejected(
+            &mutated,
+            "aarch64-core",
+            "aarch64",
+            .core,
+            fixture.virtual_size,
+        );
+    }
+}
+
+test "both core architectures publish the same build/runtime split" {
+    // #677 requires both architectures to keep every contract, and the split is
+    // now one of them: each architecture selects its own kernel and binds its
+    // own architecture-qualified selector lock, so a gate that only ever saw
+    // one of them would not be a gate.
+    for ([_][]const u8{ "x86_64-core", "aarch64-core" }) |key| {
+        var subject = try tree();
+        defer subject.deinit();
+        try fixture.makeBundle(&subject, key, .{});
+        const entry = contracts.lookup(key).?;
+        try validateUbuntu(
+            &subject,
+            key,
+            entry.architecture,
+            .core,
+            fixture.virtual_size,
+        );
+        const provenance_path = try buildProvenancePath(&subject, key);
+        defer allocator.free(provenance_path);
+        var buffer: [4096]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        var diagnostic: support.Diagnostic = .{};
+        try release.workflow.buildRuntimeSplitVerify(
+            allocator,
+            io,
+            &writer,
+            provenance_path,
+            &diagnostic,
+        );
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            writer.buffered(),
+            "image=" ++ fixture.fixture_kernel_image,
+        ) != null);
+
+        // The selector lock is published per architecture and is a real file in
+        // the candidate's provenance tree, so the selection is reviewable.
+        const source_architecture = contracts.sourceArchitecture(entry.architecture).?;
+        const selector_lock = try subject.path(
+            "candidates/{s}/internal-provenance/debz-exact-lock-linux-azure-{s}.json",
+            .{ key, source_architecture },
+        );
+        defer allocator.free(selector_lock);
+        const bytes = try Dir.cwd().readFileAlloc(
+            io,
+            selector_lock,
+            allocator,
+            .limited(1024 * 1024),
+        );
+        defer allocator.free(bytes);
+        try std.testing.expect(bytes.len != 0);
+    }
+}
+
 test "core provenance binds the explicit runtime contract" {
     var subject = try tree();
     defer subject.deinit();
@@ -3225,19 +3394,59 @@ test "core Ubuntu provenance matches the builder contract" {
             .get("source_image").?.object
             .get("role").?.string,
     );
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const expected_roots = try fixture.coreDebzPackages(arena.allocator());
     try std.testing.expect(support.isExactOrderedStrings(
         document.value.object.get("debz").?.object.get("package_roots"),
-        &contracts.core_debz_packages,
+        expected_roots,
     ));
     const transactions = document.value.object
         .get("debz").?.object
         .get("transactions").?.array.items;
-    try std.testing.expectEqual(contracts.core_debz_packages.len, transactions.len);
-    for (transactions, contracts.core_debz_packages) |item, package| {
+    try std.testing.expectEqual(expected_roots.len, transactions.len);
+    for (transactions, expected_roots) |item, package| {
         try std.testing.expectEqualStrings(
             package,
             item.object.get("package").?.string,
         );
+    }
+
+    // Issue #677 step 4: the kernel is selected from a metapackage that is not
+    // installed, and the initramfs is produced by a staging root whose own
+    // roots, transactions, and output are bound here rather than assumed.
+    const debz = document.value.object.get("debz").?.object;
+    const selection = debz.get("kernel_selection").?.object;
+    try std.testing.expectEqualStrings(
+        "linux-azure",
+        selection.get("selector").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        fixture.fixture_kernel_release,
+        selection.get("kernel_release").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        fixture.fixture_kernel_image,
+        selection.get("image_package").?.string,
+    );
+    const build_stage = debz.get("build_stage").?.object;
+    try std.testing.expectEqualStrings(
+        "initramfs-generation",
+        build_stage.get("purpose").?.string,
+    );
+    try std.testing.expect(support.isExactOrderedStrings(
+        build_stage.get("package_roots"),
+        &contracts.core_build_package_roots,
+    ));
+    try std.testing.expectEqualStrings(
+        "/boot/initrd.img-" ++ fixture.fixture_kernel_release,
+        build_stage.get("initramfs").?.object.get("path").?.string,
+    );
+    // The generator is a build root, so it must not also be a guest root.
+    for (expected_roots) |root| {
+        for (contracts.core_build_package_roots) |build_root| {
+            try std.testing.expect(!std.mem.eql(u8, root, build_root));
+        }
     }
 }
 

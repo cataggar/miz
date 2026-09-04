@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const Io = std.Io;
 const contracts = release.contracts;
+const runtime_contract = release.runtime_contract;
 const runtime_contract_document = release.runtime_contract_document;
 const size_inventory = release.size_inventory;
 const support = release.support;
@@ -418,6 +419,158 @@ fn galleryDocument(allocator: Allocator, certificate: []const u8) ![]u8 {
     , .{encoded});
 }
 
+/// The kernel the fixture's core provenance selects. Issue #677 step 4 makes
+/// the roots a shape rather than a literal list, so the fixture has to produce
+/// a plausible selection instead of copying a constant.
+pub const fixture_kernel_release = "7.0.0-1010-azure";
+pub const fixture_kernel_version = "7.0.0-1010.10";
+pub const fixture_kernel_image = "linux-image-" ++ fixture_kernel_release;
+pub const fixture_kernel_modules = "linux-modules-" ++ fixture_kernel_release;
+
+/// The core guest roots in publication order: the selected kernel image, its
+/// module tree, then the contract's literal roots.
+pub fn coreDebzPackages(arena: Allocator) ![]const []const u8 {
+    const names = try arena.alloc(
+        []const u8,
+        contracts.core_package_root_count,
+    );
+    names[0] = fixture_kernel_image;
+    names[1] = fixture_kernel_modules;
+    for (contracts.core_guest_package_roots, 0..) |package, index| {
+        names[contracts.core_kernel_root_count + index] = package;
+    }
+    return names;
+}
+
+const DebzLockRecord = struct {
+    name: []const u8,
+    text_sha256: []const u8,
+    digest: []const u8,
+};
+
+/// Writes one exact-closure lock into the provenance tree and returns what a
+/// document has to bind it by.
+fn writeDebzLockFile(
+    tree: *const Tree,
+    arena: Allocator,
+    provenance: []const u8,
+    package: []const u8,
+    source_architecture: []const u8,
+    digest_character: u8,
+    empty_baseline: bool,
+) !DebzLockRecord {
+    const allocator = tree.allocator;
+    const digest = try repeatHex(arena, digest_character);
+    const name = try std.fmt.allocPrint(
+        arena,
+        "debz-exact-lock-{s}-{s}.json",
+        .{ package, source_architecture },
+    );
+    const package_records = if (empty_baseline)
+        try std.fmt.allocPrint(
+            allocator,
+            \\  {{"name": "{s}", "version": "1", "architecture": "{s}",
+            \\    "retention": "requested"}}
+        ,
+            .{ package, source_architecture },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            \\  {{"name": "base-files", "version": "1", "architecture": "{s}",
+            \\    "retention": "retained"}},
+            \\  {{"name": "{s}", "version": "1", "architecture": "{s}",
+            \\    "retention": "requested"}}
+        ,
+            .{ source_architecture, package, source_architecture },
+        );
+    defer allocator.free(package_records);
+    const lock_text = try std.fmt.allocPrint(allocator,
+        \\{{"schema": "https://debz.dev/schema/exact-closure-lock-v1",
+        \\"version": 1, "target_architecture": "{s}",
+        \\"request_sha256": "{s}", "policy_sha256": "{s}",
+        \\"repositories": [{{"fixture": true}}],
+        \\"packages": [
+        \\{s}],
+        \\"digest_sha256": "{s}"}}
+    , .{
+        source_architecture,
+        "1" ** 64,
+        "2" ** 64,
+        package_records,
+        digest,
+    });
+    defer allocator.free(lock_text);
+    const lock_path = try std.fs.path.join(allocator, &.{ provenance, name });
+    defer allocator.free(lock_path);
+    try Dir.cwd().writeFile(tree.io, .{ .sub_path = lock_path, .data = lock_text });
+    const text_sha256 = try arena.dupe(u8, &support.digest.hexBytes(lock_text));
+    return .{ .name = name, .text_sha256 = text_sha256, .digest = digest };
+}
+
+/// Writes one transaction result and returns the `transactions[]` entry that
+/// binds it together with its lock.
+fn writeDebzTransactionRecord(
+    tree: *const Tree,
+    arena: Allocator,
+    builder: Builder,
+    provenance: []const u8,
+    package: []const u8,
+    source_architecture: []const u8,
+    lock: DebzLockRecord,
+    transaction_character: u8,
+) !std.json.Value {
+    const allocator = tree.allocator;
+    const transaction_digest = try repeatHex(arena, transaction_character);
+    const transaction_name = try std.fmt.allocPrint(
+        arena,
+        "debz-transaction-provenance-{s}-{s}.json",
+        .{ package, source_architecture },
+    );
+    const transaction_text = try std.fmt.allocPrint(allocator,
+        \\{{"schema": "https://debz.dev/schema/transaction-result-v1",
+        \\"version": 1, "target_architecture": "{s}", "lock_sha256": "{s}",
+        \\"outcome": "succeeded",
+        \\"final_verification": {{"status": "exact_match"}},
+        \\"digest_sha256": "{s}"}}
+    , .{ source_architecture, lock.digest, transaction_digest });
+    defer allocator.free(transaction_text);
+    const transaction_path = try std.fs.path.join(
+        allocator,
+        &.{ provenance, transaction_name },
+    );
+    defer allocator.free(transaction_path);
+    try Dir.cwd().writeFile(tree.io, .{
+        .sub_path = transaction_path,
+        .data = transaction_text,
+    });
+
+    var exact_lock = builder.object();
+    try builder.putString(&exact_lock, "filename", lock.name);
+    try builder.putString(&exact_lock, "sha256", lock.text_sha256);
+    try builder.putString(&exact_lock, "digest_sha256", lock.digest);
+
+    var transaction_provenance = builder.object();
+    try builder.putString(&transaction_provenance, "filename", transaction_name);
+    try builder.putString(
+        &transaction_provenance,
+        "sha256",
+        &support.digest.hexBytes(transaction_text),
+    );
+    try builder.putString(&transaction_provenance, "digest_sha256", transaction_digest);
+    try builder.putString(&transaction_provenance, "lock_sha256", lock.digest);
+
+    var record = builder.object();
+    try builder.putString(&record, "package", package);
+    try builder.put(&record, "exact_lock", .{ .object = exact_lock });
+    try builder.put(
+        &record,
+        "transaction_provenance",
+        .{ .object = transaction_provenance },
+    );
+    return .{ .object = record };
+}
+
 /// Writes the complete internal provenance tree: the Canonical source
 /// bindings, the architecture-specific disk layout, the debz closure locks and
 /// transaction results, and the UKI signing record.
@@ -490,117 +643,33 @@ fn writeProvenance(
         .data = "detached signature",
     });
 
+    const debz_packages: []const []const u8 = switch (flavor) {
+        .full => &contracts.full_debz_packages,
+        .core => try coreDebzPackages(arena.allocator()),
+    };
     var transactions = builder.array();
-    for (contracts.debzPackages(flavor), 0..) |package, index| {
+    for (debz_packages, 0..) |package, index| {
         // `format(7 + index, "x")` in the Python fixture: the digits continue
         // into the hex letters rather than running off the end of ASCII.
-        const lock_digest = try repeatHex(
+        const lock = try writeDebzLockFile(
+            tree,
             arena.allocator(),
-            std.fmt.digitToChar(@intCast(7 + index), .lower),
-        );
-        const lock_name = try std.fmt.allocPrint(
-            arena.allocator(),
-            "debz-exact-lock-{s}-{s}.json",
-            .{ package, source_architecture },
-        );
-        const package_records = if (flavor == .core and index == 0)
-            try std.fmt.allocPrint(
-                allocator,
-                \\  {{"name": "{s}", "version": "1", "architecture": "{s}",
-                \\    "retention": "requested"}}
-            ,
-                .{ package, source_architecture },
-            )
-        else
-            try std.fmt.allocPrint(
-                allocator,
-                \\  {{"name": "base-files", "version": "1", "architecture": "{s}",
-                \\    "retention": "retained"}},
-                \\  {{"name": "{s}", "version": "1", "architecture": "{s}",
-                \\    "retention": "requested"}}
-            ,
-                .{ source_architecture, package, source_architecture },
-            );
-        defer allocator.free(package_records);
-        const lock_text = try std.fmt.allocPrint(allocator,
-            \\{{"schema": "https://debz.dev/schema/exact-closure-lock-v1",
-            \\"version": 1, "target_architecture": "{s}",
-            \\"request_sha256": "{s}", "policy_sha256": "{s}",
-            \\"repositories": [{{"fixture": true}}],
-            \\"packages": [
-            \\{s}],
-            \\"digest_sha256": "{s}"}}
-        , .{
+            provenance,
+            package,
             source_architecture,
-            "1" ** 64,
-            "2" ** 64,
-            package_records,
-            lock_digest,
-        });
-        defer allocator.free(lock_text);
-        const lock_path = try std.fs.path.join(allocator, &.{ provenance, lock_name });
-        defer allocator.free(lock_path);
-        try Dir.cwd().writeFile(io, .{ .sub_path = lock_path, .data = lock_text });
-
-        const transaction_digest = try repeatHex(
+            std.fmt.digitToChar(@intCast(7 + index), .lower),
+            flavor == .core and index == 0,
+        );
+        try transactions.append(try writeDebzTransactionRecord(
+            tree,
             arena.allocator(),
+            builder,
+            provenance,
+            package,
+            source_architecture,
+            lock,
             'a' + @as(u8, @intCast(index)),
-        );
-        const transaction_name = try std.fmt.allocPrint(
-            arena.allocator(),
-            "debz-transaction-provenance-{s}-{s}.json",
-            .{ package, source_architecture },
-        );
-        const transaction_text = try std.fmt.allocPrint(allocator,
-            \\{{"schema": "https://debz.dev/schema/transaction-result-v1",
-            \\"version": 1, "target_architecture": "{s}", "lock_sha256": "{s}",
-            \\"outcome": "succeeded",
-            \\"final_verification": {{"status": "exact_match"}},
-            \\"digest_sha256": "{s}"}}
-        , .{ source_architecture, lock_digest, transaction_digest });
-        defer allocator.free(transaction_text);
-        const transaction_path = try std.fs.path.join(
-            allocator,
-            &.{ provenance, transaction_name },
-        );
-        defer allocator.free(transaction_path);
-        try Dir.cwd().writeFile(io, .{
-            .sub_path = transaction_path,
-            .data = transaction_text,
-        });
-
-        var exact_lock = builder.object();
-        try builder.putString(&exact_lock, "filename", lock_name);
-        try builder.putString(
-            &exact_lock,
-            "sha256",
-            &support.digest.hexBytes(lock_text),
-        );
-        try builder.putString(&exact_lock, "digest_sha256", lock_digest);
-
-        var transaction_provenance = builder.object();
-        try builder.putString(&transaction_provenance, "filename", transaction_name);
-        try builder.putString(
-            &transaction_provenance,
-            "sha256",
-            &support.digest.hexBytes(transaction_text),
-        );
-        try builder.putString(
-            &transaction_provenance,
-            "digest_sha256",
-            transaction_digest,
-        );
-        try builder.putString(&transaction_provenance, "lock_sha256", lock_digest);
-
-        var record = builder.object();
-        try builder.putString(&record, "package", package);
-        try builder.put(&record, "exact_lock", .{ .object = exact_lock });
-        try builder.put(
-            &record,
-            "transaction_provenance",
-            .{ .object = transaction_provenance },
-        );
-        try transactions.append(.{ .object = record });
+        ));
     }
 
     var artifacts = builder.object();
@@ -644,8 +713,81 @@ fn writeProvenance(
         try builder.put(
             &debz,
             "package_roots",
-            try builder.strings(&contracts.core_debz_packages),
+            try builder.strings(debz_packages),
         );
+        // #677 step 4: the metapackage is resolved to select the kernel and is
+        // then not installed, so its lock is published without a transaction.
+        const selector_lock = try writeDebzLockFile(
+            tree,
+            arena.allocator(),
+            provenance,
+            runtime_contract.kernel_templates.selector,
+            source_architecture,
+            '3',
+            true,
+        );
+        var selector_binding = builder.object();
+        try builder.putString(&selector_binding, "filename", selector_lock.name);
+        try builder.putString(&selector_binding, "sha256", selector_lock.text_sha256);
+        try builder.putString(&selector_binding, "digest_sha256", selector_lock.digest);
+        var kernel_selection = builder.object();
+        try builder.putString(
+            &kernel_selection,
+            "selector",
+            runtime_contract.kernel_templates.selector,
+        );
+        try builder.putString(&kernel_selection, "kernel_release", fixture_kernel_release);
+        try builder.putString(&kernel_selection, "image_package", fixture_kernel_image);
+        try builder.putString(&kernel_selection, "modules_package", fixture_kernel_modules);
+        try builder.putString(&kernel_selection, "version", fixture_kernel_version);
+        try builder.put(&kernel_selection, "exact_lock", .{ .object = selector_binding });
+        try builder.put(&debz, "kernel_selection", .{ .object = kernel_selection });
+
+        var stage_transactions = builder.array();
+        for (contracts.core_build_package_roots, 0..) |package, index| {
+            const lock = try writeDebzLockFile(
+                tree,
+                arena.allocator(),
+                provenance,
+                package,
+                source_architecture,
+                '4' + @as(u8, @intCast(index)),
+                false,
+            );
+            try stage_transactions.append(try writeDebzTransactionRecord(
+                tree,
+                arena.allocator(),
+                builder,
+                provenance,
+                package,
+                source_architecture,
+                lock,
+                'f' - @as(u8, @intCast(index)),
+            ));
+        }
+        var initramfs = builder.object();
+        try builder.putString(
+            &initramfs,
+            "path",
+            try std.fmt.allocPrint(
+                arena.allocator(),
+                "/boot/initrd.img-{s}",
+                .{fixture_kernel_release},
+            ),
+        );
+        try builder.putString(&initramfs, "kernel_release", fixture_kernel_release);
+        try builder.putString(&initramfs, "sha256", "6" ** 64);
+        try builder.putInteger(&initramfs, "bytes", 32 * 1024 * 1024);
+        var build_stage = builder.object();
+        try builder.putString(&build_stage, "purpose", "initramfs-generation");
+        try builder.put(
+            &build_stage,
+            "package_roots",
+            try builder.strings(&contracts.core_build_package_roots),
+        );
+        try builder.put(&build_stage, "transactions", .{ .array = stage_transactions });
+        try builder.put(&build_stage, "initramfs", .{ .object = initramfs });
+        try builder.put(&debz, "build_stage", .{ .object = build_stage });
     }
 
     var snapshot = builder.object();

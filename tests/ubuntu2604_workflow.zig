@@ -655,6 +655,31 @@ test "the release workflow publishes and re-checks the core runtime contract" {
         workflow_path,
     );
     try source.expectContainsIn(build_job, "runtime-contract-verify", workflow_path);
+    // Issue #677 step 4: the same job re-checks that the build tooling stayed
+    // out of the guest, and that gate is core-only for the same reason the
+    // contract is.
+    try source.expectOrder(
+        build_job,
+        "- name: Verify the explicit runtime contract",
+        "- name: Verify the build/runtime separation",
+        workflow_path,
+    );
+    try source.expectContainsIn(build_job, "build-runtime-split-verify", workflow_path);
+    {
+        const split_start = try source.indexOfIn(
+            build_job,
+            "- name: Verify the build/runtime separation",
+            workflow_path,
+        );
+        const split_rest = build_job[split_start..];
+        const split_step = split_rest[0 .. std.mem.indexOfPos(
+            u8,
+            split_rest,
+            "- name: Verify".len,
+            "- name:",
+        ) orelse split_rest.len];
+        try source.expectContainsIn(split_step, "if [ \"$FLAVOR\" != core ]", workflow_path);
+    }
     // Only core carries the contract, so the step must be flavor-gated rather
     // than failing every full candidate on a document that does not exist.
     const start = try source.indexOfIn(
