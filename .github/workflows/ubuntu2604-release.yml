@@ -305,6 +305,24 @@ jobs:
           [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
           printf '%s\n' "$digest" > "$BUNDLE_DIR/internal-provenance/build-validated-digest"
 
+      - name: Verify the reproducible size inventory
+        run: |
+          set -euo pipefail
+          # Issue #677 step 1: the build measures where every byte of the image
+          # came from, and the measurement is re-validated here rather than
+          # trusted, so a malformed or incomplete inventory fails the build
+          # that produced it.
+          inventory="$BUNDLE_DIR/internal-provenance/ubuntu2604-size-inventory-$FLAVOR-$ARCHITECTURE.json"
+          test -f "$inventory"
+          test -x "$RELEASE_TOOL"
+          measured=$("$RELEASE_TOOL" size-inventory-verify \
+            --report "$inventory" \
+            --architecture "$ARCHITECTURE" \
+            --flavor "$FLAVOR" \
+            --require-phase root_build,image_build,publication)
+          printf 'Size inventory `%s`: `%s`\n' "$CANDIDATE_KEY" "$measured" \
+            >> "$GITHUB_STEP_SUMMARY"
+
       - name: Create and verify exact candidate bundle
         env:
           RUNNER_NAME_VALUE: ${{ runner.name }}

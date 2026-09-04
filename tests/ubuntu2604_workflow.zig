@@ -644,6 +644,45 @@ test "storage diagnostics are ordered and never mask the build failure" {
     try source.expectOmitsIn(diagnostic, "sudo -n df", workflow_path);
 }
 
+test "the build job re-validates the size inventory it measured" {
+    var workflow = try open();
+    defer workflow.deinit();
+    const build_job = try workflow.section("\n  build:\n", "\n  native_qemu:\n");
+    try source.expectOrder(
+        build_job,
+        "- name: Validate standalone zstd QCOW2 and exact flavor size",
+        "- name: Verify the reproducible size inventory",
+        workflow_path,
+    );
+    try source.expectOrder(
+        build_job,
+        "- name: Verify the reproducible size inventory",
+        "- name: Create and verify exact candidate bundle",
+        workflow_path,
+    );
+    const start = try source.indexOfIn(
+        build_job,
+        "- name: Verify the reproducible size inventory",
+        workflow_path,
+    );
+    const rest = build_job[start..];
+    const step = rest[0 .. std.mem.indexOfPos(
+        u8,
+        rest,
+        "- name: Verify".len,
+        "- name:",
+    ) orelse rest.len];
+    try source.expectContainsIn(step, "size-inventory-verify", workflow_path);
+    // The candidate has been built, finalized, and published by this point,
+    // so every phase up to publication must be present rather than optional.
+    try source.expectContainsIn(
+        step,
+        "--require-phase root_build,image_build,publication",
+        workflow_path,
+    );
+    try source.expectContainsIn(step, "set -euo pipefail", workflow_path);
+}
+
 test "the build job validates the QCOW2 and publishes its metadata natively" {
     var workflow = try open();
     defer workflow.deinit();

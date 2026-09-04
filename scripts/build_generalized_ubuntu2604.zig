@@ -12,6 +12,7 @@
 const std = @import("std");
 const miz = @import("miz");
 const image_phase_timing = @import("image_phase_timing.zig");
+const size_inventory = @import("ubuntu2604/size_inventory.zig");
 const uki_kernel_payload = @import("ubuntu2604_kernel_payload.zig");
 const uki_signing = @import("uki_signing.zig");
 
@@ -1658,13 +1659,104 @@ const DebzCustomization = struct {
     evidence: [max_debz_packages]DebzEvidence,
     evidence_count: usize,
     root_free_bytes: u64,
+    /// Reproducible size attribution for this build (issue #677 step 1). The
+    /// root-build phase is measured here, while the tree is still walkable;
+    /// the later phases are appended by the stages that can observe them.
+    inventory: size_inventory.Report,
+    /// The finished root filesystem's own block and inode accounting, carried
+    /// forward so the image-build phase can be recorded once the ESP and UKI
+    /// sizes are also known.
+    root_filesystem: size_inventory.FilesystemUsage,
 
     fn deinit(self: *DebzCustomization, allocator: Allocator) void {
         allocator.free(self.root_path);
         for (self.evidence[0..self.evidence_count]) |*item| item.deinit(allocator);
+        self.inventory.deinit();
         self.* = undefined;
     }
 };
+
+/// ext4 allocates in 4 KiB blocks in every image this builder produces; the
+/// free-space contract above is already expressed in those terms.
+const root_block_size: u64 = 4096;
+
+fn inventoryIdentity(
+    profile: *const Profile,
+    flavor: Flavor,
+) size_inventory.Identity {
+    return .{
+        .architecture = switch (profile.architecture) {
+            .x86_64 => .x86_64,
+            .aarch64 => .aarch64,
+        },
+        .flavor = switch (flavor) {
+            .full => .full,
+            .core => .core,
+            .baremetal => .baremetal,
+        },
+    };
+}
+
+/// Paths the fresh-root flavors write straight into the finished filesystem
+/// rather than into the host tree the image is imported from. They are
+/// measured from the image so the inventory covers the guest it actually
+/// ships, including `mizinit` and `azagent`.
+const injected_guest_paths = [_][]const u8{
+    "/usr/sbin/mizinit",
+    "/usr/sbin/azagent",
+    "/usr/sbin/init",
+    "/usr/sbin/poweroff",
+    "/usr/sbin/reboot",
+    "/usr/sbin/shutdown",
+    "/var/lib/miz/provenance",
+    "/var/lib/miz/ubuntu2604-core-provenance.json",
+};
+
+/// ext4 charges a whole block to any file with content, nothing to a symlink
+/// short enough to live inside its own inode, and one block to a directory.
+fn injectedAllocation(entry: miz.ext4_mountless.Entry) u64 {
+    const size = entry.size();
+    return switch (entry.kind) {
+        .symlink => if (size < 60) 0 else root_block_size,
+        .directory => root_block_size,
+        else => (std.math.divCeil(u64, size, root_block_size) catch 0) * root_block_size,
+    };
+}
+
+fn collectInjectedInventory(
+    allocator: Allocator,
+    filesystem: *const miz.ext4_mountless.FileSystem,
+    entries: *std.ArrayList(size_inventory.InjectedEntry),
+) !void {
+    for (&injected_guest_paths) |path| {
+        const entry = filesystem.stat(path) catch |err| switch (err) {
+            error.PathNotFound => continue,
+            else => return err,
+        };
+        try entries.append(allocator, .{
+            .path = path,
+            .logical_bytes = entry.size(),
+            .allocated_bytes = injectedAllocation(entry),
+        });
+    }
+    const listed = filesystem.list(allocator, "/var/lib/miz/provenance", 4096) catch |err|
+        switch (err) {
+            error.PathNotFound => return,
+            else => return err,
+        };
+    defer allocator.free(listed);
+    for (listed) |entry| {
+        const absolute = if (std.mem.startsWith(u8, entry.path, "/"))
+            try allocator.dupe(u8, entry.path)
+        else
+            try std.fmt.allocPrint(allocator, "/{s}", .{entry.path});
+        try entries.append(allocator, .{
+            .path = absolute,
+            .logical_bytes = entry.size(),
+            .allocated_bytes = injectedAllocation(entry),
+        });
+    }
+}
 
 const NativeQcow2Publisher = struct {
     context: ?*anyopaque = null,
@@ -3339,7 +3431,7 @@ fn customizeRootWithDebz(
         current,
         provenance_dir,
     );
-    allocator.free(release_name);
+    defer allocator.free(release_name);
     try native_root.filesystem.importHostTreeWithManifest(current, .{}, &host_manifest);
     if (flavor == .full) {
         try native_root.filesystem.applyCustomization(.{
@@ -3403,15 +3495,172 @@ fn customizeRootWithDebz(
     if (profile.architecture == .aarch64 and flavor == .full) {
         try retireArm64BootMounts(allocator, &native_root.filesystem);
     }
+    // The injected entries borrow paths from the filesystem view, so they are
+    // copied into an arena that outlives the walk and is released with it.
+    var injected_arena: std.heap.ArenaAllocator = .init(allocator);
+    defer injected_arena.deinit();
+    var injected: std.ArrayList(size_inventory.InjectedEntry) = .empty;
+    try collectInjectedInventory(
+        injected_arena.allocator(),
+        &native_root.filesystem,
+        &injected,
+    );
     const filesystem_info = try native_root.finish();
     const root_free_bytes = @as(u64, filesystem_info.free_block_count) * 4096;
     try validateRootHeadroom(flavor, root_free_bytes, filesystem_info.free_inode_count);
+
+    // Measured now, while the root is still a walkable host tree: once it is
+    // an image, per-package attribution would have to be reconstructed rather
+    // than observed.
+    var inventory = try size_inventory.Report.init(
+        allocator,
+        inventoryIdentity(profile, flavor),
+    );
+    errdefer inventory.deinit();
+    try recordRootBuildInventory(
+        allocator,
+        io,
+        &inventory,
+        .{
+            .root_path = current,
+            .flavor = inventoryIdentity(profile, flavor).flavor,
+            .kernel_release = release_name,
+            .injected = injected.items,
+        },
+    );
     initramfs_import.succeed();
     return .{
         .root_path = current,
         .evidence = evidence,
         .evidence_count = evidence_count,
         .root_free_bytes = root_free_bytes,
+        .inventory = inventory,
+        .root_filesystem = .{
+            .block_size = root_block_size,
+            .total_blocks = filesystem_info.block_count,
+            .free_blocks = filesystem_info.free_block_count,
+            .total_inodes = filesystem_info.inode_count,
+            .free_inodes = filesystem_info.free_inode_count,
+        },
+    };
+}
+
+/// Measures the finished root tree into `report`'s `root_build` phase.
+///
+/// The measurement runs against a scratch arena because the ownership index
+/// borrows dpkg's file lists wholesale; only the section itself is kept.
+fn recordRootBuildInventory(
+    allocator: Allocator,
+    io: Io,
+    report: *size_inventory.Report,
+    options: size_inventory.RootMeasurementOptions,
+) !void {
+    var scratch: std.heap.ArenaAllocator = .init(allocator);
+    defer scratch.deinit();
+    var diagnostic: size_inventory.Diagnostic = .{};
+    const section = size_inventory.measureRootBuild(
+        report.allocator(),
+        scratch.allocator(),
+        io,
+        options,
+        &diagnostic,
+    ) catch |err| return reportInventoryFailure(err, &diagnostic);
+    report.addPhase(.root_build, section, &diagnostic) catch |err|
+        return reportInventoryFailure(err, &diagnostic);
+}
+
+/// The size inventory speaks the release tooling's one-line failure shape, so
+/// the message is printed before the build fails rather than lost behind a
+/// bare error name.
+fn reportInventoryFailure(
+    err: size_inventory.Error,
+    diagnostic: *const size_inventory.Diagnostic,
+) anyerror {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Failed => {
+            std.debug.print("size inventory: {s}\n", .{diagnostic.message()});
+            return error.SizeInventoryFailed;
+        },
+    };
+}
+
+/// Records the phases that only exist once the image is finalized: the ext4
+/// and ESP accounting of the disk as it will boot, and the published
+/// artifact's compressed length and host allocation.
+fn recordFinalizedInventory(
+    report: *size_inventory.Report,
+    root_filesystem: size_inventory.FilesystemUsage,
+    virtual_size: u64,
+    esp: EspUsage,
+    io: Io,
+    output: []const u8,
+) !void {
+    var diagnostic: size_inventory.Diagnostic = .{};
+    const image = size_inventory.imageBuildValue(report.allocator(), .{
+        .virtual_size = virtual_size,
+        .root = root_filesystem,
+        .uki_bytes = esp.uki_bytes,
+        .esp_partition_bytes = esp.partition_bytes,
+        .esp_total_bytes = esp.total_bytes,
+        .esp_free_bytes = esp.free_bytes,
+    }, &diagnostic) catch |err| return reportInventoryFailure(err, &diagnostic);
+    report.addPhase(.image_build, image, &diagnostic) catch |err|
+        return reportInventoryFailure(err, &diagnostic);
+
+    const stat = try Dir.cwd().statFile(io, output, .{ .follow_symlinks = false });
+    const usage = miz.free_space.fileUsage(output);
+    const publication = size_inventory.publicationValue(report.allocator(), .{
+        .artifact_name = std.fs.path.basename(output),
+        .compressed_artifact_bytes = stat.size,
+        // A host that cannot report allocation reports the length instead:
+        // the artifact is a compressed QCOW2 with no holes in it, so the two
+        // differ only by the filesystem's own rounding.
+        .qcow2_allocated_bytes = if (usage) |value| value.allocated_bytes else stat.size,
+    }) catch |err| return reportInventoryFailure(err, &diagnostic);
+    report.addPhase(.publication, publication, &diagnostic) catch |err|
+        return reportInventoryFailure(err, &diagnostic);
+}
+
+/// A `{"filename": ..., "sha256": ...}` provenance binding.
+const InventoryBinding = struct {
+    filename: []u8,
+    sha256: [64]u8,
+};
+
+/// Stand-in binding for the provenance tests, which are about the document the
+/// writers emit rather than about measuring a root.
+const test_inventory_binding: InventoryBinding = .{
+    .filename = @constCast("ubuntu2604-size-inventory-core-x86_64.json"),
+    .sha256 = @splat('6'),
+};
+
+/// Writes the size inventory beside the other provenance documents and
+/// returns the binding the build provenance carries, so the measurement is
+/// tamper-evident rather than an unattached file in the bundle.
+fn writeSizeInventory(
+    allocator: Allocator,
+    io: Io,
+    provenance_dir: []const u8,
+    report: *size_inventory.Report,
+    profile: *const Profile,
+    flavor: Flavor,
+) !InventoryBinding {
+    const filename = try std.fmt.allocPrint(
+        allocator,
+        "ubuntu2604-size-inventory-{s}-{s}.json",
+        .{ @tagName(flavor), @tagName(profile.architecture) },
+    );
+    errdefer allocator.free(filename);
+    const path = try std.fs.path.join(allocator, &.{ provenance_dir, filename });
+    defer allocator.free(path);
+    var diagnostic: size_inventory.Diagnostic = .{};
+    report.write(allocator, io, path, &diagnostic) catch |err|
+        return reportInventoryFailure(err, &diagnostic);
+    const metadata = try artifact_pipeline.hashFile(io, path);
+    return .{
+        .filename = filename,
+        .sha256 = artifact_pipeline.formatSha256(metadata.sha256),
     };
 }
 
@@ -3527,13 +3776,16 @@ fn writeProvenance(
     profile: *const Profile,
     source_digest: [64]u8,
     evidence: []const DebzEvidence,
+    inventory: InventoryBinding,
 ) !void {
     if (evidence.len != full_debz_packages.len) return error.InvalidDebzEvidence;
     const document = try std.fmt.allocPrint(allocator,
-        \\{{"schema":1,"type":"miz-ubuntu2604-build-provenance","architecture":"{s}","release":"26.04","snapshot":{{"id":"release-{s}","base_url":"{s}/"}},"canonical_key_fingerprint":"{s}","sha256sums_signature_verified":true,"artifacts":{{"sha256sums":{{"filename":"SHA256SUMS","sha256":"{s}"}},"sha256sums_signature":{{"filename":"SHA256SUMS.gpg","sha256":"{s}"}},"source_image":{{"filename":"{s}","sha256":"{s}"}},"image_manifest":{{"filename":"{s}","sha256":"{s}"}}}},"disk_layout":{s},"debz":{{"api_commit":"{s}","baseline":{{"source":"canonical-image-dpkg-status","enforcement":"exact-final-closure"}},"transactions":[{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}},{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}}]}}}}
+        \\{{"schema":1,"type":"miz-ubuntu2604-build-provenance","architecture":"{s}","release":"26.04","size_inventory":{{"filename":"{s}","sha256":"{s}"}},"snapshot":{{"id":"release-{s}","base_url":"{s}/"}},"canonical_key_fingerprint":"{s}","sha256sums_signature_verified":true,"artifacts":{{"sha256sums":{{"filename":"SHA256SUMS","sha256":"{s}"}},"sha256sums_signature":{{"filename":"SHA256SUMS.gpg","sha256":"{s}"}},"source_image":{{"filename":"{s}","sha256":"{s}"}},"image_manifest":{{"filename":"{s}","sha256":"{s}"}}}},"disk_layout":{s},"debz":{{"api_commit":"{s}","baseline":{{"source":"canonical-image-dpkg-status","enforcement":"exact-final-closure"}},"transactions":[{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}},{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}}]}}}}
         \\
     , .{
         @tagName(profile.architecture),
+        inventory.filename,
+        inventory.sha256,
         release,
         release_base,
         canonical_fingerprint_lower,
@@ -3582,6 +3834,7 @@ fn writeFreshRootProvenance(
     evidence: []const DebzEvidence,
     virtual_size: u64,
     root_free_bytes: u64,
+    inventory: InventoryBinding,
 ) !void {
     const package_roots = flavor.debzPackages();
     // Count alone would let a transaction for the wrong package pass, so the
@@ -3593,10 +3846,12 @@ fn writeFreshRootProvenance(
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.print(
-        "{{\"schema\":1,\"type\":\"miz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"{s}\",\"release\":\"26.04\",\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"disk_layout\":{s},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[",
+        "{{\"schema\":1,\"type\":\"miz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"{s}\",\"release\":\"26.04\",\"size_inventory\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}},\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"disk_layout\":{s},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[",
         .{
             @tagName(profile.architecture),
             @tagName(flavor),
+            inventory.filename,
+            inventory.sha256,
             virtual_size,
             core_minimum_root_free_bytes,
             root_free_bytes,
@@ -4374,7 +4629,7 @@ fn insertSignedUki(
     signed_path: []const u8,
     profile: *const Profile,
     expected_virtual_size: u64,
-) !void {
+) !EspUsage {
     var image = try miz.Image.openPath(io, image_path);
     defer image.close(io);
     const esp = if (profile.architecture == .aarch64)
@@ -4432,7 +4687,24 @@ fn insertSignedUki(
             signed.len,
         );
     }
+    const cluster_size: u64 =
+        @as(u64, filesystem.info.bytes_per_sector) * filesystem.info.sectors_per_cluster;
+    return .{
+        .partition_bytes = (esp.last_lba - esp.first_lba + 1) * miz.gpt.sector_size,
+        .total_bytes = @as(u64, filesystem.info.data_cluster_count) * cluster_size,
+        .free_bytes = @as(u64, filesystem.free_cluster_count) * cluster_size,
+        .uki_bytes = signed.len,
+    };
 }
+
+/// What the ESP costs and what is left of it, read back from the volume the
+/// signed UKI was just written into rather than assumed from the UKI's size.
+const EspUsage = struct {
+    partition_bytes: u64,
+    total_bytes: u64,
+    free_bytes: u64,
+    uki_bytes: u64,
+};
 
 fn validateFinalNativeImage(
     allocator: Allocator,
@@ -4769,7 +5041,7 @@ fn buildImage(
     var qcow2_finalization = timing.begin(.qcow2_finalization, null);
     defer qcow2_finalization.end();
     errdefer |err| qcow2_finalization.fail(@errorName(err));
-    try insertSignedUki(
+    const esp_usage = try insertSignedUki(
         allocator,
         io,
         mutable,
@@ -4819,6 +5091,28 @@ fn buildImage(
     var provenance_output = timing.begin(.provenance_output, null);
     defer provenance_output.end();
     errdefer |err| provenance_output.fail(@errorName(err));
+
+    // The image and artifact phases are recorded here, where the finished
+    // geometry and the published bytes both exist. Recording them earlier
+    // would mean recording a guess.
+    try recordFinalizedInventory(
+        &debz_customization.inventory,
+        debz_customization.root_filesystem,
+        args.size,
+        esp_usage,
+        io,
+        output,
+    );
+    const inventory_binding = try writeSizeInventory(
+        allocator,
+        io,
+        provenance_dir,
+        &debz_customization.inventory,
+        profile,
+        args.flavor,
+    );
+    defer allocator.free(inventory_binding.filename);
+
     try writeSigningProvenance(
         allocator,
         io,
@@ -4845,6 +5139,7 @@ fn buildImage(
             debz_customization.evidence[0..debz_customization.evidence_count],
             args.size,
             debz_customization.root_free_bytes,
+            inventory_binding,
         );
     } else {
         try writeProvenance(
@@ -4854,6 +5149,7 @@ fn buildImage(
             profile,
             artifact_pipeline.formatSha256(source_metadata.sha256),
             debz_customization.evidence[0..debz_customization.evidence_count],
+            inventory_binding,
         );
     }
     provenance_output.succeed();
@@ -7397,14 +7693,27 @@ test "provenance binds signed source metadata and validated debz evidence" {
         profileFor(.x86_64),
         @splat('5'),
         &evidence,
+        test_inventory_binding,
     );
     const document = try Dir.cwd().readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(64 * 1024));
     defer std.testing.allocator.free(document);
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, document, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 10), parsed.value.object.count());
+    try std.testing.expectEqual(@as(usize, 11), parsed.value.object.count());
     try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("schema").?.integer);
     try std.testing.expectEqualStrings("miz-ubuntu2604-build-provenance", parsed.value.object.get("type").?.string);
+    // The size inventory is bound by digest, so the measurement travels with
+    // the candidate instead of alongside it.
+    const bound_inventory = parsed.value.object.get("size_inventory").?.object;
+    try std.testing.expectEqualStrings(
+        test_inventory_binding.filename,
+        bound_inventory.get("filename").?.string,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &test_inventory_binding.sha256,
+        bound_inventory.get("sha256").?.string,
+    );
     try std.testing.expectEqualStrings(
         profileFor(.x86_64).manifest_sha256,
         parsed.value.object.get("artifacts").?.object.get("image_manifest").?.object.get("sha256").?.string,
@@ -7467,6 +7776,7 @@ test "fresh-root provenance binds flavor closure size and free-space evidence" {
             evidence[0..package_roots.len],
             flavor.defaultSize(),
             core_minimum_root_free_bytes + 4096,
+            test_inventory_binding,
         );
         const document = try Dir.cwd().readFileAlloc(
             std.testing.io,
@@ -7548,6 +7858,7 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
         &evidence,
         baremetal_virtual_size,
         core_minimum_root_free_bytes + 4096,
+        test_inventory_binding,
     ));
     // Right count, wrong package: the last transaction names something core
     // never installs, which a count-only check would have accepted.
@@ -7562,5 +7873,6 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
         &evidence,
         core_virtual_size,
         core_minimum_root_free_bytes + 4096,
+        test_inventory_binding,
     ));
 }

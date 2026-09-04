@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const Io = std.Io;
 const contracts = release.contracts;
+const size_inventory = release.size_inventory;
 const support = release.support;
 const miz = @import("miz");
 
@@ -657,6 +658,11 @@ fn writeProvenance(
     var document = builder.object();
     try builder.putInteger(&document, "schema", 1);
     try builder.putString(&document, "type", "miz-ubuntu2604-build-provenance");
+    try builder.put(
+        &document,
+        "size_inventory",
+        try writeSizeInventory(tree, builder, key, provenance),
+    );
     try builder.putString(&document, "architecture", entry.architecture);
     try builder.putString(&document, "release", "26.04");
     try builder.put(&document, "snapshot", .{ .object = snapshot });
@@ -695,6 +701,113 @@ fn writeProvenance(
     );
 
     try writeSigning(tree, key, provenance, options);
+}
+
+/// Writes a real size-inventory document for `key` and returns its binding.
+///
+/// The document is measured from a miniature root rather than hand-written, so
+/// the fixture exercises the same measurement the builder runs and cannot
+/// drift away from the schema the release tool validates.
+fn writeSizeInventory(
+    tree: *const Tree,
+    builder: Builder,
+    key: []const u8,
+    provenance: []const u8,
+) !std.json.Value {
+    const allocator = tree.allocator;
+    const io = tree.io;
+    const entry = contracts.lookup(key).?;
+    const flavor = contracts.parseFlavor(entry.flavor).?;
+
+    const measured_root = try tree.path("size-inventory/{s}", .{key});
+    defer allocator.free(measured_root);
+    const files = [_]struct { path: []const u8, contents: []const u8 }{
+        .{
+            .path = size_inventory.package_lock_path,
+            .contents = "alpha\t1.0-1\tamd64\n",
+        },
+        .{ .path = "/var/lib/dpkg/info/alpha.list", .contents = "/usr/bin/alpha\n" },
+        .{ .path = "/usr/bin/alpha", .contents = "owned payload" },
+        .{ .path = "/etc/ld.so.cache", .contents = "generated cache" },
+        .{ .path = "/boot/vmlinuz-6.20.0-1001-azure", .contents = "kernel" },
+    };
+    for (files) |file| {
+        const target = try std.fs.path.join(
+            allocator,
+            &.{ measured_root, file.path[1..] },
+        );
+        defer allocator.free(target);
+        if (std.fs.path.dirname(target)) |parent| {
+            try Dir.cwd().createDirPath(io, parent);
+        }
+        try Dir.cwd().writeFile(io, .{ .sub_path = target, .data = file.contents });
+    }
+
+    var diagnostic: size_inventory.Diagnostic = .{};
+    var report = try size_inventory.Report.init(allocator, .{
+        .architecture = std.meta.stringToEnum(
+            size_inventory.Architecture,
+            entry.architecture,
+        ).?,
+        .flavor = std.meta.stringToEnum(size_inventory.Flavor, entry.flavor).?,
+    });
+    defer report.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(allocator);
+    defer scratch.deinit();
+    const absolute_root = try Dir.cwd().realPathFileAlloc(io, measured_root, allocator);
+    defer allocator.free(absolute_root);
+    const section = try size_inventory.measureRootBuild(
+        report.allocator(),
+        scratch.allocator(),
+        io,
+        .{
+            .root_path = absolute_root,
+            .flavor = std.meta.stringToEnum(size_inventory.Flavor, entry.flavor).?,
+            .kernel_release = "6.20.0-1001-azure",
+        },
+        &diagnostic,
+    );
+    try report.addPhase(.root_build, section, &diagnostic);
+    try report.addPhase(.image_build, try size_inventory.imageBuildValue(
+        report.allocator(),
+        .{
+            .virtual_size = @intCast(virtual_size),
+            .root = .{
+                .block_size = 4096,
+                .total_blocks = 400,
+                .free_blocks = 120,
+                .total_inodes = 128,
+                .free_inodes = 64,
+            },
+            .uki_bytes = 32 * 1024,
+            .esp_partition_bytes = 256 * 1024,
+            .esp_total_bytes = 200 * 1024,
+            .esp_free_bytes = 100 * 1024,
+        },
+        &diagnostic,
+    ), &diagnostic);
+    try report.addPhase(.publication, try size_inventory.publicationValue(
+        report.allocator(),
+        .{
+            .artifact_name = entry.asset_name,
+            .compressed_artifact_bytes = @intCast(virtual_size),
+            .qcow2_allocated_bytes = @intCast(virtual_size),
+        },
+    ), &diagnostic);
+
+    const filename = try std.fmt.allocPrint(
+        allocator,
+        "ubuntu2604-size-inventory-{s}-{s}.json",
+        .{ @tagName(flavor), entry.architecture },
+    );
+    defer allocator.free(filename);
+    const path = try std.fs.path.join(allocator, &.{ provenance, filename });
+    defer allocator.free(path);
+    const text = try report.toJsonAlloc(allocator);
+    defer allocator.free(text);
+    try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text });
+
+    return fileBinding(builder, filename, &support.digest.hexBytes(text), null);
 }
 
 fn repeatHex(allocator: Allocator, character: u8) ![]u8 {

@@ -172,6 +172,60 @@ architecture with no foreign amd64/arm64 packages. Native inspection records
 the selected kernel, initramfs, modules directory, and exact lock digest in
 `internal-provenance/ubuntu2604-boot-input-evidence.json`.
 
+## Reproducible size attribution
+
+Every build measures where its bytes came from and binds the measurement into
+its own provenance as
+`internal-provenance/ubuntu2604-size-inventory-<flavor>-<architecture>.json`,
+digest-bound from `ubuntu2604-build-provenance.json`. The document is the
+input for reviewing a closure change: it is a measurement, not a budget, and
+no size gate is derived from it yet.
+
+The document is *phase aware* because the facts arrive at different stages,
+and `phases_present` names exactly the phases a document carries. A phase that
+has not happened is absent rather than zero.
+
+| phase | recorded by | contents |
+| --- | --- | --- |
+| `root_build` | the builder, while the root is still a host tree | installed and allocated bytes per package, package count and exact closure digest, shared and unmatched payload, the explicit unowned-file allowlist with the remainder named, top-level root usage, and kernel, initramfs, module-tree, and firmware bytes |
+| `image_build` | the builder, once the image is finalized | ext4 used and free blocks and inodes before first boot, the signed UKI's size, and ESP occupancy |
+| `publication` | the builder, once the artifact exists | compressed QCOW2 length and its host allocation |
+| `first_boot` | a later stage that boots the image | the same ext4 accounting after first boot, which is what makes measured growth possible |
+
+Ownership comes from dpkg's own file lists. A path claimed by more than one
+package is `shared` rather than charged to whichever package was indexed
+first, and a file list naming a package the exact closure does not contain is
+reported under `unmatched` rather than hidden. The fresh-root flavors write
+`mizinit`, `azagent`, their init symlinks, and the embedded provenance
+directly into the filesystem, so those are measured from the image and
+attributed by the same rules as everything else.
+
+Unowned files are split into an explicit allowlist -- each rule carrying the
+reason it is allowed -- and a named remainder under `unowned.unexpected`. The
+remainder is what later steps of issue #677 drive to zero.
+
+Aggregates must equal their parts. `size-inventory-verify` refuses a document
+whose totals do not add up, whose sections and `phases_present` disagree, or
+which is missing a phase the caller's stage is entitled to expect:
+
+```console
+$ ubuntu2604_release size-inventory-verify \
+    --report internal-provenance/ubuntu2604-size-inventory-core-x86_64.json \
+    --architecture x86_64 --flavor core \
+    --require-phase root_build,image_build,publication
+```
+
+`size-inventory-compare` reports what moved between two measured images --
+closure identity, package count, installed and allocated bytes, per-package
+additions, removals, and deltas, and the later phases both documents carry --
+and refuses to compare documents that do not describe the same image:
+
+```console
+$ ubuntu2604_release size-inventory-compare \
+    --baseline before.json --candidate after.json \
+    --output size-comparison.json --step-summary "$GITHUB_STEP_SUMMARY"
+```
+
 ## Guest and disk contract
 
 Each output is a standalone, zstd-compressed QCOW2. Full has an exact default
