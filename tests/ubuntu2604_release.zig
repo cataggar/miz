@@ -2705,6 +2705,144 @@ test "Ubuntu provenance rejects disk layout changes" {
     }
 }
 
+/// The size-inventory document the fixture bound into a candidate's
+/// provenance.
+fn sizeInventoryPath(subject: *const Tree, key: []const u8) ![]u8 {
+    const entry = contracts.lookup(key).?;
+    return subject.path(
+        "candidates/{s}/internal-provenance/ubuntu2604-size-inventory-{s}-{s}.json",
+        .{ key, entry.flavor, entry.architecture },
+    );
+}
+
+test "Ubuntu provenance binds a complete size inventory" {
+    var subject = try tree();
+    defer subject.deinit();
+    try fixture.makeBundle(&subject, "x86_64-core", .{});
+    try validateUbuntu(&subject, "x86_64-core", "x86_64", .core, fixture.virtual_size);
+
+    const inventory = try sizeInventoryPath(&subject, "x86_64-core");
+    defer allocator.free(inventory);
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    var diagnostic: support.Diagnostic = .{};
+    try release.workflow.sizeInventoryVerify(
+        allocator,
+        io,
+        &writer,
+        inventory,
+        "x86_64",
+        "core",
+        "root_build,image_build,publication",
+        &diagnostic,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "packages=1") != null);
+
+    // A phase the candidate has not reached is refused rather than assumed.
+    try std.testing.expectError(error.Failed, release.workflow.sizeInventoryVerify(
+        allocator,
+        io,
+        &writer,
+        inventory,
+        "x86_64",
+        "core",
+        "first_boot",
+        &diagnostic,
+    ));
+
+    // The inventory is bound by digest, so editing it invalidates the whole
+    // provenance tree rather than only the file.
+    try fixture.patch(
+        allocator,
+        io,
+        inventory,
+        &.{ .{ .key = "root_build" }, .{ .key = "installed_bytes" } },
+        .{ .set = .{ .integer = 1 } },
+    );
+    try expectUbuntuRejected(
+        &subject,
+        "x86_64-core",
+        "x86_64",
+        .core,
+        fixture.virtual_size,
+    );
+}
+
+test "size inventories are compared before a closure changes" {
+    var subject = try tree();
+    defer subject.deinit();
+    try fixture.makeBundle(&subject, "x86_64-core", .{});
+    try fixture.makeBundle(&subject, "aarch64-core", .{});
+
+    const baseline = try sizeInventoryPath(&subject, "x86_64-core");
+    defer allocator.free(baseline);
+    const other_architecture = try sizeInventoryPath(&subject, "aarch64-core");
+    defer allocator.free(other_architecture);
+    const candidate = try subject.path("candidate-inventory.json", .{});
+    defer allocator.free(candidate);
+    const original = try Dir.cwd().readFileAlloc(
+        io,
+        baseline,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(original);
+    try Dir.cwd().writeFile(io, .{ .sub_path = candidate, .data = original });
+    try fixture.patch(
+        allocator,
+        io,
+        candidate,
+        &.{ .{ .key = "publication" }, .{ .key = "compressed_artifact_bytes" } },
+        .{ .set = .{ .integer = fixture.virtual_size - 4096 } },
+    );
+
+    const comparison = try subject.path("size-comparison.json", .{});
+    defer allocator.free(comparison);
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    var diagnostic: support.Diagnostic = .{};
+    try release.workflow.sizeInventoryCompare(
+        allocator,
+        io,
+        &writer,
+        baseline,
+        candidate,
+        comparison,
+        null,
+        &diagnostic,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, writer.buffered(), "closure_changed=false") != null,
+    );
+    const document = try Dir.cwd().readFileAlloc(
+        io,
+        comparison,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(document);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, document, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(
+        @as(i64, -4096),
+        parsed.value.object.get("publication").?
+            .object.get("compressed_artifact_bytes_delta").?.integer,
+    );
+
+    // Two architectures do not describe the same image, so their inventories
+    // are not comparable.
+    try std.testing.expectError(error.Failed, release.workflow.sizeInventoryCompare(
+        allocator,
+        io,
+        &writer,
+        baseline,
+        other_architecture,
+        null,
+        null,
+        &diagnostic,
+    ));
+}
+
 test "Ubuntu provenance binds the source image and manifest checksums" {
     var subject = try tree();
     defer subject.deinit();

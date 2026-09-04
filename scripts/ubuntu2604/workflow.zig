@@ -24,6 +24,7 @@ const contracts = @import("contracts.zig");
 const documents = @import("documents.zig");
 const download = @import("download.zig");
 const provenance = @import("provenance.zig");
+const size_inventory = @import("size_inventory.zig");
 const support = @import("support.zig");
 
 const Builder = support.Builder;
@@ -135,6 +136,44 @@ pub fn dispatch(
             try options.require("--info"),
             try options.requireInteger("--virtual-size"),
             options.get("--virtual-size-label"),
+            diagnostic,
+        );
+    }
+    if (std.mem.eql(u8, command, "size-inventory-verify")) {
+        var options = try parse(allocator, argv, &.{
+            "--report",
+            "--architecture",
+            "--flavor",
+            "--require-phase",
+        });
+        defer options.deinit();
+        return sizeInventoryVerify(
+            allocator,
+            io,
+            out,
+            try options.require("--report"),
+            options.get("--architecture"),
+            options.get("--flavor"),
+            options.get("--require-phase"),
+            diagnostic,
+        );
+    }
+    if (std.mem.eql(u8, command, "size-inventory-compare")) {
+        var options = try parse(allocator, argv, &.{
+            "--baseline",
+            "--candidate",
+            "--output",
+            "--step-summary",
+        });
+        defer options.deinit();
+        return sizeInventoryCompare(
+            allocator,
+            io,
+            out,
+            try options.require("--baseline"),
+            try options.require("--candidate"),
+            options.get("--output"),
+            options.get("--step-summary"),
             diagnostic,
         );
     }
@@ -748,6 +787,162 @@ pub fn verifyImageInfo(
         "candidate does not use zstd cluster compression",
         .{},
     );
+}
+
+/// Translates a size-inventory rejection into this module's failure shape.
+/// The measurement module already produced the operator-facing sentence.
+fn inventoryFailure(err: size_inventory.Error) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Failed => error.Failed,
+    };
+}
+
+/// Parses a comma-separated `--require-phase` list.
+fn requiredPhases(
+    allocator: Allocator,
+    text: ?[]const u8,
+    diagnostic: *Diagnostic,
+) Error![]size_inventory.Phase {
+    const list = text orelse return allocator.dupe(
+        size_inventory.Phase,
+        &.{.root_build},
+    );
+    var phases: std.ArrayList(size_inventory.Phase) = .empty;
+    errdefer phases.deinit(allocator);
+    var names = std.mem.splitScalar(u8, list, ',');
+    while (names.next()) |name| {
+        const trimmed = std.mem.trim(u8, name, " ");
+        if (trimmed.len == 0) continue;
+        const phase = size_inventory.Phase.parse(trimmed) orelse return fail(
+            diagnostic,
+            "unknown size inventory phase {s}",
+            .{trimmed},
+        );
+        try phases.append(allocator, phase);
+    }
+    if (phases.items.len == 0) return fail(
+        diagnostic,
+        "--require-phase named no phases",
+        .{},
+    );
+    return phases.toOwnedSlice(allocator);
+}
+
+/// `size-inventory-verify`: re-checks a size-inventory document and prints the
+/// totals a reviewer needs before a closure change is proposed.
+pub fn sizeInventoryVerify(
+    allocator: Allocator,
+    io: Io,
+    out: *Writer,
+    report_path: []const u8,
+    architecture: ?[]const u8,
+    flavor: ?[]const u8,
+    require_phase: ?[]const u8,
+    diagnostic: *Diagnostic,
+) OutError!void {
+    const phases = try requiredPhases(allocator, require_phase, diagnostic);
+    defer allocator.free(phases);
+    var parsed = size_inventory.readValidated(allocator, io, report_path, .{
+        .architecture = architecture,
+        .flavor = flavor,
+        .required_phases = phases,
+    }, diagnostic) catch |err| return inventoryFailure(err);
+    defer parsed.deinit();
+    const summary = size_inventory.validateDocument(
+        allocator,
+        parsed.value,
+        .{ .architecture = architecture, .flavor = flavor, .required_phases = phases },
+        diagnostic,
+    ) catch |err| return inventoryFailure(err);
+    try out.print(
+        "{s} {s} packages={d} installed_bytes={d} allocated_bytes={d} " ++
+            "unexpected_unowned={d} closure={s}\n",
+        .{
+            summary.architecture,
+            summary.flavor,
+            summary.package_count,
+            summary.installed_bytes,
+            summary.allocated_bytes,
+            summary.unexpected_unowned_count,
+            summary.closure_sha256,
+        },
+    );
+}
+
+/// `size-inventory-compare`: the benchmark comparison #677 asks for before the
+/// closure is changed. It reports what moved between two measured images and
+/// refuses to compare documents that do not describe the same image.
+pub fn sizeInventoryCompare(
+    allocator: Allocator,
+    io: Io,
+    out: *Writer,
+    baseline_path: []const u8,
+    candidate_path: []const u8,
+    output_path: ?[]const u8,
+    step_summary: ?[]const u8,
+    diagnostic: *Diagnostic,
+) OutError!void {
+    var baseline = size_inventory.readValidated(
+        allocator,
+        io,
+        baseline_path,
+        .{},
+        diagnostic,
+    ) catch |err| return inventoryFailure(err);
+    defer baseline.deinit();
+    var candidate = size_inventory.readValidated(
+        allocator,
+        io,
+        candidate_path,
+        .{},
+        diagnostic,
+    ) catch |err| return inventoryFailure(err);
+    defer candidate.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    var scratch: std.heap.ArenaAllocator = .init(allocator);
+    defer scratch.deinit();
+    const comparison = size_inventory.compareAlloc(
+        arena.allocator(),
+        scratch.allocator(),
+        baseline.value,
+        candidate.value,
+        diagnostic,
+    ) catch |err| return inventoryFailure(err);
+
+    if (output_path) |path| {
+        try support.writeDocument(allocator, io, path, comparison, diagnostic);
+    }
+    const root = support.objectOf(comparison.object.get("root_build")).?;
+    const packages = support.integerOf(root.get("package_count_delta")).?;
+    const installed = support.integerOf(root.get("installed_bytes_delta")).?;
+    const allocated = support.integerOf(root.get("allocated_bytes_delta")).?;
+    const closure_changed = support.isTrue(root.get("closure_changed"));
+    try out.print(
+        "packages={d} installed_bytes={d} allocated_bytes={d} closure_changed={}\n",
+        .{ packages, installed, allocated, closure_changed },
+    );
+    if (step_summary) |path| {
+        var lines: std.ArrayList(u8) = .empty;
+        defer lines.deinit(allocator);
+        try lines.print(
+            allocator,
+            "### Ubuntu 26.04 size inventory\n\n" ++
+                "| measure | delta |\n| --- | --- |\n" ++
+                "| packages | {d} |\n" ++
+                "| installed bytes | {d} |\n" ++
+                "| allocated bytes | {d} |\n" ++
+                "| closure changed | {} |\n",
+            .{ packages, installed, allocated, closure_changed },
+        );
+        appendFile(io, path, lines.items) catch |err| return fail(
+            diagnostic,
+            "cannot write {s}: {s}",
+            .{ path, @errorName(err) },
+        );
+    }
 }
 
 /// Exports the candidate's signing bindings: writes the canonical DER

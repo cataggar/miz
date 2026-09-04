@@ -1272,6 +1272,32 @@ pub fn build(b: *std.Build) void {
         b.addRunArtifact(ubuntu2604_release_behavior_tests);
     ubuntu2604_release_test_step.dependOn(&run_ubuntu2604_release_behavior.step);
 
+    // ---- tests/ubuntu2604_size_inventory.zig: behavioral coverage of the
+    // reproducible size attribution the builder records and the release tool
+    // validates (issue #677 step 1). It walks generated root trees, so it owns
+    // its own step rather than riding on the bundle fixtures. ----
+    const ubuntu2604_size_inventory_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/ubuntu2604_size_inventory.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{
+                    .name = "ubuntu2604_release",
+                    .module = ubuntu2604_release_mod,
+                },
+            },
+        }),
+    });
+    const run_ubuntu2604_size_inventory =
+        b.addRunArtifact(ubuntu2604_size_inventory_tests);
+    const ubuntu2604_size_inventory_step = b.step(
+        "test-ubuntu2604-size-inventory",
+        "Run the Ubuntu 26.04 size-inventory measurement tests",
+    );
+    ubuntu2604_size_inventory_step.dependOn(&run_ubuntu2604_size_inventory.step);
+    ubuntu2604_release_test_step.dependOn(&run_ubuntu2604_size_inventory.step);
+
     // ---- tests/ubuntu2604_workflow.zig, tests/ubuntu2604_core_workflow.zig,
     // tests/ubuntu2604_azure_acceptance.zig: structural guards over the Ubuntu
     // release workflows and harnesses. Their subject is the tracked source, so
@@ -2072,6 +2098,7 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_freebsd15_acceptance_tests.step);
         aggregate_test_step.dependOn(&run_ubuntu2604_release_tests.step);
         aggregate_test_step.dependOn(&run_ubuntu2604_release_behavior.step);
+        aggregate_test_step.dependOn(&run_ubuntu2604_size_inventory.step);
         for (run_ubuntu2604_guards) |run_guard| {
             aggregate_test_step.dependOn(&run_guard.step);
         }

@@ -28,6 +28,42 @@ fn job(workflow: *const Source, name: []const u8, following: ?[]const u8) ![]con
     return workflow.section(start, null);
 }
 
+test "the core build job re-validates the size inventory it measured" {
+    var workflow = try open();
+    defer workflow.deinit();
+    const build_job = try job(&workflow, "build", "native_qemu");
+    try source.expectOrder(
+        build_job,
+        "- name: Validate standalone zstd QCOW2 and exact 3584 MiB size",
+        "- name: Verify the reproducible size inventory",
+        workflow_path,
+    );
+    try source.expectOrder(
+        build_job,
+        "- name: Verify the reproducible size inventory",
+        "- name: Create and verify exact core candidate bundle",
+        workflow_path,
+    );
+    const start = try source.indexOfIn(
+        build_job,
+        "- name: Verify the reproducible size inventory",
+        workflow_path,
+    );
+    const rest = build_job[start..];
+    const step = rest[0 .. std.mem.indexOfPos(
+        u8,
+        rest,
+        "- name: Verify".len,
+        "- name:",
+    ) orelse rest.len];
+    try source.expectContainsIn(step, "size-inventory-verify", workflow_path);
+    try source.expectContainsIn(
+        step,
+        "--require-phase root_build,image_build,publication",
+        workflow_path,
+    );
+}
+
 test "only the exact core keys and assets are accepted" {
     var workflow = try open();
     defer workflow.deinit();

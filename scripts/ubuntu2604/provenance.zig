@@ -20,6 +20,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const contracts = @import("contracts.zig");
 const keys = @import("keys.zig");
+const size_inventory = @import("size_inventory.zig");
 const support = @import("support.zig");
 const url = @import("url.zig");
 
@@ -263,6 +264,54 @@ fn parseSha256sums(
     return .{ .entries = entries, .text = text };
 }
 
+/// The size inventory the build bound into its provenance (issue #677 step 1).
+///
+/// The binding is checked the same way every other provenance file is -- named
+/// exactly, hashed, and re-read from the tree rather than trusted from the
+/// document -- and the inventory itself is then validated in full. A candidate
+/// that carries a measurement nobody can reproduce from its own bundle is not
+/// carrying a measurement.
+fn validateSizeInventory(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    object: *const std.json.ObjectMap,
+    architecture: []const u8,
+    flavor: contracts.Flavor,
+    diagnostic: *Diagnostic,
+) Error!void {
+    var name_buffer: [96]u8 = undefined;
+    const expected_name = std.fmt.bufPrint(
+        &name_buffer,
+        "ubuntu2604-size-inventory-{s}-{s}.json",
+        .{ @tagName(flavor), architecture },
+    ) catch return fail(diagnostic, "Ubuntu size inventory binding is invalid", .{});
+    const binding = try requireFileBinding(
+        object.get("size_inventory"),
+        "Ubuntu size inventory",
+        expected_name,
+        diagnostic,
+    );
+    const path = try requireBoundProvenanceFile(
+        allocator,
+        io,
+        root,
+        binding,
+        "Ubuntu size inventory",
+        diagnostic,
+    );
+    defer allocator.free(path);
+    var parsed = try size_inventory.readValidated(allocator, io, path, .{
+        .architecture = architecture,
+        .flavor = @tagName(flavor),
+        // A finished candidate has been built, finalized, and published, so
+        // every phase up to publication is expected; first-boot growth is
+        // appended later by the stage that boots it.
+        .required_phases = &.{ .root_build, .image_build, .publication },
+    }, diagnostic);
+    parsed.deinit();
+}
+
 /// `validate_ubuntu_disk_layout`.
 fn validateDiskLayout(
     value: ?std.json.Value,
@@ -394,6 +443,7 @@ pub fn validateUbuntu(
         "release",
         "schema",
         "sha256sums_signature_verified",
+        "size_inventory",
         "snapshot",
         "type",
     };
@@ -487,6 +537,7 @@ pub fn validateUbuntu(
         .{},
     );
     try validateDiskLayout(object.get("disk_layout"), architecture, diagnostic);
+    try validateSizeInventory(allocator, io, root, object, architecture, flavor, diagnostic);
 
     const source_architecture = contracts.sourceArchitecture(architecture).?;
     var prefix_buffer: [64]u8 = undefined;

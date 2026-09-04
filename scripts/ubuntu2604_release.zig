@@ -26,6 +26,7 @@ pub const documents = @import("ubuntu2604/documents.zig");
 pub const execution = @import("ubuntu2604/execution.zig");
 pub const keys = @import("ubuntu2604/keys.zig");
 pub const provenance = @import("ubuntu2604/provenance.zig");
+pub const size_inventory = @import("ubuntu2604/size_inventory.zig");
 pub const support = @import("ubuntu2604/support.zig");
 pub const workflow = @import("ubuntu2604/workflow.zig");
 
@@ -50,6 +51,8 @@ const usage_text =
     \\  verify-azure-result           re-verify an Azure acceptance result
     \\  stage                         stage the exact published asset set
     \\  verify-image-info             check a miz image-info document
+    \\  size-inventory-verify         check a measured size-inventory document
+    \\  size-inventory-compare        report size deltas between two inventories
     \\  candidate-signing-env         export the candidate signing bindings
     \\  resolve-artifacts             select exact successful workflow artifacts
     \\  release-gate                  check the exact four-candidate release gate
@@ -405,6 +408,7 @@ test {
     _ = @import("ubuntu2604/download.zig");
     _ = @import("ubuntu2604/keys.zig");
     _ = @import("ubuntu2604/provenance.zig");
+    _ = @import("ubuntu2604/size_inventory.zig");
     _ = @import("ubuntu2604/support.zig");
     _ = @import("ubuntu2604/url.zig");
     _ = @import("ubuntu2604/workflow.zig");

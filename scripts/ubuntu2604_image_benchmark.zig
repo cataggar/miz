@@ -29,6 +29,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const release = @import("release/root.zig");
+const size_inventory = @import("ubuntu2604/size_inventory.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -1892,6 +1893,7 @@ const build_provenance_fields = [_][]const u8{
     "architecture",
     "flavor",
     "release",
+    "size_inventory",
     "virtual_size",
     "minimum_root_free_bytes",
     "validated_root_free_bytes",
@@ -1906,6 +1908,43 @@ pub const ProvenanceEvidence = struct {
     contract: Value,
     transaction_files: Value,
 };
+
+/// The size-inventory document the builder bound into its provenance. The
+/// benchmark re-validates it for the same reason it re-validates every other
+/// bound file: a measurement that only its own producer accepts is not
+/// evidence.
+fn validateSizeInventory(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    build: Value,
+    context: *Context,
+) !void {
+    const binding = getField(build, "size_inventory") orelse Value.null;
+    const expected_name = "ubuntu2604-size-inventory-" ++ flavor ++ "-" ++
+        architecture ++ ".json";
+    if (binding != .object or
+        !hasExactFields(binding, &.{ "filename", "sha256" }) or
+        !stringEquals(binding, "filename", expected_name))
+    {
+        return context.fail("Ubuntu size inventory binding is invalid", .{});
+    }
+    const path = try joinPath(allocator, &.{ root, expected_name });
+    const hex = try hashFileHex(io, path);
+    if (!stringEquals(binding, "sha256", &hex)) {
+        return context.fail("Ubuntu size inventory digest does not match", .{});
+    }
+    var diagnostic: size_inventory.Diagnostic = .{};
+    var parsed = size_inventory.readValidated(allocator, io, path, .{
+        .architecture = architecture,
+        .flavor = flavor,
+        .required_phases = &.{ .root_build, .image_build, .publication },
+    }, &diagnostic) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Failed => return context.fail("{s}", .{diagnostic.message()}),
+    };
+    parsed.deinit();
+}
 
 /// `validate_provenance`: the whole output-side contract -- pinned source
 /// identity, exact package roots and locks, per-package transaction proofs,
@@ -2003,6 +2042,8 @@ pub fn validateProvenance(
             );
         }
     }
+
+    try validateSizeInventory(allocator, io, root, build, context);
 
     const debz = getField(build, "debz") orelse Value.null;
     const baseline = getField(debz, "baseline") orelse Value.null;
