@@ -343,6 +343,53 @@ test "a built root that satisfies the contract passes and every omission fails b
     try std.testing.expect(checked >= 10);
 }
 
+test "a command provided through update-alternatives satisfies the contract" {
+    // Ubuntu 26.04 ships `/usr/bin/sudo` as a link into `/etc/alternatives`,
+    // which is how Debian provides a command at all. The built-root check has
+    // to follow that chain, or the contract would refuse the very package it
+    // asked for. What it must not do is accept a chain that ends nowhere, ends
+    // in a directory, or loops.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tree = try Tree.init(allocator, io, "alternatives");
+    defer tree.deinit();
+    try populateSatisfyingRoot(&tree);
+
+    var host: HostRoot = .{ .tree = &tree };
+    var diagnostic: runtime_contract.Diagnostic = .{};
+
+    try tree.remove("/usr/bin/sudo");
+    try tree.writeFile("/usr/bin/sudo.ws", "#!/bin/sh\n");
+    try tree.symlink("/etc/alternatives/sudo", "/usr/bin/sudo.ws");
+    try tree.symlink("/usr/bin/sudo", "/etc/alternatives/sudo");
+    try runtime_contract.verifyRoot(allocator, host.probe(), &diagnostic);
+
+    // A relative alternative resolves against the link's own directory.
+    try tree.remove("/etc/alternatives/sudo");
+    try tree.symlink("/etc/alternatives/sudo", "../../usr/bin/sudo.ws");
+    try runtime_contract.verifyRoot(allocator, host.probe(), &diagnostic);
+
+    // A chain that ends nowhere is the command being missing.
+    try tree.remove("/usr/bin/sudo.ws");
+    diagnostic = .{};
+    try std.testing.expectError(
+        error.Failed,
+        runtime_contract.verifyRoot(allocator, host.probe(), &diagnostic),
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, diagnostic.message(), "/usr/bin/sudo") != null,
+    );
+
+    // A chain that loops must fail rather than run forever.
+    try tree.remove("/etc/alternatives/sudo");
+    try tree.symlink("/etc/alternatives/sudo", "/usr/bin/sudo");
+    diagnostic = .{};
+    try std.testing.expectError(
+        error.Failed,
+        runtime_contract.verifyRoot(allocator, host.probe(), &diagnostic),
+    );
+}
+
 test "a trust store without a certificate marker is a broken trust store" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -401,26 +448,39 @@ test "a symbolic link pointing somewhere else is refused with both targets named
     );
 }
 
+/// A shipped package lock for a guest built the way #677 step 4 builds one:
+/// the literal `guest_runtime` roots plus a selected versioned kernel image and
+/// its module tree, and nothing the build alone needed.
+fn guestLock(allocator: Allocator, extra: []const []const u8) ![]u8 {
+    var lock: std.ArrayList(u8) = .empty;
+    errdefer lock.deinit(allocator);
+    for (contract.requirements()) |requirement| {
+        if (requirement.kind != .package or requirement.audience != .guest_runtime) continue;
+        try lock.print(allocator, "{s}\t1.0-1\tamd64\n", .{requirement.target});
+    }
+    try lock.appendSlice(allocator, "linux-image-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n");
+    try lock.appendSlice(allocator, "linux-modules-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n");
+    for (extra) |name| try lock.print(allocator, "{s}\t1.0-1\tamd64\n", .{name});
+    return lock.toOwnedSlice(allocator);
+}
+
 test "the shipped package lock must contain every contract package" {
     var diagnostic: runtime_contract.Diagnostic = .{};
     const allocator = std.testing.allocator;
 
-    var complete: std.ArrayList(u8) = .empty;
-    defer complete.deinit(allocator);
-    for (contract.requirements()) |requirement| {
-        if (requirement.kind != .package) continue;
-        try complete.print(allocator, "{s}\t1.0-1\tamd64\n", .{requirement.target});
-    }
-    try complete.appendSlice(allocator, "unrelated\t2.0\tamd64\n");
-    try runtime_contract.verifyPackages(complete.items, &diagnostic);
+    const complete = try guestLock(allocator, &.{"unrelated"});
+    defer allocator.free(complete);
+    try runtime_contract.verifyPackages(complete, &diagnostic);
 
     var missing: std.ArrayList(u8) = .empty;
     defer missing.deinit(allocator);
     for (contract.requirements()) |requirement| {
-        if (requirement.kind != .package) continue;
+        if (requirement.kind != .package or requirement.audience != .guest_runtime) continue;
         if (std.mem.eql(u8, requirement.target, "ca-certificates")) continue;
         try missing.print(allocator, "{s}\t1.0-1\tamd64\n", .{requirement.target});
     }
+    try missing.appendSlice(allocator, "linux-image-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n");
+    try missing.appendSlice(allocator, "linux-modules-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n");
     try std.testing.expectError(
         error.Failed,
         runtime_contract.verifyPackages(missing.items, &diagnostic),
@@ -437,6 +497,71 @@ test "the shipped package lock must contain every contract package" {
     );
 }
 
+test "build-only packages cannot enter the final guest inventory" {
+    // Issue #677 step 4: the initramfs generator is resolved into a staging
+    // root that is discarded. If it is present in the shipped lock the
+    // separation leaked, and the build that produced the image fails.
+    const allocator = std.testing.allocator;
+    var diagnostic: runtime_contract.Diagnostic = .{};
+
+    const clean = try guestLock(allocator, &.{});
+    defer allocator.free(clean);
+    try runtime_contract.verifyPackages(clean, &diagnostic);
+
+    try std.testing.expect(contract.build_package_roots.len != 0);
+    for (contract.build_package_roots) |build_root| {
+        const polluted = try guestLock(allocator, &.{build_root});
+        defer allocator.free(polluted);
+        diagnostic = .{};
+        try std.testing.expectError(
+            error.Failed,
+            runtime_contract.verifyPackages(polluted, &diagnostic),
+        );
+        try std.testing.expect(
+            std.mem.indexOf(u8, diagnostic.message(), build_root) != null,
+        );
+    }
+}
+
+test "the shipped lock must select exactly one kernel and not its metapackage" {
+    const allocator = std.testing.allocator;
+    var diagnostic: runtime_contract.Diagnostic = .{};
+
+    const selected = try guestLock(allocator, &.{});
+    defer allocator.free(selected);
+    const release_name = try runtime_contract.verifyKernelSelection(selected, &diagnostic);
+    try std.testing.expectEqualStrings("7.0.0-1010-azure", release_name);
+
+    // The convenience metapackage is what drags headers, perf tools, cloud
+    // tools, and a ZFS module set into an appliance that boots one kernel.
+    const with_metapackage = try guestLock(allocator, &.{contract.kernel_templates.selector});
+    defer allocator.free(with_metapackage);
+    diagnostic = .{};
+    try std.testing.expectError(
+        error.Failed,
+        runtime_contract.verifyKernelSelection(with_metapackage, &diagnostic),
+    );
+
+    // Two kernels make "the kernel the UKI was built from" ambiguous.
+    const two_kernels = try guestLock(allocator, &.{"linux-image-7.0.0-1004-azure"});
+    defer allocator.free(two_kernels);
+    diagnostic = .{};
+    try std.testing.expectError(
+        error.Failed,
+        runtime_contract.verifyKernelSelection(two_kernels, &diagnostic),
+    );
+
+    // An image with no module tree boots into a machine with no drivers.
+    var image_only: std.ArrayList(u8) = .empty;
+    defer image_only.deinit(allocator);
+    try image_only.appendSlice(allocator, "linux-image-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n");
+    diagnostic = .{};
+    try std.testing.expectError(
+        error.Failed,
+        runtime_contract.verifyKernelSelection(image_only.items, &diagnostic),
+    );
+}
+
 test "the shipped package lock must contain no package the contract forbids" {
     // Issue #677 step 3: `ubuntu-minimal` and the conveniences it used to drag
     // in fail the lock by name, so a regression is attributable rather than an
@@ -444,23 +569,17 @@ test "the shipped package lock must contain no package the contract forbids" {
     var diagnostic: runtime_contract.Diagnostic = .{};
     const allocator = std.testing.allocator;
 
-    var complete: std.ArrayList(u8) = .empty;
-    defer complete.deinit(allocator);
-    for (contract.requirements()) |requirement| {
-        if (requirement.kind != .package) continue;
-        try complete.print(allocator, "{s}\t1.0-1\tamd64\n", .{requirement.target});
-    }
-    try runtime_contract.verifyPackages(complete.items, &diagnostic);
+    const complete = try guestLock(allocator, &.{});
+    defer allocator.free(complete);
+    try runtime_contract.verifyPackages(complete, &diagnostic);
 
     for (contract.forbidden_packages) |forbidden| {
-        var polluted: std.ArrayList(u8) = .empty;
-        defer polluted.deinit(allocator);
-        try polluted.appendSlice(allocator, complete.items);
-        try polluted.print(allocator, "{s}\t1.0-1\tamd64\n", .{forbidden});
+        const polluted = try guestLock(allocator, &.{forbidden});
+        defer allocator.free(polluted);
         diagnostic = .{};
         try std.testing.expectError(
             error.Failed,
-            runtime_contract.verifyPackages(polluted.items, &diagnostic),
+            runtime_contract.verifyPackages(polluted, &diagnostic),
         );
         try std.testing.expect(
             std.mem.indexOf(u8, diagnostic.message(), forbidden) != null,
@@ -504,6 +623,28 @@ test "the published contract carries the explicit roots and the forbidden set" {
         if (std.mem.eql(u8, published.string, "ubuntu-minimal")) saw_ubuntu_minimal = true;
     }
     try std.testing.expect(saw_ubuntu_minimal);
+
+    // Issue #677 step 4: the published contract says where each root is
+    // resolved and how the kernel is chosen, so a reader does not have to
+    // infer either from the closure.
+    const guest_roots = object.get("guest_package_roots").?.array.items;
+    try std.testing.expectEqual(contract.guest_package_roots.len, guest_roots.len);
+    for (guest_roots) |published| {
+        try std.testing.expect(!std.mem.eql(u8, published.string, "initramfs-tools"));
+    }
+    const build_roots = object.get("build_package_roots").?.array.items;
+    try std.testing.expectEqual(contract.build_package_roots.len, build_roots.len);
+    try std.testing.expectEqualStrings("initramfs-tools", build_roots[0].string);
+    const selector = object.get("kernel_selector").?.object;
+    try std.testing.expectEqualStrings("linux-azure", selector.get("selector").?.string);
+    try std.testing.expectEqualStrings(
+        "linux-image-*-azure",
+        selector.get("image_template").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "linux-modules-*-azure",
+        selector.get("modules_template").?.string,
+    );
 
     // A candidate that quietly drops an exclusion is refused, and so is one
     // that adds a root the contract does not name.

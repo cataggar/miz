@@ -81,6 +81,12 @@ test "the core build job re-validates the runtime contract it published" {
     try source.expectOrder(
         build_job,
         "- name: Verify the explicit runtime contract",
+        "- name: Verify the build/runtime separation",
+        workflow_path,
+    );
+    try source.expectOrder(
+        build_job,
+        "- name: Verify the build/runtime separation",
         "- name: Create and verify exact core candidate bundle",
         workflow_path,
     );
@@ -88,6 +94,15 @@ test "the core build job re-validates the runtime contract it published" {
     try source.expectContainsIn(
         build_job,
         "ubuntu2604-runtime-contract-$FLAVOR-$ARCHITECTURE.json",
+        workflow_path,
+    );
+    // Issue #677 step 4: the build/runtime split is re-checked from the
+    // published provenance, so a candidate that shipped its build tooling fails
+    // under its own name rather than inside a generic rejection.
+    try source.expectContainsIn(build_job, "build-runtime-split-verify", workflow_path);
+    try source.expectContainsIn(
+        build_job,
+        "ubuntu2604-build-provenance.json",
         workflow_path,
     );
 }

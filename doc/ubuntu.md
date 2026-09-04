@@ -72,16 +72,15 @@ root from packages.
 For core, the same signed cloud disk is used only as the pinned Gen2 GPT and
 EFI-system-partition substrate. The server root is discarded and a fresh root
 is assembled from an empty debz baseline with exact package roots, in stable
-order: `linux-azure`, `initramfs-tools`, `openssh-server`, `sudo`, and
-`ca-certificates`. Those five are not a hand-written list: they are exactly
-the `package` requirements of the runtime contract, and
+order: the selected `linux-image-<release>-azure`, its matching
+`linux-modules-<release>-azure`, then `openssh-server`, `sudo`, and
+`ca-certificates`. The literal three are not a hand-written list: they are
+exactly the `guest_runtime` `package` requirements of the runtime contract, and
 `build_generalized_ubuntu2604.zig` and `scripts/ubuntu2604/contracts.zig` both
-fail to compile if the two ever disagree, so a root exists only for a behavior
-the contract names. The order is a build decision the builder owns -- the
-kernel is first because the first root is the transaction that creates the
-empty baseline, and because installing it before the initramfs generator keeps
-the kernel postinst from building an initramfs that customization is about to
-rebuild from `/etc/initramfs-tools/modules`.
+fail to compile if the two ever disagree, so a guest root exists only for a
+behavior the contract names. The order is a build decision the builder owns:
+the kernel image is first because the first root is the transaction that
+creates the empty baseline.
 
 Issue #677 step 3 removed the `ubuntu-minimal` metapackage from that list. It
 was what pulled an apt client, an init system, an editor, a pager, locales, a
@@ -89,27 +88,104 @@ DHCP client, and netplan into an appliance whose PID 1 is `mizinit` and whose
 only access path is `sshd`. No base package replaces it: debz includes
 available `Essential: yes` packages in every install closure, so `bash`,
 `coreutils`, `dpkg`, and the `util-linux` that supplies the contract's `dmesg`
-arrive as part of creating a root at all. `initramfs-tools` is still a root
-because customization executes it; the contract classifies it `build_tooling`,
-and step 4 moves it out of the guest.
+arrive as part of creating a root at all.
 
-The initramfs implementation is explicit because the kernel only recommends one
-and debz's exact closure does not install recommendations; the trust store is
-explicit because no required dependency supplies it. The resolved closure must
-also contain `openssh-client`, and must not contain `ubuntu-minimal`, apt,
-cloud-init, WALinuxAgent, `ubuntu-server`, `ubuntu-server-minimal`,
-`ubuntu-standard`, an editor, a pager, locales, documentation, a conventional
-networking daemon, an init system, or the other convenience packages
+### The kernel is selected, not named
+
+Step 4 removed the `linux-azure` metapackage too. It is a convenience root in
+the exact sense the issue means: its own dependencies are `linux-headers-azure`,
+`linux-tools-azure`, and `linux-cloud-tools-azure`, and through
+`linux-image-azure` a ZFS module set -- twenty-five packages of kernel headers,
+perf tooling, Hyper-V daemons, and hardware-ID tables that no contract behavior
+stands on.
+
+Naming a version instead would trade one problem for a worse one: the next
+security kernel would need a source edit, and until someone made it the
+appliance would ship a known-stale kernel. So the metapackage is *resolved*
+and not installed. Resolving it against the pinned immutable snapshot is
+exactly Canonical's own statement of which Azure kernel is current; the
+resulting exact lock is parsed for the unique `linux-image-*-azure` and
+`linux-modules-*-azure` pair, those two versioned names become the guest's
+kernel roots, and the selector lock is published as
+`debz-exact-lock-linux-azure-<arch>.json` and bound into provenance under
+`debz.kernel_selection`. Refreshing the snapshot re-selects; nothing in this
+repository has to be edited. Zero matches, two different releases, or an image
+whose module tree is missing are all build failures, because each would
+otherwise be answered by silently installing something else.
+
+The contract expresses this as a `package_selector` requirement whose `expect`
+field carries the two name templates, so the selection rule is part of the
+published, digest-covered contract rather than a builder detail. The
+metapackage and its dependencies are in `forbidden_packages`, so a closure that
+installs one fails by name.
+
+### Build-time dependencies are not in the guest
+
+`initramfs-tools` is not a guest root either. Step 4 generates the initramfs in
+a staging root: the finished guest closure is copied, `initramfs-tools` is
+installed into the copy through an ordinary debz transaction, the reviewed
+module list is written there, `update-initramfs -c -k <release>` runs there, and
+only the resulting `/boot/initrd.img-<release>` is inserted into the guest. The
+staging root is then discarded.
+
+That is the shape the issue asks for -- "construct the final root from runtime
+packages rather than installing build tools into it and deleting files
+afterwards" -- and the difference is not cosmetic. Deleting a package's files
+would leave dpkg claiming paths that are gone and make the shipped inventory a
+fiction; the builder refuses package-owned deletions for exactly that reason.
+Building against a copy of the finished root, rather than against an
+approximation, also means the initramfs is generated from precisely the kernel
+and module tree the guest ships.
+
+The stage keeps fifteen packages out of the guest -- `initramfs-tools` and its
+`-core`/`-bin` split, `klibc-utils`, `libklibc`, `busybox-initramfs`,
+`dracut-install`, `3cpio`, `e2fsprogs` and its libraries, `logsave`,
+`dhcpcd-base`, `libsystemd-shared`, and `udev` -- none of which any contract
+behavior names. Root
+growth and resource-disk formatting are native `azagent` code (`EXT4_IOC_RESIZE_FS`
+and miz's own ext4/XFS writers), so no `resize2fs` or `mkfs` binary is a runtime
+requirement, and mizinit mounts `devtmpfs` itself rather than running a device
+manager.
+
+The stage publishes the same evidence a guest root does: its exact lock, its
+transaction result, and the initramfs it handed back, bound by digest under
+`debz.build_stage` and embedded in the image's own
+`/var/lib/miz/provenance/`. The guest's initramfs is compared byte for byte
+against that record before the image is accepted.
+
+Three gates keep the separation from becoming a claim. The guest closure must
+not contain any `build_tooling` package the contract names or any package the
+forbidden list names. `/etc/initramfs-tools` must be absent from the finished
+root. And the build-only set is *derived*, not listed: the stage's own lock
+minus the guest's lock is exactly what the generator added, and none of those
+packages may appear in the shipped inventory. A hand-written list would go
+stale the first time `initramfs-tools` gained a dependency; this cannot.
+
+Measured against the pinned snapshot on x86_64, the two removals take core's
+guest closure from 140 packages to 100, and the finished root to 100 packages
+and 291.6 MiB installed. The build stage's own closure is 115 packages, so
+fifteen of them are build-only and none of them ship.
+
+The trust store stays explicit because no required dependency supplies it. The
+resolved closure must also contain `openssh-client`, and must not contain
+`ubuntu-minimal`, apt, cloud-init, WALinuxAgent, `ubuntu-server`,
+`ubuntu-server-minimal`, `ubuntu-standard`, an editor, a pager, locales,
+documentation, a conventional networking daemon, an init system, the initramfs
+generator, the kernel metapackages, or the other convenience packages
 `runtime_contract.forbidden_packages` names. This source/package decision is
 part of core provenance and is not inferred from mutable archive state.
 
 For bare metal, the root is assembled the same way, in stable order: the
-pinned NVIDIA BaseOS `linux-image` and `linux-modules` binary packages,
-`initramfs-tools`, `openssh-server`, `sudo`, and `ca-certificates`. The last
-two are named explicitly because core reached both through `linux-azure`,
-which bare metal forbids -- a second kernel in `/boot` would make the release
-the UKI is built from ambiguous. The resolved closure must also contain
-`openssh-client`, and must not contain `linux-azure` or anything core forbids.
+pinned NVIDIA BaseOS `linux-image` and `linux-modules` binary packages, then
+`openssh-server`, `sudo`, and `ca-certificates`. Those three are named
+explicitly because core reached the first two through `linux-azure`, which bare
+metal forbids -- a second kernel in `/boot` would make the release the UKI is
+built from ambiguous. Bare metal has no selector because the pinned snapshot
+publishes no `linux-nvidia-bos` metapackage to select from, so its versioned
+package names *are* the kernel release. It runs the same initramfs build stage,
+with its own `initramfs.conf` and module list written into the staging root.
+The resolved closure must also contain `openssh-client`, and must not contain
+`linux-azure` or anything core forbids.
 
 Two checks make "exact" mean exact rather than "at least". The installed
 inventory the image carries at `/var/lib/miz/ubuntu2604-package-lock.tsv` must
@@ -302,24 +378,33 @@ enforced:
 | `presence` | `image` (already in the built root) or `runtime` (only a booted guest has it) |
 
 The contract's `package` entries are also the build's package roots: step 3 of
-issue #677 derives `core_debz_packages` from them, so `ubuntu-minimal` is gone
-and nothing can be added as a root without first naming the behavior it serves.
-The contract carries the negative statement too -- `forbidden_packages` names
-the broad metapackages, apt clients, editors, pagers, locales, documentation,
-networking daemons, init systems, and convenience tools that must never appear
-in the closure -- and the builder and the release tool both read that one list.
+issue #677 derives them from the contract, so `ubuntu-minimal` is gone and
+nothing can be added as a root without first naming the behavior it serves. A
+fourth kind, `package_selector`, names a metapackage the build resolves to
+choose exact versioned packages and then does not install; its `expect` field
+carries the name templates the selection must produce. The contract carries the
+negative statement too -- `forbidden_packages` names the broad metapackages, apt
+clients, editors, pagers, locales, documentation, networking daemons, init
+systems, the initramfs generator, the kernel convenience metapackages, and the
+other convenience tools that must never appear in the closure -- and the builder
+and the release tool both read that one list.
 
-The `audience` split is the point of the contract. `initramfs-tools` is
-`build_tooling`, so step 4 of issue #677 can remove it from the final guest
-without weakening anything; `findmnt`, `od`, `modprobe`, `modinfo`, `base64`,
-and `sha256sum` are `acceptance_only`, so nothing may be retained in the image
-because a test happened to use one. Their absence is reported, not enforced.
+The `audience` split is the point of the contract, and step 4 of issue #677 is
+what it was written for. `initramfs-tools` is `build_tooling`, so the build
+resolves it into a staging root and the finished guest must *not* contain it:
+`verifyPackages` requires every `guest_runtime` package to be present and every
+`build_tooling` package to be absent, from the same table. `findmnt`, `od`,
+`modprobe`, `modinfo`, `base64`, and `sha256sum` are `acceptance_only`, so
+nothing may be retained in the image because a test happened to use one. Their
+absence is reported, not enforced.
 
 The contract is published per core candidate as
 `internal-provenance/ubuntu2604-runtime-contract-<flavor>-<architecture>.json`,
-carrying the requirements, the `package_roots` the build resolved, and the
-`forbidden_packages` the closure excludes. All three are covered by
-`contract_sha256`, so an exclusion cannot be dropped without moving the digest.
+carrying the requirements, the `package_roots` the build resolved, the
+`guest_package_roots` and `build_package_roots` they split into, the
+`kernel_selector` templates, and the `forbidden_packages` the closure excludes.
+All of them are covered by `contract_sha256`, so an exclusion cannot be dropped
+or a build root reclassified without moving the digest.
 The document is digest-bound from `ubuntu2604-build-provenance.json` and
 re-checked, member for member and in order, against the contract the accepted
 source compiles:
@@ -397,10 +482,11 @@ boots on fresh NVRAM, so the fallback is the path it takes. `EFI/Linux/` is
 the Boot Loader Specification type 2 directory, which needs a boot loader to
 scan it, and these images ship none.
 
-The UKI combines the installed kernel, its newly generated initramfs, and
+The UKI combines the installed kernel, the initramfs generated for it, and
 matching `/lib/modules/<release>`. Which kernel is the right one is a property
-of the flavor -- `linux-azure` for full and core, the NVIDIA BaseOS kernel for
-bare metal -- and the builder refuses any other, along with missing modules,
+of the flavor -- the `linux-azure` closure for full, the versioned Azure image
+and module packages that closure selects for core, and the NVIDIA BaseOS kernel
+for bare metal -- and the builder refuses any other, along with missing modules,
 wrong PE architecture, invalid signature, missing final UKI, wrong Ubuntu
 release, backing file, or wrong virtual size.
 
@@ -466,10 +552,12 @@ recording their path and digest as boot-input evidence. It asserts only that
 the module is signed, not by whom: the running kernel's own signature
 enforcement is the actual verifier. `anbox-modules-dkms` and `anbox-modules`
 are also forbidden core package names, checked the same way every other
-forbidden package is. Core's `/etc/initramfs-tools/modules` requests
-`binder_linux` explicitly, and the generated initramfs is read back and
-required to contain it, the same way bare metal's is checked for `nvme` and
-`r8152`.
+forbidden package is. The initramfs build stage's `/etc/initramfs-tools/modules`
+requests `binder_linux` explicitly, and the generated initramfs is read back
+from the guest and required to contain it, the same way bare metal's is checked
+for `nvme` and `r8152`. That file lives in the staging root, not in the
+appliance: the guest has no generator to read it with, and its presence there
+would fail the build.
 
 None of this runs anything at boot by itself. The core UKI cmdline requests
 the required Binder workload with `mizinit.binder=required` alongside the

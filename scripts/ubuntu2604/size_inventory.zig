@@ -453,7 +453,7 @@ pub const shared_unowned_rules = [_]UnownedRule{
     .{ .pattern = "/etc/subgid*", .reason = "account database written by maintainer scripts" },
     .{ .pattern = "/etc/subuid*", .reason = "account database written by maintainer scripts" },
     .{ .pattern = "/etc/waagent.conf", .reason = "Azure agent configuration" },
-    .{ .pattern = "/boot/initrd.img*", .reason = "generated initramfs" },
+    .{ .pattern = "/boot/initrd.img*", .reason = "initramfs generated for the installed kernel; for the fresh roots, by the discarded build stage of #677 step 4" },
     .{ .pattern = "/dev/**", .reason = "runtime device tree mount point" },
     .{ .pattern = "/home/**", .reason = "provisioned administrator home" },
     .{ .pattern = "/media/**", .reason = "mount point" },
@@ -470,7 +470,6 @@ pub const shared_unowned_rules = [_]UnownedRule{
     .{ .pattern = "/var/cache/**", .reason = "package and tooling caches" },
     .{ .pattern = "/var/lib/dbus/**", .reason = "cleared D-Bus machine identity" },
     .{ .pattern = "/var/lib/dpkg/**", .reason = "package database and provenance" },
-    .{ .pattern = "/var/lib/initramfs-tools/**", .reason = "initramfs generation bookkeeping" },
     .{ .pattern = "/var/lib/misc/**", .reason = "maintainer-script bookkeeping" },
     .{ .pattern = "/var/lib/miz/**", .reason = "miz provenance and exact package lock" },
     .{ .pattern = "/var/lib/pam/**", .reason = "pam-auth-update profile bookkeeping" },
@@ -480,8 +479,12 @@ pub const shared_unowned_rules = [_]UnownedRule{
     .{ .pattern = "/var/tmp/**", .reason = "temporary state" },
 };
 
-/// Unowned payload only the fresh-root flavors carry: the injected guest and
-/// the initramfs inputs it is built with.
+/// Unowned payload only the fresh-root flavors carry: the injected guest.
+///
+/// Since #677 step 4 that no longer includes anything belonging to initramfs
+/// generation. The generated image itself is covered by the shared
+/// `/boot/initrd.img*` rule; its inputs and the generator's bookkeeping live in
+/// the staging root the guest never inherits.
 pub const fresh_root_unowned_rules = [_]UnownedRule{
     .{ .pattern = "/usr/sbin/mizinit", .reason = "injected miz PID 1" },
     .{ .pattern = "/usr/sbin/azagent", .reason = "injected Azure provisioning agent" },
@@ -490,13 +493,18 @@ pub const fresh_root_unowned_rules = [_]UnownedRule{
     .{ .pattern = "/usr/sbin/reboot", .reason = "mizinit reboot symlink" },
     .{ .pattern = "/usr/sbin/shutdown", .reason = "mizinit shutdown symlink" },
     .{ .pattern = "/usr/local/**", .reason = "injected local access provider" },
-    .{ .pattern = "/etc/initramfs-tools/**", .reason = "initramfs generation inputs" },
 };
 
 /// Unowned payload only the full flavor carries: cloud-init, netplan, and the
 /// systemd unit overrides the Azure contract needs.
 pub const full_unowned_rules = [_]UnownedRule{
     .{ .pattern = "/etc/cloud/**", .reason = "cloud-init datasource configuration" },
+    // Only `full` still installs the initramfs generator: it inherits
+    // Canonical's server root. Issue #677 step 4 moved the fresh roots'
+    // generation into a staging root, so neither the generator's bookkeeping
+    // nor its configuration is allowlisted for them any more -- if either
+    // reappears in a core or bare-metal image, the build fails.
+    .{ .pattern = "/var/lib/initramfs-tools/**", .reason = "initramfs generation bookkeeping" },
     .{ .pattern = "/etc/netplan/**", .reason = "network configuration" },
     .{ .pattern = "/etc/systemd/system/**", .reason = "systemd unit overrides" },
     .{ .pattern = "/var/lib/cloud/**", .reason = "cleared cloud-init state" },

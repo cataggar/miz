@@ -67,23 +67,34 @@ pub const canonical_fingerprint = "d2eb44626fddc30b513d5bb71a5d6c4c7db87c81";
 pub const asset_name = "Ubuntu-26.04-aarch64.baremetal.qcow2";
 pub const raw_asset_name = "Ubuntu-26.04-aarch64.baremetal.raw";
 
-/// The bare-metal flavor's explicit package roots, mirroring the builder's
-/// `baremetal_debz_packages`. Issue #677 step 3 removed `ubuntu-minimal`, so
-/// the first phase this benchmark times is the kernel image transaction that
-/// creates the otherwise-empty debz baseline.
+/// The bare-metal flavor's explicit *guest* package roots, mirroring the
+/// builder's `baremetal_guest_roots`. Issue #677 step 3 removed
+/// `ubuntu-minimal`, so the first phase this benchmark times is the kernel
+/// image transaction that creates the otherwise-empty debz baseline; step 4
+/// removed `initramfs-tools`, which is now resolved by the separately timed
+/// build stage below rather than into the image.
 pub const package_roots = [_][]const u8{
     "linux-image-7.0.0-2015-nvidia-bos-64k",
     "linux-modules-7.0.0-2015-nvidia-bos-64k",
-    "initramfs-tools",
     "openssh-server",
     "sudo",
     "ca-certificates",
 };
 
+/// The `debz_transaction` item the initramfs build stage records. It is one
+/// phase rather than one per stage root, because the stage is a unit: it exists
+/// to hand back an initramfs and is then thrown away.
+pub const build_stage_item = "initramfs-build-stage";
+
+/// Every `debz_transaction` item the builder records, in order: the guest roots
+/// as they are applied, then the build stage that runs after them.
+pub const debz_transaction_items = package_roots ++ [_][]const u8{build_stage_item};
+
 /// Every timing key the summary reports, in the order the builder produces
-/// them. `debz_transaction` appears once per package root, keyed by package.
+/// them. `debz_transaction` appears once per package root, keyed by package,
+/// and once for the build stage.
 pub const phase_order = blk: {
-    var phases: [package_roots.len + 11][]const u8 = undefined;
+    var phases: [package_roots.len + 12][]const u8 = undefined;
     phases[0] = "input_acquisition";
     phases[1] = "source_qcow2_setup";
     var next: usize = 2;
@@ -93,6 +104,9 @@ pub const phase_order = blk: {
     }
     for ([_][]const u8{
         "debz_aggregate",
+        // The stage runs inside the ext4 import phase, and a scope is recorded
+        // when it succeeds, so it lands between the aggregate and the import.
+        "debz_transaction:" ++ build_stage_item,
         "initramfs_ext4_import",
         "uki_assembly",
         "uki_signing",
@@ -1542,7 +1556,7 @@ pub fn loadTiming(
         var key: []const u8 = name;
         if (std.mem.eql(u8, name, "debz_transaction")) {
             const present = item orelse "";
-            if (!isMember(present, &package_roots)) {
+            if (!isMember(present, &debz_transaction_items)) {
                 return context.fail("timing JSON has an unknown debz package item", .{});
             }
             try debz_items.append(allocator, present);
@@ -1563,13 +1577,13 @@ pub fn loadTiming(
         }
         try values.put(allocator, key, elapsed.integer);
     }
-    if (debz_items.items.len != package_roots.len) {
+    if (debz_items.items.len != debz_transaction_items.len) {
         return context.fail(
             "timing JSON does not contain the exact ordered package transactions",
             .{},
         );
     }
-    for (debz_items.items, package_roots) |actual, expected| {
+    for (debz_items.items, debz_transaction_items) |actual, expected| {
         if (!std.mem.eql(u8, actual, expected)) return context.fail(
             "timing JSON does not contain the exact ordered package transactions",
             .{},

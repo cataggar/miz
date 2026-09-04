@@ -20,6 +20,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const contracts = @import("contracts.zig");
 const keys = @import("keys.zig");
+const runtime_contract = @import("ubuntu2604_runtime_contract");
 const runtime_contract_document = @import("runtime_contract_document.zig");
 const size_inventory = @import("size_inventory.zig");
 const support = @import("support.zig");
@@ -761,7 +762,8 @@ fn validateDebz(
     diagnostic: *Diagnostic,
 ) Error!void {
     const base_fields = [_][]const u8{ "api_commit", "baseline", "transactions" };
-    const core_fields = [_][]const u8{"package_roots"} ++ base_fields;
+    const core_fields = [_][]const u8{ "build_stage", "kernel_selection", "package_roots" } ++
+        base_fields;
     const expected_fields: []const []const u8 = switch (flavor) {
         .full => &base_fields,
         .core => &core_fields,
@@ -792,19 +794,38 @@ fn validateDebz(
         return fail(diagnostic, "debz baseline provenance contract is invalid", .{});
     }
 
-    const expected_packages = contracts.debzPackages(flavor);
-    if (flavor == .core and
-        !support.isExactOrderedStrings(
-            debz.?.get("package_roots"),
-            &contracts.core_debz_packages,
-        ))
-    {
-        return fail(
+    // The core roots are not a literal list any more: issue #677 step 4 selects
+    // the kernel from a metapackage so security updates keep arriving without a
+    // version pinned into this repository. What is exact is the *shape* -- the
+    // selected image, its module tree, then the contract's literal guest roots
+    // -- and the selection has to agree with the separately bound selector.
+    var core_root_names: [contracts.core_package_root_count][]const u8 = undefined;
+    var selection: ?runtime_contract.KernelSelection = null;
+    if (flavor == .core) {
+        const roots = support.arrayOf(debz.?.get("package_roots")) orelse return fail(
             diagnostic,
             "Ubuntu core package roots are not exact or stably ordered",
             .{},
         );
+        const resolved = contracts.validateCorePackageRoots(roots) catch return fail(
+            diagnostic,
+            "Ubuntu core package roots are not exact or stably ordered",
+            .{},
+        );
+        selection = resolved;
+        for (roots, 0..) |entry, index| core_root_names[index] = support.stringOf(entry).?;
+        try validateKernelSelection(
+            debz.?.get("kernel_selection"),
+            resolved,
+            source_architecture,
+            diagnostic,
+        );
     }
+
+    const expected_packages: []const []const u8 = switch (flavor) {
+        .full => &contracts.full_debz_packages,
+        .core => &core_root_names,
+    };
 
     const transactions = support.arrayOf(debz.?.get("transactions"));
     if (transactions == null or transactions.?.len != expected_packages.len) {
@@ -838,6 +859,200 @@ fn validateDebz(
             package,
             source_architecture,
             transaction_baseline,
+            diagnostic,
+        );
+    }
+
+    if (flavor == .core) try validateBuildStage(
+        allocator,
+        io,
+        root,
+        debz.?.get("build_stage"),
+        selection.?,
+        source_architecture,
+        diagnostic,
+    );
+}
+
+/// The selector binding: which metapackage was resolved, what it selected, and
+/// the exact lock that resolution produced.
+///
+/// This is what keeps "prefer exact versioned kernel packages" from becoming "a
+/// version somebody typed once". The selection is only defensible if the lock
+/// it came from is published and bound, so the lock is validated here with the
+/// same machinery as an installing transaction -- minus the transaction, since
+/// nothing was installed.
+fn validateKernelSelection(
+    value: ?std.json.Value,
+    selection: runtime_contract.KernelSelection,
+    source_architecture: []const u8,
+    diagnostic: *Diagnostic,
+) Error!void {
+    const selection_fields = [_][]const u8{
+        "exact_lock",
+        "image_package",
+        "kernel_release",
+        "modules_package",
+        "selector",
+        "version",
+    };
+    const object = support.objectOf(value);
+    if (object == null or !support.hasExactFields(object.?, &selection_fields)) {
+        return fail(diagnostic, "Ubuntu core kernel selection binding is invalid", .{});
+    }
+    if (!support.stringIs(object.?.get("selector"), runtime_contract.kernel_templates.selector) or
+        !support.stringIs(object.?.get("kernel_release"), selection.release) or
+        !support.stringIs(object.?.get("image_package"), selection.image_package) or
+        !support.stringIs(object.?.get("modules_package"), selection.modules_package))
+    {
+        return fail(
+            diagnostic,
+            "Ubuntu core kernel selection does not describe the published roots",
+            .{},
+        );
+    }
+    const version = support.stringOf(object.?.get("version")) orelse "";
+    if (version.len == 0) return fail(
+        diagnostic,
+        "Ubuntu core kernel selection does not record the selected version",
+        .{},
+    );
+
+    const lock_fields = [_][]const u8{ "digest_sha256", "filename", "sha256" };
+    const exact_lock = support.objectOf(object.?.get("exact_lock"));
+    if (exact_lock == null or !support.hasExactFields(exact_lock.?, &lock_fields)) {
+        return fail(diagnostic, "Ubuntu core kernel selector lock binding is invalid", .{});
+    }
+    var name_buffer: [128]u8 = undefined;
+    const expected_name = std.fmt.bufPrint(
+        &name_buffer,
+        "debz-exact-lock-{s}-{s}.json",
+        .{ runtime_contract.kernel_templates.selector, source_architecture },
+    ) catch unreachable;
+    if (!support.stringIs(exact_lock.?.get("filename"), expected_name)) return fail(
+        diagnostic,
+        "Ubuntu core kernel selector lock binding is invalid",
+        .{},
+    );
+    _ = try support.requireSha256(
+        exact_lock.?.get("sha256"),
+        "kernel selector lock",
+        diagnostic,
+    );
+    _ = try support.requireSha256(
+        exact_lock.?.get("digest_sha256"),
+        "kernel selector lock semantic digest",
+        diagnostic,
+    );
+}
+
+/// The initramfs build stage: the roots resolved outside the guest, the
+/// transactions that installed them, and the one artifact the stage handed
+/// back.
+///
+/// Issue #677 step 4 is only true if this exists and is bound. A staging root
+/// whose output is unattributed is indistinguishable from an initramfs somebody
+/// dropped in, which is why the stage publishes the same lock and transaction
+/// evidence a guest root does.
+fn validateBuildStage(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    value: ?std.json.Value,
+    selection: runtime_contract.KernelSelection,
+    source_architecture: []const u8,
+    diagnostic: *Diagnostic,
+) Error!void {
+    const stage_fields = [_][]const u8{
+        "initramfs",
+        "package_roots",
+        "purpose",
+        "transactions",
+    };
+    const stage = support.objectOf(value);
+    if (stage == null or !support.hasExactFields(stage.?, &stage_fields)) {
+        return fail(diagnostic, "Ubuntu core build stage binding is invalid", .{});
+    }
+    if (!support.stringIs(stage.?.get("purpose"), "initramfs-generation")) return fail(
+        diagnostic,
+        "Ubuntu core build stage does not describe initramfs generation",
+        .{},
+    );
+    if (!support.isExactOrderedStrings(
+        stage.?.get("package_roots"),
+        &contracts.core_build_package_roots,
+    )) {
+        return fail(
+            diagnostic,
+            "Ubuntu core build stage roots are not the contract's build tooling",
+            .{},
+        );
+    }
+
+    const initramfs_fields = [_][]const u8{ "bytes", "kernel_release", "path", "sha256" };
+    const initramfs = support.objectOf(stage.?.get("initramfs"));
+    if (initramfs == null or !support.hasExactFields(initramfs.?, &initramfs_fields)) {
+        return fail(diagnostic, "Ubuntu core build stage output binding is invalid", .{});
+    }
+    var path_buffer: [128]u8 = undefined;
+    const expected_path = std.fmt.bufPrint(
+        &path_buffer,
+        "/boot/initrd.img-{s}",
+        .{selection.release},
+    ) catch unreachable;
+    if (!support.stringIs(initramfs.?.get("path"), expected_path) or
+        !support.stringIs(initramfs.?.get("kernel_release"), selection.release))
+    {
+        return fail(
+            diagnostic,
+            "Ubuntu core build stage output is not the selected kernel's initramfs",
+            .{},
+        );
+    }
+    _ = try support.requireSha256(
+        initramfs.?.get("sha256"),
+        "build stage initramfs",
+        diagnostic,
+    );
+    const bytes = support.integerOf(initramfs.?.get("bytes")) orelse 0;
+    if (bytes <= 0) return fail(
+        diagnostic,
+        "Ubuntu core build stage initramfs size is invalid",
+        .{},
+    );
+
+    const transactions = support.arrayOf(stage.?.get("transactions"));
+    if (transactions == null or
+        transactions.?.len != contracts.core_build_package_roots.len)
+    {
+        return fail(
+            diagnostic,
+            "Ubuntu core build stage transaction set is not exact or stably ordered",
+            .{},
+        );
+    }
+    for (transactions.?, contracts.core_build_package_roots) |item, package| {
+        const entry = support.objectOf(item) orelse return fail(
+            diagnostic,
+            "Ubuntu core build stage transaction set is not exact or stably ordered",
+            .{},
+        );
+        if (!support.stringIs(entry.get("package"), package)) return fail(
+            diagnostic,
+            "Ubuntu core build stage transaction set is not exact or stably ordered",
+            .{},
+        );
+        // The stage starts from the finished guest closure, so its baseline is
+        // retained rather than empty: an "empty" build stage would mean the
+        // initramfs was generated against no kernel at all.
+        try validateDebzTransaction(
+            allocator,
+            io,
+            root,
+            item,
+            package,
+            source_architecture,
+            .retained,
             diagnostic,
         );
     }

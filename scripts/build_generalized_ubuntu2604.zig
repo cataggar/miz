@@ -158,11 +158,107 @@ const Flavor = enum {
     fn debzPackages(self: Flavor) []const []const u8 {
         return switch (self) {
             .full => &full_debz_packages,
-            .core => &core_debz_packages,
-            .baremetal => &baremetal_debz_packages,
+            .core => &core_guest_literal_roots,
+            .baremetal => &baremetal_guest_roots,
+        };
+    }
+
+    /// The metapackage this flavor resolves to decide which versioned kernel
+    /// packages the guest installs, or null when it names them outright.
+    fn kernelSelector(self: Flavor) ?[]const u8 {
+        return switch (self) {
+            .core => core_contract.kernel_templates.selector,
+            .full, .baremetal => null,
+        };
+    }
+
+    /// The roots the initramfs build stage resolves on top of the finished
+    /// guest closure. Empty for `full`, which inherits Canonical's root and the
+    /// initramfs that came with it.
+    fn buildStageRoots(self: Flavor) []const []const u8 {
+        return switch (self) {
+            .full => &.{},
+            .core => &core_build_roots,
+            .baremetal => &baremetal_build_roots,
         };
     }
 };
+
+/// The versioned kernel roots a selector transaction chose, and the provenance
+/// of the resolution that chose them.
+///
+/// Issue #677 step 4 asks for exact versioned kernel packages without giving up
+/// security-update selection. This is how both hold: the metapackage is
+/// resolved against the immutable snapshot, its lock is published as evidence,
+/// and the two versioned names the lock yielded become the roots the guest
+/// installs. Refreshing the snapshot re-selects; nothing here has to be edited.
+const KernelSelection = struct {
+    selector: []const u8,
+    release: []const u8,
+    version: []const u8,
+    image_package: []const u8,
+    modules_package: []const u8,
+    lock_filename: []const u8,
+    lock_path: []const u8,
+    lock_sha256: [64]u8,
+    lock_digest_sha256: [64]u8,
+};
+
+/// The debz roots one build resolves, split by where they are installed.
+///
+/// Everything is owned by `arena`, including copies of the static lists, so a
+/// caller never has to know which names were selected and which were written
+/// down.
+const RootPlan = struct {
+    arena: std.heap.ArenaAllocator,
+    guest: []const []const u8,
+    build: []const []const u8,
+    kernel: ?KernelSelection,
+
+    fn deinit(self: *RootPlan) void {
+        self.arena.deinit();
+    }
+};
+
+// A kernel selection standing in for a resolve transaction, so tests can
+// exercise the shape `planRoots` produces without reaching the archive. The
+// release is a real one from the pinned snapshot, which keeps the templates
+// honest.
+const test_kernel_release = "7.0.0-1010-azure";
+const test_kernel_version = "7.0.0-1010.10";
+const test_kernel_image = "linux-image-" ++ test_kernel_release;
+const test_kernel_modules = "linux-modules-" ++ test_kernel_release;
+
+/// The plan a build of `flavor` would produce, for tests that need roots
+/// without running debz.
+fn testRootPlan(allocator: Allocator, flavor: Flavor) !RootPlan {
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer arena.deinit();
+    const scratch = arena.allocator();
+    const literal = flavor.debzPackages();
+    const kernel: ?KernelSelection = if (flavor.kernelSelector()) |selector| .{
+        .selector = selector,
+        .release = test_kernel_release,
+        .version = test_kernel_version,
+        .image_package = test_kernel_image,
+        .modules_package = test_kernel_modules,
+        .lock_filename = "test-debz-exact-lock-linux-azure-amd64.json",
+        .lock_path = "test-debz-exact-lock-linux-azure-amd64.json",
+        .lock_sha256 = @splat('1'),
+        .lock_digest_sha256 = @splat('a'),
+    } else null;
+    const kernel_root_count: usize = if (kernel == null) 0 else 2;
+    const guest = try scratch.alloc([]const u8, kernel_root_count + literal.len);
+    if (kernel) |selection| {
+        guest[0] = selection.image_package;
+        guest[1] = selection.modules_package;
+    }
+    for (literal, 0..) |name, index| guest[kernel_root_count + index] = name;
+    const stage_roots = flavor.buildStageRoots();
+    const build = try scratch.alloc([]const u8, stage_roots.len);
+    for (stage_roots, 0..) |name, index| build[index] = name;
+    return .{ .arena = arena, .guest = guest, .build = build, .kernel = kernel };
+}
 
 fn validateRootHeadroom(flavor: Flavor, free_bytes: u64, free_inodes: u32) !void {
     if (flavor.freshRoot() and free_bytes < core_minimum_root_free_bytes)
@@ -322,27 +418,23 @@ const full_debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
 // pager, locales, a DHCP client, and netplan into an appliance whose PID 1 is
 // `mizinit` and whose only access path is `sshd`. Nothing below is here because
 // it was convenient: every entry is a `package` requirement of the machine-
-// readable runtime contract, and `core_contract.isPackageRootSet` refuses
+// readable runtime contract, and `core_contract.isGuestPackageRootSet` refuses
 // this list if the two ever disagree. The base system is not named because
 // debz includes available `Essential: yes` packages in every install closure,
 // so `bash`, `coreutils`, `dpkg`, and `util-linux` -- which is what supplies
 // the `dmesg` the contract's diagnostics entry stands on -- arrive as part of
 // creating a root at all rather than as a root of their own.
 //
-// The order is deliberate and is not derived. `linux-azure` is first because
-// the first root is the transaction that creates the empty baseline, and
-// because installing the kernel before the initramfs generator keeps the
-// kernel's postinst from building an initramfs that customization is about to
-// rebuild from the reviewed module list in `/etc/initramfs-tools/modules`.
-const core_debz_packages = [_][]const u8{
-    "linux-azure",
-    // The versioned Azure kernel only recommends `dracut |
-    // linux-initramfs-tool`; recommends are outside the exact debz closure.
-    // Name the generator that customization executes instead of assuming the
-    // kernel transaction supplied `/usr/sbin/update-initramfs`. The contract
-    // classifies it `build_tooling`, so step 4 removes it from the guest; until
-    // then it is installed and must be accounted for as a root.
-    "initramfs-tools",
+// Step 4 removed two more things from this list. The kernel is no longer named:
+// `linux-azure` is *resolved* to learn which release Canonical currently ships
+// and is then not installed, because its own dependencies are headers, perf
+// tools, cloud tools, and a ZFS module set no appliance behavior stands on.
+// `selectCoreKernel` turns that resolution into the two versioned roots the
+// guest installs, so a security kernel still arrives by refreshing the snapshot
+// rather than by editing a version into this file. And `initramfs-tools` is no
+// longer a guest root: the generator and its build-only closure are resolved
+// into a staging root that produces the initramfs and is then discarded.
+const core_guest_literal_roots = [_][]const u8{
     "openssh-server",
     "sudo",
     // No required dependency above supplies the TLS trust store. Keep it a
@@ -350,18 +442,29 @@ const core_debz_packages = [_][]const u8{
     "ca-certificates",
 };
 
+// The roots the initramfs build stage resolves on top of the finished guest
+// closure. The versioned kernel only recommends `dracut |
+// linux-initramfs-tool`, and recommends are outside the exact debz closure, so
+// the stage names the generator it executes rather than assuming one arrived.
+const core_build_roots = [_][]const u8{"initramfs-tools"};
+
 comptime {
-    if (!core_contract.isPackageRootSet(&core_debz_packages))
+    if (!core_contract.isGuestPackageRootSet(&core_guest_literal_roots))
         @compileError(
-            "core package roots and the runtime contract have separated; a " ++
-                "root exists only for a behavior the contract names",
+            "core guest package roots and the runtime contract have separated; " ++
+                "a guest root exists only for a guest_runtime behavior the " ++
+                "contract names",
+        );
+    if (!core_contract.isBuildPackageRootSet(&core_build_roots))
+        @compileError(
+            "the initramfs build stage and the runtime contract have separated; " ++
+                "the stage resolves exactly the contract's build_tooling roots",
         );
 }
 
-// The official in-tree Binder module name Ubuntu packages. `linux-azure`
-// pulls it in transitively through
-// `linux-modules-extra-*-azure`, so no additional debz package root is
-// needed -- only validating that the module, its kernel config, and its
+// The official in-tree Binder module name Ubuntu packages. The selected
+// `linux-modules-*-azure` root carries it, so no additional debz package root
+// is needed -- only validating that the module, its kernel config, and its
 // signature are what core actually ships.
 const binder_module_name = "binder_linux";
 
@@ -380,24 +483,24 @@ const core_required_kernel_config = [_][]const u8{
 // There is no `linux-nvidia-bos` meta package in the pinned snapshot -- the
 // only ones published are for builds that postdate it -- so the versioned
 // binary package is named directly. That name *is* the kernel release, which
-// is why no separate version pin is needed.
+// is why no separate version pin is needed, and why bare metal has no selector
+// to resolve: a selection needs something to select from.
 const baremetal_kernel_release = "7.0.0-2015" ++ nvidia_bos_kernel_suffix;
 const baremetal_image_package = "linux-image-" ++ baremetal_kernel_release;
 const baremetal_modules_package = "linux-modules-" ++ baremetal_kernel_release;
-const baremetal_debz_packages = [_][]const u8{
+const baremetal_guest_roots = [_][]const u8{
     baremetal_image_package,
     baremetal_modules_package,
-    // The generator this flavor configures and then runs. Kernel packages only
-    // recommend an initramfs implementation, so every fresh-root flavor names
-    // the implementation it executes.
-    "initramfs-tools",
     "openssh-server",
     "sudo",
     // The trust store is explicit for every fresh root: none of their required
     // package dependencies supplies it.
     "ca-certificates",
 };
-const max_debz_packages = baremetal_debz_packages.len;
+// Bare metal builds its initramfs the same way core does, in a staging root it
+// throws away.
+const baremetal_build_roots = [_][]const u8{"initramfs-tools"};
+const max_debz_packages = baremetal_guest_roots.len;
 
 const full_required_packages = [_][]const u8{
     "linux-azure",
@@ -407,9 +510,11 @@ const full_required_packages = [_][]const u8{
     "udisks2",
 };
 
+// The literal packages a finished guest closure must contain. The core kernel
+// is not here: it is selected rather than named, so `validateExactLockRuntime`
+// checks it through the contract's selector instead of through a literal that
+// would go stale with the next security kernel.
 const core_required_packages = [_][]const u8{
-    "linux-azure",
-    "initramfs-tools",
     "openssh-server",
     "openssh-client",
     "sudo",
@@ -419,7 +524,6 @@ const core_required_packages = [_][]const u8{
 const baremetal_required_packages = [_][]const u8{
     baremetal_image_package,
     baremetal_modules_package,
-    "initramfs-tools",
     "openssh-server",
     "openssh-client",
     "sudo",
@@ -431,18 +535,18 @@ const baremetal_required_packages = [_][]const u8{
 // signed module resolved above, never a DKMS-built shadow copy layered on top
 // of it. The contract's list is the shared one so the builder, the release
 // tool, and the published contract document cannot disagree about what
-// "minimal" excludes.
+// "minimal" excludes. Since step 4 that list also names `initramfs-tools` and
+// the kernel convenience metapackages, which is the enforcement that makes the
+// build/runtime split real rather than merely intended.
 const core_forbidden_packages = core_contract.forbidden_packages ++ [_][]const u8{
     "anbox-modules-dkms",
     "anbox-modules",
 };
 
-// Bare metal forbids everything core does, and `linux-azure` besides: pulling
-// it in would leave two kernels in `/boot` and make the release the UKI is
-// built from ambiguous.
-const baremetal_forbidden_packages = core_forbidden_packages ++ [_][]const u8{
-    "linux-azure",
-};
+// Bare metal forbids everything core does. `linux-azure` is already in that
+// set -- pulling it in would leave two kernels in `/boot` and make the release
+// the UKI is built from ambiguous -- so there is nothing left to add.
+const baremetal_forbidden_packages = core_forbidden_packages;
 
 const core_forbidden_paths = [_][]const u8{
     "/usr/bin/cloud-init",
@@ -1543,6 +1647,23 @@ fn forbiddenPackages(flavor: Flavor) []const []const u8 {
     };
 }
 
+/// Fails unless a flavor that selects its kernel ended up with exactly one
+/// versioned image and the matching module tree installed.
+///
+/// The forbidden list already refuses the metapackage; this is the other half,
+/// so a closure that lost the module tree fails here instead of at first boot.
+fn requireSelectedKernel(bytes: []const u8, flavor: Flavor) !void {
+    if (flavor.kernelSelector() == null) return;
+    var selector: core_contract.KernelSelector = .{};
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const end = std.mem.indexOfScalar(u8, line, '\t') orelse line.len;
+        selector.offer(line[0..end]) catch return error.KernelSelectionInvalid;
+    }
+    _ = selector.finish() catch return error.KernelSelectionInvalid;
+}
+
 fn validateExactLock(bytes: []const u8, profile: *const Profile, flavor: Flavor) !void {
     for (requiredPackages(flavor)) |package| {
         const needle = try std.fmt.allocPrint(std.testing.allocator, "{s}\t", .{package});
@@ -1562,6 +1683,7 @@ fn validateExactLock(bytes: []const u8, profile: *const Profile, flavor: Flavor)
         defer std.testing.allocator.free(needle);
         if (std.mem.indexOf(u8, bytes, needle) != null) return error.ForbiddenCorePackage;
     }
+    try requireSelectedKernel(bytes, flavor);
 }
 
 fn validateExactLockRuntime(
@@ -1588,6 +1710,7 @@ fn validateExactLockRuntime(
         defer allocator.free(needle);
         if (std.mem.indexOf(u8, bytes, needle) != null) return error.ForbiddenCorePackage;
     }
+    try requireSelectedKernel(bytes, flavor);
 }
 
 fn validateInventoryAgainstExactLock(
@@ -1665,6 +1788,13 @@ const DebzCustomization = struct {
     root_path: []u8,
     evidence: [max_debz_packages]DebzEvidence,
     evidence_count: usize,
+    /// The roots this build resolved and where each was applied (issue #677
+    /// step 4). Carried forward because the published provenance names both
+    /// the guest roots and the build stage's, and for `core` the guest roots
+    /// were selected rather than written down.
+    plan: RootPlan,
+    /// The staging build that produced the initramfs, for the fresh roots.
+    stage: ?InitramfsStage,
     root_free_bytes: u64,
     /// Reproducible size attribution for this build (issue #677 step 1). The
     /// root-build phase is measured here, while the tree is still walkable;
@@ -1678,6 +1808,8 @@ const DebzCustomization = struct {
     fn deinit(self: *DebzCustomization, allocator: Allocator) void {
         allocator.free(self.root_path);
         for (self.evidence[0..self.evidence_count]) |*item| item.deinit(allocator);
+        if (self.stage) |*stage| stage.deinit(allocator);
+        self.plan.deinit();
         self.inventory.deinit();
         self.* = undefined;
     }
@@ -2596,6 +2728,19 @@ fn requireUnownedRemoval(owned: *const size_inventory.OwnedPaths, path: []const 
     return error.PackageOwnedContentRemoval;
 }
 
+/// The result of customizing a built root: the kernel release it boots and,
+/// for the fresh-root flavors, the staging build that produced its initramfs.
+const OfflineCustomization = struct {
+    release_name: []u8,
+    stage: ?InitramfsStage,
+
+    fn deinit(self: *OfflineCustomization, allocator: Allocator) void {
+        allocator.free(self.release_name);
+        if (self.stage) |*stage| stage.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
 fn customizeOfflineRoot(
     allocator: Allocator,
     io: Io,
@@ -2603,7 +2748,10 @@ fn customizeOfflineRoot(
     flavor: Flavor,
     root_path: []const u8,
     provenance_dir: []const u8,
-) ![]u8 {
+    timing: *image_phase_timing.Recorder,
+    debz_context: ?DebzContext,
+    build_roots: []const []const u8,
+) !OfflineCustomization {
     var root = try offline_root.Root.init(allocator, io, root_path, .{});
     defer root.deinit();
     const release_name = try root.activeKernelRelease(flavor.kernelSuffix());
@@ -2680,28 +2828,27 @@ fn customizeOfflineRoot(
             });
             try applyFullUdisks2Policy(&root);
         },
+        // Neither fresh root writes `/etc/initramfs-tools`: since #677 step 4
+        // the generation inputs belong to the staging root that runs the
+        // generator, and an appliance with no generator has nothing to read
+        // them with.
         .core => {
             try root.apply(&.{
                 .{ .create_directory = .{ .path = "/etc/ssh/sshd_config.d", .mode = 0o755 } },
-                .{ .create_directory = .{ .path = "/etc/initramfs-tools", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/var/lib/miz", .mode = 0o755 } },
                 .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-mizinit.conf", .source = .{ .inline_bytes = core_ssh_config }, .mode = 0o600 } },
                 .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = core_azagent_config } } },
                 .{ .write_file = .{ .path = "/etc/resolv.conf", .source = .{ .inline_bytes = "" } } },
-                .{ .write_file = .{ .path = "/etc/initramfs-tools/modules", .source = .{ .inline_bytes = core_initramfs_modules } } },
             });
         },
         .baremetal => {
             try root.apply(&.{
                 .{ .create_directory = .{ .path = "/etc/ssh/sshd_config.d", .mode = 0o755 } },
-                .{ .create_directory = .{ .path = "/etc/initramfs-tools", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/usr/local/sbin", .mode = 0o755 } },
                 .{ .create_directory = .{ .path = "/var/lib/miz", .mode = 0o755 } },
                 .{ .write_file = .{ .path = "/etc/ssh/sshd_config.d/10-mizinit.conf", .source = .{ .inline_bytes = core_ssh_config }, .mode = 0o600 } },
                 .{ .write_file = .{ .path = "/etc/waagent.conf", .source = .{ .inline_bytes = core_azagent_config } } },
                 .{ .write_file = .{ .path = "/etc/resolv.conf", .source = .{ .inline_bytes = "" } } },
-                .{ .write_file = .{ .path = "/etc/initramfs-tools/initramfs.conf", .source = .{ .inline_bytes = baremetal_initramfs_conf } } },
-                .{ .write_file = .{ .path = "/etc/initramfs-tools/modules", .source = .{ .inline_bytes = baremetal_initramfs_modules } } },
                 .{ .write_file = .{ .path = baremetal_access_provider_path, .source = .{ .inline_bytes = baremetal_access_provider }, .mode = 0o755 } },
             });
         },
@@ -2719,8 +2866,28 @@ fn customizeOfflineRoot(
         binder_evidence = try validateBinderModule(allocator, &root, release_name);
     }
 
-    var initramfs = try runOfflineCommand(&executor, .{ .update_initramfs = release_name });
-    defer initramfs.deinit(allocator);
+    // Issue #677 step 4: a fresh root never runs the generator. Its initramfs
+    // is produced by a staging root that carries the same kernel and modules
+    // plus `initramfs-tools`, and only the resulting image comes back.
+    var stage: ?InitramfsStage = null;
+    errdefer if (stage) |*built| built.deinit(allocator);
+    if (flavor.freshRoot()) {
+        const context = debz_context orelse return error.InitramfsBuildStageEmpty;
+        var built = try buildInitramfsStage(
+            context,
+            timing,
+            flavor,
+            root_path,
+            release_name,
+            build_roots,
+        );
+        errdefer built.deinit(allocator);
+        try root.insert(built.host_path, built.guest_path, 0o600);
+        stage = built;
+    } else {
+        var initramfs = try runOfflineCommand(&executor, .{ .update_initramfs = release_name });
+        defer initramfs.deinit(allocator);
+    }
 
     try validateInitramfs(allocator, &root, release_name);
 
@@ -2835,6 +3002,12 @@ fn customizeOfflineRoot(
         .modules = modules_path,
         .package_lock = "/var/lib/miz/ubuntu2604-package-lock.tsv",
         .package_lock_sha256 = @as([]const u8, &lock_sha256),
+        // Where the initramfs came from, so a reader does not have to assume
+        // the guest built its own. A fresh root's was produced by a staging
+        // build whose packages the guest deliberately does not carry.
+        .initramfs_origin = @as([]const u8, if (stage == null) "guest-root" else "build-stage"),
+        .initramfs_sha256 = if (stage) |built| @as(?[]const u8, &built.sha256) else null,
+        .initramfs_bytes = if (stage) |built| @as(?u64, built.bytes) else null,
         .binder_kernel_config_verified = binder_kernel_config_verified,
         .binder_module_path = binder_module_path,
         .binder_module_sha256 = binder_module_sha256,
@@ -2842,7 +3015,7 @@ fn customizeOfflineRoot(
     }, .{ .whitespace = .indent_2 });
     defer allocator.free(evidence);
     try Dir.cwd().writeFile(io, .{ .sub_path = evidence_path, .data = evidence });
-    return release_name;
+    return .{ .release_name = release_name, .stage = stage };
 }
 
 fn generalizationPolicy(flavor: Flavor) miz.os_customization.GeneralizationPolicy {
@@ -2985,7 +3158,9 @@ fn injectCoreGuest(
     profile: *const Profile,
     mizinit_path: []const u8,
     azagent_path: []const u8,
+    plan: *const RootPlan,
     evidence: []const DebzEvidence,
+    stage: ?*const InitramfsStage,
 ) !void {
     const mizinit_bytes = try Dir.cwd().readFileAlloc(io, mizinit_path, allocator, .limited(32 * 1024 * 1024));
     defer allocator.free(mizinit_bytes);
@@ -3022,6 +3197,50 @@ fn injectCoreGuest(
             try filesystem.copyIn(source, destination, .{ .mode = 0o600 });
         }
     }
+    // The staging build's own lock and transaction result travel with the
+    // image too. #677 step 4 removes the build tooling from the guest; it does
+    // not remove the obligation to say what produced the guest's initramfs.
+    if (stage) |built| {
+        for (built.evidence[0..built.evidence_count]) |item| {
+            for ([_][]const u8{ item.lock_path, item.provenance_path }) |source| {
+                const destination = try std.fmt.allocPrint(
+                    allocator,
+                    "/var/lib/miz/provenance/{s}",
+                    .{std.fs.path.basename(source)},
+                );
+                defer allocator.free(destination);
+                try filesystem.copyIn(source, destination, .{ .mode = 0o600 });
+            }
+        }
+    }
+    if (plan.kernel) |selection| {
+        const destination = try std.fmt.allocPrint(
+            allocator,
+            "/var/lib/miz/provenance/{s}",
+            .{selection.lock_filename},
+        );
+        defer allocator.free(destination);
+        try filesystem.copyIn(selection.lock_path, destination, .{ .mode = 0o600 });
+    }
+    const kernel_selection = if (plan.kernel) |selection| .{
+        .selector = selection.selector,
+        .kernel_release = selection.release,
+        .image_package = selection.image_package,
+        .modules_package = selection.modules_package,
+        .version = selection.version,
+        .exact_lock = selection.lock_filename,
+    } else null;
+    const build_stage = if (stage) |built| .{
+        .purpose = "initramfs-generation",
+        .package_roots = plan.build,
+        .initramfs = .{
+            .path = built.guest_path,
+            .kernel_release = built.kernel_release,
+            .sha256 = @as([]const u8, &built.sha256),
+            .bytes = built.bytes,
+        },
+        .transaction_count = built.evidence_count,
+    } else null;
     const contract = try std.json.Stringify.valueAlloc(allocator, .{
         .schema = 1,
         .type = "miz-ubuntu2604-core-provenance",
@@ -3029,8 +3248,10 @@ fn injectCoreGuest(
         .release = "26.04",
         .snapshot = snapshot_base,
         .debz_api_commit = package_family.debz_api_commit,
-        .package_roots = core_debz_packages,
+        .package_roots = plan.guest,
         .transaction_count = evidence.len,
+        .kernel_selection = kernel_selection,
+        .build_stage = build_stage,
     }, .{ .whitespace = .indent_2 });
     defer allocator.free(contract);
     try filesystem.write(
@@ -3154,9 +3375,14 @@ fn validateCoreRoot(
     filesystem: *const miz.ext4_mountless.FileSystem,
     profile: *const Profile,
     flavor: Flavor,
+    plan: *const RootPlan,
     evidence: []const DebzEvidence,
+    stage: ?*const InitramfsStage,
 ) !void {
-    if (evidence.len != flavor.debzPackages().len) return error.InvalidDebzEvidence;
+    if (evidence.len != plan.guest.len) return error.InvalidDebzEvidence;
+    for (evidence, plan.guest) |item, root| {
+        if (!std.mem.eql(u8, item.package, root)) return error.InvalidDebzEvidence;
+    }
     // Issue #677 step 2: the explicit runtime contract is the single statement
     // of what a fresh root must carry, and it is enforced here rather than in a
     // second hand-maintained path list that could disagree with it. A closure
@@ -3167,8 +3393,13 @@ fn validateCoreRoot(
         // would fall back to sshd, which waits for a provisioning sentinel that
         // nothing on bare metal ever writes.
         try requireRootPath(filesystem, baremetal_access_provider_path);
-        try requireRootPath(filesystem, "/etc/initramfs-tools/initramfs.conf");
     }
+    // Issue #677 step 4: the generation inputs are staging inputs. A guest that
+    // still carries them either installed the generator or kept files nobody
+    // can attribute, and both are the failure this step exists to prevent.
+    try requireRootPathAbsent(filesystem, "/etc/initramfs-tools/initramfs.conf");
+    try requireRootPathAbsent(filesystem, "/etc/initramfs-tools/modules");
+    if (stage) |built| try validateStagedInitramfs(allocator, filesystem, built);
     for (&core_forbidden_paths) |path| try requireRootPathAbsent(filesystem, path);
     const sbin = try filesystem.readLink(allocator, "/sbin", 1024);
     defer allocator.free(sbin);
@@ -3247,6 +3478,18 @@ fn validateCoreRoot(
     );
     defer allocator.free(final_exact_lock);
     try validateInventoryAgainstExactLock(allocator, inventory, final_exact_lock, profile);
+    // Issue #677 step 4's fail-closed gate, derived rather than listed: the
+    // build stage's own lock says exactly which packages the generator added,
+    // and not one of them may appear in the guest the stage was kept out of.
+    // A hand-written list of build-only packages would go stale the first time
+    // `initramfs-tools` gained a dependency; this cannot.
+    if (stage) |built| try requireNoBuildOnlyPackages(
+        allocator,
+        io,
+        inventory,
+        final_exact_lock,
+        built,
+    );
 
     for (evidence) |item| {
         const embedded_lock_path = try std.fmt.allocPrint(
@@ -3284,12 +3527,717 @@ fn validateCoreRoot(
         )) return error.EmbeddedProvenanceMismatch;
     }
 
+    if (stage) |built| for (built.evidence[0..built.evidence_count]) |item| {
+        try requireEmbeddedProvenance(allocator, filesystem, item.lock_path, item.lock_sha256);
+        try requireEmbeddedProvenance(
+            allocator,
+            filesystem,
+            item.provenance_path,
+            item.provenance_sha256,
+        );
+    };
+    if (plan.kernel) |selection| try requireEmbeddedProvenance(
+        allocator,
+        filesystem,
+        selection.lock_path,
+        selection.lock_sha256,
+    );
+
     const mizinit = try filesystem.read(allocator, "/usr/sbin/mizinit", 32 * 1024 * 1024);
     defer allocator.free(mizinit);
     try validateGuestElf(mizinit, profile);
     const azagent = try filesystem.read(allocator, "/usr/sbin/azagent", 32 * 1024 * 1024);
     defer allocator.free(azagent);
     try validateGuestElf(azagent, profile);
+}
+
+/// Fails unless the image carries the provenance file it says it does, byte for
+/// byte.
+fn requireEmbeddedProvenance(
+    allocator: Allocator,
+    filesystem: *const miz.ext4_mountless.FileSystem,
+    host_path: []const u8,
+    expected: [64]u8,
+) !void {
+    const embedded_path = try std.fmt.allocPrint(
+        allocator,
+        "/var/lib/miz/provenance/{s}",
+        .{std.fs.path.basename(host_path)},
+    );
+    defer allocator.free(embedded_path);
+    const embedded = filesystem.read(allocator, embedded_path, 16 * 1024 * 1024) catch
+        return error.EmbeddedProvenanceMismatch;
+    defer allocator.free(embedded);
+    const actual = artifact_pipeline.formatSha256(artifact_pipeline.sha256Bytes(embedded));
+    if (!std.mem.eql(u8, &actual, &expected)) return error.EmbeddedProvenanceMismatch;
+}
+
+/// Fails unless the guest carries exactly the initramfs the staging build
+/// produced.
+///
+/// Without this the split would be an assertion: the guest's `/boot` would hold
+/// an initramfs no package claims and nothing would connect it to the stage
+/// that made it.
+fn validateStagedInitramfs(
+    allocator: Allocator,
+    filesystem: *const miz.ext4_mountless.FileSystem,
+    stage: *const InitramfsStage,
+) !void {
+    const bytes = filesystem.read(
+        allocator,
+        stage.guest_path,
+        miz.uki.limits.max_initrd_size,
+    ) catch return error.InitramfsMissing;
+    defer allocator.free(bytes);
+    if (bytes.len != stage.bytes) return error.StagedInitramfsMismatch;
+    const actual = artifact_pipeline.formatSha256(artifact_pipeline.sha256Bytes(bytes));
+    if (!std.mem.eql(u8, &actual, &stage.sha256)) return error.StagedInitramfsMismatch;
+}
+
+/// Fails when any package the initramfs build stage added is also installed in
+/// the guest.
+///
+/// The two locks are the whole argument. `guest_lock` is what the appliance
+/// carries; `stage_lock` is that plus the generator's closure. Their difference
+/// is the build-only set, measured from this build's own resolution rather than
+/// from a list somebody remembered to update.
+fn requireNoBuildOnlyPackages(
+    allocator: Allocator,
+    io: Io,
+    inventory: []const u8,
+    guest_lock: []const u8,
+    stage: *const InitramfsStage,
+) !void {
+    if (stage.evidence_count == 0) return error.InitramfsBuildStageEmpty;
+    const stage_lock = try Dir.cwd().readFileAlloc(
+        io,
+        stage.evidence[stage.evidence_count - 1].lock_path,
+        allocator,
+        .limited(16 * 1024 * 1024),
+    );
+    defer allocator.free(stage_lock);
+
+    var guest_document = try std.json.parseFromSlice(std.json.Value, allocator, guest_lock, .{});
+    defer guest_document.deinit();
+    var stage_document = try std.json.parseFromSlice(std.json.Value, allocator, stage_lock, .{});
+    defer stage_document.deinit();
+    const guest_packages = lockPackageArray(guest_document.value) orelse
+        return error.ExactLockIncomplete;
+    const stage_packages = lockPackageArray(stage_document.value) orelse
+        return error.ExactLockIncomplete;
+
+    var build_only: usize = 0;
+    for (stage_packages) |item| {
+        const name = lockPackageName(item) orelse return error.ExactLockIncomplete;
+        var in_guest = false;
+        for (guest_packages) |other| {
+            const other_name = lockPackageName(other) orelse return error.ExactLockIncomplete;
+            if (std.mem.eql(u8, name, other_name)) {
+                in_guest = true;
+                break;
+            }
+        }
+        if (in_guest) continue;
+        build_only += 1;
+        if (inventoryContains(inventory, name)) {
+            std.debug.print(
+                "[ubuntu2604] build-only package {s} is installed in the final guest\n",
+                .{name},
+            );
+            return error.BuildOnlyPackageInGuest;
+        }
+    }
+    // A stage that added nothing did not install the generator, which means the
+    // initramfs it returned was produced by something nobody accounted for.
+    if (build_only == 0) return error.InitramfsBuildStageEmpty;
+}
+
+fn lockPackageArray(value: std.json.Value) ?[]const std.json.Value {
+    const object = switch (value) {
+        .object => |map| map,
+        else => return null,
+    };
+    const packages = object.get("packages") orelse return null;
+    return switch (packages) {
+        .array => |items| items.items,
+        else => null,
+    };
+}
+
+fn lockPackageName(value: std.json.Value) ?[]const u8 {
+    const object = switch (value) {
+        .object => |map| map,
+        else => return null,
+    };
+    const name = object.get("name") orelse return null;
+    return switch (name) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+/// Whether the shipped `name<TAB>version<TAB>architecture` inventory names a
+/// package. The comparison is whole-field, so `initramfs-tools-bin` is not
+/// `initramfs-tools`.
+fn inventoryContains(inventory: []const u8, name: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, inventory, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const end = std.mem.indexOfScalar(u8, line, '\t') orelse line.len;
+        const field = line[0..end];
+        const normalized = if (std.mem.lastIndexOfScalar(u8, field, ':')) |separator|
+            field[0..separator]
+        else
+            field;
+        if (std.mem.eql(u8, normalized, name)) return true;
+    }
+    return false;
+}
+
+/// Everything a debz transaction needs that is the same for every root it
+/// applies to. Extracted so the guest chain, the kernel selector, and the
+/// initramfs build stage all resolve and publish through one code path rather
+/// than three that could drift.
+const DebzContext = struct {
+    allocator: Allocator,
+    io: Io,
+    profile: *const Profile,
+    work_dir: []const u8,
+    provenance_dir: []const u8,
+    config_inputs: []const []const u8,
+    keyring_inputs: []const []const u8,
+    cache: []const u8,
+    lock_dir: ?[]const u8,
+    proxy: ?[]const u8,
+    offline: bool,
+
+    fn lockFilename(self: DebzContext, package: []const u8) ![]u8 {
+        return std.fmt.allocPrint(
+            self.allocator,
+            "debz-exact-lock-{s}-{s}.json",
+            .{ package, self.profile.ubuntu_architecture },
+        );
+    }
+
+    fn provenanceFilename(self: DebzContext, package: []const u8) ![]u8 {
+        return std.fmt.allocPrint(
+            self.allocator,
+            "debz-transaction-provenance-{s}-{s}.json",
+            .{ package, self.profile.ubuntu_architecture },
+        );
+    }
+};
+
+/// One transaction's scratch directory: its dpkg admin state and the exact lock
+/// the transaction is bound to.
+const DebzTransactionDir = struct {
+    path: []u8,
+    state: []u8,
+    lock: []u8,
+
+    fn deinit(self: *DebzTransactionDir, allocator: Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.state);
+        allocator.free(self.lock);
+        self.* = undefined;
+    }
+};
+
+fn createDebzTransactionDir(
+    context: DebzContext,
+    package: []const u8,
+) !DebzTransactionDir {
+    const allocator = context.allocator;
+    const io = context.io;
+    const directory = try std.fmt.allocPrint(
+        allocator,
+        "{s}/debz-{s}",
+        .{ context.work_dir, package },
+    );
+    errdefer allocator.free(directory);
+    try Dir.cwd().deleteTree(io, directory);
+    try Dir.cwd().createDirPath(io, directory);
+    const state = try std.fs.path.join(allocator, &.{ directory, "state" });
+    errdefer allocator.free(state);
+    try Dir.cwd().createDirPath(io, state);
+    const absolute_state = try Dir.cwd().realPathFileAlloc(io, state, allocator);
+    allocator.free(state);
+    errdefer allocator.free(absolute_state);
+    const absolute_directory = try Dir.cwd().realPathFileAlloc(io, directory, allocator);
+    allocator.free(directory);
+    errdefer allocator.free(absolute_directory);
+    const lock = try std.fs.path.join(allocator, &.{ absolute_directory, "exact-lock.json" });
+    return .{ .path = absolute_directory, .state = absolute_state, .lock = lock };
+}
+
+/// Puts one package's exact closure lock at `transaction.lock`, either by
+/// resolving it against the pinned snapshot or by reusing a supplied one.
+fn resolveDebzLock(
+    context: DebzContext,
+    package: []const u8,
+    resolve_root: []const u8,
+    transaction: DebzTransactionDir,
+    installed_baseline: package_family.InstalledBaselinePolicy,
+) !void {
+    const allocator = context.allocator;
+    const io = context.io;
+    if (context.lock_dir) |lock_dir| {
+        const filename = try context.lockFilename(package);
+        defer allocator.free(filename);
+        const lock_input = try std.fs.path.join(allocator, &.{ lock_dir, filename });
+        defer allocator.free(lock_input);
+        return copyExactLockInput(allocator, io, lock_input, transaction.lock);
+    }
+    const dummy = try std.fs.path.join(
+        allocator,
+        &.{ transaction.path, "resolve-published-unused" },
+    );
+    defer allocator.free(dummy);
+    const packages = [_][]const u8{package};
+    const request = packageFamilyRequest(
+        .resolve_lock,
+        context.profile,
+        &packages,
+        resolve_root,
+        dummy,
+        context.config_inputs,
+        context.keyring_inputs,
+        context.cache,
+        transaction.state,
+        transaction.lock,
+        installed_baseline,
+        context.proxy,
+        context.offline,
+    );
+    try assertRequestSeparation(request);
+    const resolved = try package_family.execute(allocator, io, .{}, request);
+    try requireSucceeded(resolved, request, package);
+    if (resolved.lock_path == null or !std.mem.eql(u8, resolved.lock_path.?, transaction.lock))
+        return error.DebzLockMismatch;
+}
+
+/// Copies one transaction's lock and result into the stable provenance
+/// directory and returns the binding a published document records.
+fn publishDebzEvidence(
+    context: DebzContext,
+    package: []const u8,
+    lock_path: []const u8,
+    provenance_path: []const u8,
+) !DebzEvidence {
+    const allocator = context.allocator;
+    const io = context.io;
+    const lock_metadata = try artifact_pipeline.hashFile(io, lock_path);
+    const provenance_metadata = try artifact_pipeline.hashFile(io, provenance_path);
+    const lock_filename = try context.lockFilename(package);
+    defer allocator.free(lock_filename);
+    const provenance_filename = try context.provenanceFilename(package);
+    defer allocator.free(provenance_filename);
+    const stable_lock = try std.fs.path.join(
+        allocator,
+        &.{ context.provenance_dir, lock_filename },
+    );
+    errdefer allocator.free(stable_lock);
+    const stable_provenance = try std.fs.path.join(
+        allocator,
+        &.{ context.provenance_dir, provenance_filename },
+    );
+    errdefer allocator.free(stable_provenance);
+    try Dir.cwd().copyFile(lock_path, Dir.cwd(), stable_lock, io, .{});
+    try Dir.cwd().copyFile(provenance_path, Dir.cwd(), stable_provenance, io, .{});
+    const evidence: DebzEvidence = .{
+        .package = package,
+        .lock_path = stable_lock,
+        .lock_sha256 = artifact_pipeline.formatSha256(lock_metadata.sha256),
+        .lock_digest_sha256 = try requireJsonSha256Field(allocator, io, stable_lock, "digest_sha256"),
+        .provenance_path = stable_provenance,
+        .provenance_sha256 = artifact_pipeline.formatSha256(provenance_metadata.sha256),
+        .provenance_digest_sha256 = try requireJsonSha256Field(allocator, io, stable_provenance, "digest_sha256"),
+        .provenance_lock_sha256 = try requireJsonSha256Field(allocator, io, stable_provenance, "lock_sha256"),
+    };
+    if (!std.mem.eql(u8, &evidence.lock_digest_sha256, &evidence.provenance_lock_sha256))
+        return error.DebzProvenanceLockMismatch;
+    return evidence;
+}
+
+/// Resolves, applies, and publishes one package root on top of `current`.
+///
+/// Returns the absolute path of the published root, which the caller owns and
+/// which becomes the next transaction's input.
+fn runDebzTransaction(
+    context: DebzContext,
+    package: []const u8,
+    current: []const u8,
+    stage: []const u8,
+    published: []const u8,
+    installed_baseline: package_family.InstalledBaselinePolicy,
+    apply_operation: package_family.Operation,
+    evidence: *DebzEvidence,
+) ![]u8 {
+    const allocator = context.allocator;
+    const io = context.io;
+    var transaction = try createDebzTransactionDir(context, package);
+    defer transaction.deinit(allocator);
+
+    const absolute_resolve_root = try Dir.cwd().realPathFileAlloc(io, current, allocator);
+    defer allocator.free(absolute_resolve_root);
+    try resolveDebzLock(context, package, absolute_resolve_root, transaction, installed_baseline);
+
+    try Dir.cwd().deleteTree(io, stage);
+    try Dir.cwd().deleteTree(io, published);
+    try Dir.cwd().createDirPath(io, stage);
+    const current_contents = try std.fmt.allocPrint(allocator, "{s}/.", .{current});
+    defer allocator.free(current_contents);
+    const restricted_permissions = try copyRootStage(allocator, io, current, current_contents, stage);
+    const absolute_stage = try Dir.cwd().realPathFileAlloc(io, stage, allocator);
+    defer allocator.free(absolute_stage);
+    const absolute_published = if (std.fs.path.isAbsolute(published))
+        try allocator.dupe(u8, published)
+    else blk: {
+        const absolute_work = try Dir.cwd().realPathFileAlloc(io, context.work_dir, allocator);
+        defer allocator.free(absolute_work);
+        break :blk try std.fs.path.join(
+            allocator,
+            &.{ absolute_work, std.fs.path.basename(published) },
+        );
+    };
+    var published_transferred = false;
+    errdefer if (!published_transferred) allocator.free(absolute_published);
+
+    const packages = [_][]const u8{package};
+    const customize_request = packageFamilyRequest(
+        apply_operation,
+        context.profile,
+        &packages,
+        absolute_stage,
+        absolute_published,
+        context.config_inputs,
+        context.keyring_inputs,
+        context.cache,
+        transaction.state,
+        transaction.lock,
+        installed_baseline,
+        context.proxy,
+        context.offline,
+    );
+    try assertRequestSeparation(customize_request);
+    const customized = try package_family.execute(allocator, io, .{}, customize_request);
+    try requireSucceeded(customized, customize_request, package);
+    if (!customized.published or customized.provenance_path == null)
+        return error.DebzProvenanceMissing;
+    defer allocator.free(customized.provenance_path.?);
+    try restoreRestrictedRootEntry(allocator, io, absolute_published, restricted_permissions);
+    const expected_provenance = try std.fs.path.join(
+        allocator,
+        &.{ transaction.state, "transaction-result.json" },
+    );
+    defer allocator.free(expected_provenance);
+    if (!std.mem.eql(u8, customized.provenance_path.?, expected_provenance))
+        return error.DebzProvenanceMismatch;
+
+    evidence.* = try publishDebzEvidence(
+        context,
+        package,
+        transaction.lock,
+        expected_provenance,
+    );
+    published_transferred = true;
+    return absolute_published;
+}
+
+/// Resolves the kernel metapackage and turns its closure into the versioned
+/// roots the guest installs.
+///
+/// Nothing is installed here. The metapackage exists precisely to say "this is
+/// the Azure kernel Ubuntu currently ships", so resolving it against the pinned
+/// immutable snapshot is the security-update selection; installing it would
+/// additionally drag in headers, perf tools, cloud tools, and a ZFS module set
+/// the appliance has no behavior for. The lock this resolution produces is
+/// published as provenance, so the selection is reviewable rather than asserted.
+fn selectCoreKernel(
+    context: DebzContext,
+    selector: []const u8,
+    empty_root: []const u8,
+    arena: Allocator,
+) !KernelSelection {
+    const allocator = context.allocator;
+    const io = context.io;
+    var transaction = try createDebzTransactionDir(context, selector);
+    defer transaction.deinit(allocator);
+    try resolveDebzLock(context, selector, empty_root, transaction, .none);
+
+    const bytes = try Dir.cwd().readFileAlloc(
+        io,
+        transaction.lock,
+        allocator,
+        .limited(16 * 1024 * 1024),
+    );
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const packages = switch (parsed.value) {
+        .object => |object| object.get("packages") orelse return error.KernelSelectionInvalid,
+        else => return error.KernelSelectionInvalid,
+    };
+    if (packages != .array) return error.KernelSelectionInvalid;
+
+    var chooser: core_contract.KernelSelector = .{};
+    for (packages.array.items) |item| {
+        if (item != .object) return error.KernelSelectionInvalid;
+        const name = item.object.get("name") orelse return error.KernelSelectionInvalid;
+        if (name != .string) return error.KernelSelectionInvalid;
+        chooser.offer(name.string) catch return error.KernelSelectionInvalid;
+    }
+    const chosen = chooser.finish() catch return error.KernelSelectionInvalid;
+
+    // The version is the image package's own, not the metapackage's: it is what
+    // the guest inventory will carry, and the two are only equal by convention.
+    var version: ?[]const u8 = null;
+    for (packages.array.items) |item| {
+        const name = item.object.get("name").?;
+        if (!std.mem.eql(u8, name.string, chosen.image_package)) continue;
+        const recorded = item.object.get("version") orelse return error.KernelSelectionInvalid;
+        if (recorded != .string or recorded.string.len == 0) return error.KernelSelectionInvalid;
+        version = recorded.string;
+    }
+    const selected_version = version orelse return error.KernelSelectionInvalid;
+
+    const lock_filename = try context.lockFilename(selector);
+    defer allocator.free(lock_filename);
+    const stable_lock = try std.fs.path.join(
+        allocator,
+        &.{ context.provenance_dir, lock_filename },
+    );
+    defer allocator.free(stable_lock);
+    try Dir.cwd().copyFile(transaction.lock, Dir.cwd(), stable_lock, io, .{});
+    const lock_metadata = try artifact_pipeline.hashFile(io, stable_lock);
+
+    return .{
+        .selector = try arena.dupe(u8, selector),
+        .release = try arena.dupe(u8, chosen.release),
+        .version = try arena.dupe(u8, selected_version),
+        .image_package = try arena.dupe(u8, chosen.image_package),
+        .modules_package = try arena.dupe(u8, chosen.modules_package),
+        .lock_filename = try arena.dupe(u8, lock_filename),
+        .lock_path = try arena.dupe(u8, stable_lock),
+        .lock_sha256 = artifact_pipeline.formatSha256(lock_metadata.sha256),
+        .lock_digest_sha256 = try requireJsonSha256Field(
+            allocator,
+            io,
+            stable_lock,
+            "digest_sha256",
+        ),
+    };
+}
+
+/// Decides which package roots this build resolves, and where each is applied.
+///
+/// For `core` the kernel roots are selected rather than named, which needs a
+/// resolve transaction, so this runs before the guest chain and against the
+/// same empty baseline the chain starts from.
+fn planRoots(
+    context: DebzContext,
+    flavor: Flavor,
+    empty_root: []const u8,
+) !RootPlan {
+    var arena: std.heap.ArenaAllocator = .init(context.allocator);
+    errdefer arena.deinit();
+    const scratch = arena.allocator();
+
+    const literal = flavor.debzPackages();
+    const kernel: ?KernelSelection = if (flavor.kernelSelector()) |selector|
+        try selectCoreKernel(context, selector, empty_root, scratch)
+    else
+        null;
+
+    const kernel_root_count: usize = if (kernel == null) 0 else 2;
+    const guest = try scratch.alloc([]const u8, kernel_root_count + literal.len);
+    if (kernel) |selection| {
+        // The image is first because the first root is the transaction that
+        // creates the otherwise-empty baseline, and because a module tree
+        // without its kernel is not something to install by itself.
+        guest[0] = selection.image_package;
+        guest[1] = selection.modules_package;
+    }
+    for (literal, 0..) |name, index| {
+        guest[kernel_root_count + index] = try scratch.dupe(u8, name);
+    }
+
+    const stage_roots = flavor.buildStageRoots();
+    const build = try scratch.alloc([]const u8, stage_roots.len);
+    for (stage_roots, 0..) |name, index| build[index] = try scratch.dupe(u8, name);
+
+    return .{ .arena = arena, .guest = guest, .build = build, .kernel = kernel };
+}
+
+/// What the initramfs build stage produced and what it can be attributed to.
+const InitramfsStage = struct {
+    /// Host path of the generated initramfs, extracted from the staging root.
+    host_path: []u8,
+    sha256: [64]u8,
+    bytes: u64,
+    guest_path: []u8,
+    kernel_release: []u8,
+    evidence: [max_debz_packages]DebzEvidence,
+    evidence_count: usize,
+
+    fn deinit(self: *InitramfsStage, allocator: Allocator) void {
+        allocator.free(self.host_path);
+        allocator.free(self.guest_path);
+        allocator.free(self.kernel_release);
+        for (self.evidence[0..self.evidence_count]) |*item| item.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// Generates the initramfs in a staging root instead of in the guest.
+///
+/// Issue #677 step 4 in one function. The staging root is the finished guest
+/// closure plus the generator's own closure, so the initramfs is built against
+/// exactly the kernel and modules the guest ships -- nothing is approximated --
+/// while `initramfs-tools`, `klibc-utils`, `busybox-initramfs`, `dracut-install`
+/// and the rest of that closure never touch the image. The alternative the issue
+/// rules out, installing the generator into the guest and deleting its files
+/// afterwards, would leave dpkg claiming files that are gone and would make the
+/// shipped inventory a fiction.
+///
+/// The result is the initramfs bytes plus the same lock and transaction
+/// evidence a guest root publishes, so a staging output is as attributable as
+/// an installed package.
+fn buildInitramfsStage(
+    context: DebzContext,
+    timing: *image_phase_timing.Recorder,
+    flavor: Flavor,
+    guest_root: []const u8,
+    kernel_release: []const u8,
+    build_roots: []const []const u8,
+) !InitramfsStage {
+    const allocator = context.allocator;
+    const io = context.io;
+    var stage_timing = timing.begin(.debz_transaction, "initramfs-build-stage");
+    defer stage_timing.end();
+    errdefer |err| stage_timing.fail(@errorName(err));
+
+    if (build_roots.len == 0) return error.InitramfsBuildStageEmpty;
+
+    var evidence: [max_debz_packages]DebzEvidence = undefined;
+    var evidence_count: usize = 0;
+    errdefer for (evidence[0..evidence_count]) |*item| item.deinit(allocator);
+
+    var current = try allocator.dupe(u8, guest_root);
+    defer allocator.free(current);
+    for (build_roots, 0..) |package, index| {
+        const stage = try std.fmt.allocPrint(
+            allocator,
+            "{s}/root-stage-build-{d}",
+            .{ context.work_dir, index },
+        );
+        defer allocator.free(stage);
+        const published = try std.fmt.allocPrint(
+            allocator,
+            "{s}/root-build-{d}",
+            .{ context.work_dir, index },
+        );
+        defer allocator.free(published);
+        // `.require_locked` because the stage starts from the finished guest
+        // closure: a build stage whose baseline was empty would have generated
+        // an initramfs against no kernel at all.
+        const next = try runDebzTransaction(
+            context,
+            package,
+            current,
+            stage,
+            published,
+            .require_locked,
+            .customize,
+            &evidence[index],
+        );
+        evidence_count += 1;
+        allocator.free(current);
+        current = next;
+    }
+
+    var root = try offline_root.Root.init(allocator, io, current, .{});
+    defer root.deinit();
+    var executor = try offline_root.Executor.init(allocator, io, .{
+        .root = &root,
+        .architecture = switch (context.profile.architecture) {
+            .x86_64 => .x86_64,
+            .aarch64 => .aarch64,
+        },
+        .timeout_ms = 30 * 60 * 1000,
+    });
+    defer executor.deinit();
+
+    // The generation inputs belong to the stage, not to the appliance: the
+    // guest has no generator to read them and no reason to carry them.
+    switch (flavor) {
+        .core => try root.apply(&.{
+            .{ .create_directory = .{ .path = "/etc/initramfs-tools", .mode = 0o755 } },
+            .{ .write_file = .{
+                .path = "/etc/initramfs-tools/modules",
+                .source = .{ .inline_bytes = core_initramfs_modules },
+            } },
+        }),
+        .baremetal => try root.apply(&.{
+            .{ .create_directory = .{ .path = "/etc/initramfs-tools", .mode = 0o755 } },
+            .{ .write_file = .{
+                .path = "/etc/initramfs-tools/initramfs.conf",
+                .source = .{ .inline_bytes = baremetal_initramfs_conf },
+            } },
+            .{ .write_file = .{
+                .path = "/etc/initramfs-tools/modules",
+                .source = .{ .inline_bytes = baremetal_initramfs_modules },
+            } },
+        }),
+        .full => return error.InitramfsBuildStageEmpty,
+    }
+    try requireRootFile(&root, "/etc/initramfs-tools/initramfs.conf");
+    try requireRootFile(&root, "/usr/sbin/update-initramfs");
+
+    // The module tree the generator reads has to be the guest's own, or the
+    // initramfs would describe a kernel the image does not boot.
+    try validateKernelModuleArtifacts(allocator, &root, kernel_release);
+    var generated = try runOfflineCommand(&executor, .{ .update_initramfs = kernel_release });
+    defer generated.deinit(allocator);
+    try validateInitramfs(allocator, &root, kernel_release);
+
+    const guest_path = try std.fmt.allocPrint(
+        allocator,
+        "/boot/initrd.img-{s}",
+        .{kernel_release},
+    );
+    errdefer allocator.free(guest_path);
+    const host_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/initrd.img-{s}",
+        .{ context.work_dir, kernel_release },
+    );
+    errdefer allocator.free(host_path);
+    try root.extract(guest_path, host_path);
+    const metadata = try artifact_pipeline.hashFile(io, host_path);
+    const stat = try Dir.cwd().statFile(io, host_path, .{ .follow_symlinks = false });
+    if (stat.size == 0) return error.InitramfsMissing;
+
+    stage_timing.succeed();
+    return .{
+        .host_path = host_path,
+        .sha256 = artifact_pipeline.formatSha256(metadata.sha256),
+        .bytes = stat.size,
+        .guest_path = guest_path,
+        .kernel_release = try allocator.dupe(u8, kernel_release),
+        .evidence = evidence,
+        .evidence_count = evidence_count,
+    };
+}
+
+/// Fails unless `path` is a regular file in the offline root.
+fn requireRootFile(root: *offline_root.Root, path: []const u8) !void {
+    const entry = root.inspect(path) catch |err| switch (err) {
+        error.FileNotFound => return error.CoreRequiredPathMissing,
+        else => return err,
+    };
+    defer root.allocator.free(entry.path);
+    if (entry.kind != .file) return error.CoreRequiredPathMissing;
 }
 
 fn customizeRootWithDebz(
@@ -3419,7 +4367,30 @@ fn customizeRootWithDebz(
     const absolute_cache = try Dir.cwd().realPathFileAlloc(io, shared_cache, allocator);
     defer allocator.free(absolute_cache);
 
-    const debz_packages: []const []const u8 = flavor.debzPackages();
+    const debz_context: DebzContext = .{
+        .allocator = allocator,
+        .io = io,
+        .profile = profile,
+        .work_dir = work_dir,
+        .provenance_dir = provenance_dir,
+        .config_inputs = &config_inputs,
+        .keyring_inputs = &keyring_inputs,
+        .cache = absolute_cache,
+        .lock_dir = debz_lock_dir,
+        .proxy = proxy,
+        .offline = offline,
+    };
+
+    // Issue #677 step 4: which roots the guest installs is decided before any
+    // of them is installed, because for `core` the kernel roots are selected
+    // from a metapackage rather than written down.
+    const absolute_empty_root = try Dir.cwd().realPathFileAlloc(io, current, allocator);
+    defer allocator.free(absolute_empty_root);
+    var plan = try planRoots(debz_context, flavor, absolute_empty_root);
+    var plan_transferred = false;
+    defer if (!plan_transferred) plan.deinit();
+    const debz_packages: []const []const u8 = plan.guest;
+
     var evidence: [max_debz_packages]DebzEvidence = undefined;
     var evidence_count: usize = 0;
     errdefer {
@@ -3435,137 +4406,23 @@ fn customizeRootWithDebz(
             if (flavor.freshRoot() and index == 0) .none else .require_locked;
         const apply_operation: package_family.Operation =
             if (flavor.freshRoot() and index == 0) .create else .customize;
-        const packages = [_][]const u8{package};
-        const transaction_dir = try std.fmt.allocPrint(allocator, "{s}/debz-{s}", .{ work_dir, package });
-        defer allocator.free(transaction_dir);
-        try Dir.cwd().deleteTree(io, transaction_dir);
-        try Dir.cwd().createDirPath(io, transaction_dir);
-        const state = try std.fs.path.join(allocator, &.{ transaction_dir, "state" });
-        defer allocator.free(state);
-        try Dir.cwd().createDirPath(io, state);
-
-        const absolute_state = try Dir.cwd().realPathFileAlloc(io, state, allocator);
-        defer allocator.free(absolute_state);
-        const absolute_resolve_root = try Dir.cwd().realPathFileAlloc(io, current, allocator);
-        defer allocator.free(absolute_resolve_root);
-        const absolute_transaction = try Dir.cwd().realPathFileAlloc(io, transaction_dir, allocator);
-        defer allocator.free(absolute_transaction);
-        const absolute_dummy = try std.fs.path.join(allocator, &.{ absolute_transaction, "resolve-published-unused" });
-        defer allocator.free(absolute_dummy);
-        const absolute_lock = try std.fs.path.join(allocator, &.{ absolute_transaction, "exact-lock.json" });
-        defer allocator.free(absolute_lock);
-        const lock_filename = try std.fmt.allocPrint(
-            allocator,
-            "debz-exact-lock-{s}-{s}.json",
-            .{ package, profile.ubuntu_architecture },
-        );
-        defer allocator.free(lock_filename);
-        if (debz_lock_dir) |lock_dir| {
-            const lock_input = try std.fs.path.join(allocator, &.{ lock_dir, lock_filename });
-            defer allocator.free(lock_input);
-            try copyExactLockInput(allocator, io, lock_input, absolute_lock);
-        } else {
-            const resolve_request = packageFamilyRequest(
-                .resolve_lock,
-                profile,
-                &packages,
-                absolute_resolve_root,
-                absolute_dummy,
-                &config_inputs,
-                &keyring_inputs,
-                absolute_cache,
-                absolute_state,
-                absolute_lock,
-                installed_baseline,
-                proxy,
-                offline,
-            );
-            try assertRequestSeparation(resolve_request);
-            const resolved = try package_family.execute(allocator, io, .{}, resolve_request);
-            try requireSucceeded(resolved, resolve_request, package);
-            if (resolved.lock_path == null or !std.mem.eql(u8, resolved.lock_path.?, absolute_lock))
-                return error.DebzLockMismatch;
-        }
-
         const stage = try std.fmt.allocPrint(allocator, "{s}/root-stage-{d}", .{ work_dir, index });
         defer allocator.free(stage);
         const published = try std.fmt.allocPrint(allocator, "{s}/root-debz-{d}", .{ work_dir, index });
         defer allocator.free(published);
-        try Dir.cwd().deleteTree(io, stage);
-        try Dir.cwd().deleteTree(io, published);
-        try Dir.cwd().createDirPath(io, stage);
-        const current_contents = try std.fmt.allocPrint(allocator, "{s}/.", .{current});
-        defer allocator.free(current_contents);
-        const restricted_permissions = try copyRootStage(allocator, io, current, current_contents, stage);
-        const absolute_stage = try Dir.cwd().realPathFileAlloc(io, stage, allocator);
-        defer allocator.free(absolute_stage);
-        const absolute_published = if (std.fs.path.isAbsolute(published))
-            try allocator.dupe(u8, published)
-        else blk: {
-            const absolute_work = try Dir.cwd().realPathFileAlloc(io, work_dir, allocator);
-            defer allocator.free(absolute_work);
-            break :blk try std.fs.path.join(allocator, &.{ absolute_work, std.fs.path.basename(published) });
-        };
-        var published_transferred = false;
-        errdefer if (!published_transferred) allocator.free(absolute_published);
-
-        const customize_request = packageFamilyRequest(
-            apply_operation,
-            profile,
-            &packages,
-            absolute_stage,
-            absolute_published,
-            &config_inputs,
-            &keyring_inputs,
-            absolute_cache,
-            absolute_state,
-            absolute_lock,
+        const next = try runDebzTransaction(
+            debz_context,
+            package,
+            current,
+            stage,
+            published,
             installed_baseline,
-            proxy,
-            offline,
+            apply_operation,
+            &evidence[index],
         );
-        try assertRequestSeparation(customize_request);
-        const customized = try package_family.execute(allocator, io, .{}, customize_request);
-        try requireSucceeded(customized, customize_request, package);
-        if (!customized.published or customized.provenance_path == null)
-            return error.DebzProvenanceMissing;
-        defer allocator.free(customized.provenance_path.?);
-        try restoreRestrictedRootEntry(allocator, io, absolute_published, restricted_permissions);
-        const expected_provenance = try std.fs.path.join(allocator, &.{ absolute_state, "transaction-result.json" });
-        defer allocator.free(expected_provenance);
-        if (!std.mem.eql(u8, customized.provenance_path.?, expected_provenance))
-            return error.DebzProvenanceMismatch;
-
-        const lock_metadata = try artifact_pipeline.hashFile(io, absolute_lock);
-        const provenance_metadata = try artifact_pipeline.hashFile(io, expected_provenance);
-        const provenance_filename = try std.fmt.allocPrint(
-            allocator,
-            "debz-transaction-provenance-{s}-{s}.json",
-            .{ package, profile.ubuntu_architecture },
-        );
-        defer allocator.free(provenance_filename);
-        const stable_lock = try std.fs.path.join(allocator, &.{ provenance_dir, lock_filename });
-        defer allocator.free(stable_lock);
-        const stable_provenance = try std.fs.path.join(allocator, &.{ provenance_dir, provenance_filename });
-        defer allocator.free(stable_provenance);
-        try Dir.cwd().copyFile(absolute_lock, Dir.cwd(), stable_lock, io, .{});
-        try Dir.cwd().copyFile(expected_provenance, Dir.cwd(), stable_provenance, io, .{});
-        evidence[index] = .{
-            .package = package,
-            .lock_path = try allocator.dupe(u8, stable_lock),
-            .lock_sha256 = artifact_pipeline.formatSha256(lock_metadata.sha256),
-            .lock_digest_sha256 = try requireJsonSha256Field(allocator, io, stable_lock, "digest_sha256"),
-            .provenance_path = try allocator.dupe(u8, stable_provenance),
-            .provenance_sha256 = artifact_pipeline.formatSha256(provenance_metadata.sha256),
-            .provenance_digest_sha256 = try requireJsonSha256Field(allocator, io, stable_provenance, "digest_sha256"),
-            .provenance_lock_sha256 = try requireJsonSha256Field(allocator, io, stable_provenance, "lock_sha256"),
-        };
-        if (!std.mem.eql(u8, &evidence[index].lock_digest_sha256, &evidence[index].provenance_lock_sha256))
-            return error.DebzProvenanceLockMismatch;
         evidence_count += 1;
         allocator.free(current);
-        current = absolute_published;
-        published_transferred = true;
+        current = next;
         debz_transaction.succeed();
     }
 
@@ -3575,15 +4432,25 @@ fn customizeRootWithDebz(
     var initramfs_import = timing.begin(.initramfs_ext4_import, null);
     defer initramfs_import.end();
     errdefer |err| initramfs_import.fail(@errorName(err));
-    const release_name = try customizeOfflineRoot(
+    var customization = try customizeOfflineRoot(
         allocator,
         io,
         profile,
         flavor,
         current,
         provenance_dir,
+        timing,
+        if (flavor.freshRoot()) debz_context else null,
+        plan.build,
     );
-    defer allocator.free(release_name);
+    var stage_transferred = false;
+    defer {
+        allocator.free(customization.release_name);
+        if (!stage_transferred) {
+            if (customization.stage) |*built| built.deinit(allocator);
+        }
+    }
+    const release_name = customization.release_name;
     try native_root.filesystem.importHostTreeWithManifest(current, .{}, &host_manifest);
     if (flavor == .full) {
         try native_root.filesystem.applyCustomization(.{
@@ -3625,7 +4492,9 @@ fn customizeRootWithDebz(
             profile,
             mizinit,
             azagent,
+            &plan,
             evidence[0..evidence_count],
+            if (customization.stage) |*built| built else null,
         );
         try validateCoreRoot(
             allocator,
@@ -3633,7 +4502,9 @@ fn customizeRootWithDebz(
             &native_root.filesystem,
             profile,
             flavor,
+            &plan,
             evidence[0..evidence_count],
+            if (customization.stage) |*built| built else null,
         );
     } else {
         try validateFullUdisks2Policy(allocator, &native_root.filesystem);
@@ -3688,10 +4559,14 @@ fn customizeRootWithDebz(
         },
     );
     initramfs_import.succeed();
+    plan_transferred = true;
+    stage_transferred = true;
     return .{
         .root_path = current,
         .evidence = evidence,
         .evidence_count = evidence_count,
+        .plan = plan,
+        .stage = customization.stage,
         .root_free_bytes = root_free_bytes,
         .inventory = inventory,
         .root_filesystem = .{
@@ -4024,11 +4899,11 @@ fn writeProvenance(
 }
 
 /// Provenance for the flavors that build their root from scratch with debz.
-/// The package roots and the transaction evidence both come from the flavor
-/// rather than from one flavor's hardcoded list, because `core` and
-/// `baremetal` install different closures and a document that named core's
-/// roots under a bare-metal build would describe an image that was never
-/// built.
+/// The package roots and the transaction evidence both come from the build's
+/// own plan rather than from one flavor's hardcoded list, because `core` and
+/// `baremetal` install different closures -- and since #677 step 4 core's
+/// kernel roots are selected at build time -- so a document that named a
+/// literal list would describe an image that was never built.
 fn writeFreshRootProvenance(
     allocator: Allocator,
     io: Io,
@@ -4036,13 +4911,15 @@ fn writeFreshRootProvenance(
     profile: *const Profile,
     flavor: Flavor,
     source_digest: [64]u8,
+    plan: *const RootPlan,
     evidence: []const DebzEvidence,
+    stage: ?*const InitramfsStage,
     virtual_size: u64,
     root_free_bytes: u64,
     inventory: InventoryBinding,
     runtime_contract: ?InventoryBinding,
 ) !void {
-    const package_roots = flavor.debzPackages();
+    const package_roots = plan.guest;
     // Only core publishes a runtime contract: the explicit allowlist is a
     // statement about the appliance issue #677 minimizes, and a document
     // claiming to describe another flavor would describe an image nobody
@@ -4110,7 +4987,59 @@ fn writeFreshRootProvenance(
             },
         );
     }
-    try output.writer.writeAll("]}}\n");
+    try output.writer.writeAll("]");
+    // #677 step 4: the selection and the staging build are published beside the
+    // transactions, because "the guest does not contain the build tooling" is
+    // only checkable if the document says what the build tooling was and what
+    // it handed back.
+    if (plan.kernel) |selection| {
+        try output.writer.print(
+            ",\"kernel_selection\":{{\"selector\":\"{s}\",\"kernel_release\":\"{s}\",\"image_package\":\"{s}\",\"modules_package\":\"{s}\",\"version\":\"{s}\",\"exact_lock\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"digest_sha256\":\"{s}\"}}}}",
+            .{
+                selection.selector,
+                selection.release,
+                selection.image_package,
+                selection.modules_package,
+                selection.version,
+                selection.lock_filename,
+                selection.lock_sha256,
+                selection.lock_digest_sha256,
+            },
+        );
+    }
+    if (stage) |built| {
+        if (built.evidence_count != plan.build.len) return error.InvalidDebzEvidence;
+        for (built.evidence[0..built.evidence_count], plan.build) |item, root| {
+            if (!std.mem.eql(u8, item.package, root)) return error.InvalidDebzEvidence;
+        }
+        try output.writer.writeAll(",\"build_stage\":{\"purpose\":\"initramfs-generation\",\"package_roots\":[");
+        for (plan.build, 0..) |root, index| {
+            if (index != 0) try output.writer.writeByte(',');
+            try output.writer.print("\"{s}\"", .{root});
+        }
+        try output.writer.print(
+            "],\"initramfs\":{{\"path\":\"{s}\",\"kernel_release\":\"{s}\",\"sha256\":\"{s}\",\"bytes\":{d}}},\"transactions\":[",
+            .{ built.guest_path, built.kernel_release, built.sha256, built.bytes },
+        );
+        for (built.evidence[0..built.evidence_count], 0..) |item, index| {
+            if (index != 0) try output.writer.writeByte(',');
+            try output.writer.print(
+                "{{\"package\":\"{s}\",\"exact_lock\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"digest_sha256\":\"{s}\"}},\"transaction_provenance\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"digest_sha256\":\"{s}\",\"lock_sha256\":\"{s}\"}}}}",
+                .{
+                    item.package,
+                    std.fs.path.basename(item.lock_path),
+                    item.lock_sha256,
+                    item.lock_digest_sha256,
+                    std.fs.path.basename(item.provenance_path),
+                    item.provenance_sha256,
+                    item.provenance_digest_sha256,
+                    item.provenance_lock_sha256,
+                },
+            );
+        }
+        try output.writer.writeAll("]}");
+    }
+    try output.writer.writeAll("}}\n");
     const document = try output.toOwnedSlice();
     defer allocator.free(document);
     try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = document });
@@ -5296,7 +6225,9 @@ fn buildImage(
         &final_root.filesystem,
         profile,
         args.flavor,
+        &debz_customization.plan,
         debz_customization.evidence[0..debz_customization.evidence_count],
+        if (debz_customization.stage) |*built| built else null,
     ) else try validateFullUdisks2Policy(allocator, &final_root.filesystem);
     if (try peMachine(signed.bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
     final_image_validation.succeed();
@@ -5365,7 +6296,9 @@ fn buildImage(
             profile,
             args.flavor,
             artifact_pipeline.formatSha256(source_metadata.sha256),
+            &debz_customization.plan,
             debz_customization.evidence[0..debz_customization.evidence_count],
+            if (debz_customization.stage) |*built| built else null,
             args.size,
             debz_customization.root_free_bytes,
             inventory_binding,
@@ -5945,7 +6878,7 @@ test "package-family resolve and customize requests are exact-lock operations" {
     const core_create = packageFamilyRequest(
         .create,
         profileFor(.x86_64),
-        &.{core_debz_packages[0]},
+        &.{test_kernel_image},
         "/root-stage",
         "/published",
         &.{"/inputs/ubuntu.sources"},
@@ -6034,11 +6967,15 @@ test "the shared debz cache outlives per-stage deletion and stays outside every 
     // away the objects the previous one just fetched. Both flavors share the
     // `debz-` prefix, so a package literally named `cache` would collide with
     // the shared directory and be deleted along with its own stage.
-    for (&[_][]const []const u8{ &core_debz_packages, &baremetal_debz_packages }) |packages| {
-        for (packages) |package| {
-            var buffer: [128]u8 = undefined;
-            const transaction_dir = try std.fmt.bufPrint(&buffer, "{s}/debz-{s}", .{ work_dir, package });
-            try std.testing.expect(!package_family.pathsOverlap(transaction_dir, shared_cache));
+    for ([_]Flavor{ .core, .baremetal }) |flavor| {
+        var plan = try testRootPlan(std.testing.allocator, flavor);
+        defer plan.deinit();
+        for ([_][]const []const u8{ plan.guest, plan.build }) |packages| {
+            for (packages) |package| {
+                var buffer: [128]u8 = undefined;
+                const transaction_dir = try std.fmt.bufPrint(&buffer, "{s}/debz-{s}", .{ work_dir, package });
+                try std.testing.expect(!package_family.pathsOverlap(transaction_dir, shared_cache));
+            }
         }
     }
 
@@ -6046,7 +6983,7 @@ test "the shared debz cache outlives per-stage deletion and stays outside every 
     // request still has to keep the cache out of what it publishes.
     const config = work_dir ++ "/ubuntu-snapshot.json";
     const keyring = work_dir ++ "/ubuntu-archive-keyring.gpg";
-    for (&baremetal_debz_packages, 0..) |package, index| {
+    for (&baremetal_guest_roots, 0..) |package, index| {
         var stage_buffer: [128]u8 = undefined;
         const stage = try std.fmt.bufPrint(&stage_buffer, "{s}/root-stage-{d}", .{ work_dir, index });
         var published_buffer: [128]u8 = undefined;
@@ -6753,20 +7690,23 @@ test "bare metal is named apart from core and requires exactly one administrator
 }
 
 test "fresh-root package roots explicitly install runtime requirements" {
-    for ([_][]const []const u8{ &core_debz_packages, &baremetal_debz_packages }) |packages| {
-        for ([_][]const u8{ "initramfs-tools", "ca-certificates" }) |expected| {
-            var found = false;
-            for (packages) |package| {
-                if (std.mem.eql(u8, package, expected)) {
-                    found = true;
-                    break;
-                }
-            }
-            try std.testing.expect(found);
+    // #677 step 4: `ca-certificates` stays an explicit guest root, while the
+    // generator moved to the build stage. Both fresh roots make the same split,
+    // and neither installs the generator into the image.
+    for ([_]Flavor{ .core, .baremetal }) |flavor| {
+        var plan = try testRootPlan(std.testing.allocator, flavor);
+        defer plan.deinit();
+        var saw_trust_store = false;
+        for (plan.guest) |package| {
+            try std.testing.expect(!std.mem.eql(u8, package, "initramfs-tools"));
+            if (std.mem.eql(u8, package, "ca-certificates")) saw_trust_store = true;
         }
+        try std.testing.expect(saw_trust_store);
+        try std.testing.expectEqual(@as(usize, 1), plan.build.len);
+        try std.testing.expectEqualStrings("initramfs-tools", plan.build[0]);
     }
 
-    for ([_][]const u8{ "initramfs-tools", "ca-certificates" }) |expected| {
+    for ([_][]const u8{"ca-certificates"}) |expected| {
         var required = false;
         for (&core_required_packages) |package| {
             if (std.mem.eql(u8, package, expected)) {
@@ -7607,10 +8547,12 @@ test "core initramfs validation requires the packaged Binder module" {
 }
 
 test "core package policy rejects Anbox DKMS shadow packages" {
+    // A core inventory as #677 step 4 leaves it: a selected versioned kernel
+    // and its module tree, no metapackage, and no initramfs generator.
     const inventory =
         "ca-certificates\t1\tall\n" ++
-        "initramfs-tools\t0.151\tall\n" ++
-        "linux-azure\t7.0\tamd64\n" ++
+        "linux-image-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n" ++
+        "linux-modules-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n" ++
         "openssh-client\t10.2\tamd64\n" ++
         "openssh-server\t10.2\tamd64\n" ++
         "sudo\t1.9\tamd64\n";
@@ -7668,10 +8610,12 @@ test "exact lock requires coherent Azure and provisioning packages" {
 }
 
 test "core package policy rejects server agents foreign packages and closure drift" {
+    // A core inventory as #677 step 4 leaves it: a selected versioned kernel
+    // and its module tree, no metapackage, and no initramfs generator.
     const inventory =
         "ca-certificates\t1\tall\n" ++
-        "initramfs-tools\t0.151\tall\n" ++
-        "linux-azure\t7.0\tamd64\n" ++
+        "linux-image-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n" ++
+        "linux-modules-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n" ++
         "openssh-client\t10.2\tamd64\n" ++
         "openssh-server\t10.2\tamd64\n" ++
         "sudo\t1.9\tamd64\n";
@@ -7684,8 +8628,8 @@ test "core package policy rejects server agents foreign packages and closure dri
     const exact_lock =
         \\{"target_architecture":"amd64","packages":[
         \\{"name":"ca-certificates","version":"1","architecture":"all"},
-        \\{"name":"initramfs-tools","version":"0.151","architecture":"all"},
-        \\{"name":"linux-azure","version":"7.0","architecture":"amd64"},
+        \\{"name":"linux-image-7.0.0-1010-azure","version":"7.0.0-1010.10","architecture":"amd64"},
+        \\{"name":"linux-modules-7.0.0-1010-azure","version":"7.0.0-1010.10","architecture":"amd64"},
         \\{"name":"openssh-client","version":"10.2","architecture":"amd64"},
         \\{"name":"openssh-server","version":"10.2","architecture":"amd64"},
         \\{"name":"sudo","version":"1.9","architecture":"amd64"}]}
@@ -7712,8 +8656,8 @@ test "core package policy rejects server agents foreign packages and closure dri
         validateInventoryAgainstExactLock(
             std.testing.allocator,
             "ca-certificates\t1\tall\n" ++
-                "initramfs-tools\t0.151\tall\n" ++
-                "linux-azure\t7.0\tamd64\n" ++
+                "linux-image-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n" ++
+                "linux-modules-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n" ++
                 "openssh-client\t10.2\tamd64\n" ++
                 "openssh-server\t10.2\tamd64\n",
             exact_lock,
@@ -7726,19 +8670,22 @@ test "ubuntu-minimal and its conveniences fail the core closure" {
     // #677 acceptance criterion: `ubuntu-minimal` is absent from the final
     // package inventory, and the metapackage's payload does not come back
     // under another name.
+    // A core inventory as #677 step 4 leaves it: a selected versioned kernel
+    // and its module tree, no metapackage, and no initramfs generator.
     const inventory =
         "ca-certificates\t1\tall\n" ++
-        "initramfs-tools\t0.151\tall\n" ++
-        "linux-azure\t7.0\tamd64\n" ++
+        "linux-image-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n" ++
+        "linux-modules-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n" ++
         "openssh-client\t10.2\tamd64\n" ++
         "openssh-server\t10.2\tamd64\n" ++
         "sudo\t1.9\tamd64\n";
     try validateExactLock(inventory, profileFor(.x86_64), .core);
-    for (core_debz_packages) |package| {
-        try std.testing.expect(!std.mem.eql(u8, package, "ubuntu-minimal"));
-    }
-    for (baremetal_debz_packages) |package| {
-        try std.testing.expect(!std.mem.eql(u8, package, "ubuntu-minimal"));
+    for ([_]Flavor{ .core, .baremetal }) |flavor| {
+        var plan = try testRootPlan(std.testing.allocator, flavor);
+        defer plan.deinit();
+        for (plan.guest) |package| {
+            try std.testing.expect(!std.mem.eql(u8, package, "ubuntu-minimal"));
+        }
     }
     inline for ([_][]const u8{
         "ubuntu-minimal\t1\tamd64\n",
@@ -7768,12 +8715,112 @@ test "ubuntu-minimal and its conveniences fail the core closure" {
     try runtime_contract_document.verifyPackages(inventory, &diagnostic);
     diagnostic = .{};
     try std.testing.expectError(error.Failed, runtime_contract_document.verifyPackages(
-        "initramfs-tools\t0.151\tall\n" ++
-            "linux-azure\t7.0\tamd64\n" ++
+        "linux-image-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n" ++
+            "linux-modules-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n" ++
             "openssh-server\t10.2\tamd64\n" ++
             "sudo\t1.9\tamd64\n",
         &diagnostic,
     ));
+    // #677 step 4, both halves: the build tooling and the kernel metapackage
+    // are refused by name, and a closure that lost the module tree is refused
+    // for having no complete kernel at all.
+    inline for ([_][]const u8{
+        "initramfs-tools\t0.151\tall\n",
+        "linux-azure\t7.0.0-1010.10\tamd64\n",
+        "linux-headers-azure\t7.0.0-1010.10\tamd64\n",
+        "udev\t258\tamd64\n",
+    }) |build_only| {
+        try std.testing.expectError(error.ForbiddenCorePackage, validateExactLock(
+            inventory ++ build_only,
+            profileFor(.x86_64),
+            .core,
+        ));
+    }
+    try std.testing.expectError(error.KernelSelectionInvalid, validateExactLock(
+        "ca-certificates\t1\tall\n" ++
+            "linux-image-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n" ++
+            "openssh-client\t10.2\tamd64\n" ++
+            "openssh-server\t10.2\tamd64\n" ++
+            "sudo\t1.9\tamd64\n",
+        profileFor(.x86_64),
+        .core,
+    ));
+}
+
+test "the build stage's own lock decides what may not enter the guest" {
+    // Issue #677 step 4's fail-closed gate. The build-only set is the staging
+    // lock minus the guest lock, so it is measured from this build rather than
+    // from a list someone has to remember to update when `initramfs-tools`
+    // gains a dependency.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const stage_lock_path = "test-ubuntu2604-stage-lock.json";
+    defer Dir.cwd().deleteFile(io, stage_lock_path) catch {};
+    const guest_lock =
+        \\{"target_architecture":"amd64","packages":[
+        \\{"name":"ca-certificates","version":"1","architecture":"all"},
+        \\{"name":"linux-image-7.0.0-1010-azure","version":"7.0.0-1010.10","architecture":"amd64"},
+        \\{"name":"openssh-server","version":"10.2","architecture":"amd64"}]}
+    ;
+    const stage_lock =
+        \\{"target_architecture":"amd64","packages":[
+        \\{"name":"ca-certificates","version":"1","architecture":"all"},
+        \\{"name":"linux-image-7.0.0-1010-azure","version":"7.0.0-1010.10","architecture":"amd64"},
+        \\{"name":"openssh-server","version":"10.2","architecture":"amd64"},
+        \\{"name":"initramfs-tools","version":"0.151","architecture":"all"},
+        \\{"name":"klibc-utils","version":"2.0","architecture":"amd64"}]}
+    ;
+    try Dir.cwd().writeFile(io, .{ .sub_path = stage_lock_path, .data = stage_lock });
+
+    var stage: InitramfsStage = .{
+        .host_path = try allocator.dupe(u8, "/work/initrd.img"),
+        .sha256 = @splat('7'),
+        .bytes = 4096,
+        .guest_path = try allocator.dupe(u8, "/boot/initrd.img-" ++ test_kernel_release),
+        .kernel_release = try allocator.dupe(u8, test_kernel_release),
+        .evidence = undefined,
+        .evidence_count = 1,
+    };
+    stage.evidence[0] = .{
+        .package = "initramfs-tools",
+        .lock_path = try allocator.dupe(u8, stage_lock_path),
+        .lock_sha256 = @splat('3'),
+        .lock_digest_sha256 = @splat('c'),
+        .provenance_path = try allocator.dupe(u8, "unused-transaction.json"),
+        .provenance_sha256 = @splat('4'),
+        .provenance_digest_sha256 = @splat('d'),
+        .provenance_lock_sha256 = @splat('c'),
+    };
+    defer stage.deinit(allocator);
+
+    const clean_inventory =
+        "ca-certificates\t1\tall\n" ++
+        "linux-image-7.0.0-1010-azure\t7.0.0-1010.10\tamd64\n" ++
+        "openssh-server\t10.2\tamd64\n";
+    try requireNoBuildOnlyPackages(allocator, io, clean_inventory, guest_lock, &stage);
+
+    // Either build-only package leaking into the guest is a build failure, and
+    // a multi-arch name (`libklibc:amd64`) must not be able to hide behind its
+    // architecture qualifier.
+    for ([_][]const u8{
+        "initramfs-tools\t0.151\tall\n",
+        "klibc-utils:amd64\t2.0\tamd64\n",
+    }) |leaked| {
+        const polluted = try std.mem.concat(allocator, u8, &.{ clean_inventory, leaked });
+        defer allocator.free(polluted);
+        try std.testing.expectError(
+            error.BuildOnlyPackageInGuest,
+            requireNoBuildOnlyPackages(allocator, io, polluted, guest_lock, &stage),
+        );
+    }
+
+    // A stage that added nothing installed no generator, so the initramfs it
+    // returned came from somewhere nobody accounted for.
+    try Dir.cwd().writeFile(io, .{ .sub_path = stage_lock_path, .data = guest_lock });
+    try std.testing.expectError(
+        error.InitramfsBuildStageEmpty,
+        requireNoBuildOnlyPackages(allocator, io, clean_inventory, guest_lock, &stage),
+    );
 }
 
 test "core guest contract uses architecture-correct static artifacts and full generalization" {
@@ -7845,10 +8892,15 @@ test "core injection writes static agents links configuration and embedded evide
         .atomic_path = image_path,
     });
     defer filesystem.deinit();
-    var evidence: [core_debz_packages.len]DebzEvidence = undefined;
+    var plan = try testRootPlan(allocator, .core);
+    defer plan.deinit();
+    const selector_lock = plan.kernel.?.lock_path;
+    try Dir.cwd().writeFile(io, .{ .sub_path = selector_lock, .data = "{}" });
+    defer Dir.cwd().deleteFile(io, selector_lock) catch {};
+    var evidence: [max_debz_packages]DebzEvidence = undefined;
     var initialized: usize = 0;
     defer for (evidence[0..initialized]) |*item| item.deinit(allocator);
-    for (&core_debz_packages, 0..) |package, index| {
+    for (plan.guest, 0..) |package, index| {
         const lock_path = try std.fmt.allocPrint(allocator, "test-core-{d}.lock.json", .{index});
         errdefer allocator.free(lock_path);
         const provenance_path = try std.fmt.allocPrint(allocator, "test-core-{d}.transaction.json", .{index});
@@ -7871,6 +8923,34 @@ test "core injection writes static agents links configuration and embedded evide
         Dir.cwd().deleteFile(io, item.lock_path) catch {};
         Dir.cwd().deleteFile(io, item.provenance_path) catch {};
     };
+    // The staging build's evidence travels with the guest even though its
+    // packages do not (#677 step 4).
+    const stage_lock = "test-core-stage.lock.json";
+    const stage_provenance = "test-core-stage.transaction.json";
+    try Dir.cwd().writeFile(io, .{ .sub_path = stage_lock, .data = "{}" });
+    try Dir.cwd().writeFile(io, .{ .sub_path = stage_provenance, .data = "{}" });
+    defer Dir.cwd().deleteFile(io, stage_lock) catch {};
+    defer Dir.cwd().deleteFile(io, stage_provenance) catch {};
+    var stage: InitramfsStage = .{
+        .host_path = try allocator.dupe(u8, "/work/initrd.img-" ++ test_kernel_release),
+        .sha256 = @splat('7'),
+        .bytes = 4096,
+        .guest_path = try allocator.dupe(u8, "/boot/initrd.img-" ++ test_kernel_release),
+        .kernel_release = try allocator.dupe(u8, test_kernel_release),
+        .evidence = undefined,
+        .evidence_count = 1,
+    };
+    stage.evidence[0] = .{
+        .package = "initramfs-tools",
+        .lock_path = try allocator.dupe(u8, stage_lock),
+        .lock_sha256 = @splat('3'),
+        .lock_digest_sha256 = @splat('c'),
+        .provenance_path = try allocator.dupe(u8, stage_provenance),
+        .provenance_sha256 = @splat('4'),
+        .provenance_digest_sha256 = @splat('d'),
+        .provenance_lock_sha256 = @splat('c'),
+    };
+    defer stage.deinit(allocator);
 
     try injectCoreGuest(
         allocator,
@@ -7879,7 +8959,9 @@ test "core injection writes static agents links configuration and embedded evide
         profileFor(.x86_64),
         mizinit_path,
         azagent_path,
-        &evidence,
+        &plan,
+        evidence[0..initialized],
+        &stage,
     );
     const injected = try filesystem.read(allocator, "/usr/sbin/mizinit", 1024);
     defer allocator.free(injected);
@@ -7895,7 +8977,32 @@ test "core injection writes static agents links configuration and embedded evide
     defer allocator.free(ssh_config);
     try std.testing.expectEqualStrings(core_ssh_config, ssh_config);
     _ = try filesystem.stat("/var/lib/miz/provenance/test-core-0.lock.json");
-    _ = try filesystem.stat("/var/lib/miz/ubuntu2604-core-provenance.json");
+    _ = try filesystem.stat("/var/lib/miz/provenance/test-core-stage.lock.json");
+    _ = try filesystem.stat(
+        "/var/lib/miz/provenance/test-debz-exact-lock-linux-azure-amd64.json",
+    );
+    const embedded = try filesystem.read(
+        allocator,
+        "/var/lib/miz/ubuntu2604-core-provenance.json",
+        64 * 1024,
+    );
+    defer allocator.free(embedded);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, embedded, .{});
+    defer parsed.deinit();
+    const selection = parsed.value.object.get("kernel_selection").?.object;
+    try std.testing.expectEqualStrings(
+        test_kernel_image,
+        selection.get("image_package").?.string,
+    );
+    const build_stage = parsed.value.object.get("build_stage").?.object;
+    try std.testing.expectEqualStrings(
+        "initramfs-generation",
+        build_stage.get("purpose").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "/boot/initrd.img-" ++ test_kernel_release,
+        build_stage.get("initramfs").?.object.get("path").?.string,
+    );
 }
 
 test "final native qcow2 validation covers the exact release size" {
@@ -8039,7 +9146,9 @@ test "fresh-root provenance binds flavor closure size and free-space evidence" {
     // roots against core's four and a writer that only fits one of them
     // fails the other at the very end of a finished build.
     for ([_]Flavor{ .core, .baremetal }) |flavor| {
-        const package_roots = flavor.debzPackages();
+        var plan = try testRootPlan(std.testing.allocator, flavor);
+        defer plan.deinit();
+        const package_roots = plan.guest;
         const path = try std.fmt.allocPrint(
             std.testing.allocator,
             "{s}/{s}-provenance.json",
@@ -8069,7 +9178,9 @@ test "fresh-root provenance binds flavor closure size and free-space evidence" {
             profileFor(.aarch64),
             flavor,
             @splat('5'),
+            &plan,
             evidence[0..package_roots.len],
+            null,
             flavor.defaultSize(),
             core_minimum_root_free_bytes + 4096,
             test_inventory_binding,
@@ -8128,10 +9239,14 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
         &.{ root_buffer[0..root_length], "mismatched-provenance.json" },
     );
     defer std.testing.allocator.free(path);
-    var evidence: [core_debz_packages.len]DebzEvidence = undefined;
+    var core_plan = try testRootPlan(std.testing.allocator, .core);
+    defer core_plan.deinit();
+    var baremetal_plan = try testRootPlan(std.testing.allocator, .baremetal);
+    defer baremetal_plan.deinit();
+    var evidence: [max_debz_packages]DebzEvidence = undefined;
     var initialized: usize = 0;
     defer for (evidence[0..initialized]) |*item| item.deinit(std.testing.allocator);
-    for (&core_debz_packages, 0..) |package, index| {
+    for (core_plan.guest, 0..) |package, index| {
         evidence[index] = .{
             .package = package,
             .lock_path = try std.fmt.allocPrint(std.testing.allocator, "/state/{s}.lock", .{package}),
@@ -8144,7 +9259,8 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
         };
         initialized += 1;
     }
-    // Core's evidence offered for a bare-metal build: the wrong count.
+    // Core's evidence offered for a bare-metal build: the wrong packages for a
+    // plan that names a different kernel entirely.
     try std.testing.expectError(error.InvalidDebzEvidence, writeFreshRootProvenance(
         std.testing.allocator,
         std.testing.io,
@@ -8152,7 +9268,9 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
         profileFor(.aarch64),
         .baremetal,
         @splat('5'),
-        &evidence,
+        &baremetal_plan,
+        evidence[0..initialized],
+        null,
         baremetal_virtual_size,
         core_minimum_root_free_bytes + 4096,
         test_inventory_binding,
@@ -8160,7 +9278,8 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
     ));
     // Right count, wrong package: the last transaction names something core
     // never installs, which a count-only check would have accepted.
-    evidence[core_debz_packages.len - 1].package = "cloud-init";
+    const restore = evidence[initialized - 1].package;
+    evidence[initialized - 1].package = "cloud-init";
     try std.testing.expectError(error.InvalidDebzEvidence, writeFreshRootProvenance(
         std.testing.allocator,
         std.testing.io,
@@ -8168,7 +9287,48 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
         profileFor(.aarch64),
         .core,
         @splat('5'),
-        &evidence,
+        &core_plan,
+        evidence[0..initialized],
+        null,
+        core_virtual_size,
+        core_minimum_root_free_bytes + 4096,
+        test_inventory_binding,
+        test_runtime_contract_binding,
+    ));
+    evidence[initialized - 1].package = restore;
+
+    // #677 step 4: a staging build whose transactions are not the stage's own
+    // roots would publish an initramfs nobody can attribute.
+    var stage: InitramfsStage = .{
+        .host_path = try std.testing.allocator.dupe(u8, "/work/initrd.img"),
+        .sha256 = @splat('7'),
+        .bytes = 4096,
+        .guest_path = try std.testing.allocator.dupe(u8, "/boot/initrd.img-" ++ test_kernel_release),
+        .kernel_release = try std.testing.allocator.dupe(u8, test_kernel_release),
+        .evidence = undefined,
+        .evidence_count = 1,
+    };
+    stage.evidence[0] = .{
+        .package = "cpio",
+        .lock_path = try std.testing.allocator.dupe(u8, "/state/cpio.lock"),
+        .lock_sha256 = @splat('3'),
+        .lock_digest_sha256 = @splat('c'),
+        .provenance_path = try std.testing.allocator.dupe(u8, "/state/cpio.transaction.json"),
+        .provenance_sha256 = @splat('4'),
+        .provenance_digest_sha256 = @splat('d'),
+        .provenance_lock_sha256 = @splat('c'),
+    };
+    defer stage.deinit(std.testing.allocator);
+    try std.testing.expectError(error.InvalidDebzEvidence, writeFreshRootProvenance(
+        std.testing.allocator,
+        std.testing.io,
+        path,
+        profileFor(.aarch64),
+        .core,
+        @splat('5'),
+        &core_plan,
+        evidence[0..initialized],
+        &stage,
         core_virtual_size,
         core_minimum_root_free_bytes + 4096,
         test_inventory_binding,
@@ -8178,7 +9338,6 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
     // The runtime contract belongs to core alone (issue #677 step 2). A core
     // document without one, or another flavor carrying one, would publish a
     // statement nobody checked the image against.
-    for (core_debz_packages, 0..) |package, index| evidence[index].package = package;
     try std.testing.expectError(
         error.InvalidRuntimeContractBinding,
         writeFreshRootProvenance(
@@ -8188,7 +9347,9 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
             profileFor(.aarch64),
             .core,
             @splat('5'),
-            evidence[0..core_debz_packages.len],
+            &core_plan,
+            evidence[0..initialized],
+            null,
             core_virtual_size,
             core_minimum_root_free_bytes + 4096,
             test_inventory_binding,
@@ -8207,7 +9368,9 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
             profileFor(.aarch64),
             .baremetal,
             @splat('5'),
-            &evidence,
+            &baremetal_plan,
+            evidence[0..initialized],
+            null,
             baremetal_virtual_size,
             core_minimum_root_free_bytes + 4096,
             test_inventory_binding,
@@ -8325,10 +9488,26 @@ test "both guest architectures resolve the same explicit roots with no recommend
             },
             profile.ubuntu_architecture,
         );
-        const roots = Flavor.core.debzPackages();
-        try std.testing.expectEqual(core_debz_packages.len, roots.len);
-        for (roots, core_debz_packages) |planned, expected| {
+        var plan = try testRootPlan(allocator, .core);
+        defer plan.deinit();
+        const roots = plan.guest;
+        // #677 step 4: both architectures resolve the same shape -- the
+        // selected kernel image, its module tree, then the contract's literal
+        // guest roots -- and the build tooling is resolved separately.
+        try std.testing.expectEqual(
+            @as(usize, 2 + core_guest_literal_roots.len),
+            roots.len,
+        );
+        try std.testing.expectEqualStrings(test_kernel_image, roots[0]);
+        try std.testing.expectEqualStrings(test_kernel_modules, roots[1]);
+        for (roots[2..], core_guest_literal_roots) |planned, expected| {
             try std.testing.expectEqualStrings(expected, planned);
+        }
+        try std.testing.expectEqualStrings("initramfs-tools", plan.build[0]);
+        for (roots) |root| {
+            for (plan.build) |build_root| {
+                try std.testing.expect(!std.mem.eql(u8, root, build_root));
+            }
         }
         for (roots, 0..) |package, index| {
             const first = index == 0;
