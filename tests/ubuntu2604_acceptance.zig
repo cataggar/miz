@@ -8,10 +8,19 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
-const execution = @import("ubuntu2604_execution");
 const qemu_host = @import("qemu_host");
 const qmp = @import("qmp");
 const miz = @import("miz");
+const release = @import("ubuntu2604_release");
+
+// The acceptance harness and the release tooling must agree on the execution
+// profile, the size-inventory schema, and the runtime contract, so they are
+// taken from the one module that defines them rather than re-imported as
+// separate copies of the same files.
+const execution = release.execution;
+const runtime_contract = release.runtime_contract;
+const runtime_contract_document = release.runtime_contract_document;
+const size_inventory = release.size_inventory;
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -189,6 +198,7 @@ const core_contracts = [_][]const u8{
     "binderfs-dynamic-devices",
     "binder-device-usability",
     "dma-heap-device",
+    "runtime-contract",
 };
 
 const FlavorPolicy = struct {
@@ -2156,29 +2166,25 @@ fn verifyGuestSignedBinderModule(
     allocator.free(output);
 }
 
-const binderfs_dynamic_device_checks =
-    \\set -eu
-    \\test "$(findmnt -n -o FSTYPE --target /dev/binderfs)" = binder
-    \\test -c /dev/binderfs/binder-control
-    \\test -c /dev/binderfs/binder
-    \\test -c /dev/binderfs/hwbinder
-    \\test -c /dev/binderfs/vndbinder
-;
+/// The contract requirements `binderfs-dynamic-devices` stands on: the mount
+/// must be the real Binder filesystem and each dynamic device must be a live
+/// character device. Naming them here keeps the contract's meaning visible at
+/// the place the contract is asserted.
+const binderfs_contract_requirements = [_][]const u8{
+    "binderfs-mount",
+    "binder-control-device",
+    "binder-device",
+    "binder-hwbinder-device",
+    "binder-vndbinder-device",
+};
 
-fn verifyGuestBinderfsDevices(
-    allocator: Allocator,
-    io: Io,
-    ssh_path: []const u8,
-    instance: *const Instance,
-) !void {
-    const output = sshOutputAlloc(
-        allocator,
-        io,
-        ssh_path,
-        instance,
-        binderfs_dynamic_device_checks,
-    ) catch return error.GuestBinderfsDeviceContractFailed;
-    allocator.free(output);
+/// `binderfs-dynamic-devices`, answered from the contract report. The shell
+/// version needed `findmnt` in the guest purely so a test could read a
+/// filesystem type; the probe reads `/proc/mounts` itself.
+fn verifyGuestBinderfsDevices(report: *const RuntimeContractReport) !void {
+    for (binderfs_contract_requirements) |id| {
+        report.expectSatisfied(id) catch return error.GuestBinderfsDeviceContractFailed;
+    }
 }
 
 fn sshWithStdinAlloc(
@@ -2272,17 +2278,23 @@ fn sshWithStdinAlloc(
     return error.SshCommandFailed;
 }
 
-fn pushBinderProbeBinary(
+/// Uploads a host-built static probe binary into the guest.
+///
+/// Shared by both probes so a second uploaded probe cannot acquire a second,
+/// subtly different transfer path.
+fn pushProbeBinary(
     allocator: Allocator,
     io: Io,
     ssh_path: []const u8,
     instance: *const Instance,
+    host_path: []const u8,
+    remote_path: []const u8,
 ) !void {
     const probe_bytes = try Dir.cwd().readFileAlloc(
         io,
-        binderProbeHostPath(),
+        host_path,
         allocator,
-        .limited(4 * 1024 * 1024),
+        .limited(8 * 1024 * 1024),
     );
     defer allocator.free(probe_bytes);
 
@@ -2291,8 +2303,12 @@ fn pushBinderProbeBinary(
     defer allocator.free(encoded);
     _ = std.base64.standard.Encoder.encode(encoded, probe_bytes);
 
-    const push_command = "base64 -d > " ++ binder_probe_remote_path ++
-        " && chmod 0755 " ++ binder_probe_remote_path;
+    const push_command = try std.fmt.allocPrint(
+        allocator,
+        "base64 -d > {s} && chmod 0755 {s}",
+        .{ remote_path, remote_path },
+    );
+    defer allocator.free(push_command);
     const output = try sshWithStdinAlloc(
         allocator,
         io,
@@ -2302,6 +2318,22 @@ fn pushBinderProbeBinary(
         encoded,
     );
     allocator.free(output);
+}
+
+fn pushBinderProbeBinary(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+) !void {
+    try pushProbeBinary(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        binderProbeHostPath(),
+        binder_probe_remote_path,
+    );
 }
 
 fn binderProbeHostPath() []const u8 {
@@ -2411,21 +2443,119 @@ fn verifyGuestBinderDeviceUsability(
         return error.GuestBinderDeviceUsabilityContractFailed;
 }
 
-const dma_heap_checks =
-    \\set -eu
-    \\test -d /dev/dma_heap
-    \\sudo -n test -c /dev/dma_heap/system
-    \\sudo -n test -r /dev/dma_heap/system
-    \\sudo -n test -w /dev/dma_heap/system
-;
+// --- Runtime contract (core flavor only) ---
+//
+// Issue #677 step 2. The contract is evaluated inside the guest by a static
+// probe rather than by shell utilities, so package minimization is never asked
+// to keep `findmnt`, `od`, `grep`, or `mountpoint` alive for a test. One probe
+// run answers the whole contract; the named contracts that used to run their
+// own shell checks now read their verdict out of that one report.
+const runtime_contract_probe_remote_path = "/tmp/ubuntu2604-runtime-contract-probe";
 
-fn verifyGuestDmaHeap(
+fn runtimeContractProbeHostPath() []const u8 {
+    return build_options.ubuntu2604_runtime_contract_probe_path;
+}
+
+/// One guest's runtime-contract report, owned by the caller.
+const RuntimeContractReport = struct {
+    text: []u8,
+
+    fn deinit(self: *RuntimeContractReport, allocator: Allocator) void {
+        allocator.free(self.text);
+        self.* = undefined;
+    }
+
+    /// Requires the named requirement to have been reported satisfied.
+    ///
+    /// A requirement the probe never mentioned is a failure, not a pass: a
+    /// report that stopped early must never read as agreement.
+    fn expectSatisfied(self: *const RuntimeContractReport, id: []const u8) !void {
+        const status = runtime_contract.statusOf(self.text, id) orelse {
+            std.debug.print("runtime contract probe never reported {s}\n", .{id});
+            return error.GuestRuntimeContractFailed;
+        };
+        if (status != .ok) {
+            std.debug.print(
+                "runtime contract requirement {s} is {s}\n",
+                .{ id, status.key() },
+            );
+            return error.GuestRuntimeContractFailed;
+        }
+    }
+};
+
+/// Uploads the probe, runs the whole contract, and refuses a report that does
+/// not satisfy every guest requirement.
+fn readGuestRuntimeContractAlloc(
     allocator: Allocator,
     io: Io,
     ssh_path: []const u8,
     instance: *const Instance,
-) !void {
-    if (!try sshSucceeded(allocator, io, ssh_path, instance, dma_heap_checks))
+) !RuntimeContractReport {
+    try pushProbeBinary(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        runtimeContractProbeHostPath(),
+        runtime_contract_probe_remote_path,
+    );
+    const output = try sshOutputAlloc(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        "sudo -n " ++ runtime_contract_probe_remote_path ++ " contract",
+    );
+    errdefer allocator.free(output);
+    var diagnostic: runtime_contract_document.Diagnostic = .{};
+    runtime_contract_document.verifyProbeReport(output, &diagnostic) catch {
+        std.debug.print("{s}\n", .{diagnostic.message()});
+        return error.GuestRuntimeContractFailed;
+    };
+    return .{ .text = output };
+}
+
+/// The guest's own ext4 accounting for `path`, measured with `statfs` by the
+/// same static probe, which is what lets the size inventory record a real
+/// first-boot phase without a `df` in the final image.
+fn readGuestFilesystemUsage(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+    path: []const u8,
+) !size_inventory.FilesystemUsage {
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "sudo -n {s} filesystem {s}",
+        .{ runtime_contract_probe_remote_path, path },
+    );
+    defer allocator.free(command);
+    const output = try sshOutputAlloc(allocator, io, ssh_path, instance, command);
+    defer allocator.free(output);
+    var diagnostic: runtime_contract_document.Diagnostic = .{};
+    const line = runtime_contract_document.filesystemUsage(
+        output,
+        path,
+        &diagnostic,
+    ) catch {
+        std.debug.print("{s}\n", .{diagnostic.message()});
+        return error.GuestFilesystemAccountingFailed;
+    };
+    return .{
+        .block_size = line.block_size,
+        .total_blocks = line.total_blocks,
+        .free_blocks = line.free_blocks,
+        .total_inodes = line.total_inodes,
+        .free_inodes = line.free_inodes,
+    };
+}
+
+/// `dma-heap-device`, answered from the contract report rather than by
+/// `sudo -n test -c/-r/-w` in a shell the final image should not have to keep.
+fn verifyGuestDmaHeap(report: *const RuntimeContractReport) !void {
+    report.expectSatisfied("dma-heap-system") catch
         return error.GuestDmaHeapContractFailed;
 }
 
@@ -3168,6 +3298,100 @@ fn writeAcceptanceResultValue(
     });
 }
 
+/// Appends the measured `first_boot` phase to the candidate's size inventory.
+///
+/// Issue #678 measured everything a build and a publication can see, and left
+/// `first_boot` for "a later stage that boots the image". This is that stage.
+/// Two rules keep the result honest:
+///
+///   * The numbers come from the guest's own `statfs`, taken after the root has
+///     grown, so they describe the filesystem that actually booted rather than
+///     the geometry the builder wrote.
+///   * The bound inventory in the candidate bundle is never edited. Its digest
+///     is part of build provenance, and a document rewritten after the fact
+///     would break that binding. The phase is appended to a copy, written to
+///     the path the acceptance job asked for.
+///
+/// Both environment variables are optional: a developer running acceptance by
+/// hand has no inventory to extend, and inventing one would be worse than
+/// recording nothing.
+fn recordFirstBootInventory(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *const Instance,
+    candidate: Candidate,
+) !void {
+    const source_path = try optionalEnvAlloc(
+        allocator,
+        "MIZ_UBUNTU2604_SIZE_INVENTORY",
+    ) orelse return;
+    defer allocator.free(source_path);
+    const output_path = try optionalEnvAlloc(
+        allocator,
+        "MIZ_UBUNTU2604_FIRST_BOOT_INVENTORY",
+    ) orelse return;
+    defer allocator.free(output_path);
+
+    const usage = try readGuestFilesystemUsage(allocator, io, ssh_path, instance, "/");
+
+    var diagnostic: size_inventory.Diagnostic = .{};
+    var parsed = size_inventory.readValidated(allocator, io, source_path, .{
+        .architecture = @tagName(candidate.architecture),
+        .flavor = @tagName(candidate.flavor),
+        .required_phases = &.{ .root_build, .image_build, .publication },
+    }, &diagnostic) catch {
+        std.debug.print("{s}\n", .{diagnostic.message()});
+        return error.SizeInventoryUnusable;
+    };
+    defer parsed.deinit();
+
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    defer arena.deinit();
+    const section = size_inventory.firstBootValue(
+        arena.allocator(),
+        usage,
+        &diagnostic,
+    ) catch {
+        std.debug.print("{s}\n", .{diagnostic.message()});
+        return error.SizeInventoryUnusable;
+    };
+    const updated = size_inventory.appendPhaseAlloc(
+        arena.allocator(),
+        parsed.value,
+        .first_boot,
+        section,
+        &diagnostic,
+    ) catch {
+        std.debug.print("{s}\n", .{diagnostic.message()});
+        return error.SizeInventoryUnusable;
+    };
+
+    const text = try std.json.Stringify.valueAlloc(
+        allocator,
+        updated,
+        .{ .whitespace = .indent_2 },
+    );
+    defer allocator.free(text);
+    var document: std.ArrayList(u8) = .empty;
+    defer document.deinit(allocator);
+    try document.appendSlice(allocator, text);
+    try document.append(allocator, '\n');
+    try Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = document.items });
+
+    // Re-read what was written, requiring the phase that was just added. A
+    // document nobody re-validated is a document nobody has measured.
+    var written = size_inventory.readValidated(allocator, io, output_path, .{
+        .architecture = @tagName(candidate.architecture),
+        .flavor = @tagName(candidate.flavor),
+        .required_phases = &.{ .root_build, .image_build, .publication, .first_boot },
+    }, &diagnostic) catch {
+        std.debug.print("{s}\n", .{diagnostic.message()});
+        return error.SizeInventoryUnusable;
+    };
+    written.deinit();
+}
+
 fn writeAcceptanceResult(
     allocator: Allocator,
     io: Io,
@@ -3512,7 +3736,7 @@ test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
     try std.testing.expectEqual(@as(u32, 4), full.flavor.policy().result_schema);
     try std.testing.expectEqual(@as(u32, 9), core.flavor.policy().result_schema);
     try std.testing.expectEqual(@as(usize, 18), full.contracts().len);
-    try std.testing.expectEqual(@as(usize, 28), core.contracts().len);
+    try std.testing.expectEqual(@as(usize, 29), core.contracts().len);
     try std.testing.expect(hasContract(core.contracts(), "mizinit-sshd-supervision"));
     try std.testing.expect(hasContract(core.contracts(), "no-cloud-init"));
     try std.testing.expect(hasContract(core.contracts(), "signed-binder-module"));
@@ -3520,26 +3744,76 @@ test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
     try std.testing.expect(hasContract(core.contracts(), "binderfs-dynamic-devices"));
     try std.testing.expect(hasContract(core.contracts(), "binder-device-usability"));
     try std.testing.expect(hasContract(core.contracts(), "dma-heap-device"));
+    try std.testing.expect(hasContract(core.contracts(), "runtime-contract"));
     try std.testing.expect(!hasContract(full.contracts(), "signed-binder-module"));
     try std.testing.expect(!hasContract(full.contracts(), "binder-boot-required"));
     try std.testing.expect(!hasContract(full.contracts(), "binderfs-dynamic-devices"));
     try std.testing.expect(!hasContract(full.contracts(), "binder-device-usability"));
     try std.testing.expect(!hasContract(full.contracts(), "dma-heap-device"));
+    try std.testing.expect(!hasContract(full.contracts(), "runtime-contract"));
     for (core.contracts()) |contract| {
         try std.testing.expect(std.ascii.indexOfIgnoreCase(contract, "android") == null);
     }
 }
 
-test "core DMA-heap checks require the system character device" {
-    try std.testing.expect(std.mem.indexOf(u8, dma_heap_checks, "test -d /dev/dma_heap") != null);
-    try std.testing.expect(
-        std.mem.indexOf(u8, dma_heap_checks, "test -c /dev/dma_heap/system") != null,
+test "core DMA-heap and BinderFS contracts are answered by the runtime contract" {
+    // The shell versions of these checks needed `findmnt` and `test -c/-r/-w`
+    // in the guest. They are now requirements in the contract the static probe
+    // evaluates, which is what lets a later step remove those utilities.
+    const dma_heap = runtime_contract.lookup("dma-heap-system").?;
+    try std.testing.expectEqualStrings("/dev/dma_heap/system", dma_heap.target);
+    try std.testing.expectEqual(runtime_contract.Kind.device, dma_heap.kind);
+    try std.testing.expect(dma_heap.required());
+
+    const mount = runtime_contract.lookup("binderfs-mount").?;
+    try std.testing.expectEqualStrings(binderfs_mount_point, mount.target);
+    try std.testing.expectEqualStrings("binder", mount.expect);
+    for (binder_dynamic_device_names) |name| {
+        var found = false;
+        for (binderfs_contract_requirements) |id| {
+            const entry = runtime_contract.lookup(id).?;
+            if (std.mem.endsWith(u8, entry.target, name)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+    for (binderfs_contract_requirements) |id| {
+        const entry = runtime_contract.lookup(id).?;
+        try std.testing.expect(entry.required());
+        try std.testing.expectEqual(runtime_contract.Presence.runtime, entry.presence);
+    }
+}
+
+test "a runtime contract report is read per requirement and refuses silence" {
+    const allocator = std.testing.allocator;
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    for (runtime_contract.requirements()) |requirement| {
+        if (!requirement.kind.probeable()) continue;
+        const status = if (std.mem.eql(u8, requirement.id, "dma-heap-system"))
+            "not-writable"
+        else
+            "ok";
+        try text.print(
+            allocator,
+            "runtime-contract id={s} status={s}\n",
+            .{ requirement.id, status },
+        );
+    }
+    const report: RuntimeContractReport = .{ .text = text.items };
+    try verifyGuestBinderfsDevices(&report);
+    try std.testing.expectError(
+        error.GuestDmaHeapContractFailed,
+        verifyGuestDmaHeap(&report),
     );
-    try std.testing.expect(
-        std.mem.indexOf(u8, dma_heap_checks, "test -r /dev/dma_heap/system") != null,
+
+    const empty: RuntimeContractReport = .{ .text = "" };
+    try std.testing.expectError(
+        error.GuestBinderfsDeviceContractFailed,
+        verifyGuestBinderfsDevices(&empty),
     );
-    try std.testing.expect(
-        std.mem.indexOf(u8, dma_heap_checks, "test -w /dev/dma_heap/system") != null,
+    try std.testing.expectError(
+        error.GuestDmaHeapContractFailed,
+        verifyGuestDmaHeap(&empty),
     );
 }
 
@@ -3804,13 +4078,17 @@ test "signed Binder module script pins the module tree and requires evidence" {
     try std.testing.expect(std.mem.indexOf(u8, signed_binder_module_checks, "modprobe") == null);
 }
 
-test "binderfs device script checks the assumed mount point and every dynamic device" {
-    try std.testing.expect(std.mem.indexOf(u8, binderfs_dynamic_device_checks, binderfs_mount_point) != null);
-    try std.testing.expect(std.mem.indexOf(u8, binderfs_dynamic_device_checks, "binder-control") != null);
-    for (binder_dynamic_device_names) |name| {
-        try std.testing.expect(std.mem.indexOf(u8, binderfs_dynamic_device_checks, name) != null);
+test "the core flavor carries a runtime-contract acceptance contract" {
+    const core = Flavor.core;
+    try std.testing.expect(hasContract(core.policy().contracts, "runtime-contract"));
+    try std.testing.expect(!hasContract(Flavor.full.policy().contracts, "runtime-contract"));
+    // Every acceptance-only convenience must be declared as such, so a package
+    // is never retained because a test happened to use it.
+    try std.testing.expect(runtime_contract.countFor(.acceptance_only) != 0);
+    for (runtime_contract.requirements()) |requirement| {
+        if (requirement.audience != .acceptance_only) continue;
+        try std.testing.expect(!requirement.required());
     }
-    try std.testing.expect(std.mem.indexOf(u8, binderfs_dynamic_device_checks, "FSTYPE") != null);
 }
 
 test "Binder probe line parser accepts every reported status" {
@@ -4311,12 +4589,37 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
     if (candidate.flavor == .core) {
         try verifyGuestSignedBinderModule(allocator, io, ssh_path, &first);
         try verifyGuestSignedBinderModule(allocator, io, ssh_path, &second);
-        try verifyGuestBinderfsDevices(allocator, io, ssh_path, &first);
-        try verifyGuestBinderfsDevices(allocator, io, ssh_path, &second);
+
+        // One probe run per guest answers the whole runtime contract, and the
+        // BinderFS and DMA-heap contracts are then read out of it rather than
+        // re-asked with shell utilities the final image should not have to keep.
+        var first_contract = try readGuestRuntimeContractAlloc(
+            allocator,
+            io,
+            ssh_path,
+            &first,
+        );
+        defer first_contract.deinit(allocator);
+        var second_contract = try readGuestRuntimeContractAlloc(
+            allocator,
+            io,
+            ssh_path,
+            &second,
+        );
+        defer second_contract.deinit(allocator);
+        try verifyGuestBinderfsDevices(&first_contract);
+        try verifyGuestBinderfsDevices(&second_contract);
         try verifyGuestBinderDeviceUsability(allocator, io, ssh_path, &first);
         try verifyGuestBinderDeviceUsability(allocator, io, ssh_path, &second);
-        try verifyGuestDmaHeap(allocator, io, ssh_path, &first);
-        try verifyGuestDmaHeap(allocator, io, ssh_path, &second);
+        try verifyGuestDmaHeap(&first_contract);
+        try verifyGuestDmaHeap(&second_contract);
+
+        // The measured first-boot phase issue #677 step 1 left open. The root
+        // has booted and grown by now, so this is the first moment the numbers
+        // exist at all; they are read from the guest's own `statfs` and
+        // appended to a copy of the candidate's inventory, never to the bound
+        // document, whose digest provenance already depends on.
+        try recordFirstBootInventory(allocator, io, ssh_path, &first, candidate);
     }
 
     var first_before = try readGuestIdentityAlloc(allocator, io, ssh_path, &first);

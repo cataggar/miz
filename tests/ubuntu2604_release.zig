@@ -1974,6 +1974,7 @@ test "the contract sets cover the acceptance each flavor actually performs" {
             "reboot-reconnect",
             "resource-disk",
             "root-growth",
+            "runtime-contract",
             "runtime-release-identity",
             "secure-boot",
             "signed-uki",
@@ -2028,6 +2029,7 @@ test "the contract sets cover the acceptance each flavor actually performs" {
             "persistent-provisioned-state",
             "reboot-reconnect",
             "root-growth",
+            "runtime-contract",
             "same-architecture-qemu",
             "secure-boot",
             "signed-binder-module",
@@ -2766,6 +2768,151 @@ test "Ubuntu provenance binds a complete size inventory" {
         .core,
         fixture.virtual_size,
     );
+}
+
+/// The runtime-contract document the fixture bound into a core candidate's
+/// provenance.
+fn runtimeContractPath(subject: *const Tree, key: []const u8) ![]u8 {
+    const entry = contracts.lookup(key).?;
+    return subject.path(
+        "candidates/{s}/internal-provenance/ubuntu2604-runtime-contract-{s}-{s}.json",
+        .{ key, entry.flavor, entry.architecture },
+    );
+}
+
+test "core provenance binds the explicit runtime contract" {
+    var subject = try tree();
+    defer subject.deinit();
+    try fixture.makeBundle(&subject, "aarch64-core", .{});
+    try validateUbuntu(&subject, "aarch64-core", "aarch64", .core, fixture.virtual_size);
+
+    const contract_path = try runtimeContractPath(&subject, "aarch64-core");
+    defer allocator.free(contract_path);
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    var diagnostic: support.Diagnostic = .{};
+    try release.workflow.runtimeContractVerify(
+        allocator,
+        io,
+        &writer,
+        contract_path,
+        "aarch64",
+        "core",
+        &diagnostic,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "aarch64 core") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "guest_runtime=") != null);
+
+    // The wrong architecture is refused rather than accepted as "a contract".
+    writer.end = 0;
+    try std.testing.expectError(error.Failed, release.workflow.runtimeContractVerify(
+        allocator,
+        io,
+        &writer,
+        contract_path,
+        "x86_64",
+        "core",
+        &diagnostic,
+    ));
+
+    // The contract is bound by digest, so editing it invalidates the whole
+    // provenance tree rather than only the file.
+    try fixture.patch(
+        allocator,
+        io,
+        contract_path,
+        &.{.{ .key = "flavor" }},
+        .{ .set = .{ .string = "full" } },
+    );
+    try expectUbuntuRejected(
+        &subject,
+        "aarch64-core",
+        "aarch64",
+        .core,
+        fixture.virtual_size,
+    );
+}
+
+test "a core candidate without a runtime contract is refused" {
+    var subject = try tree();
+    defer subject.deinit();
+    try fixture.makeBundle(&subject, "x86_64-core", .{});
+    const path = try subject.path(
+        "candidates/x86_64-core/internal-provenance/{s}",
+        .{contracts.ubuntu_provenance_filename},
+    );
+    defer allocator.free(path);
+    try fixture.patch(
+        allocator,
+        io,
+        path,
+        &.{ .{ .key = "runtime_contract" }, .{ .key = "filename" } },
+        .{ .set = .{ .string = "ubuntu2604-runtime-contract-core-aarch64.json" } },
+    );
+    try expectUbuntuRejected(&subject, "x86_64-core", "x86_64", .core, fixture.virtual_size);
+}
+
+test "a guest runtime-contract probe report is judged by the release tool" {
+    var subject = try tree();
+    defer subject.deinit();
+
+    var complete: std.ArrayList(u8) = .empty;
+    defer complete.deinit(allocator);
+    var broken: std.ArrayList(u8) = .empty;
+    defer broken.deinit(allocator);
+    for (release.runtime_contract.requirements()) |requirement| {
+        if (!requirement.kind.probeable()) continue;
+        try complete.print(allocator, "runtime-contract id={s} status=ok\n", .{requirement.id});
+        const status = if (std.mem.eql(u8, requirement.id, "sshd")) "missing" else "ok";
+        try broken.print(
+            allocator,
+            "runtime-contract id={s} status={s}\n",
+            .{ requirement.id, status },
+        );
+    }
+
+    const good_path = try subject.path("probe-report-ok.txt", .{});
+    defer allocator.free(good_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = good_path, .data = complete.items });
+    const bad_path = try subject.path("probe-report-broken.txt", .{});
+    defer allocator.free(bad_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = bad_path, .data = broken.items });
+
+    var buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    var diagnostic: support.Diagnostic = .{};
+    try release.workflow.runtimeContractProbeVerify(
+        allocator,
+        io,
+        &writer,
+        good_path,
+        &diagnostic,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, writer.buffered(), "runtime-contract satisfied") != null,
+    );
+
+    writer.end = 0;
+    try std.testing.expectError(error.Failed, release.workflow.runtimeContractProbeVerify(
+        allocator,
+        io,
+        &writer,
+        bad_path,
+        &diagnostic,
+    ));
+    try std.testing.expect(std.mem.indexOf(u8, diagnostic.message(), "sshd") != null);
+
+    // A report that was never produced is a failure, not an empty pass.
+    const absent = try subject.path("probe-report-absent.txt", .{});
+    defer allocator.free(absent);
+    writer.end = 0;
+    try std.testing.expectError(error.Failed, release.workflow.runtimeContractProbeVerify(
+        allocator,
+        io,
+        &writer,
+        absent,
+        &diagnostic,
+    ));
 }
 
 test "size inventories are compared before a closure changes" {

@@ -134,6 +134,7 @@ pub const core_azure_contracts = [_][]const u8{
     "reboot-reconnect",
     "resource-disk",
     "root-growth",
+    "runtime-contract",
     "runtime-release-identity",
     "secure-boot",
     "signed-uki",
@@ -184,6 +185,7 @@ pub const core_native_contracts = [_][]const u8{
     "persistent-provisioned-state",
     "reboot-reconnect",
     "root-growth",
+    "runtime-contract",
     "same-architecture-qemu",
     "secure-boot",
     "signed-binder-module",
@@ -299,6 +301,21 @@ pub const private_key_pem_markers = [_][]const u8{
 pub const openssh_private_key_magic = "openssh-key-v1\x00";
 
 pub const ubuntu_provenance_filename = "ubuntu2604-build-provenance.json";
+
+/// The runtime-contract document a core candidate binds into its provenance
+/// (issue #677 step 2). Only the core appliance has this contract, so the name
+/// is flavor-qualified and no full-flavor document exists to be confused with it.
+pub fn runtimeContractFilename(
+    buffer: []u8,
+    flavor: Flavor,
+    architecture: []const u8,
+) ?[]const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        "ubuntu2604-runtime-contract-{s}-{s}.json",
+        .{ @tagName(flavor), architecture },
+    ) catch null;
+}
 pub const debz_api_commit = "beac3f20dd93fd98863af71e8fe621d47db663f6";
 pub const full_debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
 pub const core_debz_packages = [_][]const u8{

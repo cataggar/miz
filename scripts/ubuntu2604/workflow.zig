@@ -24,6 +24,7 @@ const contracts = @import("contracts.zig");
 const documents = @import("documents.zig");
 const download = @import("download.zig");
 const provenance = @import("provenance.zig");
+const runtime_contract_document = @import("runtime_contract_document.zig");
 const size_inventory = @import("size_inventory.zig");
 const support = @import("support.zig");
 
@@ -174,6 +175,34 @@ pub fn dispatch(
             try options.require("--candidate"),
             options.get("--output"),
             options.get("--step-summary"),
+            diagnostic,
+        );
+    }
+    if (std.mem.eql(u8, command, "runtime-contract-verify")) {
+        var options = try parse(allocator, argv, &.{
+            "--contract",
+            "--architecture",
+            "--flavor",
+        });
+        defer options.deinit();
+        return runtimeContractVerify(
+            allocator,
+            io,
+            out,
+            try options.require("--contract"),
+            options.get("--architecture"),
+            options.get("--flavor"),
+            diagnostic,
+        );
+    }
+    if (std.mem.eql(u8, command, "runtime-contract-probe-verify")) {
+        var options = try parse(allocator, argv, &.{"--report"});
+        defer options.deinit();
+        return runtimeContractProbeVerify(
+            allocator,
+            io,
+            out,
+            try options.require("--report"),
             diagnostic,
         );
     }
@@ -868,6 +897,87 @@ pub fn sizeInventoryVerify(
             summary.closure_sha256,
         },
     );
+}
+
+/// Translates a runtime-contract rejection into this module's failure shape.
+/// The contract module already produced the operator-facing sentence.
+fn contractFailure(err: runtime_contract_document.Error) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Failed => error.Failed,
+    };
+}
+
+/// `runtime-contract-verify`: re-checks a published runtime-contract document
+/// against the contract this tool was compiled with (issue #677 step 2).
+///
+/// The check is deliberately not "does the file parse". A candidate carries
+/// this document so a reviewer can see what it promised; a document that no
+/// longer matches the compiled contract means the promise and the enforcement
+/// have separated, which is the one failure a size-minimization program cannot
+/// afford to discover late.
+pub fn runtimeContractVerify(
+    allocator: Allocator,
+    io: Io,
+    out: *Writer,
+    contract_path: []const u8,
+    architecture: ?[]const u8,
+    flavor: ?[]const u8,
+    diagnostic: *Diagnostic,
+) OutError!void {
+    var parsed = runtime_contract_document.readValidated(allocator, io, contract_path, .{
+        .architecture = architecture,
+        .flavor = flavor,
+    }, diagnostic) catch |err| return contractFailure(err);
+    defer parsed.deinit();
+    const summary = runtime_contract_document.validateDocument(
+        parsed.value,
+        .{ .architecture = architecture, .flavor = flavor },
+        diagnostic,
+    ) catch |err| return contractFailure(err);
+    try out.print(
+        "{s} {s} requirements={d} guest_runtime={d} build_tooling={d} " ++
+            "acceptance_only={d} contract={s}\n",
+        .{
+            summary.architecture,
+            summary.flavor,
+            summary.total,
+            summary.guest_runtime,
+            summary.build_tooling,
+            summary.acceptance_only,
+            summary.contract_sha256,
+        },
+    );
+}
+
+/// `runtime-contract-probe-verify`: judges a guest probe report.
+///
+/// The report is produced inside the guest by the static probe acceptance
+/// uploads, so the shell harness never has to know the contract; it only has
+/// to hand the captured output here. A guest requirement that is not `ok`, a
+/// requirement the probe failed to report at all, and an unparseable line are
+/// all refusals -- a partial report must never read as a pass.
+pub fn runtimeContractProbeVerify(
+    allocator: Allocator,
+    io: Io,
+    out: *Writer,
+    report_path: []const u8,
+    diagnostic: *Diagnostic,
+) OutError!void {
+    const text = support.file_support.readBounded(
+        allocator,
+        io,
+        report_path,
+        runtime_contract_document.document_max_bytes,
+    ) catch |err| return fail(
+        diagnostic,
+        "cannot read runtime contract probe report {s}: {s}",
+        .{ report_path, @errorName(err) },
+    );
+    defer allocator.free(text);
+    runtime_contract_document.verifyProbeReport(text, diagnostic) catch |err|
+        return contractFailure(err);
+    try out.print("runtime-contract satisfied\n", .{});
 }
 
 /// `size-inventory-compare`: the benchmark comparison #677 asks for before the

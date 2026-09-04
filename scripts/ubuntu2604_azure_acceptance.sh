@@ -116,6 +116,14 @@ if [[ "$FLAVOR" == core ]]; then
     echo "::error::Binder device probe binary is not executable"
     exit 1
   }
+  if [[ -z ${RUNTIME_CONTRACT_PROBE:-} ]]; then
+    echo "::error::Core Azure acceptance requires a runtime contract probe binary"
+    exit 1
+  fi
+  [[ -x "$RUNTIME_CONTRACT_PROBE" ]] || {
+    echo "::error::Runtime contract probe binary is not executable"
+    exit 1
+  }
 fi
 
 report_error() {
@@ -1109,15 +1117,11 @@ guest_error() {
 trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 probe=$1
 
-# binderfs must be the real dynamic Binder IPC filesystem, not a fixed set of
-# legacy static device nodes.
+# The binderfs mount type, every fixed device node, and the DMA heap are
+# `runtime-contract` requirements, evaluated by the static contract probe with
+# syscalls alone (issue #677 step 2). Re-checking them here with `findmnt` and
+# `test -c` would make the image keep those utilities for a test's sake.
 binderfs_mount=/dev/binderfs
-test -d "$binderfs_mount"
-test "$(findmnt -n -o FSTYPE "$binderfs_mount")" = binder
-test -c "$binderfs_mount/binder-control"
-for device in binder hwbinder vndbinder; do
-  test -c "$binderfs_mount/$device"
-done
 
 # A real, driver-backed BINDER_VERSION ioctl on each fixed device, and a
 # real BINDER_CTL_ADD dynamic allocation through binder-control.
@@ -1128,13 +1132,30 @@ done
 sudo -n "$probe" alloc "$binderfs_mount/binder-control" miz-acceptance-probe
 sudo -n "$probe" version "$binderfs_mount/miz-acceptance-probe"
 sudo -n /usr/bin/rm -f -- "$binderfs_mount/miz-acceptance-probe" "$probe"
-
-dma_heap=/dev/dma_heap/system
-test -d /dev/dma_heap
-sudo -n test -c "$dma_heap"
-sudo -n test -r "$dma_heap"
-sudo -n test -w "$dma_heap"
 GUEST
+
+  # `runtime-contract`: the explicit allowlist issue #677 step 2 defines,
+  # evaluated inside the guest by a static probe rather than by shell
+  # utilities, and judged on the host by the release tool so a partial or
+  # unparseable report can never read as agreement.
+  runtime_contract_remote=/home/miztest/.miz-runtime-contract-probe
+  runtime_contract_sha256=$(sha256sum "$RUNTIME_CONTRACT_PROBE" | awk '{print $1}')
+  base64 -w0 "$RUNTIME_CONTRACT_PROBE" | ssh "${ssh_options[@]}" "$ssh_target" \
+    "set -eu; rm -f -- '$runtime_contract_remote'; umask 077; base64 -d >'$runtime_contract_remote'; chmod 0700 '$runtime_contract_remote'"
+  runtime_contract_remote_sha256=$(
+    ssh "${ssh_options[@]}" "$ssh_target" "sha256sum '$runtime_contract_remote'" |
+      awk '{print $1}'
+  )
+  test "$runtime_contract_remote_sha256" = "$runtime_contract_sha256"
+
+  ssh "${ssh_options[@]}" "$ssh_target" \
+    "sudo -n '$runtime_contract_remote' contract" \
+    >"$RESULT_DIR/runtime-contract-report.txt"
+  test -s "$RESULT_DIR/runtime-contract-report.txt"
+  "$RELEASE_TOOL" runtime-contract-probe-verify \
+    --report "$RESULT_DIR/runtime-contract-report.txt"
+  ssh "${ssh_options[@]}" "$ssh_target" \
+    "sudo -n /usr/bin/rm -f -- '$runtime_contract_remote'"
 fi
 
 if [[ "$FLAVOR" == core ]]; then
@@ -1633,6 +1654,7 @@ test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
   echo "- Flavor: \`$FLAVOR\`"
   if [[ "$FLAVOR" == core ]]; then
     echo "- Binder device probe SHA-256: \`$binder_probe_sha256\`"
+    echo "- Runtime contract probe SHA-256: \`$runtime_contract_sha256\`"
   fi
   echo "- Contracts: \`$azure_contract_list\`"
 } >>"$GITHUB_STEP_SUMMARY"

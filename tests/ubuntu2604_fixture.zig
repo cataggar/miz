@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const Io = std.Io;
 const contracts = release.contracts;
+const runtime_contract_document = release.runtime_contract_document;
 const size_inventory = release.size_inventory;
 const support = release.support;
 const miz = @import("miz");
@@ -680,6 +681,11 @@ fn writeProvenance(
     );
     try builder.put(&document, "debz", .{ .object = debz });
     if (flavor == .core) {
+        try builder.put(
+            &document,
+            "runtime_contract",
+            try writeRuntimeContract(tree, builder, key, provenance),
+        );
         try builder.putString(&document, "flavor", "core");
         try builder.putInteger(&document, "virtual_size", virtual_size);
         try builder.putInteger(&document, "minimum_root_free_bytes", 1024 * 1024);
@@ -701,6 +707,49 @@ fn writeProvenance(
     );
 
     try writeSigning(tree, key, provenance, options);
+}
+
+/// Writes the real runtime-contract document for `key` and returns its binding.
+///
+/// The fixture emits the same document the builder does, through the same
+/// writer, so a contract change lands in the fixture and the shipped image at
+/// once instead of leaving the bundle tests asserting a stale table.
+fn writeRuntimeContract(
+    tree: *const Tree,
+    builder: Builder,
+    key: []const u8,
+    provenance: []const u8,
+) !std.json.Value {
+    const allocator = tree.allocator;
+    const io = tree.io;
+    const entry = contracts.lookup(key).?;
+    const flavor = contracts.parseFlavor(entry.flavor).?;
+
+    const filename = try runtime_contract_document.filenameAlloc(
+        allocator,
+        @tagName(flavor),
+        entry.architecture,
+    );
+    defer allocator.free(filename);
+    const path = try std.fs.path.join(allocator, &.{ provenance, filename });
+    defer allocator.free(path);
+    var diagnostic: runtime_contract_document.Diagnostic = .{};
+    try runtime_contract_document.write(
+        allocator,
+        io,
+        path,
+        entry.architecture,
+        @tagName(flavor),
+        &diagnostic,
+    );
+    const text = try Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(runtime_contract_document.document_max_bytes),
+    );
+    defer allocator.free(text);
+    return fileBinding(builder, filename, &support.digest.hexBytes(text), null);
 }
 
 /// Writes a real size-inventory document for `key` and returns its binding.

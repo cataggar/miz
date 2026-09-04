@@ -644,6 +644,54 @@ test "storage diagnostics are ordered and never mask the build failure" {
     try source.expectOmitsIn(diagnostic, "sudo -n df", workflow_path);
 }
 
+test "the release workflow publishes and re-checks the core runtime contract" {
+    var workflow = try open();
+    defer workflow.deinit();
+    const build_job = try workflow.section("\n  build:\n", "\n  native_qemu:\n");
+    try source.expectOrder(
+        build_job,
+        "- name: Verify the reproducible size inventory",
+        "- name: Verify the explicit runtime contract",
+        workflow_path,
+    );
+    try source.expectContainsIn(build_job, "runtime-contract-verify", workflow_path);
+    // Only core carries the contract, so the step must be flavor-gated rather
+    // than failing every full candidate on a document that does not exist.
+    const start = try source.indexOfIn(
+        build_job,
+        "- name: Verify the explicit runtime contract",
+        workflow_path,
+    );
+    const rest = build_job[start..];
+    const step = rest[0 .. std.mem.indexOfPos(
+        u8,
+        rest,
+        "- name: Verify".len,
+        "- name:",
+    ) orelse rest.len];
+    try source.expectContainsIn(step, "if: matrix.flavor == 'core'", workflow_path);
+
+    const native = try workflow.section("\n  native_qemu:\n", "\n  azure_acceptance:\n");
+    try source.expectContainsIn(
+        native,
+        "MIZ_UBUNTU2604_FIRST_BOOT_INVENTORY=",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        native,
+        "--require-phase root_build,image_build,publication,first_boot",
+        workflow_path,
+    );
+
+    const azure = try workflow.section("\n  azure_acceptance:\n", null);
+    try source.expectContainsIn(azure, "RUNTIME_CONTRACT_PROBE:", workflow_path);
+    try source.expectContainsIn(
+        azure,
+        "zig build install-ubuntu2604-runtime-contract-probes",
+        workflow_path,
+    );
+}
+
 test "the build job re-validates the size inventory it measured" {
     var workflow = try open();
     defer workflow.deinit();
