@@ -1015,6 +1015,7 @@ fn configureBinder(policy: BinderPolicy) BinderSetupOutcome {
 // route.h flags; stable ABI, not exposed by std.os.linux.
 const RTF_UP: u16 = 0x0001;
 const RTF_GATEWAY: u16 = 0x0002;
+const RTF_HOST: u16 = 0x0004;
 
 // struct rtentry (linux/route.h); stable ABI, not exposed by std.os.linux.
 const rtentry = extern struct {
@@ -1145,6 +1146,26 @@ fn readCarrier(iface: []const u8) ?bool {
     return contents[0] == '1';
 }
 
+fn interfaceMasterName(target: []const u8) ?[]const u8 {
+    const start = if (std.mem.lastIndexOfScalar(u8, target, '/')) |slash| slash + 1 else 0;
+    const name = target[start..];
+    if (name.len == 0 or name.len >= linux.IFNAMESIZE) return null;
+    return name;
+}
+
+/// Returns the routable master for an enslaved interface. Azure MANA VFs are
+/// child devices of the synthetic netvsc interface, where IPs and routes belong.
+fn readInterfaceMaster(iface: []const u8, out: *[linux.IFNAMESIZE]u8) ?[]const u8 {
+    var path_buf: [linux.IFNAMESIZE + 32]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/sys/class/net/{s}/master", .{iface}) catch return null;
+    var target_buf: [128]u8 = undefined;
+    const rc = linux.readlink(path.ptr, &target_buf, target_buf.len);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const name = interfaceMasterName(target_buf[0..rc]) orelse return null;
+    @memcpy(out[0..name.len], name);
+    return out[0..name.len];
+}
+
 /// Which interfaces are worth a DHCP attempt, in the order to try them.
 ///
 /// Preferring carrier is what keeps a bare-metal node reachable. Exactly one
@@ -1176,6 +1197,7 @@ const DhcpResult = struct {
     subnet_mask: u32, // network byte order
     router: u32, // network byte order, 0 if absent
     dns: [2]u32, // network byte order, 0 if absent
+    wireserver_endpoint: u32, // network byte order, 0 if option 245 was absent
 };
 
 const DhcpAttempt = struct {
@@ -1235,6 +1257,7 @@ const ParsedReply = struct {
     mask: u32,
     dns: [2]u32,
     has_option_245: bool,
+    wireserver_endpoint: u32,
 };
 
 fn recordDhcpEvidence(attempt: *DhcpAttempt, reply: ParsedReply) void {
@@ -1255,6 +1278,7 @@ fn parseDhcpReply(buf: []const u8, len: usize, expected_xid: u32) ?ParsedReply {
     var mask: u32 = 0;
     var dns: [2]u32 = .{ 0, 0 };
     var has_option_245 = false;
+    var wireserver_endpoint: u32 = 0;
 
     var pos: usize = 240;
     while (pos < len) {
@@ -1287,6 +1311,9 @@ fn parseDhcpReply(buf: []const u8, len: usize, expected_xid: u32) ?ParsedReply {
             },
             245 => {
                 has_option_245 = opt_len == 4;
+                if (has_option_245) {
+                    wireserver_endpoint = std.mem.readInt(u32, buf[val_start..][0..4], .big);
+                }
             },
             else => {},
         }
@@ -1300,6 +1327,27 @@ fn parseDhcpReply(buf: []const u8, len: usize, expected_xid: u32) ?ParsedReply {
         .mask = mask,
         .dns = dns,
         .has_option_245 = has_option_245,
+        .wireserver_endpoint = wireserver_endpoint,
+    };
+}
+
+fn dhcpResultFromReplies(offer: ParsedReply, ack: ParsedReply) DhcpResult {
+    const your_ip = if (ack.your_ip != 0) ack.your_ip else offer.your_ip;
+    const mask = if (ack.mask != 0) ack.mask else offer.mask;
+    const router = if (ack.router != 0) ack.router else offer.router;
+    const endpoint = if (ack.wireserver_endpoint != 0)
+        ack.wireserver_endpoint
+    else
+        offer.wireserver_endpoint;
+    return .{
+        .your_ip = std.mem.nativeToBig(u32, your_ip),
+        .subnet_mask = std.mem.nativeToBig(u32, if (mask != 0) mask else 0xffffff00),
+        .router = std.mem.nativeToBig(u32, router),
+        .dns = .{
+            std.mem.nativeToBig(u32, if (ack.dns[0] != 0) ack.dns[0] else offer.dns[0]),
+            std.mem.nativeToBig(u32, if (ack.dns[1] != 0) ack.dns[1] else offer.dns[1]),
+        },
+        .wireserver_endpoint = std.mem.nativeToBig(u32, endpoint),
     };
 }
 
@@ -1449,6 +1497,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
 
     var offer_ip: u32 = 0;
     var offer_server: u32 = 0;
+    var offer_reply: ?ParsedReply = null;
     var got_offer = false;
     var attempt: u32 = 0;
     while (attempt < 3 and !got_offer) : (attempt += 1) {
@@ -1474,6 +1523,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
                 if (reply.msg_type == 2) { // DHCPOFFER
                     offer_ip = reply.your_ip;
                     offer_server = reply.server_ip;
+                    offer_reply = reply;
                     got_offer = true;
                 }
             } else if (n_signed > 0) {
@@ -1507,12 +1557,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
             if (parseDhcpReply(data, data.len, xid)) |reply| {
                 recordDhcpEvidence(&result, reply);
                 if (reply.msg_type == 5) { // DHCPACK
-                    got_ack = .{
-                        .your_ip = std.mem.nativeToBig(u32, reply.your_ip),
-                        .subnet_mask = if (reply.mask != 0) std.mem.nativeToBig(u32, reply.mask) else std.mem.nativeToBig(u32, 0xffffff00),
-                        .router = std.mem.nativeToBig(u32, reply.router),
-                        .dns = .{ std.mem.nativeToBig(u32, reply.dns[0]), std.mem.nativeToBig(u32, reply.dns[1]) },
-                    };
+                    got_ack = dhcpResultFromReplies(offer_reply.?, reply);
                 }
             }
         } else {
@@ -1545,6 +1590,28 @@ fn addDefaultRoute(iface: []const u8, gateway_be: u32) void {
     const rc = linux.ioctl(sock, linux.SIOCADDRT, @intFromPtr(&route));
     const e = linux.errno(rc);
     if (e != .SUCCESS) writeErrno("[mizinit] add default route failed", e);
+}
+
+fn addWireServerRoute(iface: []const u8, endpoint_be: u32, gateway_be: u32) void {
+    const sock_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM, 0);
+    const sock: i32 = @intCast(sock_rc);
+    if (linux.errno(sock_rc) != .SUCCESS) return;
+    defer _ = linux.close(sock);
+
+    var iface_buf: [linux.IFNAMESIZE:0]u8 = std.mem.zeroes([linux.IFNAMESIZE:0]u8);
+    @memcpy(iface_buf[0..iface.len], iface);
+
+    var route: rtentry = .{
+        .rt_dst = sockaddrIn(endpoint_be),
+        .rt_genmask = sockaddrIn(0xffffffff),
+        .rt_gateway = sockaddrIn(gateway_be),
+        .rt_flags = RTF_UP | RTF_GATEWAY | RTF_HOST,
+        .rt_dev = @ptrCast(&iface_buf),
+    };
+
+    const rc = linux.ioctl(sock, linux.SIOCADDRT, @intFromPtr(&route));
+    const e = linux.errno(rc);
+    if (e != .SUCCESS and e != .EXIST) writeErrno("[mizinit] add WireServer route failed", e);
 }
 
 fn writeResolvConf(dns: [2]u32) void {
@@ -1618,7 +1685,9 @@ fn setupNetworking() NetworkResult {
 
     var network_result: NetworkResult = .{};
     for (order) |candidate| {
-        const iface = list.name(candidate);
+        const candidate_iface = list.name(candidate);
+        var master_buf: [linux.IFNAMESIZE]u8 = undefined;
+        const iface = readInterfaceMaster(candidate_iface, &master_buf) orelse candidate_iface;
         var msg_buf: [96]u8 = undefined;
         const msg = std.fmt.bufPrint(&msg_buf, "[mizinit] running DHCP on {s}\r\n", .{iface}) catch "[mizinit] running DHCP\r\n";
         writeStr(msg);
@@ -1635,7 +1704,12 @@ fn setupNetworking() NetworkResult {
         setIfaceAddr(ctl, iface, linux.SIOCSIFNETMASK, lease.subnet_mask);
         ifUp(ctl, iface);
 
-        if (lease.router != 0) addDefaultRoute(iface, lease.router);
+        if (lease.router != 0) {
+            addDefaultRoute(iface, lease.router);
+            if (lease.wireserver_endpoint != 0) {
+                addWireServerRoute(iface, lease.wireserver_endpoint, lease.router);
+            }
+        }
         writeResolvConf(lease.dns);
 
         const ip_bytes = std.mem.asBytes(&lease.your_ip);
@@ -2614,6 +2688,33 @@ test "DHCP parser retains valid option 245 evidence from OFFER or ACK" {
     try std.testing.expect(parseDhcpReply(&buf, ack_only_len, xid).?.has_option_245);
 }
 
+test "DHCP lease retains routing options from a sparse ACK" {
+    const offer: ParsedReply = .{
+        .msg_type = 2,
+        .your_ip = 0x0a000004,
+        .server_ip = 0x0a000001,
+        .router = 0x0a000001,
+        .mask = 0xffffff00,
+        .dns = .{ 0xa83f8181, 0 },
+        .has_option_245 = true,
+        .wireserver_endpoint = 0xa83f8110,
+    };
+    var ack = offer;
+    ack.msg_type = 5;
+    ack.router = 0;
+    ack.mask = 0;
+    ack.dns = .{ 0, 0 };
+    ack.has_option_245 = false;
+    ack.wireserver_endpoint = 0;
+
+    const lease = dhcpResultFromReplies(offer, ack);
+    try std.testing.expectEqual(std.mem.nativeToBig(u32, offer.your_ip), lease.your_ip);
+    try std.testing.expectEqual(std.mem.nativeToBig(u32, offer.router), lease.router);
+    try std.testing.expectEqual(std.mem.nativeToBig(u32, offer.mask), lease.subnet_mask);
+    try std.testing.expectEqual(std.mem.nativeToBig(u32, offer.dns[0]), lease.dns[0]);
+    try std.testing.expectEqual(std.mem.nativeToBig(u32, offer.wireserver_endpoint), lease.wireserver_endpoint);
+}
+
 test "DHCP parser ignores malformed or truncated option 245" {
     const xid = 0x12345678;
     var buf: [512]u8 = undefined;
@@ -2662,6 +2763,12 @@ test "interface order does not depend on readdir order" {
     try std.testing.expectEqualStrings("enP1p3s0f0np0", list.name(0));
     try std.testing.expectEqualStrings("enx3eb3994d4bf7", list.name(1));
     try std.testing.expectEqualStrings("enxb4e9b8888d30", list.name(2));
+}
+
+test "interface master name accepts kernel sysfs link targets" {
+    try std.testing.expectEqualStrings("eth0", interfaceMasterName("../../eth0").?);
+    try std.testing.expectEqualStrings("bond0", interfaceMasterName("bond0").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), interfaceMasterName("../../"));
 }
 
 test "interface list is bounded and rejects unusable names" {
