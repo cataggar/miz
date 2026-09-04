@@ -471,21 +471,38 @@ test "core BinderFS, Binder devices, and DMA heap are probed" {
         "binder_probe_remote_sha256",
         "test \"$binder_probe_remote_sha256\" = \"$binder_probe_sha256\"",
         "binderfs_mount=/dev/binderfs",
-        "test \"$(findmnt -n -o FSTYPE \"$binderfs_mount\")\" = binder",
-        "test -c \"$binderfs_mount/binder-control\"",
         "binder",
         "hwbinder",
         "vndbinder",
         "sudo -n \"$probe\" version",
         "sudo -n \"$probe\" alloc \"$binderfs_mount/binder-control\"",
         "miz-acceptance-probe",
-        "dma_heap=/dev/dma_heap/system",
-        "test -d /dev/dma_heap",
-        "sudo -n test -c \"$dma_heap\"",
+        // The runtime contract probe replaces the shell utilities the guest
+        // block used to need, and its report is judged on the host.
+        "runtime_contract_sha256=$(sha256sum",
+        "base64 -w0 \"$RUNTIME_CONTRACT_PROBE\"",
+        "test \"$runtime_contract_remote_sha256\" = \"$runtime_contract_sha256\"",
+        "sudo -n '$runtime_contract_remote' contract",
+        "runtime-contract-report.txt",
+        "\"$RELEASE_TOOL\" runtime-contract-probe-verify",
+    };
+    for (needles) |needle| try source.expectContainsIn(binder, needle, "binder probe");
+    // Nothing in the guest may depend on utilities the image is not required
+    // to keep: those checks now live in the static contract probe.
+    const absent = [_][]const u8{
+        "findmnt -n -o FSTYPE \"$binderfs_mount\"",
+        "test -c \"$binderfs_mount/binder-control\"",
         "sudo -n test -r \"$dma_heap\"",
         "sudo -n test -w \"$dma_heap\"",
     };
-    for (needles) |needle| try source.expectContainsIn(binder, needle, "binder probe");
+    for (absent) |needle| try source.expectOmitsIn(binder, needle, "binder probe");
+}
+
+test "core Azure acceptance refuses to start without a runtime contract probe" {
+    var script = try open();
+    defer script.deinit();
+    try script.expectContains("Core Azure acceptance requires a runtime contract probe binary");
+    try script.expectContains("[[ -x \"$RUNTIME_CONTRACT_PROBE\" ]] ||");
 }
 
 test "the Binder probe binary targets the public UAPI constants" {

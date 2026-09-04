@@ -20,6 +20,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const contracts = @import("contracts.zig");
 const keys = @import("keys.zig");
+const runtime_contract_document = @import("runtime_contract_document.zig");
 const size_inventory = @import("size_inventory.zig");
 const support = @import("support.zig");
 const url = @import("url.zig");
@@ -312,6 +313,54 @@ fn validateSizeInventory(
     parsed.deinit();
 }
 
+/// The runtime contract the build bound into its provenance (issue #677 step 2).
+///
+/// Core is the flavor being minimized, so it is the flavor that carries an
+/// explicit statement of what it needs. The binding is checked exactly like
+/// every other provenance file -- named, hashed, and re-read from the tree --
+/// and the document is then re-validated against the contract this tool was
+/// compiled with. A candidate whose contract has drifted from the source that
+/// accepted it is a candidate nobody can review.
+fn validateRuntimeContract(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    object: *const std.json.ObjectMap,
+    architecture: []const u8,
+    flavor: contracts.Flavor,
+    diagnostic: *Diagnostic,
+) Error!void {
+    var name_buffer: [96]u8 = undefined;
+    const expected_name = contracts.runtimeContractFilename(
+        &name_buffer,
+        flavor,
+        architecture,
+    ) orelse return fail(diagnostic, "Ubuntu runtime contract binding is invalid", .{});
+    const binding = try requireFileBinding(
+        object.get("runtime_contract"),
+        "Ubuntu runtime contract",
+        expected_name,
+        diagnostic,
+    );
+    const path = try requireBoundProvenanceFile(
+        allocator,
+        io,
+        root,
+        binding,
+        "Ubuntu runtime contract",
+        diagnostic,
+    );
+    defer allocator.free(path);
+    var parsed = runtime_contract_document.readValidated(allocator, io, path, .{
+        .architecture = architecture,
+        .flavor = @tagName(flavor),
+    }, diagnostic) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Failed => return error.Failed,
+    };
+    parsed.deinit();
+}
+
 /// `validate_ubuntu_disk_layout`.
 fn validateDiskLayout(
     value: ?std.json.Value,
@@ -449,6 +498,7 @@ pub fn validateUbuntu(
     };
     const core_fields = [_][]const u8{
         "minimum_root_free_bytes",
+        "runtime_contract",
         "validated_root_free_bytes",
         "flavor",
         "virtual_size",
@@ -538,6 +588,17 @@ pub fn validateUbuntu(
     );
     try validateDiskLayout(object.get("disk_layout"), architecture, diagnostic);
     try validateSizeInventory(allocator, io, root, object, architecture, flavor, diagnostic);
+    if (flavor == .core) {
+        try validateRuntimeContract(
+            allocator,
+            io,
+            root,
+            object,
+            architecture,
+            flavor,
+            diagnostic,
+        );
+    }
 
     const source_architecture = contracts.sourceArchitecture(architecture).?;
     var prefix_buffer: [64]u8 = undefined;

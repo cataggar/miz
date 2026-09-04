@@ -190,7 +190,18 @@ has not happened is absent rather than zero.
 | `root_build` | the builder, while the root is still a host tree | installed and allocated bytes per package, package count and exact closure digest, shared and unmatched payload, the explicit unowned-file allowlist with the remainder named, top-level root usage, and kernel, initramfs, module-tree, and firmware bytes |
 | `image_build` | the builder, once the image is finalized | ext4 used and free blocks and inodes before first boot, the signed UKI's size, and ESP occupancy |
 | `publication` | the builder, once the artifact exists | compressed QCOW2 length and its host allocation |
-| `first_boot` | a later stage that boots the image | the same ext4 accounting after first boot, which is what makes measured growth possible |
+| `first_boot` | core QEMU acceptance, once the guest has booted and grown its root | the same ext4 accounting measured inside the running guest with `statfs`, which is what makes measured growth possible |
+
+`first_boot` is appended by the acceptance harness to a *copy* of the bound
+inventory, published beside the acceptance result as
+`ubuntu2604-size-inventory-<flavor>-<architecture>.first-boot.json`. The bound
+document is never rewritten: its digest is part of build provenance, and a file
+edited after that digest was taken would break the binding it exists to
+support. The numbers are read from the guest's own `statfs` through the static
+runtime-contract probe, so nothing in the final image has to provide `df`. The
+acceptance guest boots on a resized overlay, so its `root_total_blocks` is
+larger than `image_build`'s by design; first-boot *growth* is the used-block and
+used-inode delta, which the resize does not affect.
 
 Ownership comes from dpkg's own file lists. A path claimed by more than one
 package is `shared` rather than charged to whichever package was indexed
@@ -225,6 +236,72 @@ $ ubuntu2604_release size-inventory-compare \
     --baseline before.json --candidate after.json \
     --output size-comparison.json --step-summary "$GITHUB_STEP_SUMMARY"
 ```
+
+## Explicit runtime contract
+
+Core publishes what it needs. `scripts/ubuntu2604/runtime_contract.zig` is a
+machine-readable allowlist derived from the behaviors the appliance must keep
+-- `mizinit` as PID 1 and its shutdown and reboot paths, `azagent` provisioning
+and WireServer readiness, key-only OpenSSH and first-boot host keys, the
+provisioned administrator shell and passwordless privilege path, root growth
+and disk policy, Secure Boot, vTPM, kernel lockdown and signed module loading,
+BinderFS and the DMA heap, the diagnostics needed to recover the appliance, and
+`ca-certificates` with its trust store. Each entry names a package, command,
+file, directory, symbolic link, library, configuration marker, mutable path,
+kernel module, device, or mount, and states three things that decide how it is
+enforced:
+
+| field | meaning |
+| --- | --- |
+| `behavior` | which shipped behavior the entry exists for; an entry nobody can attribute to a behavior is a convenience |
+| `audience` | `guest_runtime` (the appliance needs it), `build_tooling` (only the build needs it), or `acceptance_only` (only the test harness needs it) |
+| `presence` | `image` (already in the built root) or `runtime` (only a booted guest has it) |
+
+The `audience` split is the point of the contract. `initramfs-tools` is
+`build_tooling`, so step 4 of issue #677 can remove it from the final guest
+without weakening anything; `findmnt`, `od`, `modprobe`, `modinfo`, `base64`,
+and `sha256sum` are `acceptance_only`, so nothing may be retained in the image
+because a test happened to use one. Their absence is reported, not enforced.
+
+The contract is published per core candidate as
+`internal-provenance/ubuntu2604-runtime-contract-<flavor>-<architecture>.json`,
+digest-bound from `ubuntu2604-build-provenance.json`, and re-checked against the
+contract the accepted source compiles:
+
+```console
+$ ubuntu2604_release runtime-contract-verify \
+    --contract internal-provenance/ubuntu2604-runtime-contract-core-x86_64.json \
+    --architecture x86_64 --flavor core
+```
+
+Enforcement happens at three stages:
+
+- **Build.** The finished root is checked against every `image`-present guest
+  requirement, and the shipped exact lock against every contract package, before
+  the image is finalized. A closure change that deletes `/usr/bin/sudo` or
+  empties the trust store fails the build that made it, naming the requirement.
+- **QEMU and Azure acceptance.** A static probe
+  (`tests/ubuntu2604_runtime_contract_probe.zig`), cross-built for the guest
+  architecture and uploaded over the established SSH session, evaluates the
+  whole contract with syscalls alone: `statx`, `faccessat`, `readlink`,
+  `/proc/mounts`, `/proc/1/exe`, the `SecureBoot` efivar, the lockdown mode, and
+  `/sys/module/<name>/taint`. It replaces the guest-side `findmnt`, `od`,
+  `grep`, `mountpoint`, and `cat` invocations acceptance used to depend on, and
+  it also reports `statfs` accounting for the `first_boot` size-inventory phase.
+  The report is judged on the host, where a requirement that is not `ok`, a
+  requirement the probe never reported, and an unparseable line are all
+  refusals; a partial report never reads as agreement.
+- **Provenance.** `runtime-contract-verify` and the core provenance validator
+  refuse a candidate whose published contract has drifted from the source that
+  accepted it.
+
+```console
+$ ubuntu2604_release runtime-contract-probe-verify \
+    --report runtime-contract-report.txt
+```
+
+A contract change is therefore a reviewable change: it moves the contract
+digest, the published document, and the acceptance verdict together.
 
 ## Guest and disk contract
 

@@ -12,6 +12,7 @@
 const std = @import("std");
 const miz = @import("miz");
 const image_phase_timing = @import("image_phase_timing.zig");
+const runtime_contract_document = @import("ubuntu2604/runtime_contract_document.zig");
 const size_inventory = @import("ubuntu2604/size_inventory.zig");
 const uki_kernel_payload = @import("ubuntu2604_kernel_payload.zig");
 const uki_signing = @import("uki_signing.zig");
@@ -423,18 +424,6 @@ const baremetal_forbidden_packages = [_][]const u8{
     "anbox-modules-dkms",
     "anbox-modules",
     "linux-azure",
-};
-
-const core_required_paths = [_][]const u8{
-    "/usr/sbin/mizinit",
-    "/usr/sbin/azagent",
-    "/usr/sbin/sshd",
-    "/usr/bin/ssh-keygen",
-    "/etc/ssh/sshd_config.d/10-mizinit.conf",
-    "/etc/waagent.conf",
-    "/var/lib/miz/ubuntu2604-package-lock.tsv",
-    "/var/lib/miz/ubuntu2604-core-provenance.json",
-    "/var/lib/miz/source-release",
 };
 
 const core_forbidden_paths = [_][]const u8{
@@ -3016,6 +3005,69 @@ fn validateNoBakedIdentity(
     }
 }
 
+/// Adapts the mountless ext4 view to the runtime contract's root probe.
+///
+/// `stat` does not follow symbolic links, which is exactly what the contract
+/// needs: a required regular file that has become a link to somewhere else is
+/// not the file the contract asked for.
+const ContractRoot = struct {
+    allocator: Allocator,
+    filesystem: *const miz.ext4_mountless.FileSystem,
+
+    fn stat(context: *anyopaque, path: []const u8) ?runtime_contract_document.EntryKind {
+        const self: *ContractRoot = @ptrCast(@alignCast(context));
+        const entry = self.filesystem.stat(path) catch return null;
+        return switch (entry.kind) {
+            .file => .regular,
+            .directory => .directory,
+            .symlink => .symlink,
+            else => .other,
+        };
+    }
+
+    fn readLink(context: *anyopaque, path: []const u8, out: []u8) ?[]const u8 {
+        const self: *ContractRoot = @ptrCast(@alignCast(context));
+        const target = self.filesystem.readLink(self.allocator, path, out.len) catch return null;
+        defer self.allocator.free(target);
+        @memcpy(out[0..target.len], target);
+        return out[0..target.len];
+    }
+
+    fn read(context: *anyopaque, path: []const u8, out: []u8) ?[]const u8 {
+        const self: *ContractRoot = @ptrCast(@alignCast(context));
+        const bytes = self.filesystem.read(self.allocator, path, out.len) catch return null;
+        defer self.allocator.free(bytes);
+        @memcpy(out[0..bytes.len], bytes);
+        return out[0..bytes.len];
+    }
+
+    fn probe(self: *ContractRoot) runtime_contract_document.RootProbe {
+        return .{
+            .context = @ptrCast(self),
+            .statFn = stat,
+            .readLinkFn = readLink,
+            .readFn = read,
+        };
+    }
+};
+
+/// Fails the build, naming the requirement, when the finished root no longer
+/// carries something the runtime contract says it must.
+fn verifyRuntimeContractRoot(
+    allocator: Allocator,
+    filesystem: *const miz.ext4_mountless.FileSystem,
+) !void {
+    var root: ContractRoot = .{ .allocator = allocator, .filesystem = filesystem };
+    var diagnostic: runtime_contract_document.Diagnostic = .{};
+    runtime_contract_document.verifyRoot(allocator, root.probe(), &diagnostic) catch |err| {
+        std.debug.print("{s}\n", .{diagnostic.message()});
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Failed => error.RuntimeContractViolated,
+        };
+    };
+}
+
 fn validateCoreRoot(
     allocator: Allocator,
     io: Io,
@@ -3025,7 +3077,11 @@ fn validateCoreRoot(
     evidence: []const DebzEvidence,
 ) !void {
     if (evidence.len != flavor.debzPackages().len) return error.InvalidDebzEvidence;
-    for (&core_required_paths) |path| try requireRootPath(filesystem, path);
+    // Issue #677 step 2: the explicit runtime contract is the single statement
+    // of what a fresh root must carry, and it is enforced here rather than in a
+    // second hand-maintained path list that could disagree with it. A closure
+    // change that deletes a required file now stops the build that made it.
+    try verifyRuntimeContractRoot(allocator, filesystem);
     if (flavor == .baremetal) {
         // Without this the machine boots and never becomes reachable: mizinit
         // would fall back to sshd, which waits for a provisioning sentinel that
@@ -3087,6 +3143,22 @@ fn validateCoreRoot(
     );
     defer allocator.free(inventory);
     try validateExactLockRuntime(allocator, inventory, profile, flavor);
+    // The contract names the packages core's behaviors stand on. Step 3 of
+    // #677 makes core's closure equal that set; until then this proves it is at
+    // least a superset, so a root that lost `ca-certificates` fails here. Bare
+    // metal is deliberately excluded: it boots a different kernel package and
+    // forbids `linux-azure` outright, so core's package set is not a statement
+    // about it. Its file-level requirements are identical and are checked above.
+    if (flavor == .core) {
+        var contract_diagnostic: runtime_contract_document.Diagnostic = .{};
+        runtime_contract_document.verifyPackages(inventory, &contract_diagnostic) catch |err| {
+            std.debug.print("{s}\n", .{contract_diagnostic.message()});
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.Failed => error.RuntimeContractViolated,
+            };
+        };
+    }
     const final_exact_lock = try Dir.cwd().readFileAlloc(
         io,
         evidence[evidence.len - 1].lock_path,
@@ -3635,6 +3707,12 @@ const test_inventory_binding: InventoryBinding = .{
     .sha256 = @splat('6'),
 };
 
+/// The same stand-in for the runtime contract the fresh-root provenance binds.
+const test_runtime_contract_binding: InventoryBinding = .{
+    .filename = @constCast("ubuntu2604-runtime-contract-core-x86_64.json"),
+    .sha256 = @splat('7'),
+};
+
 /// Writes the size inventory beside the other provenance documents and
 /// returns the binding the build provenance carries, so the measurement is
 /// tamper-evident rather than an unattached file in the bundle.
@@ -3657,6 +3735,46 @@ fn writeSizeInventory(
     var diagnostic: size_inventory.Diagnostic = .{};
     report.write(allocator, io, path, &diagnostic) catch |err|
         return reportInventoryFailure(err, &diagnostic);
+    const metadata = try artifact_pipeline.hashFile(io, path);
+    return .{
+        .filename = filename,
+        .sha256 = artifact_pipeline.formatSha256(metadata.sha256),
+    };
+}
+
+/// Writes the runtime contract beside the size inventory and returns its
+/// binding, so the published contract is hashed into build provenance exactly
+/// like every other evidence file rather than shipped unattached.
+fn writeRuntimeContract(
+    allocator: Allocator,
+    io: Io,
+    provenance_dir: []const u8,
+    profile: *const Profile,
+    flavor: Flavor,
+) !InventoryBinding {
+    const filename = try std.fmt.allocPrint(
+        allocator,
+        "ubuntu2604-runtime-contract-{s}-{s}.json",
+        .{ @tagName(flavor), @tagName(profile.architecture) },
+    );
+    errdefer allocator.free(filename);
+    const path = try std.fs.path.join(allocator, &.{ provenance_dir, filename });
+    defer allocator.free(path);
+    var diagnostic: runtime_contract_document.Diagnostic = .{};
+    runtime_contract_document.write(
+        allocator,
+        io,
+        path,
+        @tagName(profile.architecture),
+        @tagName(flavor),
+        &diagnostic,
+    ) catch |err| {
+        std.debug.print("{s}\n", .{diagnostic.message()});
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Failed => error.RuntimeContractViolated,
+        };
+    };
     const metadata = try artifact_pipeline.hashFile(io, path);
     return .{
         .filename = filename,
@@ -3835,8 +3953,23 @@ fn writeFreshRootProvenance(
     virtual_size: u64,
     root_free_bytes: u64,
     inventory: InventoryBinding,
+    runtime_contract: ?InventoryBinding,
 ) !void {
     const package_roots = flavor.debzPackages();
+    // Only core publishes a runtime contract: the explicit allowlist is a
+    // statement about the appliance issue #677 minimizes, and a document
+    // claiming to describe another flavor would describe an image nobody
+    // checked it against.
+    if ((flavor == .core) != (runtime_contract != null)) return error.InvalidRuntimeContractBinding;
+    var runtime_contract_buffer: [192]u8 = undefined;
+    const runtime_contract_field: []const u8 = if (runtime_contract) |binding|
+        try std.fmt.bufPrint(
+            &runtime_contract_buffer,
+            ",\"runtime_contract\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}",
+            .{ binding.filename, binding.sha256 },
+        )
+    else
+        "";
     // Count alone would let a transaction for the wrong package pass, so the
     // evidence has to name this flavor's roots in the order they were applied.
     if (evidence.len != package_roots.len) return error.InvalidDebzEvidence;
@@ -3846,12 +3979,13 @@ fn writeFreshRootProvenance(
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.print(
-        "{{\"schema\":1,\"type\":\"miz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"{s}\",\"release\":\"26.04\",\"size_inventory\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}},\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"disk_layout\":{s},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[",
+        "{{\"schema\":1,\"type\":\"miz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"{s}\",\"release\":\"26.04\",\"size_inventory\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}{s},\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"disk_layout\":{s},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[",
         .{
             @tagName(profile.architecture),
             @tagName(flavor),
             inventory.filename,
             inventory.sha256,
+            runtime_contract_field,
             virtual_size,
             core_minimum_root_free_bytes,
             root_free_bytes,
@@ -5112,6 +5246,14 @@ fn buildImage(
         args.flavor,
     );
     defer allocator.free(inventory_binding.filename);
+    // Core is the flavor #677 minimizes, so core is the flavor that publishes
+    // what it needs. The document is written for every fresh-root flavor that
+    // shares the contract and bound into the same provenance.
+    const runtime_contract_binding: ?InventoryBinding = if (args.flavor == .core)
+        try writeRuntimeContract(allocator, io, provenance_dir, profile, args.flavor)
+    else
+        null;
+    defer if (runtime_contract_binding) |binding| allocator.free(binding.filename);
 
     try writeSigningProvenance(
         allocator,
@@ -5140,6 +5282,7 @@ fn buildImage(
             args.size,
             debz_customization.root_free_bytes,
             inventory_binding,
+            runtime_contract_binding,
         );
     } else {
         try writeProvenance(
@@ -7777,6 +7920,7 @@ test "fresh-root provenance binds flavor closure size and free-space evidence" {
             flavor.defaultSize(),
             core_minimum_root_free_bytes + 4096,
             test_inventory_binding,
+            if (flavor == .core) test_runtime_contract_binding else null,
         );
         const document = try Dir.cwd().readFileAlloc(
             std.testing.io,
@@ -7859,6 +8003,7 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
         baremetal_virtual_size,
         core_minimum_root_free_bytes + 4096,
         test_inventory_binding,
+        null,
     ));
     // Right count, wrong package: the last transaction names something core
     // never installs, which a count-only check would have accepted.
@@ -7874,5 +8019,46 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
         core_virtual_size,
         core_minimum_root_free_bytes + 4096,
         test_inventory_binding,
+        test_runtime_contract_binding,
     ));
+
+    // The runtime contract belongs to core alone (issue #677 step 2). A core
+    // document without one, or another flavor carrying one, would publish a
+    // statement nobody checked the image against.
+    for (core_debz_packages, 0..) |package, index| evidence[index].package = package;
+    try std.testing.expectError(
+        error.InvalidRuntimeContractBinding,
+        writeFreshRootProvenance(
+            std.testing.allocator,
+            std.testing.io,
+            path,
+            profileFor(.aarch64),
+            .core,
+            @splat('5'),
+            evidence[0..core_debz_packages.len],
+            core_virtual_size,
+            core_minimum_root_free_bytes + 4096,
+            test_inventory_binding,
+            null,
+        ),
+    );
+    // The binding is checked before the evidence is, so a non-core flavor
+    // carrying a contract is refused for that reason rather than for its
+    // package roots.
+    try std.testing.expectError(
+        error.InvalidRuntimeContractBinding,
+        writeFreshRootProvenance(
+            std.testing.allocator,
+            std.testing.io,
+            path,
+            profileFor(.aarch64),
+            .baremetal,
+            @splat('5'),
+            &evidence,
+            baremetal_virtual_size,
+            core_minimum_root_free_bytes + 4096,
+            test_inventory_binding,
+            test_runtime_contract_binding,
+        ),
+    );
 }

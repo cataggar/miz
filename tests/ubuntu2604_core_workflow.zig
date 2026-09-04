@@ -64,6 +64,75 @@ test "the core build job re-validates the size inventory it measured" {
     );
 }
 
+test "the core build job re-validates the runtime contract it published" {
+    var workflow = try open();
+    defer workflow.deinit();
+    const build_job = try job(&workflow, "build", "native_qemu");
+    try source.expectOrder(
+        build_job,
+        "- name: Verify the reproducible size inventory",
+        "- name: Verify the explicit runtime contract",
+        workflow_path,
+    );
+    try source.expectOrder(
+        build_job,
+        "- name: Verify the explicit runtime contract",
+        "- name: Create and verify exact core candidate bundle",
+        workflow_path,
+    );
+    try source.expectContainsIn(build_job, "runtime-contract-verify", workflow_path);
+    try source.expectContainsIn(
+        build_job,
+        "ubuntu2604-runtime-contract-$FLAVOR-$ARCHITECTURE.json",
+        workflow_path,
+    );
+}
+
+test "core QEMU acceptance measures and re-validates the first-boot inventory" {
+    var workflow = try open();
+    defer workflow.deinit();
+    const native = try job(&workflow, "native_qemu", "azure_acceptance");
+    // The bound inventory is an input; the measured phase goes to a separate
+    // document, so the build provenance digest still describes the file it was
+    // computed over.
+    try source.expectContainsIn(native, "MIZ_UBUNTU2604_SIZE_INVENTORY=", workflow_path);
+    try source.expectContainsIn(
+        native,
+        "MIZ_UBUNTU2604_FIRST_BOOT_INVENTORY=",
+        workflow_path,
+    );
+    try source.expectOrder(
+        native,
+        "- name: Run same-architecture Secure Boot QEMU core acceptance",
+        "- name: Verify the measured first-boot size inventory",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        native,
+        "--require-phase root_build,image_build,publication,first_boot",
+        workflow_path,
+    );
+    try source.expectContainsIn(native, "*.first-boot.json", workflow_path);
+}
+
+test "core Azure acceptance builds the runtime contract probe from the build graph" {
+    var workflow = try open();
+    defer workflow.deinit();
+    const azure = try job(&workflow, "azure_acceptance", null);
+    try source.expectContainsIn(azure, "RUNTIME_CONTRACT_PROBE:", workflow_path);
+    try source.expectContainsIn(
+        azure,
+        "zig build install-ubuntu2604-runtime-contract-probes",
+        workflow_path,
+    );
+    try source.expectOrder(
+        azure,
+        "- name: Build the guest runtime contract probe",
+        "- name: Run exact-digest Azure Trusted Launch core acceptance",
+        workflow_path,
+    );
+}
+
 test "only the exact core keys and assets are accepted" {
     var workflow = try open();
     defer workflow.deinit();

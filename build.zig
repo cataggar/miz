@@ -158,6 +158,58 @@ fn addUbuntu2604CoreArtifacts(
     return .{ .mizinit = mizinit, .azagent = azagent };
 }
 
+/// The Ubuntu 26.04 core runtime contract (issue #677 step 2) as a module.
+///
+/// One file holds the contract tables, and it is compiled twice: host-native
+/// for the release tooling and builder that publish and enforce it, and
+/// guest-native for the static probe that evaluates it inside a running VM.
+/// Sharing the module rather than the text is what keeps the probe, the
+/// provenance document, and the acceptance verdict from drifting apart.
+fn addUbuntu2604RuntimeContractModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("scripts/ubuntu2604/runtime_contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
+/// A statically linked binary that Ubuntu 26.04 core acceptance pushes into
+/// the running guest to evaluate the runtime contract with syscalls alone.
+///
+/// It exists so acceptance never needs `findmnt`, `od`, `grep`, `mountpoint`,
+/// or `modprobe` in the guest: retaining a package because a test used it is
+/// precisely what issue #677 forbids. Acceptance tooling, not an image
+/// artifact -- `build_generalized_ubuntu2604` never receives it.
+fn addUbuntu2604RuntimeContractProbe(
+    b: *std.Build,
+    architecture: Ubuntu2604Architecture,
+) *std.Build.Step.Compile {
+    const guest_target = b.resolveTargetQuery(.{
+        .cpu_arch = switch (architecture) {
+            .x86_64 => .x86_64,
+            .aarch64 => .aarch64,
+        },
+        .os_tag = .linux,
+    });
+    return b.addExecutable(.{
+        .name = b.fmt("ubuntu2604-runtime-contract-probe-{s}", .{@tagName(architecture)}),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/ubuntu2604_runtime_contract_probe.zig"),
+            .target = guest_target,
+            .optimize = .ReleaseSmall,
+            .imports = &.{.{
+                .name = "ubuntu2604_runtime_contract",
+                .module = addUbuntu2604RuntimeContractModule(b, guest_target, .ReleaseSmall),
+            }},
+        }),
+        .linkage = .static,
+    });
+}
+
 /// A tiny statically linked binary that native Ubuntu 26.04 core acceptance
 /// pushes into the running guest over SSH to confirm Binder workload device
 /// usability (open + `BINDER_VERSION`) rather than only checking paths. It
@@ -1218,11 +1270,19 @@ pub fn build(b: *std.Build) void {
     // scripts/ubuntu2604_release.py and the inline Python its callers
     // embedded. Validation only, so it is host-native everywhere the release
     // and core-validation jobs run. ----
+    const ubuntu2604_runtime_contract_mod =
+        addUbuntu2604RuntimeContractModule(b, b.graph.host, optimize);
     const ubuntu2604_release_mod = b.createModule(.{
         .root_source_file = b.path("scripts/ubuntu2604_release.zig"),
         .target = b.graph.host,
         .optimize = optimize,
-        .imports = &.{.{ .name = "miz", .module = host_miz_mod }},
+        .imports = &.{
+            .{ .name = "miz", .module = host_miz_mod },
+            .{
+                .name = "ubuntu2604_runtime_contract",
+                .module = ubuntu2604_runtime_contract_mod,
+            },
+        },
     });
     const ubuntu2604_release_exe = b.addExecutable(.{
         .name = "ubuntu2604_release",
@@ -1297,6 +1357,58 @@ pub fn build(b: *std.Build) void {
     );
     ubuntu2604_size_inventory_step.dependOn(&run_ubuntu2604_size_inventory.step);
     ubuntu2604_release_test_step.dependOn(&run_ubuntu2604_size_inventory.step);
+
+    // ---- scripts/ubuntu2604/runtime_contract.zig and
+    // tests/ubuntu2604_runtime_contract.zig: the explicit runtime contract
+    // (issue #677 step 2) and its enforcement. The contract tables are their
+    // own module because the static guest probe compiles them too, so their
+    // unit tests need a test artifact of their own rather than riding on a
+    // module that merely imports them. ----
+    const ubuntu2604_runtime_contract_tests = b.addTest(.{
+        .root_module = ubuntu2604_runtime_contract_mod,
+    });
+    const run_ubuntu2604_runtime_contract_tests =
+        b.addRunArtifact(ubuntu2604_runtime_contract_tests);
+    const ubuntu2604_runtime_contract_behavior_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/ubuntu2604_runtime_contract.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{
+                    .name = "ubuntu2604_release",
+                    .module = ubuntu2604_release_mod,
+                },
+                .{
+                    .name = "ubuntu2604_runtime_contract",
+                    .module = ubuntu2604_runtime_contract_mod,
+                },
+            },
+        }),
+    });
+    const run_ubuntu2604_runtime_contract_behavior =
+        b.addRunArtifact(ubuntu2604_runtime_contract_behavior_tests);
+    const ubuntu2604_runtime_contract_step = b.step(
+        "test-ubuntu2604-runtime-contract",
+        "Run the Ubuntu 26.04 core runtime-contract tests",
+    );
+    ubuntu2604_runtime_contract_step.dependOn(&run_ubuntu2604_runtime_contract_tests.step);
+    ubuntu2604_runtime_contract_step.dependOn(&run_ubuntu2604_runtime_contract_behavior.step);
+    ubuntu2604_release_test_step.dependOn(&run_ubuntu2604_runtime_contract_tests.step);
+    ubuntu2604_release_test_step.dependOn(&run_ubuntu2604_runtime_contract_behavior.step);
+
+    // The Azure core acceptance script runs the probe against a real Trusted
+    // Launch VM, so it needs both guest architectures installed by name rather
+    // than an ad hoc `zig build-exe` that would not share the contract module.
+    const install_ubuntu2604_runtime_contract_probes = b.step(
+        "install-ubuntu2604-runtime-contract-probes",
+        "Install the guest runtime-contract probes for both Ubuntu 26.04 core architectures",
+    );
+    for ([_]Ubuntu2604Architecture{ .x86_64, .aarch64 }) |probe_architecture| {
+        const probe = addUbuntu2604RuntimeContractProbe(b, probe_architecture);
+        const install_probe = b.addInstallArtifact(probe, .{});
+        install_ubuntu2604_runtime_contract_probes.dependOn(&install_probe.step);
+    }
 
     // ---- tests/ubuntu2604_workflow.zig, tests/ubuntu2604_core_workflow.zig,
     // tests/ubuntu2604_azure_acceptance.zig: structural guards over the Ubuntu
@@ -1825,6 +1937,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "miz", .module = host_miz_mod },
+                .{
+                    .name = "ubuntu2604_runtime_contract",
+                    .module = ubuntu2604_runtime_contract_mod,
+                },
             },
         });
         const ubuntu2604_builder_exe = b.addExecutable(.{
@@ -1956,11 +2072,6 @@ pub fn build(b: *std.Build) void {
         // 26.04 full or core candidate. The runtime image and signing identity
         // are supplied externally.
         const ubuntu2604_acceptance_options = b.addOptions();
-        const ubuntu2604_execution_mod = b.createModule(.{
-            .root_source_file = b.path("scripts/ubuntu2604/execution.zig"),
-            .target = b.graph.host,
-            .optimize = optimize,
-        });
         ubuntu2604_acceptance_options.addOption(
             []const u8,
             "ubuntu2604_architecture",
@@ -1981,10 +2092,23 @@ pub fn build(b: *std.Build) void {
                 "ubuntu2604_binder_probe_path",
                 ubuntu2604_binder_probe.getEmittedBin(),
             );
+            // The runtime contract is core-only for the same reason, and the
+            // probe that evaluates it is cross-built beside the Binder probe.
+            const ubuntu2604_contract_probe =
+                addUbuntu2604RuntimeContractProbe(b, ubuntu2604_architecture);
+            ubuntu2604_acceptance_options.addOptionPath(
+                "ubuntu2604_runtime_contract_probe_path",
+                ubuntu2604_contract_probe.getEmittedBin(),
+            );
         } else {
             ubuntu2604_acceptance_options.addOption(
                 []const u8,
                 "ubuntu2604_binder_probe_path",
+                "",
+            );
+            ubuntu2604_acceptance_options.addOption(
+                []const u8,
+                "ubuntu2604_runtime_contract_probe_path",
                 "",
             );
         }
@@ -1995,10 +2119,13 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .imports = &.{
                     .{ .name = "build_options", .module = ubuntu2604_acceptance_options.createModule() },
-                    .{ .name = "ubuntu2604_execution", .module = ubuntu2604_execution_mod },
                     .{ .name = "qemu_host", .module = host_qemu_host_mod },
                     .{ .name = "qmp", .module = host_qmp_mod },
                     .{ .name = "miz", .module = host_miz_mod },
+                    .{
+                        .name = "ubuntu2604_release",
+                        .module = ubuntu2604_release_mod,
+                    },
                 },
             }),
         });
