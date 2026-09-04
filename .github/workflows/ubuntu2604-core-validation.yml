@@ -315,6 +315,9 @@ jobs:
           # Issue #677 step 1: core is the flavor being minimized, so its
           # measurement is re-validated here rather than trusted, and a
           # malformed or incomplete inventory fails the build that made it.
+          # Step 3 adds the bound: a fresh root assembled from an exact closure
+          # carries no unowned payload outside the explicit injected-file
+          # allowlist, so any remainder at all fails the candidate.
           inventory="$BUNDLE_DIR/internal-provenance/ubuntu2604-size-inventory-$FLAVOR-$ARCHITECTURE.json"
           test -f "$inventory"
           test -x "$RELEASE_TOOL"
@@ -322,7 +325,8 @@ jobs:
             --report "$inventory" \
             --architecture "$ARCHITECTURE" \
             --flavor "$FLAVOR" \
-            --require-phase root_build,image_build,publication)
+            --require-phase root_build,image_build,publication \
+            --max-unexpected-unowned 0)
           printf 'Size inventory `%s`: `%s`\n' "$CANDIDATE_KEY" "$measured" \
             >> "$GITHUB_STEP_SUMMARY"
 
@@ -691,7 +695,8 @@ jobs:
             --report "$first_boot" \
             --architecture "$ARCHITECTURE" \
             --flavor "$FLAVOR" \
-            --require-phase root_build,image_build,publication,first_boot)
+            --require-phase root_build,image_build,publication,first_boot \
+            --max-unexpected-unowned 0)
           printf 'First-boot size inventory `%s`: `%s`\n' "$CANDIDATE_KEY" "$measured" \
             >> "$GITHUB_STEP_SUMMARY"
 

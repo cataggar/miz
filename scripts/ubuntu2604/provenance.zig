@@ -1430,7 +1430,7 @@ test "debz lock retention matches the declared installed baseline" {
     const empty_lock =
         \\{"schema":"https://debz.dev/schema/exact-closure-lock-v1","version":1,
         \\"target_architecture":"amd64","repositories":[{"fixture":true}],
-        \\"packages":[{"name":"ubuntu-minimal","version":"1","architecture":"amd64",
+        \\"packages":[{"name":"linux-azure","version":"1","architecture":"amd64",
         \\"retention":"requested"}],
         \\"digest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
     ;
@@ -1444,7 +1444,7 @@ test "debz lock retention matches the declared installed baseline" {
     var diagnostic: Diagnostic = .{};
     try validateDebzLock(
         &empty.value.object,
-        "ubuntu-minimal",
+        "linux-azure",
         "amd64",
         "a" ** 64,
         .empty,
@@ -1453,7 +1453,7 @@ test "debz lock retention matches the declared installed baseline" {
     diagnostic = .{};
     try std.testing.expectError(error.Failed, validateDebzLock(
         &empty.value.object,
-        "ubuntu-minimal",
+        "linux-azure",
         "amd64",
         "a" ** 64,
         .retained,

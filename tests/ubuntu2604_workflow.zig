@@ -728,6 +728,12 @@ test "the build job re-validates the size inventory it measured" {
         "--require-phase root_build,image_build,publication",
         workflow_path,
     );
+    // Issue #677 step 3: core is assembled from an exact closure, so its
+    // unowned remainder is gated at zero. The full flavor inherits Canonical's
+    // server root and is measured rather than gated, which is why the bound is
+    // applied per flavor rather than unconditionally.
+    try source.expectContainsIn(step, "--max-unexpected-unowned 0", workflow_path);
+    try source.expectContainsIn(step, "if [ \"$FLAVOR\" = core ]; then", workflow_path);
     try source.expectContainsIn(step, "set -euo pipefail", workflow_path);
 }
 

@@ -146,6 +146,7 @@ pub fn dispatch(
             "--architecture",
             "--flavor",
             "--require-phase",
+            "--max-unexpected-unowned",
         });
         defer options.deinit();
         return sizeInventoryVerify(
@@ -156,6 +157,7 @@ pub fn dispatch(
             options.get("--architecture"),
             options.get("--flavor"),
             options.get("--require-phase"),
+            options.get("--max-unexpected-unowned"),
             diagnostic,
         );
     }
@@ -860,6 +862,12 @@ fn requiredPhases(
 
 /// `size-inventory-verify`: re-checks a size-inventory document and prints the
 /// totals a reviewer needs before a closure change is proposed.
+///
+/// `--max-unexpected-unowned` turns the reported remainder into a gate. Issue
+/// #677 step 3 requires the fresh roots to carry no unowned payload outside the
+/// explicit injected-file allowlist, so their workflows pass `0`; a document
+/// without the bound is verified but not gated, which is what the `full` flavor
+/// and the pre-change benchmark comparisons need.
 pub fn sizeInventoryVerify(
     allocator: Allocator,
     io: Io,
@@ -868,8 +876,17 @@ pub fn sizeInventoryVerify(
     architecture: ?[]const u8,
     flavor: ?[]const u8,
     require_phase: ?[]const u8,
+    max_unexpected_unowned: ?[]const u8,
     diagnostic: *Diagnostic,
 ) OutError!void {
+    const unexpected_bound: ?u64 = if (max_unexpected_unowned) |text|
+        std.fmt.parseInt(u64, text, 10) catch return fail(
+            diagnostic,
+            "--max-unexpected-unowned must be a non-negative integer, not {s}",
+            .{text},
+        )
+    else
+        null;
     const phases = try requiredPhases(allocator, require_phase, diagnostic);
     defer allocator.free(phases);
     var parsed = size_inventory.readValidated(allocator, io, report_path, .{
@@ -884,6 +901,14 @@ pub fn sizeInventoryVerify(
         .{ .architecture = architecture, .flavor = flavor, .required_phases = phases },
         diagnostic,
     ) catch |err| return inventoryFailure(err);
+    if (unexpected_bound) |bound| {
+        if (summary.unexpected_unowned_count > bound) return fail(
+            diagnostic,
+            "size inventory carries {d} unowned path(s) outside the explicit " ++
+                "allowlist, which is more than the {d} allowed",
+            .{ summary.unexpected_unowned_count, bound },
+        );
+    }
     try out.print(
         "{s} {s} packages={d} installed_bytes={d} allocated_bytes={d} " ++
             "unexpected_unowned={d} closure={s}\n",

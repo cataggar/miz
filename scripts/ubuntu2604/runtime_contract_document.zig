@@ -70,6 +70,8 @@ pub const document_fields = [_][]const u8{
     "contract_sha256",
     "counts",
     "flavor",
+    "forbidden_packages",
+    "package_roots",
     "release",
     "requirements",
     "schema",
@@ -148,6 +150,20 @@ pub fn documentValue(
         entries.appendAssumeCapacity(.{ .object = map });
     }
 
+    // Issue #677 step 3 publishes the closure statement, not only the
+    // requirement list: the explicit roots the build resolves and the
+    // convenience packages the closure must never contain.
+    var roots = builder.array();
+    try roots.ensureTotalCapacity(contract.package_roots.len);
+    for (contract.package_roots) |name| {
+        roots.appendAssumeCapacity(.{ .string = try arena.dupe(u8, name) });
+    }
+    var forbidden = builder.array();
+    try forbidden.ensureTotalCapacity(contract.forbidden_packages.len);
+    for (contract.forbidden_packages) |name| {
+        forbidden.appendAssumeCapacity(.{ .string = try arena.dupe(u8, name) });
+    }
+
     var counts = builder.object();
     try builder.putCount(&counts, "acceptance_only", contract.countFor(.acceptance_only));
     try builder.putCount(&counts, "build_tooling", contract.countFor(.build_tooling));
@@ -163,6 +179,8 @@ pub fn documentValue(
     try builder.putString(&document, "flavor", flavor);
     try builder.putString(&document, "contract_sha256", &contract_digest);
     try builder.put(&document, "counts", .{ .object = counts });
+    try builder.put(&document, "package_roots", .{ .array = roots });
+    try builder.put(&document, "forbidden_packages", .{ .array = forbidden });
     try builder.put(&document, "requirements", .{ .array = entries });
     return .{ .object = document };
 }
@@ -375,6 +393,19 @@ pub fn validateDocument(
         return fail(diagnostic, "runtime contract counts disagree with its requirements", .{});
     }
 
+    try expectExactStrings(
+        object.get("package_roots"),
+        &contract.package_roots,
+        "package roots",
+        diagnostic,
+    );
+    try expectExactStrings(
+        object.get("forbidden_packages"),
+        &contract.forbidden_packages,
+        "forbidden packages",
+        diagnostic,
+    );
+
     const recorded = stringOf(object.get("contract_sha256")) orelse return fail(
         diagnostic,
         "runtime contract digest is invalid",
@@ -396,6 +427,38 @@ pub fn validateDocument(
         .acceptance_only = acceptance_only,
         .total = expected_entries.len,
     };
+}
+
+/// A published string list must be the compiled one, member for member and in
+/// the same order. "Contains" would let a candidate quietly drop an exclusion.
+fn expectExactStrings(
+    value: ?std.json.Value,
+    expected: []const []const u8,
+    label: []const u8,
+    diagnostic: *Diagnostic,
+) Error!void {
+    const items = arrayOf(value) orelse return fail(
+        diagnostic,
+        "runtime contract {s} are invalid",
+        .{label},
+    );
+    if (items.len != expected.len) return fail(
+        diagnostic,
+        "runtime contract lists {d} {s}, expected {d}",
+        .{ items.len, label, expected.len },
+    );
+    for (items, expected) |item, name| {
+        const actual = stringOf(item) orelse return fail(
+            diagnostic,
+            "runtime contract {s} contain a non-string entry",
+            .{label},
+        );
+        if (!std.mem.eql(u8, actual, name)) return fail(
+            diagnostic,
+            "runtime contract {s} declare {s}, expected {s}",
+            .{ label, actual, name },
+        );
+    }
 }
 
 fn expectField(
@@ -585,24 +648,35 @@ fn wrongKind(
     );
 }
 
-/// Confirms every package the contract names as a guest runtime requirement is
-/// present in the shipped exact lock.
+/// Confirms the shipped exact lock carries every package the contract requires
+/// and none of the packages it forbids.
 ///
 /// The lock is the tab-separated `name<TAB>version<TAB>architecture` table the
-/// image carries at `/var/lib/miz/ubuntu2604-package-lock.tsv`. This is a
-/// containment check, not an equality check: making the closure *equal* the
-/// contract is step 3's job, and asserting it here would fail every build until
-/// that lands while proving nothing about the behaviors this step defends.
+/// image carries at `/var/lib/miz/ubuntu2604-package-lock.tsv`. Both the
+/// `guest_runtime` packages and the `build_tooling` ones are required, because
+/// until #677 step 4 moves initramfs generation out of the guest the generator
+/// is genuinely installed and a lock without it is a lock that did not describe
+/// the image. Whether the closure is *exactly* the resolved set is a separate,
+/// stronger check the builder makes against the final debz lock; this one names
+/// the missing behavior or the returned convenience.
 pub fn verifyPackages(
     lock_text: []const u8,
     diagnostic: *Diagnostic,
 ) Error!void {
     for (contract.requirements()) |requirement| {
-        if (requirement.kind != .package or !requirement.required()) continue;
+        if (requirement.kind != .package) continue;
+        if (requirement.audience == .acceptance_only) continue;
         if (!lockContains(lock_text, requirement.target)) return fail(
             diagnostic,
             "runtime contract requirement {s} (package {s}) is absent from the shipped package lock",
             .{ requirement.id, requirement.target },
+        );
+    }
+    for (contract.forbidden_packages) |forbidden| {
+        if (lockContains(lock_text, forbidden)) return fail(
+            diagnostic,
+            "package {s} is installed but no runtime contract behavior needs it",
+            .{forbidden},
         );
     }
 }

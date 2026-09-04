@@ -62,6 +62,10 @@ test "the core build job re-validates the size inventory it measured" {
         "--require-phase root_build,image_build,publication",
         workflow_path,
     );
+    // Issue #677 step 3: a fresh core root carries no unowned payload outside
+    // the explicit injected-file allowlist, so the reported remainder is a gate
+    // rather than a number in a summary.
+    try source.expectContainsIn(step, "--max-unexpected-unowned 0", workflow_path);
 }
 
 test "the core build job re-validates the runtime contract it published" {

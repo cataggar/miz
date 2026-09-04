@@ -3,15 +3,16 @@
 //!
 //! The full flavor keeps the official cloud disk as its authoritative
 //! filesystem/package input. The core flavor uses the same signed disk only
-//! as its pinned GPT/ESP substrate and creates a fresh ubuntu-minimal root
-//! through embedded debz. Both flavors pin the detached signature, signer,
-//! checksum document, image, manifest, snapshot transactions, exact locks,
-//! and provenance. The UKI is assembled and signed on the host so private
-//! signing material is never copied into the guest disk.
+//! as its pinned GPT/ESP substrate and creates a fresh root from explicit,
+//! contract-derived package roots through embedded debz. Both flavors pin the
+//! detached signature, signer, checksum document, image, manifest, snapshot
+//! transactions, exact locks, and provenance. The UKI is assembled and signed
+//! on the host so private signing material is never copied into the guest disk.
 
 const std = @import("std");
 const miz = @import("miz");
 const image_phase_timing = @import("image_phase_timing.zig");
+const core_contract = @import("ubuntu2604_runtime_contract");
 const runtime_contract_document = @import("ubuntu2604/runtime_contract_document.zig");
 const size_inventory = @import("ubuntu2604/size_inventory.zig");
 const uki_kernel_payload = @import("ubuntu2604_kernel_payload.zig");
@@ -315,13 +316,32 @@ const required_manifest_packages = [_][]const u8{
 };
 
 const full_debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
+// Issue #677 step 3: the fresh roots no longer start from `ubuntu-minimal`.
+//
+// That metapackage is what pulled an apt client, an init system, an editor, a
+// pager, locales, a DHCP client, and netplan into an appliance whose PID 1 is
+// `mizinit` and whose only access path is `sshd`. Nothing below is here because
+// it was convenient: every entry is a `package` requirement of the machine-
+// readable runtime contract, and `core_contract.isPackageRootSet` refuses
+// this list if the two ever disagree. The base system is not named because
+// debz includes available `Essential: yes` packages in every install closure,
+// so `bash`, `coreutils`, `dpkg`, and `util-linux` -- which is what supplies
+// the `dmesg` the contract's diagnostics entry stands on -- arrive as part of
+// creating a root at all rather than as a root of their own.
+//
+// The order is deliberate and is not derived. `linux-azure` is first because
+// the first root is the transaction that creates the empty baseline, and
+// because installing the kernel before the initramfs generator keeps the
+// kernel's postinst from building an initramfs that customization is about to
+// rebuild from the reviewed module list in `/etc/initramfs-tools/modules`.
 const core_debz_packages = [_][]const u8{
-    "ubuntu-minimal",
     "linux-azure",
     // The versioned Azure kernel only recommends `dracut |
     // linux-initramfs-tool`; recommends are outside the exact debz closure.
     // Name the generator that customization executes instead of assuming the
-    // kernel transaction supplied `/usr/sbin/update-initramfs`.
+    // kernel transaction supplied `/usr/sbin/update-initramfs`. The contract
+    // classifies it `build_tooling`, so step 4 removes it from the guest; until
+    // then it is installed and must be accounted for as a root.
     "initramfs-tools",
     "openssh-server",
     "sudo",
@@ -329,6 +349,14 @@ const core_debz_packages = [_][]const u8{
     // package root so the finished image's HTTPS clients are usable.
     "ca-certificates",
 };
+
+comptime {
+    if (!core_contract.isPackageRootSet(&core_debz_packages))
+        @compileError(
+            "core package roots and the runtime contract have separated; a " ++
+                "root exists only for a behavior the contract names",
+        );
+}
 
 // The official in-tree Binder module name Ubuntu packages. `linux-azure`
 // pulls it in transitively through
@@ -357,7 +385,6 @@ const baremetal_kernel_release = "7.0.0-2015" ++ nvidia_bos_kernel_suffix;
 const baremetal_image_package = "linux-image-" ++ baremetal_kernel_release;
 const baremetal_modules_package = "linux-modules-" ++ baremetal_kernel_release;
 const baremetal_debz_packages = [_][]const u8{
-    "ubuntu-minimal",
     baremetal_image_package,
     baremetal_modules_package,
     // The generator this flavor configures and then runs. Kernel packages only
@@ -381,7 +408,6 @@ const full_required_packages = [_][]const u8{
 };
 
 const core_required_packages = [_][]const u8{
-    "ubuntu-minimal",
     "linux-azure",
     "initramfs-tools",
     "openssh-server",
@@ -391,7 +417,6 @@ const core_required_packages = [_][]const u8{
 };
 
 const baremetal_required_packages = [_][]const u8{
-    "ubuntu-minimal",
     baremetal_image_package,
     baremetal_modules_package,
     "initramfs-tools",
@@ -401,14 +426,13 @@ const baremetal_required_packages = [_][]const u8{
     "ca-certificates",
 };
 
-const core_forbidden_packages = [_][]const u8{
-    "cloud-init",
-    "walinuxagent",
-    "ubuntu-server",
-    "ubuntu-server-minimal",
-    // Out-of-tree Binder implementations: core's Binder workload must run
-    // only the official in-tree, signed module resolved above, never a
-    // DKMS-built shadow copy layered on top of it.
+// Everything the runtime contract forbids, plus the out-of-tree Binder
+// implementations: core's Binder workload must run only the official in-tree,
+// signed module resolved above, never a DKMS-built shadow copy layered on top
+// of it. The contract's list is the shared one so the builder, the release
+// tool, and the published contract document cannot disagree about what
+// "minimal" excludes.
+const core_forbidden_packages = core_contract.forbidden_packages ++ [_][]const u8{
     "anbox-modules-dkms",
     "anbox-modules",
 };
@@ -416,13 +440,7 @@ const core_forbidden_packages = [_][]const u8{
 // Bare metal forbids everything core does, and `linux-azure` besides: pulling
 // it in would leave two kernels in `/boot` and make the release the UKI is
 // built from ambiguous.
-const baremetal_forbidden_packages = [_][]const u8{
-    "cloud-init",
-    "walinuxagent",
-    "ubuntu-server",
-    "ubuntu-server-minimal",
-    "anbox-modules-dkms",
-    "anbox-modules",
+const baremetal_forbidden_packages = core_forbidden_packages ++ [_][]const u8{
     "linux-azure",
 };
 
@@ -2522,6 +2540,62 @@ fn validateFullUdisks2Policy(
     }
 }
 
+/// Applies generalization operations, refusing to delete package-owned content.
+///
+/// Issue #677 states the rule this enforces: "nothing is installed only to be
+/// deleted later". A minimization that carves files out of an installed package
+/// leaves a root whose dpkg database describes files that are not there, and
+/// makes the per-package size attribution a fiction. So for the fresh-root
+/// flavors every concrete target -- including everything a recursive removal or
+/// a wildcard cleanup would take with it -- is checked against dpkg's own file
+/// lists first, and a package-owned target fails the build that proposed it.
+/// The right fix for such a failure is always to stop installing the package,
+/// which is what step 3 is for.
+///
+/// The `full` flavor inherits Canonical's server root and generalizes state
+/// that packages do ship, so it applies the operations unchecked.
+fn applyGeneralization(
+    allocator: Allocator,
+    io: Io,
+    root: *offline_root.Root,
+    root_path: []const u8,
+    flavor: Flavor,
+    operations: []const offline_root.Operation,
+) !void {
+    if (!flavor.freshRoot()) return root.apply(operations);
+
+    var owned = size_inventory.readOwnedPaths(allocator, io, root_path) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Failed => return error.PackageOwnershipUnreadable,
+    };
+    defer owned.deinit();
+
+    for (operations) |operation| {
+        switch (operation) {
+            .remove => |path| try requireUnownedRemoval(&owned, path),
+            .cleanup => |target| {
+                const entries = root.discover(target.directory, target.pattern) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => return err,
+                };
+                defer root.freeFound(entries);
+                for (entries) |entry| try requireUnownedRemoval(&owned, entry.path);
+            },
+            else => {},
+        }
+        try root.applyOne(operation);
+    }
+}
+
+fn requireUnownedRemoval(owned: *const size_inventory.OwnedPaths, path: []const u8) !void {
+    const claim = owned.subtreeOwner(path) orelse return;
+    std.debug.print(
+        "[ubuntu2604] refusing to delete package-owned content: {s} is owned by {s}\n",
+        .{ claim.path, claim.package },
+    );
+    return error.PackageOwnedContentRemoval;
+}
+
 fn customizeOfflineRoot(
     allocator: Allocator,
     io: Io,
@@ -2675,7 +2749,7 @@ fn customizeOfflineRoot(
     else
         null;
     defer if (cloud_init) |*result| result.deinit(allocator);
-    try root.apply(&.{
+    const shared_generalization = [_]offline_root.Operation{
         .{ .remove = "/var/lib/dbus/machine-id" },
         .{ .remove = "/var/lib/systemd/random-seed" },
         .{ .cleanup = .{ .directory = "/etc/ssh", .pattern = "ssh_host_*" } },
@@ -2683,21 +2757,28 @@ fn customizeOfflineRoot(
         .{ .cleanup = .{ .directory = "/var/log/journal", .pattern = "*" } },
         .{ .cleanup = .{ .directory = "/tmp", .pattern = "*" } },
         .{ .cleanup = .{ .directory = "/var/tmp", .pattern = "*" } },
-    });
-    if (flavor == .full) {
-        try root.apply(&.{
-            .{ .cleanup = .{ .directory = "/var/lib/cloud", .pattern = "*" } },
-            .{ .cleanup = .{ .directory = "/var/lib/waagent", .pattern = "*" } },
-        });
-    } else {
-        try root.apply(&.{
-            .{ .remove = "/var/lib/cloud" },
-            .{ .remove = "/var/lib/waagent" },
-            .{ .remove = "/var/lib/azagent" },
-            .{ .remove = "/var/lib/dhcp" },
-            .{ .remove = "/var/lib/NetworkManager" },
-        });
-    }
+    };
+    const full_generalization = [_]offline_root.Operation{
+        .{ .cleanup = .{ .directory = "/var/lib/cloud", .pattern = "*" } },
+        .{ .cleanup = .{ .directory = "/var/lib/waagent", .pattern = "*" } },
+    };
+    // The fresh roots no longer install cloud-init, WALinuxAgent, a DHCP
+    // client, or NetworkManager, so their state directories are not created and
+    // not removed. What is left is `azagent`'s own runtime directory, which no
+    // package claims. `applyGeneralization` proves that for every target below
+    // rather than trusting this comment.
+    const fresh_root_generalization = [_]offline_root.Operation{
+        .{ .remove = "/var/lib/azagent" },
+    };
+    try applyGeneralization(allocator, io, &root, root_path, flavor, &shared_generalization);
+    try applyGeneralization(
+        allocator,
+        io,
+        &root,
+        root_path,
+        flavor,
+        if (flavor == .full) &full_generalization else &fresh_root_generalization,
+    );
 
     const modules_path = try kernelModulesPath(allocator, &root, release_name);
     defer allocator.free(modules_path);
@@ -2709,9 +2790,8 @@ fn customizeOfflineRoot(
         "/var/tmp/*",
     };
     const core_cleanup_patterns = [_][]const u8{
-        "/etc/ssh/ssh_host_*",       "/var/lib/azagent/*", "/var/lib/dhcp/*",
-        "/var/lib/NetworkManager/*", "/var/log/azure/*",   "/var/log/journal/*",
-        "/tmp/*",                    "/var/tmp/*",
+        "/etc/ssh/ssh_host_*", "/var/lib/azagent/*", "/var/log/azure/*",
+        "/var/log/journal/*",  "/tmp/*",             "/var/tmp/*",
     };
     const cleanup_patterns: []const []const u8 = if (flavor == .full)
         &full_cleanup_patterns
@@ -3598,6 +3678,13 @@ fn customizeRootWithDebz(
             .flavor = inventoryIdentity(profile, flavor).flavor,
             .kernel_release = release_name,
             .injected = injected.items,
+            // #677 step 3: a fresh root is assembled from an exact closure, so
+            // every file it carries is either package-owned or named by an
+            // explicit injected-file rule. An unowned path nobody can attribute
+            // is exactly the payload minimization is supposed to remove, so it
+            // fails the build that produced it rather than being reported and
+            // forgotten.
+            .require_allowlisted_unowned = flavor.freshRoot(),
         },
     );
     initramfs_import.succeed();
@@ -5858,14 +5945,14 @@ test "package-family resolve and customize requests are exact-lock operations" {
     const core_create = packageFamilyRequest(
         .create,
         profileFor(.x86_64),
-        &.{"ubuntu-minimal"},
+        &.{core_debz_packages[0]},
         "/root-stage",
         "/published",
         &.{"/inputs/ubuntu.sources"},
         &.{"/inputs/ubuntu.gpg"},
         "/cache",
         "/state",
-        "/state/ubuntu-minimal.lock",
+        "/state/linux-azure.lock",
         .none,
         null,
         false,
@@ -7526,8 +7613,7 @@ test "core package policy rejects Anbox DKMS shadow packages" {
         "linux-azure\t7.0\tamd64\n" ++
         "openssh-client\t10.2\tamd64\n" ++
         "openssh-server\t10.2\tamd64\n" ++
-        "sudo\t1.9\tamd64\n" ++
-        "ubuntu-minimal\t1\tamd64\n";
+        "sudo\t1.9\tamd64\n";
     try validateExactLock(inventory, profileFor(.x86_64), .core);
     try std.testing.expectError(
         error.ForbiddenCorePackage,
@@ -7588,8 +7674,7 @@ test "core package policy rejects server agents foreign packages and closure dri
         "linux-azure\t7.0\tamd64\n" ++
         "openssh-client\t10.2\tamd64\n" ++
         "openssh-server\t10.2\tamd64\n" ++
-        "sudo\t1.9\tamd64\n" ++
-        "ubuntu-minimal\t1\tamd64\n";
+        "sudo\t1.9\tamd64\n";
     try validateExactLock(inventory, profileFor(.x86_64), .core);
     try std.testing.expectError(
         error.ForbiddenCorePackage,
@@ -7603,8 +7688,7 @@ test "core package policy rejects server agents foreign packages and closure dri
         \\{"name":"linux-azure","version":"7.0","architecture":"amd64"},
         \\{"name":"openssh-client","version":"10.2","architecture":"amd64"},
         \\{"name":"openssh-server","version":"10.2","architecture":"amd64"},
-        \\{"name":"sudo","version":"1.9","architecture":"amd64"},
-        \\{"name":"ubuntu-minimal","version":"1","architecture":"amd64"}]}
+        \\{"name":"sudo","version":"1.9","architecture":"amd64"}]}
     ;
     try validateInventoryAgainstExactLock(
         std.testing.allocator,
@@ -7621,6 +7705,75 @@ test "core package policy rejects server agents foreign packages and closure dri
             profileFor(.x86_64),
         ),
     );
+    // A package the reviewed closure resolved but the image failed to install
+    // is drift in the other direction, and equality has to catch that too.
+    try std.testing.expectError(
+        error.UnexpectedCorePackage,
+        validateInventoryAgainstExactLock(
+            std.testing.allocator,
+            "ca-certificates\t1\tall\n" ++
+                "initramfs-tools\t0.151\tall\n" ++
+                "linux-azure\t7.0\tamd64\n" ++
+                "openssh-client\t10.2\tamd64\n" ++
+                "openssh-server\t10.2\tamd64\n",
+            exact_lock,
+            profileFor(.x86_64),
+        ),
+    );
+}
+
+test "ubuntu-minimal and its conveniences fail the core closure" {
+    // #677 acceptance criterion: `ubuntu-minimal` is absent from the final
+    // package inventory, and the metapackage's payload does not come back
+    // under another name.
+    const inventory =
+        "ca-certificates\t1\tall\n" ++
+        "initramfs-tools\t0.151\tall\n" ++
+        "linux-azure\t7.0\tamd64\n" ++
+        "openssh-client\t10.2\tamd64\n" ++
+        "openssh-server\t10.2\tamd64\n" ++
+        "sudo\t1.9\tamd64\n";
+    try validateExactLock(inventory, profileFor(.x86_64), .core);
+    for (core_debz_packages) |package| {
+        try std.testing.expect(!std.mem.eql(u8, package, "ubuntu-minimal"));
+    }
+    for (baremetal_debz_packages) |package| {
+        try std.testing.expect(!std.mem.eql(u8, package, "ubuntu-minimal"));
+    }
+    inline for ([_][]const u8{
+        "ubuntu-minimal\t1\tamd64\n",
+        "apt\t3.1\tamd64\n",
+        "vim-tiny\t9.1\tamd64\n",
+        "locales\t2.43\tall\n",
+        "man-db\t2.13\tamd64\n",
+        "netplan.io\t1.4\tamd64\n",
+        "systemd\t258\tamd64\n",
+        "systemd-sysv\t258\tamd64\n",
+        "isc-dhcp-client\t4.4\tamd64\n",
+        "snapd\t2.70\tamd64\n",
+    }) |convenience| {
+        try std.testing.expectError(error.ForbiddenCorePackage, validateExactLock(
+            inventory ++ convenience,
+            profileFor(.x86_64),
+            .core,
+        ));
+        var diagnostic: runtime_contract_document.Diagnostic = .{};
+        try std.testing.expectError(error.Failed, runtime_contract_document.verifyPackages(
+            inventory ++ convenience,
+            &diagnostic,
+        ));
+    }
+    // The contract's own packages, including the trust store, must still pass.
+    var diagnostic: runtime_contract_document.Diagnostic = .{};
+    try runtime_contract_document.verifyPackages(inventory, &diagnostic);
+    diagnostic = .{};
+    try std.testing.expectError(error.Failed, runtime_contract_document.verifyPackages(
+        "initramfs-tools\t0.151\tall\n" ++
+            "linux-azure\t7.0\tamd64\n" ++
+            "openssh-server\t10.2\tamd64\n" ++
+            "sudo\t1.9\tamd64\n",
+        &diagnostic,
+    ));
 }
 
 test "core guest contract uses architecture-correct static artifacts and full generalization" {
@@ -8061,4 +8214,188 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
             test_runtime_contract_binding,
         ),
     );
+}
+
+test "fresh-root generalization refuses to delete package-owned content" {
+    // #677: "nothing is installed only to be deleted later". A cleanup that
+    // would carve files out of an installed package is a build failure, because
+    // the answer is to stop installing the package rather than to hide it.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const root_path = "test-ubuntu2604-generalization-root";
+    defer Dir.cwd().deleteTree(io, root_path) catch {};
+    try Dir.cwd().deleteTree(io, root_path);
+    try Dir.cwd().createDirPath(io, root_path ++ "/var/lib/dpkg/info");
+    try Dir.cwd().createDirPath(io, root_path ++ "/var/lib/convenience");
+    try Dir.cwd().createDirPath(io, root_path ++ "/var/lib/azagent");
+    try Dir.cwd().createDirPath(io, root_path ++ "/etc/ssh");
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = root_path ++ "/var/lib/dpkg/info/convenience.list",
+        .data = "/var/lib/convenience\n/var/lib/convenience/state\n/etc/ssh/ssh_host_shipped_key\n",
+    });
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = root_path ++ "/var/lib/convenience/state",
+        .data = "package-owned state",
+    });
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = root_path ++ "/etc/ssh/ssh_host_shipped_key",
+        .data = "a host key a package shipped",
+    });
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = root_path ++ "/var/lib/azagent/provisioned",
+        .data = "agent state no package claims",
+    });
+
+    const absolute = try Dir.cwd().realPathFileAlloc(io, root_path, allocator);
+    defer allocator.free(absolute);
+    var root = try offline_root.Root.init(allocator, io, absolute, .{});
+    defer root.deinit();
+
+    // A recursive removal is judged by what it would take with it, not only by
+    // the directory it names.
+    try std.testing.expectError(error.PackageOwnedContentRemoval, applyGeneralization(
+        allocator,
+        io,
+        &root,
+        absolute,
+        .core,
+        &.{.{ .remove = "/var/lib/convenience" }},
+    ));
+    // A wildcard cleanup is judged by what it actually matched.
+    try std.testing.expectError(error.PackageOwnedContentRemoval, applyGeneralization(
+        allocator,
+        io,
+        &root,
+        absolute,
+        .core,
+        &.{.{ .cleanup = .{ .directory = "/etc/ssh", .pattern = "ssh_host_*" } }},
+    ));
+    _ = try Dir.cwd().statFile(io, root_path ++ "/var/lib/convenience/state", .{});
+    _ = try Dir.cwd().statFile(io, root_path ++ "/etc/ssh/ssh_host_shipped_key", .{});
+
+    // Unowned state is still generalized away.
+    try applyGeneralization(
+        allocator,
+        io,
+        &root,
+        absolute,
+        .core,
+        &.{
+            .{ .remove = "/var/lib/azagent" },
+            .{ .cleanup = .{ .directory = "/var/lib", .pattern = "absent-*" } },
+        },
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        Dir.cwd().statFile(io, root_path ++ "/var/lib/azagent", .{}),
+    );
+
+    // The full flavor inherits Canonical's root and generalizes state its own
+    // packages ship, so it is not held to the fresh-root rule.
+    try applyGeneralization(
+        allocator,
+        io,
+        &root,
+        absolute,
+        .full,
+        &.{.{ .remove = "/var/lib/convenience" }},
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        Dir.cwd().statFile(io, root_path ++ "/var/lib/convenience", .{}),
+    );
+}
+
+test "both guest architectures resolve the same explicit roots with no recommends" {
+    // #677 step 3 keeps resolution architecture-specific and exact: the same
+    // contract-derived roots, in the same order, resolved against the same
+    // immutable snapshot, with recommends off and one exact lock per root named
+    // for the Ubuntu architecture it was resolved for.
+    const allocator = std.testing.allocator;
+    for ([_]Architecture{ .x86_64, .aarch64 }) |architecture| {
+        const profile = profileFor(architecture);
+        const expected_architecture: package_family.Architecture = switch (architecture) {
+            .x86_64 => .amd64,
+            .aarch64 => .arm64,
+        };
+        try std.testing.expectEqualStrings(
+            switch (architecture) {
+                .x86_64 => "amd64",
+                .aarch64 => "arm64",
+            },
+            profile.ubuntu_architecture,
+        );
+        const roots = Flavor.core.debzPackages();
+        try std.testing.expectEqual(core_debz_packages.len, roots.len);
+        for (roots, core_debz_packages) |planned, expected| {
+            try std.testing.expectEqualStrings(expected, planned);
+        }
+        for (roots, 0..) |package, index| {
+            const first = index == 0;
+            const lock_filename = try std.fmt.allocPrint(
+                allocator,
+                "debz-exact-lock-{s}-{s}.json",
+                .{ package, profile.ubuntu_architecture },
+            );
+            defer allocator.free(lock_filename);
+            const resolve = packageFamilyRequest(
+                .resolve_lock,
+                profile,
+                &.{package},
+                "/resolve-root",
+                "/resolve-unused",
+                &.{"/inputs/ubuntu.sources"},
+                &.{"/inputs/ubuntu.gpg"},
+                "/cache",
+                "/state",
+                lock_filename,
+                if (first) .none else .require_locked,
+                null,
+                true,
+            );
+            try std.testing.expectEqual(expected_architecture, resolve.inputs.architecture);
+            try std.testing.expect(!resolve.inputs.recommends);
+            try std.testing.expectEqual(
+                package_family.CacheMode.offline,
+                resolve.inputs.cache_mode,
+            );
+            try std.testing.expectEqualStrings(lock_filename, resolve.inputs.lock_output_path.?);
+            try std.testing.expect(resolve.inputs.lock_input_path == null);
+
+            const apply = packageFamilyRequest(
+                if (first) .create else .customize,
+                profile,
+                &.{package},
+                "/root-stage",
+                "/published",
+                &.{"/inputs/ubuntu.sources"},
+                &.{"/inputs/ubuntu.gpg"},
+                "/cache",
+                "/state",
+                lock_filename,
+                if (first) .none else .require_locked,
+                null,
+                true,
+            );
+            // Only the transaction that creates the root starts from nothing;
+            // every later one must inherit the locked baseline, which is what
+            // makes the final closure the exact union of the reviewed roots.
+            try std.testing.expectEqual(
+                if (first)
+                    package_family.Operation.create
+                else
+                    package_family.Operation.customize,
+                apply.operation,
+            );
+            try std.testing.expectEqual(
+                if (first)
+                    package_family.InstalledBaselinePolicy.none
+                else
+                    package_family.InstalledBaselinePolicy.require_locked,
+                apply.inputs.installed_baseline,
+            );
+            try std.testing.expectEqualStrings(lock_filename, apply.inputs.lock_input_path.?);
+            try std.testing.expect(apply.inputs.lock_output_path == null);
+        }
+    }
 }

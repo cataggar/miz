@@ -223,9 +223,9 @@ test "schema serialization preserves stable ordering and completeness" {
     var source = recorder.begin(.source_qcow2_setup, null);
     source.succeed();
     var aggregate = recorder.begin(.debz_aggregate, null);
-    var first_transaction = recorder.begin(.debz_transaction, "ubuntu-minimal");
+    var first_transaction = recorder.begin(.debz_transaction, "linux-azure");
     first_transaction.succeed();
-    var second_transaction = recorder.begin(.debz_transaction, "linux-azure");
+    var second_transaction = recorder.begin(.debz_transaction, "initramfs-tools");
     second_transaction.succeed();
     aggregate.succeed();
     var initramfs = recorder.begin(.initramfs_ext4_import, null);
@@ -266,7 +266,7 @@ test "schema serialization preserves stable ordering and completeness" {
         phases[0].object.get("name").?.string,
     );
     try std.testing.expectEqualStrings(
-        "ubuntu-minimal",
+        "linux-azure",
         phases[2].object.get("item").?.string,
     );
     try std.testing.expectEqualStrings(

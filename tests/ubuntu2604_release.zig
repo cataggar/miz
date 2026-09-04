@@ -2736,6 +2736,7 @@ test "Ubuntu provenance binds a complete size inventory" {
         "x86_64",
         "core",
         "root_build,image_build,publication",
+        null,
         &diagnostic,
     );
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "packages=1") != null);
@@ -2749,6 +2750,51 @@ test "Ubuntu provenance binds a complete size inventory" {
         "x86_64",
         "core",
         "first_boot",
+        null,
+        &diagnostic,
+    ));
+
+    // Issue #677 step 3: the fresh-root bound the core workflows pass. The
+    // fixture root deliberately carries a kernel no package claims, so the
+    // bound the core workflows use refuses it by name rather than reporting it.
+    try std.testing.expectError(error.Failed, release.workflow.sizeInventoryVerify(
+        allocator,
+        io,
+        &writer,
+        inventory,
+        "x86_64",
+        "core",
+        "root_build,image_build,publication",
+        "0",
+        &diagnostic,
+    ));
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        diagnostic.message(),
+        "outside the explicit allowlist",
+    ) != null);
+    writer.end = 0;
+    try release.workflow.sizeInventoryVerify(
+        allocator,
+        io,
+        &writer,
+        inventory,
+        "x86_64",
+        "core",
+        "root_build,image_build,publication",
+        "1024",
+        &diagnostic,
+    );
+    // A malformed bound is refused rather than silently ignored.
+    try std.testing.expectError(error.Failed, release.workflow.sizeInventoryVerify(
+        allocator,
+        io,
+        &writer,
+        inventory,
+        "x86_64",
+        "core",
+        "root_build,image_build,publication",
+        "many",
         &diagnostic,
     ));
 
