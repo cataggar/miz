@@ -1493,6 +1493,23 @@ fn validateFinalizedImage(
     return miz.artifact_pipeline.sha256Bytes(uki);
 }
 
+const qemu_user_data_template =
+    \\#cloud-config
+    \\bootcmd:
+    \\  - [systemctl, mask, --runtime, --now, fwupd.service, fwupd-refresh.service]
+    \\users:
+    \\  - default
+    \\  - name: miztest
+    \\    groups: sudo
+    \\    shell: /bin/bash
+    \\    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    \\    ssh_authorized_keys:
+    \\      - {s}
+    \\ssh_pwauth: false
+    \\disable_root: true
+    \\
+;
+
 fn createSeed(
     allocator: Allocator,
     io: Io,
@@ -1527,19 +1544,7 @@ fn createSeed(
     defer allocator.free(metadata);
     const user_data = try std.fmt.allocPrint(
         allocator,
-        \\#cloud-config
-        \\users:
-        \\  - default
-        \\  - name: miztest
-        \\    groups: sudo
-        \\    shell: /bin/bash
-        \\    sudo: "ALL=(ALL) NOPASSWD:ALL"
-        \\    ssh_authorized_keys:
-        \\      - {s}
-        \\ssh_pwauth: false
-        \\disable_root: true
-        \\
-    ,
+        qemu_user_data_template,
         .{public_key},
     );
     defer allocator.free(user_data);
@@ -1572,6 +1577,16 @@ fn createSeed(
         .user_data = user_data,
         .additional_files = &additional_files,
     });
+}
+
+test "QEMU seed runtime-masks hardware firmware update services" {
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            qemu_user_data_template,
+            "[systemctl, mask, --runtime, --now, fwupd.service, fwupd-refresh.service]",
+        ) != null,
+    );
 }
 
 fn startInstance(
