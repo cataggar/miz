@@ -300,6 +300,11 @@ data_disk_name="miz-data-${name_seed}"
 gallery_name="mizu2604${name_seed}"
 image_name="mizu2604${short_arch}${FLAVOR}"
 vm_name="miz-vm-${name_seed}"
+vnet_name="miz-vnet-${name_seed}"
+subnet_name="miz-subnet-${name_seed}"
+public_ip_name="miz-ip-${name_seed}"
+nsg_name="miz-nsg-${name_seed}"
+nic_name="miz-nic-${name_seed}"
 admin_username=miztest
 vhd="$RESULT_DIR/${CANDIDATE_KEY}.vhd"
 private_key="$RESULT_DIR/id_ed25519"
@@ -318,6 +323,7 @@ vm_security_json="$RESULT_DIR/vm-security.json"
 instance_security_json="$RESULT_DIR/instance-security.json"
 conversion_attestation="$RESULT_DIR/conversion-attestation.json"
 vm_create_stderr="$RESULT_DIR/vm-create.stderr"
+vm_request="$RESULT_DIR/vm-request.json"
 mkdir -p "$(dirname -- "$STATE_FILE")"
 rm -f -- "$STATE_FILE" "${STATE_FILE}.group.json" "$vhd" "$private_key" "$private_key.pub"
 # Writes the canonical DER signing certificate next to the acceptance results
@@ -358,6 +364,29 @@ record_boot_diagnostics_error() {
   rm -f -- "$error_file"
 }
 
+retrieve_managed_boot_log() {
+  local output=$1
+  local error_file=$2
+  rm -f -- "$output" "$error_file"
+  if ! timeout 90s az vm boot-diagnostics get-boot-log \
+      --resource-group "$resource_group" \
+      --name "$vm_name" \
+      --output tsv >"$output" 2>"$error_file"; then
+    rm -f -- "$output"
+    return 1
+  fi
+  if [[ ! -s "$output" ]]; then
+    printf '%s\n' 'Azure returned an empty managed boot log' >"$error_file"
+    rm -f -- "$output"
+    return 1
+  fi
+  if head -c 512 "$output" | grep -Eq '<Error>|<Code>BlobNotFound</Code>'; then
+    mv -- "$output" "$error_file"
+    return 1
+  fi
+  rm -f -- "$error_file"
+}
+
 collect_failure_diagnostics() {
   local instance_view_status=unavailable
   local boot_log_status=unavailable
@@ -377,29 +406,6 @@ collect_failure_diagnostics() {
   else
     rm -f -- "$failure_instance_view"
     record_boot_diagnostics_error "instance view" "$boot_diagnostics_attempt_error"
-  fi
-
-  # The protected-environment identity intentionally cannot create storage
-  # accounts. Enable Azure-managed diagnostics on the failed VM instead, then
-  # reboot once so the repeatable guest startup path is captured.
-  if timeout 120s az vm boot-diagnostics enable \
-      --resource-group "$resource_group" \
-      --name "$vm_name" \
-      --output none 2>"$boot_diagnostics_attempt_error"; then
-    rm -f -- "$boot_diagnostics_attempt_error"
-    if timeout 180s az vm restart \
-        --resource-group "$resource_group" \
-        --name "$vm_name" \
-        --output none 2>"$boot_diagnostics_attempt_error"; then
-      rm -f -- "$boot_diagnostics_attempt_error"
-      sleep 30
-    else
-      record_boot_diagnostics_error \
-        "diagnostic reboot" "$boot_diagnostics_attempt_error"
-    fi
-  else
-    record_boot_diagnostics_error \
-      "enable managed boot diagnostics" "$boot_diagnostics_attempt_error"
   fi
 
   # Managed boot diagnostics can take up to ~2 minutes to populate after a
@@ -423,7 +429,8 @@ collect_failure_diagnostics() {
     rm -f -- "$boot_diagnostics_attempt_error"
     if [[ "$serial_console_uri" == https://* ]]; then
       if download_boot_artifact \
-          "$serial_console_uri" "$boot_log" 2>"$boot_diagnostics_attempt_error"; then
+          "$serial_console_uri" "$boot_log" 2>"$boot_diagnostics_attempt_error" &&
+          [[ -s "$boot_log" ]]; then
         boot_log_status=retrieved
         rm -f -- "$boot_diagnostics_attempt_error"
       else
@@ -441,13 +448,10 @@ collect_failure_diagnostics() {
     serial_console_uri=
 
     if [[ "$boot_log_status" != retrieved ]]; then
-      if timeout 90s az vm boot-diagnostics get-boot-log \
-          --resource-group "$resource_group" \
-          --name "$vm_name" >"$boot_log" 2>"$boot_diagnostics_attempt_error"; then
+      if retrieve_managed_boot_log \
+          "$boot_log" "$boot_diagnostics_attempt_error"; then
         boot_log_status=retrieved
-        rm -f -- "$boot_diagnostics_attempt_error"
       else
-        rm -f -- "$boot_log"
         record_boot_diagnostics_error \
           "direct boot log attempt $diagnostics_attempt" \
           "$boot_diagnostics_attempt_error"
@@ -711,23 +715,168 @@ if [[ "$FLAVOR" == core ]]; then
   enable_agent=false
 fi
 vm_create_status=0
-az vm create \
-  --resource-group "$resource_group" \
-  --name "$vm_name" \
-  --location "$AZURE_LOCATION" \
-  --size "$AZURE_VM_SIZE" \
-  --image "$image_version_id" \
-  --admin-username "$admin_username" \
-  --authentication-type ssh \
-  --ssh-key-values "$private_key.pub" \
-  --enable-agent "$enable_agent" \
-  --enable-auto-update false \
-  --security-type TrustedLaunch \
-  --enable-secure-boot true \
-  --enable-vtpm true \
-  --public-ip-sku Standard \
-  --nsg-rule SSH \
-  --output json >/dev/null 2>"$vm_create_stderr" || vm_create_status=$?
+if [[ "$CANDIDATE_KEY" == x86_64-core ]]; then
+  # Azure CLI cannot express managed boot diagnostics during `az vm create`
+  # (Azure/azure-cli#30340). Build the network with the CLI, then deploy the VM
+  # resource with diagnostics enabled in its initial ARM request so serial
+  # output exists even when OS provisioning reaches a terminal failure.
+  az network vnet create \
+    --resource-group "$resource_group" \
+    --name "$vnet_name" \
+    --location "$AZURE_LOCATION" \
+    --subnet-name "$subnet_name" \
+    --output none
+  az network public-ip create \
+    --resource-group "$resource_group" \
+    --name "$public_ip_name" \
+    --location "$AZURE_LOCATION" \
+    --sku Standard \
+    --allocation-method Static \
+    --output none
+  az network nsg create \
+    --resource-group "$resource_group" \
+    --name "$nsg_name" \
+    --location "$AZURE_LOCATION" \
+    --output none
+  az network nsg rule create \
+    --resource-group "$resource_group" \
+    --nsg-name "$nsg_name" \
+    --name SSH \
+    --priority 1000 \
+    --direction Inbound \
+    --access Allow \
+    --protocol Tcp \
+    --destination-port-ranges 22 \
+    --output none
+  az network nic create \
+    --resource-group "$resource_group" \
+    --name "$nic_name" \
+    --location "$AZURE_LOCATION" \
+    --vnet-name "$vnet_name" \
+    --subnet "$subnet_name" \
+    --network-security-group "$nsg_name" \
+    --public-ip-address "$public_ip_name" \
+    --output none
+  nic_id=$(az network nic show \
+    --resource-group "$resource_group" \
+    --name "$nic_name" \
+    --query id \
+    --output tsv)
+  [[ "$nic_id" == /subscriptions/*/resourceGroups/*/providers/Microsoft.Network/networkInterfaces/* ]]
+  ssh_public_key=$(<"$private_key.pub")
+  jq -n \
+    --arg location "$AZURE_LOCATION" \
+    --arg vm_name "$vm_name" \
+    --arg vm_size "$AZURE_VM_SIZE" \
+    --arg image_id "$image_version_id" \
+    --arg admin_username "$admin_username" \
+    --arg ssh_public_key "$ssh_public_key" \
+    --arg nic_id "$nic_id" \
+    --argjson enable_agent "$enable_agent" \
+    '{
+      location: $location,
+      properties: {
+        hardwareProfile: {vmSize: $vm_size},
+        storageProfile: {
+          imageReference: {id: $image_id},
+          osDisk: {
+            createOption: "FromImage",
+            caching: "ReadWrite",
+            deleteOption: "Delete"
+          }
+        },
+        osProfile: {
+          computerName: $vm_name,
+          adminUsername: $admin_username,
+          linuxConfiguration: {
+            disablePasswordAuthentication: true,
+            provisionVMAgent: $enable_agent,
+            ssh: {publicKeys: [{
+              path: ("/home/" + $admin_username + "/.ssh/authorized_keys"),
+              keyData: $ssh_public_key
+            }]}
+          }
+        },
+        networkProfile: {networkInterfaces: [{
+          id: $nic_id,
+          properties: {primary: true, deleteOption: "Delete"}
+        }]},
+        securityProfile: {
+          securityType: "TrustedLaunch",
+          uefiSettings: {secureBootEnabled: true, vTpmEnabled: true}
+        },
+        diagnosticsProfile: {bootDiagnostics: {enabled: true}}
+      }
+    }' >"$vm_request"
+  resource_group_id=$(az group show \
+    --name "$resource_group" \
+    --query id \
+    --output tsv)
+  vm_id="${resource_group_id}/providers/Microsoft.Compute/virtualMachines/${vm_name}"
+  az rest \
+    --method put \
+    --uri "https://management.azure.com${vm_id}?api-version=2024-11-01" \
+    --body "@$vm_request" \
+    --output none 2>"$vm_create_stderr" || vm_create_status=$?
+  if [[ "$vm_create_status" -eq 0 ]]; then
+    diagnostics_enabled=
+    for _ in {1..12}; do
+      diagnostics_enabled=$(az vm show \
+        --resource-group "$resource_group" \
+        --name "$vm_name" \
+        --query diagnosticsProfile.bootDiagnostics.enabled \
+        --output tsv 2>/dev/null) || diagnostics_enabled=
+      [[ "$diagnostics_enabled" == true ]] && break
+      sleep 5
+    done
+    test "$diagnostics_enabled" = true
+
+    vm_provisioning_state=
+    for _ in {1..180}; do
+      vm_provisioning_state=$(az vm show \
+        --resource-group "$resource_group" \
+        --name "$vm_name" \
+        --query provisioningState \
+        --output tsv 2>/dev/null) || vm_provisioning_state=
+      case "$vm_provisioning_state" in
+        Succeeded) break ;;
+        Failed)
+          printf '%s\n' \
+            "::error::VM provisioning reached terminal state $vm_provisioning_state" \
+            >"$vm_create_stderr"
+          vm_create_status=1
+          break
+          ;;
+      esac
+      sleep 10
+    done
+    if [[ "$vm_provisioning_state" != Succeeded ]] &&
+        [[ "$vm_create_status" -eq 0 ]]; then
+      printf '%s\n' \
+        "::error::VM provisioning did not succeed within 30 minutes (last state: ${vm_provisioning_state:-unavailable})" \
+        >"$vm_create_stderr"
+      vm_create_status=124
+    fi
+  fi
+else
+  az vm create \
+    --resource-group "$resource_group" \
+    --name "$vm_name" \
+    --location "$AZURE_LOCATION" \
+    --size "$AZURE_VM_SIZE" \
+    --image "$image_version_id" \
+    --admin-username "$admin_username" \
+    --authentication-type ssh \
+    --ssh-key-values "$private_key.pub" \
+    --enable-agent "$enable_agent" \
+    --enable-auto-update false \
+    --security-type TrustedLaunch \
+    --enable-secure-boot true \
+    --enable-vtpm true \
+    --public-ip-sku Standard \
+    --nsg-rule SSH \
+    --output json >/dev/null 2>"$vm_create_stderr" || vm_create_status=$?
+fi
 if [[ "$vm_create_status" -ne 0 ]]; then
   cat -- "$vm_create_stderr" >&2
   # Two real x86_64-core deployments remained failed throughout the former
@@ -1425,11 +1574,11 @@ GUEST
 
 rm -f -- "$boot_log"
 for _ in {1..6}; do
-  if az vm boot-diagnostics get-boot-log \
-    --resource-group "$resource_group" \
-    --name "$vm_name" >"$boot_log" 2>/dev/null && [[ -s "$boot_log" ]]; then
+  if retrieve_managed_boot_log \
+      "$boot_log" "$boot_diagnostics_attempt_error"; then
     break
   fi
+  rm -f -- "$boot_diagnostics_attempt_error"
   sleep 5
 done
 if [[ -s "$boot_log" ]]; then

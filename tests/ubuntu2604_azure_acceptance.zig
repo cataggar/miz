@@ -640,17 +640,41 @@ test "failed VMs use managed boot diagnostics without Storage permissions" {
     defer script.deinit();
 
     // The release identity has VM write permission but deliberately lacks
-    // Microsoft.Storage/storageAccounts/write. Managed boot diagnostics need
-    // no caller-owned account. A diagnostic reboot records the same startup
-    // path after a terminal provisioning failure.
+    // Microsoft.Storage/storageAccounts/write. Azure CLI cannot request
+    // managed diagnostics during `az vm create`, so the failing x86 core VM
+    // is deployed with diagnostics in its initial ARM resource.
     try script.expectOmits("az storage account create");
     try script.expectOmits("--boot-diagnostics-storage");
-    try script.expectContains("az vm boot-diagnostics enable \\");
-    try script.expectContains("--output none 2>\"$boot_diagnostics_attempt_error\"");
-    try script.expectContains("az vm restart \\");
     try script.expectContains(
-        "\"enable managed boot diagnostics\" \"$boot_diagnostics_attempt_error\"",
+        "diagnosticsProfile: {bootDiagnostics: {enabled: true}}",
     );
+    try script.expectContains("az rest \\");
+    try script.expectContains(
+        "--uri \"https://management.azure.com${vm_id}?api-version=2024-11-01\"",
+    );
+    try script.expectContains(
+        "--query diagnosticsProfile.bootDiagnostics.enabled",
+    );
+    try script.expectContains("test \"$diagnostics_enabled\" = true");
+    try script.expectContains("securityType: \"TrustedLaunch\"");
+    try script.expectContains("secureBootEnabled: true");
+    try script.expectContains("vTpmEnabled: true");
+    try script.expectContains(
+        "if [[ \"$CANDIDATE_KEY\" == x86_64-core ]]; then",
+    );
+    try script.expectOmits("az vm boot-diagnostics enable");
+    try script.expectOmits("az vm restart");
+}
+
+test "Azure error bodies are never accepted as retrieved boot logs" {
+    var script = try open();
+    defer script.deinit();
+
+    try script.expectCount("retrieve_managed_boot_log \\", 2);
+    try script.expectContains(
+        "head -c 512 \"$output\" | grep -Eq '<Error>|<Code>BlobNotFound</Code>'",
+    );
+    try script.expectContains("if [[ ! -s \"$output\" ]]; then");
 }
 
 // ---- process and fixture support ----
