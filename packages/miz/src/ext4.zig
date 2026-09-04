@@ -12537,10 +12537,12 @@ fn readJournalSuperblockUuid(reader: *Reader, io: Io) ![16]u8 {
 
 test "rewriteUuid updates a miz ext4 region and its journal identity" {
     const io = std.testing.io;
-    const path = "test-ext4-uuid-rewrite-miz.raw";
-    const extracted_path = "test-ext4-uuid-rewrite-miz.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, extracted_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-uuid-rewrite-miz.raw");
+    defer std.testing.allocator.free(path);
+    const extracted_path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-uuid-rewrite-miz.img");
+    defer std.testing.allocator.free(extracted_path);
 
     const offset: u64 = 1024 * 1024;
     const length: u64 = 256 * 1024 * 1024;
@@ -12627,10 +12629,12 @@ test "rewriteUuid updates a miz ext4 region and its journal identity" {
 
 test "rewriteUuidImage preserves arbitrary checksum seeds" {
     const io = std.testing.io;
-    const path = "test-ext4-uuid-rewrite-image.raw";
-    const extracted_path = "test-ext4-uuid-rewrite-image.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
-    defer Io.Dir.cwd().deleteFile(io, extracted_path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-uuid-rewrite-image.raw");
+    defer std.testing.allocator.free(path);
+    const extracted_path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-uuid-rewrite-image.img");
+    defer std.testing.allocator.free(extracted_path);
 
     const offset: u64 = 1024 * 1024;
     const length: u64 = 256 * 1024 * 1024;
@@ -12699,8 +12703,10 @@ test "rewriteUuidImage preserves arbitrary checksum seeds" {
 
 test "rewriteUuid updates UUID-derived checksum seeds on a real e2fsprogs profile" {
     const io = std.testing.io;
-    const path = "test-ext4-uuid-rewrite-mke2fs.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-uuid-rewrite-mke2fs.img");
+    defer std.testing.allocator.free(path);
 
     const length: u64 = 256 * 1024 * 1024;
     const new_uuid = [_]u8{0x74} ** 16;
@@ -12737,8 +12743,10 @@ test "rewriteUuid updates UUID-derived checksum seeds on a real e2fsprogs profil
 
 test "rewriteUuid refuses unsupported checksum-seed layouts before mutating" {
     const io = std.testing.io;
-    const path = "test-ext4-uuid-rewrite-unsupported.img";
-    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-uuid-rewrite-unsupported.img");
+    defer std.testing.allocator.free(path);
 
     const length: u64 = 64 * 1024 * 1024;
     const old_uuid = [_]u8{0x19} ** 16;
@@ -14793,6 +14801,21 @@ fn temporaryTestPath(
     var root_buffer: [Io.Dir.max_path_bytes]u8 = undefined;
     const root_length = try temporary.dir.realPath(io, &root_buffer);
     return std.fs.path.join(allocator, &.{ root_buffer[0..root_length], sub_path });
+}
+
+test "ext4 test fixture paths are isolated" {
+    const source = @embedFile("ext4.zig");
+    const quote = "\"";
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "const path = " ++ quote ++ "test-ext4-",
+    ) == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        source,
+        "const extracted_path = " ++ quote ++ "test-ext4-",
+    ) == null);
 }
 
 fn findGeneralEntry(tree: *GeneralTree, path: []const u8) ?GeneralEntry {
