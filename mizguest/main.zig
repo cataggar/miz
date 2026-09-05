@@ -71,6 +71,7 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         .failure = outcome.failure,
         .tools = session.tools.items,
         .installed_packages = session.installed_packages.items,
+        .package_inventory_collected = session.package_inventory_collected,
         .package_lock = session.emitted_lock.items,
         .hooks = session.hook_outcomes.items,
         .selinux_relabel = session.selinux_relabel,
@@ -96,6 +97,7 @@ const Session = struct {
     allocator: Allocator,
     tools: std.array_list.Managed(control_mod.Tool),
     installed_packages: std.array_list.Managed([]const u8),
+    package_inventory_collected: bool = false,
     /// The installed set as it stood before the package actions ran. Read only
     /// under a pinned control document, which is the only one with a question
     /// to ask of it: what this transaction added.
@@ -316,12 +318,17 @@ const Session = struct {
                 return self.stageFailure("selinux", err);
             };
         }
-        // After every hook, so a hook that installed a package is visible in
-        // the inventory the result carries -- the same point the chroot
-        // backend reads its own.
-        self.loadInstalledPackages() catch |err| {
-            return self.stageFailure("package-inventory", err);
-        };
+        // Read the RPM inventory only when the declared package policy used
+        // that database. A network-only repository may support a reviewed
+        // hook on a non-RPM image, and must not turn that image into an
+        // unsupported package-manager request after the hook succeeds.
+        const package_tools = control_mod.packageToolNeed(control);
+        if (package_tools.database) {
+            self.loadInstalledPackages() catch |err| {
+                return self.stageFailure("package-inventory", err);
+            };
+            self.package_inventory_collected = true;
+        }
         // After the inventory and before the result is published: a run whose
         // pins did not hold must come home as a failure, not as a success
         // whose report happens to disagree with the plan that produced it.
@@ -550,15 +557,19 @@ const Session = struct {
     }
 
     fn writeRepositoryFiles(self: *Session, control: control_mod.Control) !void {
-        if (control.repositories.len == 0) return;
-        try mkdirPath(guest_root ++ packages_mod.repository_directory);
-        // No cache: a package cache is a host directory bind-mounted into the
-        // target, and this backend refuses `.cache` by name because the control
-        // channel carries a rendered document rather than host files.
-        const config_body = try packages_mod.configBody(self.allocator, null);
-        try self.writeGuestFile(packages_mod.config_path, config_body);
+        if (packages_mod.needsManagerConfiguration(
+            control.actions.len,
+            hasPackageManagerRepository(control.repositories),
+        )) {
+            try mkdirPath(guest_root ++ packages_mod.repository_directory);
+            // No cache: a package cache is a host directory bind-mounted into
+            // the target, and the control channel carries no host directory.
+            const config_body = try packages_mod.configBody(self.allocator, null);
+            try self.writeGuestFile(packages_mod.config_path, config_body);
+        }
 
         for (control.repositories) |repository| {
+            if (repository.use != .package_manager) continue;
             const path = try packages_mod.repositoryPath(self.allocator, repository.id);
             const material = try self.credentialFor(repository);
             const body = try renderRepositoryFile(self.allocator, repository, material);
@@ -602,6 +613,7 @@ const Session = struct {
     fn importTrust(self: *Session, control: control_mod.Control) !void {
         var index: usize = 0;
         for (control.repositories) |repository| {
+            if (repository.use != .package_manager) continue;
             for (repository.trust_base64) |encoded| {
                 const decoder = std.base64.standard.Decoder;
                 const size = try decoder.calcSizeForSlice(encoded);
@@ -624,7 +636,9 @@ const Session = struct {
         repositories: []const control_mod.Repository,
     ) !void {
         var ids: std.array_list.Managed([]const u8) = .init(self.allocator);
-        for (repositories) |repository| try ids.append(repository.id);
+        for (repositories) |repository| {
+            if (repository.use == .package_manager) try ids.append(repository.id);
+        }
         var argv: std.array_list.Managed([]const u8) = .init(self.allocator);
         try packages_mod.appendTransactionArgv(&argv, .{
             .verb = verb,
@@ -856,10 +870,7 @@ const Session = struct {
     /// no package manager is a legitimate thing to customize as long as
     /// nothing asks it to install.
     fn requirePackageTools(self: *Session, control: control_mod.Control) !void {
-        const need = packages_mod.toolNeed(
-            control.actions.len != 0,
-            declaresPackageTrust(control),
-        );
+        const need = control_mod.packageToolNeed(control);
         if (need.none()) return;
 
         const verdict = packages_mod.toolVerdict(
@@ -1147,6 +1158,7 @@ const Session = struct {
 
     fn removeRepositoryFiles(self: *Session) void {
         for (self.repositories_written) |repository| {
+            if (repository.use != .package_manager) continue;
             const guest_path = packages_mod.repositoryPath(
                 self.allocator,
                 repository.id,
@@ -1159,7 +1171,7 @@ const Session = struct {
             ) catch continue;
             _ = linux.unlink(path);
         }
-        if (self.repositories_written.len != 0) {
+        if (hasPackageManagerRepository(self.repositories_written)) {
             _ = linux.unlink(guest_root ++ packages_mod.config_path);
             _ = linux.rmdir(guest_root ++ packages_mod.repository_directory);
         }
@@ -1591,11 +1603,9 @@ fn mkdirParents(allocator: Allocator, path: []const u8) !void {
     }
 }
 
-/// Opening with `O_DIRECTORY` answers the question without needing a `struct
-/// stat` whose layout varies by architecture.
-fn declaresPackageTrust(control: control_mod.Control) bool {
-    for (control.repositories) |repository| {
-        if (repository.trust_base64.len != 0) return true;
+fn hasPackageManagerRepository(repositories: []const control_mod.Repository) bool {
+    for (repositories) |repository| {
+        if (repository.use == .package_manager) return true;
     }
     return false;
 }
@@ -1767,16 +1777,24 @@ fn readFileAlloc(allocator: Allocator, path: []const u8, limit: usize) ![]u8 {
 /// will resolve no names and so must leave the image's own resolver alone.
 ///
 /// Both halves matter. An offline guest has no network to resolve over, and a
-/// transaction with no package actions runs no package manager -- and replacing
-/// the resolver in either case would touch a file the run has no reason to
-/// touch, which is exactly what the chroot backend and the documentation both
-/// say does not happen.
+/// remove-only transaction uses only the local package database. A reviewed
+/// hook can consume a declared network-only repository without a package
+/// action, so it receives the same resolver as an online package transaction.
 fn resolverConfigFor(control: control_mod.Control) ?control_mod.NetworkConfig {
-    if (control.actions.len == 0) return null;
+    if (!controlUsesRepositoryNetwork(control)) return null;
     return switch (control.network) {
         .offline => null,
         .declared_repositories => |config| config,
     };
+}
+
+fn controlUsesRepositoryNetwork(control: control_mod.Control) bool {
+    for (control.actions) |action| {
+        if (packages_mod.invocationFor(std.meta.activeTag(action)).repositories) {
+            return true;
+        }
+    }
+    return control.hooks.len != 0 and control.repositories.len != 0;
 }
 
 /// Moves whatever is at `path` aside to `backup` and writes `bytes` in its
@@ -2202,7 +2220,7 @@ test "the image's own resolver comes back the kind of file it was" {
     );
 }
 
-test "the image's resolver is touched only by a transaction that resolves names" {
+test "an online guest receives its declared resolver even without package actions" {
     const config = control_mod.NetworkConfig{
         .address = "10.0.2.15",
         .netmask = "255.255.255.0",
@@ -2210,23 +2228,39 @@ test "the image's resolver is touched only by a transaction that resolves names"
         .nameservers = &.{"10.0.2.3"},
     };
     const actions = [_]control_mod.Action{.{ .install = &.{"dracut"} }};
+    const repositories = [_]control_mod.Repository{.{
+        .id = "snapshot",
+        .urls = &.{"https://example.invalid/snapshot"},
+        .use = .network_only,
+        .trust_base64 = &.{"a2V5"},
+    }};
+    const hooks = [_]control_mod.Hook{.{
+        .name = "fetch",
+        .phase = .after_packages,
+        .script_base64 = "dHJ1ZQo=",
+    }};
     const base = control_mod.Control{
         .root_device = "/dev/vda2",
         .result_device = "/dev/vdb",
         .network = .{ .declared_repositories = config },
+        .repositories = &repositories,
+        .hooks = &hooks,
     };
 
     var working = base;
     working.actions = &actions;
     try std.testing.expect(resolverConfigFor(working) != null);
 
-    // A run with repositories and no package action still starts no package
-    // manager, so there is nothing to resolve for and nothing to replace.
-    try std.testing.expect(resolverConfigFor(base) == null);
+    // A reviewed hook can be the consumer of a network-only repository.
+    try std.testing.expect(resolverConfigFor(base) != null);
 
     // An offline guest has no network to resolve over whatever else it does.
     var offline = base;
-    offline.actions = &actions;
     offline.network = .offline;
     try std.testing.expect(resolverConfigFor(offline) == null);
+
+    var remove_only = base;
+    remove_only.hooks = &.{};
+    remove_only.actions = &.{.{ .remove = &.{"dracut"} }};
+    try std.testing.expect(resolverConfigFor(remove_only) == null);
 }

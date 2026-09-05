@@ -820,6 +820,10 @@ fn mapPackagePolicy(
             .id = repository.id,
             .urls = repository.urls,
             .trust = trust,
+            .use = switch (repository.use) {
+                .package_manager => .package_manager,
+                .network_only => .network_only,
+            },
             .credential = if (repository.credential) |credential| switch (credential) {
                 .basic => |basic| .{ .basic = .{
                     .username = basic.username,
@@ -1183,7 +1187,7 @@ fn runVm(
         .plan = plan,
         .transaction_path = plan.data.transaction_path,
         .target = target,
-        .agent = agent,
+        .agent = .{ .embedded_bytes = agent },
         .console = .{ .writeFn = writeGuestConsole },
         // The same environment the chroot backend reads, for the same reason:
         // a credential declared as `host_environment` is resolved from the

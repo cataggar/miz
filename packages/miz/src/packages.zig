@@ -14,6 +14,13 @@
 
 const std = @import("std");
 
+/// Whether miz configures a repository for its package manager or only records
+/// it as the trusted network destination used by caller-supplied hooks.
+pub const RepositoryUse = enum {
+    package_manager,
+    network_only,
+};
+
 /// Where the package manager is looked for inside the target root. An absolute
 /// path rather than a name on `PATH`, because the command runs in a chroot the
 /// caller does not control the environment of.
@@ -226,6 +233,19 @@ pub fn invocationFor(kind: ActionKind) Invocation {
         .update_all => .{ .verb = "update", .pinned = false, .repositories = true },
         .update_selected => .{ .verb = "update", .pinned = true, .repositories = true },
     };
+}
+
+/// Whether the package-manager configuration and repository directory must
+/// exist for a run.
+///
+/// Every action invokes tdnf, including remove-only transactions that enable
+/// no repository. A repository without an action still needs its rendered
+/// configuration for trust import and audit.
+pub fn needsManagerConfiguration(
+    action_count: usize,
+    has_package_manager_repository: bool,
+) bool {
+    return action_count != 0 or has_package_manager_repository;
 }
 
 /// Everything a tdnf command line varies by.
@@ -665,6 +685,12 @@ test "every action maps to one verb, and only two of them are rewritten by a loc
         try std.testing.expectEqual(case.pinned, invocation.pinned);
         try std.testing.expectEqual(case.repositories, invocation.repositories);
     }
+}
+
+test "remove-only runs still receive the base package-manager configuration" {
+    try std.testing.expect(needsManagerConfiguration(1, false));
+    try std.testing.expect(needsManagerConfiguration(0, true));
+    try std.testing.expect(!needsManagerConfiguration(0, false));
 }
 
 test "the config body differs from itself only by a cache the guest cannot have" {

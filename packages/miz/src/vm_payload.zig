@@ -167,10 +167,21 @@ pub fn probeDrivers(
     }) catch return error.GuestDriversUndetermined;
     defer reader.deinit();
 
-    const release = try resolveModuleRelease(allocator, io, &reader, options.kernel_release);
+    const modules_root = try resolveModulesRoot(allocator, io, &reader);
+    const release = try resolveModuleRelease(
+        allocator,
+        io,
+        &reader,
+        modules_root,
+        options.kernel_release,
+    );
     defer allocator.free(release);
 
-    const tree_path = try std.fmt.allocPrint(allocator, "lib/modules/{s}", .{release});
+    const tree_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}",
+        .{ modules_root, release },
+    );
     defer allocator.free(tree_path);
 
     const builtin_listing = readTreeFile(allocator, io, &reader, tree_path, "modules.builtin") catch
@@ -406,10 +417,11 @@ fn resolveModuleRelease(
     allocator: Allocator,
     io: Io,
     reader: *ext4.Reader,
+    modules_root: []const u8,
     requested: ?[]const u8,
 ) ![]u8 {
     if (requested) |release| return allocator.dupe(u8, release);
-    const entries = reader.listDir(io, allocator, "lib/modules") catch
+    const entries = reader.listDir(io, allocator, modules_root) catch
         return error.GuestDriversUndetermined;
     defer ext4.freeDirEntries(allocator, entries);
     var found: ?[]const u8 = null;
@@ -423,6 +435,19 @@ fn resolveModuleRelease(
         found = entry.name;
     }
     return allocator.dupe(u8, found orelse return error.GuestDriversUndetermined);
+}
+
+fn resolveModulesRoot(
+    allocator: Allocator,
+    io: Io,
+    reader: *ext4.Reader,
+) ![]const u8 {
+    for ([_][]const u8{ "lib/modules", "usr/lib/modules" }) |path| {
+        const entries = reader.listDir(io, allocator, path) catch continue;
+        ext4.freeDirEntries(allocator, entries);
+        return path;
+    }
+    return error.GuestDriversUndetermined;
 }
 
 /// A file appended to the extracted initramfs. `path` is a cpio member name and
@@ -715,6 +740,8 @@ pub fn appendMembers(
     var out: std.array_list.Managed(u8) = .init(allocator);
     errdefer out.deinit();
     try out.appendSlice(initrd);
+    const padding = std.mem.alignForward(usize, initrd.len, 4) - initrd.len;
+    try out.appendNTimes(0, padding);
     var writer = cpio.Writer.init(&out, .newc);
     for (members) |member| try writer.append(try cpioMember(member));
     try writer.finish();
@@ -793,6 +820,24 @@ test "appending an agent leaves the original initramfs bytes untouched" {
     });
     defer allocator.free(combined);
     try std.testing.expectEqualSlices(u8, original.items, combined[0..original.items.len]);
+}
+
+test "the appended archive starts on a four-byte initramfs boundary" {
+    const allocator = std.testing.allocator;
+    const original = "unaligned";
+    const combined = try appendMembers(allocator, original, &.{
+        .{ .path = "miz-guest-agent", .bytes = "agent" },
+    });
+    defer allocator.free(combined);
+
+    const archive_offset = std.mem.alignForward(usize, original.len, 4);
+    try std.testing.expectEqualSlices(u8, original, combined[0..original.len]);
+    try std.testing.expect(std.mem.allEqual(
+        u8,
+        combined[original.len..archive_offset],
+        0,
+    ));
+    try std.testing.expectEqualStrings("070701", combined[archive_offset..][0..6]);
 }
 
 test "an identical agent produces an identical archive" {
@@ -1099,8 +1144,9 @@ const ProbeImage = struct {
     releases: []const []const u8,
     builtin: ?[]const u8 = null,
     dep: ?[]const u8 = null,
+    usr_merged: bool = false,
     /// Module files to place under each release's tree, named by their path
-    /// relative to `lib/modules/<release>`.
+    /// relative to the selected modules root and release.
     modules: []const []const u8 = &.{},
     /// Written verbatim instead of a generated object, for the case where the
     /// tree holds something that is not a module.
@@ -1115,10 +1161,21 @@ fn writeDriverProbeImage(
 ) !void {
     var tree = root_tree.RootTree.initMemory(allocator, io, .{});
     defer tree.deinit();
-    try tree.putDirectory("lib", .{ .mode = 0o755 });
-    try tree.putDirectory("lib/modules", .{ .mode = 0o755 });
+    const modules_root = if (image.usr_merged) "usr/lib/modules" else "lib/modules";
+    if (image.usr_merged) {
+        try tree.putDirectory("usr", .{ .mode = 0o755 });
+        try tree.putDirectory("usr/lib", .{ .mode = 0o755 });
+        try tree.putSymlink("lib", "usr/lib", .{ .mode = 0o777 });
+    } else {
+        try tree.putDirectory("lib", .{ .mode = 0o755 });
+    }
+    try tree.putDirectory(modules_root, .{ .mode = 0o755 });
     for (image.releases) |release| {
-        const directory = try std.fmt.allocPrint(allocator, "lib/modules/{s}", .{release});
+        const directory = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}",
+            .{ modules_root, release },
+        );
         defer allocator.free(directory);
         try tree.putDirectory(directory, .{ .mode = 0o755 });
         if (image.builtin) |bytes| {
@@ -1211,6 +1268,32 @@ test "the disk transport is read from the image rather than assumed" {
     // Nothing claimed virtio-net, so a networked run must not be attempted.
     try std.testing.expect(!both.network);
     try std.testing.expectEqual(@as(usize, 0), both.modules.len);
+}
+
+test "driver probing supports a usr-merged module tree" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "test-vm-payload-usr-merged.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    try writeDriverProbeImage(allocator, io, path, .{
+        .releases = &.{"7.0.0-cloud"},
+        .usr_merged = true,
+        .builtin = "kernel/drivers/virtio/virtio_pci.ko\n" ++
+            "kernel/drivers/block/virtio_blk.ko\n" ++
+            "kernel/fs/ext4/ext4.ko\n" ++
+            "kernel/drivers/net/virtio_net.ko\n",
+    });
+
+    var drivers = try probeDrivers(allocator, io, .{
+        .raw_path = path,
+        .root_partition_offset = 0,
+        .network_required = true,
+    });
+    defer drivers.deinit(allocator);
+    try std.testing.expectEqual(DiskTransport.virtio_blk, drivers.disk);
+    try std.testing.expect(drivers.network);
+    try std.testing.expectEqual(@as(usize, 0), drivers.modules.len);
 }
 
 test "a kernel that modularizes its drivers is served by its own module tree" {

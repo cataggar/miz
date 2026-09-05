@@ -53,13 +53,6 @@ const partition_sectors: u32 = 900 * 1024;
 const partition_offset = @as(u64, partition_first_lba) * miz.mbr.sector_size;
 const partition_length = @as(u64, partition_sectors) * miz.mbr.sector_size;
 
-/// Written by the `rpm` stub from inside the guest's chroot. Its presence in
-/// the published image is the proof that matters: the guest booted, found the
-/// root filesystem, mounted it writable, and executed a binary out of it.
-const marker_path = guest_stub.marker_path;
-const marker_bytes = guest_stub.marker_bytes;
-const installed_nevra = guest_stub.installed_nevra;
-
 /// The hook the run declares: a script the host reads, carries through the
 /// control document, and the guest executes with the image's own interpreter.
 const hook_name = "records-its-arguments";
@@ -287,8 +280,11 @@ fn runBoot(
 
     const preserved = result.provenance.execution.preserved orelse
         return error.MissingPreservedProvenance;
-    try ensure(preserved.installed_packages.len == 1);
-    try ensure(std.mem.eql(u8, preserved.installed_packages[0], installed_nevra));
+    // This run executes a package-shaped stub as the hook interpreter but
+    // declares no package action or package-manager trust. The inventory must
+    // therefore be omitted rather than inferred from an unrelated executable.
+    try ensure(!preserved.package_inventory_collected);
+    try ensure(preserved.installed_packages.len == 0);
 
     // The hook is recorded by the host's own account of what it sent: the name
     // and phase the caller declared, and the digest of the bytes read here. The
@@ -302,10 +298,14 @@ fn runBoot(
     std.crypto.hash.sha2.Sha256.hash(hook_script, &hook_digest, .{});
     try ensure(std.mem.eql(u8, &hook_record.source_sha256.bytes, &hook_digest));
 
-    // The marker is in the published image and not in the source, which is the
-    // whole contract: the guest changed a copy and the original is untouched.
-    try expectGuestFile(allocator, io, output_path, marker_path, marker_bytes);
-    try expectMissingGuestFile(allocator, io, source_path, marker_path);
+    // An inventory subprocess must not be inferred from the hook interpreter
+    // merely because the same executable also stands in for rpm.
+    try expectMissingGuestFile(
+        allocator,
+        io,
+        output_path,
+        guest_stub.marker_path,
+    );
     // And the hook's own marker, written by the guest's interpreter from the
     // arguments the caller declared. Nothing the host runs could have produced
     // it: on a cross-architecture run the host cannot execute that binary.
@@ -355,9 +355,9 @@ fn runVm(
         .plan = plan,
         .transaction_path = plan.data.transaction_path,
         .target = target,
-        .agent = guest_agents.get(
+        .agent = .{ .embedded_bytes = guest_agents.get(
             @tagName(plan.data.architectures.runner),
-        ) orelse return error.VmGuestAgentUnavailable,
+        ) orelse return error.VmGuestAgentUnavailable },
         .console = .{ .writeFn = writeConsole },
     });
 }

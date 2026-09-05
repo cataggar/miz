@@ -20,8 +20,8 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
-pub const control_version: u32 = 7;
-pub const result_version: u32 = 4;
+pub const control_version: u32 = 8;
+pub const result_version: u32 = 5;
 
 /// Path the host writes the control document to inside the initramfs, and the
 /// path the guest reads it back from once the kernel has unpacked rootfs.
@@ -73,6 +73,7 @@ pub const Error = error{
     EmptyAction,
     OfflineNetworkWithPackageActions,
     NoDeclaredRepositories,
+    NoPackageManagerRepositories,
     InvalidNetworkConfiguration,
     UnusableNameserver,
     RepositoryWithoutTrust,
@@ -83,6 +84,7 @@ pub const Error = error{
     FrameDigestMismatch,
     ResultTooLarge,
     InvalidToolRecord,
+    UnexpectedPackageInventory,
     InvalidSelinuxRecord,
     InvalidInitramfsRecord,
     InvalidTrustKeyRecord,
@@ -108,6 +110,7 @@ pub const Error = error{
     CredentialMaterialTooLarge,
     CredentialIndexOutOfRange,
     InvalidCredentialUsername,
+    UnexpectedRepositoryCredential,
     MissingCredentialDevice,
     UnexpectedCredentialDevice,
 };
@@ -322,6 +325,7 @@ pub const ControlCredential = union(enum) {
 pub const Repository = struct {
     id: []const u8,
     urls: []const []const u8,
+    use: packages.RepositoryUse = .package_manager,
     /// Keyring material, base64-encoded. Trust material may legitimately be a
     /// binary keyring rather than an ASCII armour, and JSON strings must be
     /// valid UTF-8, so it cannot travel raw.
@@ -574,6 +578,9 @@ pub const Control = struct {
                     return error.InvalidTrustMaterial;
             }
             const credential = repository.credential orelse continue;
+            if (repository.use == .network_only) {
+                return error.UnexpectedRepositoryCredential;
+            }
             switch (credential) {
                 .basic => |basic| {
                     if (!validCredentialUsername(basic.username)) {
@@ -614,6 +621,17 @@ pub const Control = struct {
             for (names) |name| {
                 if (!validPackageName(name)) return error.InvalidPackageName;
             }
+        }
+        var actions_need_repositories = false;
+        for (self.actions) |action| {
+            if (packages.invocationFor(std.meta.activeTag(action)).repositories) {
+                actions_need_repositories = true;
+            }
+        }
+        if (actions_need_repositories) {
+            for (self.repositories) |repository| {
+                if (repository.use == .package_manager) break;
+            } else return error.NoPackageManagerRepositories;
         }
 
         for (self.package_pins, 0..) |pin, index| {
@@ -672,7 +690,7 @@ pub const Control = struct {
         try validateHooks(self.hooks);
 
         switch (self.network) {
-            .offline => if (self.actions.len != 0) {
+            .offline => if (usesRepositoryNetwork(self.actions, self.hooks, self.repositories)) {
                 return error.OfflineNetworkWithPackageActions;
             },
             .declared_repositories => |config| {
@@ -682,6 +700,30 @@ pub const Control = struct {
         }
     }
 };
+
+pub fn packageToolNeed(control: Control) packages.ToolNeed {
+    var imports_trust = false;
+    for (control.repositories) |repository| {
+        if (repository.use == .package_manager and repository.trust_base64.len != 0) {
+            imports_trust = true;
+            break;
+        }
+    }
+    return packages.toolNeed(control.actions.len != 0, imports_trust);
+}
+
+fn usesRepositoryNetwork(
+    actions: []const Action,
+    hooks: []const Hook,
+    repositories: []const Repository,
+) bool {
+    for (actions) |action| {
+        if (packages.invocationFor(std.meta.activeTag(action)).repositories) {
+            return true;
+        }
+    }
+    return hooks.len != 0 and repositories.len != 0;
+}
 
 /// One package pinned to an exact rpm identity.
 ///
@@ -830,6 +872,9 @@ pub const Result = struct {
     failure: ?Failure = null,
     tools: []const Tool = &.{},
     installed_packages: []const []const u8 = &.{},
+    /// Whether `installed_packages` is an observed empty/nonempty RPM
+    /// database rather than an omitted observation for a package-free run.
+    package_inventory_collected: bool = false,
     /// Every package the transaction added or changed, at the exact identity
     /// it settled on. The lock a later run would state to get this closure,
     /// emitted whether or not one was declared.
@@ -886,6 +931,13 @@ pub const Result = struct {
             if (configure.relabelled != selinux.relabels(configure.relabel_reason)) {
                 return error.InvalidSelinuxRecord;
             }
+        }
+        if (!self.package_inventory_collected and
+            (self.installed_packages.len != 0 or
+                self.package_lock.len != 0 or
+                self.imported_trust_keys.len != 0))
+        {
+            return error.UnexpectedPackageInventory;
         }
         if (self.initramfs) |initramfs| {
             // Bounded by the same limit the inventory is: both are lists the
@@ -1333,7 +1385,13 @@ test "a version mismatch is refused by name even when the document is otherwise 
     // what it must report -- not the parse failure that happens to come first.
     try std.testing.expectError(error.UnsupportedVersion, parseControl(
         allocator,
-        \\{"version":8,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":9,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
+        ,
+    ));
+    try std.testing.expectError(error.UnsupportedVersion, parseControl(
+        allocator,
+        \\{"version":7,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
         ,
     ));
@@ -1342,7 +1400,7 @@ test "a version mismatch is refused by name even when the document is otherwise 
     // failure: the version claimed it would be understood, and it was not.
     try std.testing.expectError(error.UnknownField, parseControl(
         allocator,
-        \\{"version":7,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":8,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}},"actions":[{"reinstall_everything":["x"]}]}
         ,
     ));
@@ -1458,12 +1516,93 @@ test "a document written before root_filesystem existed still parses as the ext4
     // Deliberately hand-written without a `root_filesystem` key, standing in
     // for a document a pre-existing host build would have sent.
     const json =
-        \\{"version":7,"root_device":"/dev/vda2","result_device":"/dev/vdb",
+        \\{"version":8,"root_device":"/dev/vda2","result_device":"/dev/vdb",
         \\"network":{"offline":{}}}
     ;
     const parsed = try parseControl(allocator, json);
     defer parsed.deinit();
     try std.testing.expectEqual(RootFilesystemKind.ext4, parsed.value.root_filesystem);
+}
+
+test "network-only repositories enable hooks without invoking package management" {
+    const repository = Repository{
+        .id = "hook-input",
+        .urls = &.{"https://example.invalid/snapshot"},
+        .trust_base64 = &.{"a2V5"},
+        .use = .network_only,
+    };
+    const control = Control{
+        .root_device = "/dev/vda2",
+        .result_device = "/dev/vdb",
+        .network = .{ .declared_repositories = qemu_user_network },
+        .repositories = &.{repository},
+    };
+    try control.validate();
+
+    var package_control = control;
+    package_control.actions = &.{.{ .install = &.{"example"} }};
+    try std.testing.expectError(
+        error.NoPackageManagerRepositories,
+        package_control.validate(),
+    );
+
+    var credentialed = control;
+    credentialed.credential_device = "/dev/vdc";
+    credentialed.repositories = &.{.{
+        .id = repository.id,
+        .urls = repository.urls,
+        .trust_base64 = repository.trust_base64,
+        .use = .network_only,
+        .credential = .{ .basic = .{
+            .username = "builder",
+            .password_index = 0,
+        } },
+    }};
+    try std.testing.expectError(
+        error.UnexpectedRepositoryCredential,
+        credentialed.validate(),
+    );
+}
+
+test "a remove-only transaction needs neither networking nor repositories" {
+    const control = Control{
+        .root_device = "/dev/vda2",
+        .result_device = "/dev/vdb",
+        .network = .offline,
+        .actions = &.{.{ .remove = &.{"example"} }},
+    };
+    try control.validate();
+    try std.testing.expect(packageToolNeed(control).database);
+}
+
+test "package inventory follows RPM use rather than repository networking" {
+    const repository = Repository{
+        .id = "hook-input",
+        .urls = &.{"https://example.invalid/snapshot"},
+        .trust_base64 = &.{"a2V5"},
+        .use = .network_only,
+    };
+    const hook_only = Control{
+        .root_device = "/dev/vda2",
+        .result_device = "/dev/vdb",
+        .network = .{ .declared_repositories = qemu_user_network },
+        .repositories = &.{repository},
+        .hooks = &.{.{
+            .name = "fetch",
+            .phase = .after_packages,
+            .script_base64 = "dHJ1ZQo=",
+        }},
+    };
+    try std.testing.expect(!packageToolNeed(hook_only).database);
+
+    var package_trust = hook_only;
+    package_trust.hooks = &.{};
+    package_trust.repositories = &.{.{
+        .id = repository.id,
+        .urls = repository.urls,
+        .trust_base64 = repository.trust_base64,
+    }};
+    try std.testing.expect(packageToolNeed(package_trust).database);
 }
 
 test "an explicitly declared root filesystem round-trips through the control document" {
@@ -1923,6 +2062,7 @@ test "a sealed result round-trips through the block-device frame" {
             .command = &.{ "/usr/bin/tdnf", "install", "-y", "strace" },
         }},
         .installed_packages = &.{ "filesystem-1.1-1.azl.x86_64", "strace-6.6-1.azl.x86_64" },
+        .package_inventory_collected = true,
     });
     defer allocator.free(sealed);
     try std.testing.expectEqual(@as(usize, 0), sealed.len % sector_size);
@@ -1932,6 +2072,7 @@ test "a sealed result round-trips through the block-device frame" {
     try std.testing.expect(parsed.value.failure == null);
     try std.testing.expectEqualStrings("tdnf", parsed.value.tools[0].name);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.installed_packages.len);
+    try std.testing.expect(parsed.value.package_inventory_collected);
 }
 
 test "a guest failure survives the round trip with its stage and exit code" {
@@ -2024,6 +2165,7 @@ test "a result the host would record verbatim is bounded before it is believed" 
     const valid = Result{
         .tools = &.{.{ .name = "tdnf", .version = "3.5.8", .command = &.{ "tdnf", "--version" } }},
         .installed_packages = &.{"strace-6.6-1.azl3.x86_64"},
+        .package_inventory_collected = true,
         .imported_trust_keys = &.{"gpg-pubkey-3135ce90-5e6d0f1e"},
         .initramfs = .{
             // A release that failed the rule is reported under the name that
@@ -2063,8 +2205,16 @@ test "a result the host would record verbatim is bounded before it is believed" 
         },
         .{
             .name = "an empty package name is not a package",
-            .result = .{ .installed_packages = &.{""} },
+            .result = .{
+                .installed_packages = &.{""},
+                .package_inventory_collected = true,
+            },
             .expected = error.InvalidPackageName,
+        },
+        .{
+            .name = "packages cannot be reported when no inventory was collected",
+            .result = .{ .installed_packages = &.{"strace-6.6-1.azl3.x86_64"} },
+            .expected = error.UnexpectedPackageInventory,
         },
         .{
             .name = "a failure that names no stage explains nothing",
@@ -2076,7 +2226,10 @@ test "a result the host would record verbatim is bounded before it is believed" 
             // -- or anything else -- in the trust list would have the host
             // state as trust something rpm never derived a key from.
             .name = "trust is only trust if rpm named it as such",
-            .result = .{ .imported_trust_keys = &.{"strace-6.6-1.azl3.x86_64"} },
+            .result = .{
+                .imported_trust_keys = &.{"strace-6.6-1.azl3.x86_64"},
+                .package_inventory_collected = true,
+            },
             .expected = error.InvalidTrustKeyRecord,
         },
         .{

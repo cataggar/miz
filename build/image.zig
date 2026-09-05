@@ -282,6 +282,7 @@ pub const PreservedPackageRepository = struct {
     id: []const u8,
     urls: []const []const u8,
     trust: []const PreservedTrustSource = &.{},
+    use: preserved_image_wire.RepositoryUse = .package_manager,
     /// A plain locator rather than a `LazyPath`, so the build system never
     /// stages, hashes or caches the material a credential names.
     credential: ?PreservedRepositoryCredential = null,
@@ -687,6 +688,7 @@ fn materializePreservedConfiguration(
             .id = repository.id,
             .urls = repository.urls,
             .trust = trust,
+            .use = repository.use,
             .credential = repository.credential,
         };
     }
