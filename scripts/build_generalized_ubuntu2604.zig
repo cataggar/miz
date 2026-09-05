@@ -6666,6 +6666,66 @@ const EspUsage = struct {
     uki_bytes: u64,
 };
 
+/// Validates a published core disk against the plan that produced it.
+///
+/// Issue #677 step 5 stopped core from inheriting Canonical's geometry, so the
+/// inherited-layout assertions cannot describe it: its partition array holds
+/// exactly the ESP and the root, in that order, at offsets this build
+/// calculated. Checking the published GPT against `plan` is stricter than the
+/// bare ESP lookup the x86_64 core path used before, because it re-reads every
+/// boundary the plan promised rather than trusting that whatever ESP is
+/// present is the one that was planned.
+fn validateCoreFinalLayout(
+    verified: miz.gpt.VerifiedGpt,
+    virtual_size: u64,
+    profile: *const Profile,
+    plan: disk_geometry.Plan,
+) !miz.gpt.PartitionEntry {
+    if (virtual_size != plan.virtual_size or
+        virtual_size % miz.gpt.sector_size != 0 or
+        verified.primary_header.backup_lba != plan.backupHeaderLba())
+    {
+        return error.UnexpectedCoreDiskSize;
+    }
+    if (verified.primary_header.num_partition_entries !=
+        miz.gpt.default_num_partition_entries or
+        verified.primary_header.partition_entry_size !=
+            miz.gpt.partition_entry_size or
+        verified.partitions.len != 2)
+    {
+        return error.UnexpectedCorePartitionTable;
+    }
+    const esp = try espPartition(verified.partitions);
+    if (esp.table_index != plan.esp.table_index or
+        esp.first_lba != plan.esp.firstLba() or
+        esp.last_lba != plan.esp.lastLba() or
+        !partitionNameEquals(esp, plan.esp.name))
+    {
+        return error.UnexpectedCoreEspGeometry;
+    }
+    const root = try findNamedRootPartition(verified.partitions);
+    if (root.table_index != plan.root.table_index or
+        !std.mem.eql(
+            u8,
+            &root.partition_type_guid,
+            &profile.root_partition_type_guid,
+        ) or
+        root.first_lba != plan.root.firstLba() or
+        root.last_lba != plan.root.lastLba() or
+        !partitionNameEquals(root, plan.root.name))
+    {
+        return error.UnexpectedCoreRootGeometry;
+    }
+    if (std.mem.eql(u8, &verified.primary_header.disk_guid, &guid.nil) or
+        std.mem.eql(u8, &root.unique_partition_guid, &guid.nil) or
+        std.mem.eql(u8, &esp.unique_partition_guid, &guid.nil) or
+        std.mem.eql(u8, &root.unique_partition_guid, &esp.unique_partition_guid))
+    {
+        return error.InvalidCorePartitionIdentity;
+    }
+    return esp;
+}
+
 fn validateFinalNativeImage(
     allocator: Allocator,
     io: Io,
@@ -6673,6 +6733,7 @@ fn validateFinalNativeImage(
     signed_bytes: []const u8,
     profile: *const Profile,
     expected_cmdline: []const u8,
+    core_plan: ?disk_geometry.Plan,
 ) !void {
     var image = try miz.Image.openPathReadOnly(io, image_path);
     defer image.close(io);
@@ -6683,7 +6744,12 @@ fn validateFinalNativeImage(
         miz.gpt.default_max_partition_array_bytes,
     );
     defer parsed.deinit(allocator);
-    const esp = if (profile.architecture == .aarch64)
+    // Core carries the disk this build planned, so it is judged against that
+    // plan on both architectures. Only the flavors that publish Canonical's
+    // substrate are judged against the inherited Arm64 layout.
+    const esp = if (core_plan) |plan|
+        try validateCoreFinalLayout(parsed, image.virtual_size, profile, plan)
+    else if (profile.architecture == .aarch64)
         try validateArm64FinalLayout(parsed, image.virtual_size)
     else
         try espPartition(parsed.partitions);
@@ -7044,7 +7110,15 @@ fn buildImage(
         break :size args.size.?;
     };
     try validateFinalQcow2(io, output, virtual_size);
-    try validateFinalNativeImage(allocator, io, output, signed.bytes, profile, cmdline);
+    try validateFinalNativeImage(
+        allocator,
+        io,
+        output,
+        signed.bytes,
+        profile,
+        cmdline,
+        if (core_disk) |disk| disk.plan else null,
+    );
     qcow2_finalization.succeed();
     var final_image_validation = timing.begin(.final_image_validation, null);
     defer final_image_validation.end();
@@ -7400,6 +7474,106 @@ test "Arm64 ESP source and final geometry are exact and reject layout drift" {
         error.Arm64XbootldrEntryNotCleared,
         validateArm64FinalLayout(final, virtual_size),
     );
+}
+
+test "a core disk is judged against its own plan, not the inherited Arm64 layout" {
+    // Issue #677 step 5 gave core a fresh GPT whose ESP is table index 0 and
+    // whose root starts where this build's plan put it. The inherited Arm64
+    // assertions describe Canonical's substrate -- root at table index 0 and
+    // LBA 2099200 -- so applying them to a core disk rejected every AArch64
+    // core image that was otherwise correct. Core is checked against the plan
+    // that wrote it, on both architectures.
+    for ([_]Architecture{ .x86_64, .aarch64 }) |architecture| {
+        const profile = profileFor(architecture);
+        const plan = try disk_geometry.plan(.{
+            .architecture = geometryArchitecture(architecture),
+            .measurements = .{
+                .signed_uki_bytes = 58 * 1024 * 1024,
+                .esp_minimum_bytes = 60 * 1024 * 1024,
+                .root_minimum_bytes = 340 * 1024 * 1024,
+                .root_fitted_bytes = 470 * 1024 * 1024,
+                .first_boot = disk_geometry.firstBootGrowth(
+                    geometryArchitecture(architecture),
+                ),
+            },
+        });
+        var partitions = [_]miz.gpt.PartitionEntry{
+            arm64PartitionFixture(
+                plan.esp.table_index,
+                guid.esp,
+                guid.parse("33333333-3333-3333-3333-333333333333"),
+                plan.esp.firstLba(),
+                plan.esp.lastLba(),
+                plan.esp.name,
+            ),
+            arm64PartitionFixture(
+                plan.root.table_index,
+                profile.root_partition_type_guid,
+                guid.parse("11111111-1111-1111-1111-111111111111"),
+                plan.root.firstLba(),
+                plan.root.lastLba(),
+                plan.root.name,
+            ),
+        };
+        var array: [
+            miz.gpt.default_num_partition_entries *
+                miz.gpt.partition_entry_size
+        ]u8 = @splat(0);
+        const verified = arm64VerifiedFixture(
+            &partitions,
+            &array,
+            plan.virtual_size,
+        );
+        const esp = try validateCoreFinalLayout(
+            verified,
+            plan.virtual_size,
+            profile,
+            plan,
+        );
+        try std.testing.expectEqual(plan.esp.firstLba(), esp.first_lba);
+        try std.testing.expectEqual(
+            plan.esp.length_bytes,
+            (esp.last_lba - esp.first_lba + 1) * miz.gpt.sector_size,
+        );
+
+        // The check is a check: a root one sector away from its planned start
+        // is a disk the signed command line's PARTUUID no longer describes.
+        var drifted = partitions;
+        drifted[1].first_lba += 1;
+        const drifted_gpt = arm64VerifiedFixture(
+            &drifted,
+            &array,
+            plan.virtual_size,
+        );
+        try std.testing.expectError(
+            error.UnexpectedCoreRootGeometry,
+            validateCoreFinalLayout(
+                drifted_gpt,
+                plan.virtual_size,
+                profile,
+                plan,
+            ),
+        );
+
+        // And a disk carrying the substrate's third partition is not this plan.
+        var extra = [_]miz.gpt.PartitionEntry{
+            partitions[0],
+            partitions[1],
+            arm64PartitionFixture(
+                2,
+                guid.linux_xbootldr,
+                guid.parse("44444444-4444-4444-4444-444444444444"),
+                plan.root.lastLba() + 1,
+                plan.root.lastLba() + 2,
+                "",
+            ),
+        };
+        const extra_gpt = arm64VerifiedFixture(&extra, &array, plan.virtual_size);
+        try std.testing.expectError(
+            error.UnexpectedCorePartitionTable,
+            validateCoreFinalLayout(extra_gpt, plan.virtual_size, profile, plan),
+        );
+    }
 }
 
 test "Arm64 FAT rebuild preserves volume ID and leaves only signed fallback" {
