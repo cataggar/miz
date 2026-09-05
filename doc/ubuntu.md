@@ -500,15 +500,39 @@ the verdict from the observations, and recomputes the status from whether a
 reviewed budget exists at all. A candidate carrying a hand-written
 `"result": "pass"` is refused by an unmodified release tool.
 
-### Architectures without a measurement
+### One measurement per architecture
 
-x86_64 core is budgeted from a real x86_64 core build. **AArch64 core has no
-production measurement of the minimized closure**, and its kernel, module tree
-and UKI are not x86_64's, so borrowing x86_64's numbers would state a
-measurement nobody took. Instead `budgetFor` returns nothing for it, and its
-builds evaluate as `candidate_baseline`: every metric is recorded, in the same
-document, with `baseline` and `limit` as `null`, for a reviewer to transcribe
-into the table.
+Both published core architectures are budgeted, each from its own production
+build. The two tables bound the same metrics in the same order so a reviewer
+diffs numbers rather than structure, but they share no measured quantity:
+
+| measure | x86_64 | AArch64 |
+| --- | ---: | ---: |
+| packages | 100 | 100 |
+| installed bytes | 312455680 | 367523299 |
+| kernel bytes | 17403904 | 22024192 |
+| initramfs bytes | 40538112 | 58855424 |
+| module tree bytes | 155000832 | 170225664 |
+| signed UKI bytes | 58015648 | 130871200 |
+| calculated virtual size | 611319808 (583 MiB) | 818937856 (781 MiB) |
+| published artifact bytes | 294322176 (281 MiB) | 352911360 (336 MiB) |
+
+Every baseline in `size_budget.zig` is transcribed from one production core
+validation run: run
+[33956340723](https://github.com/cataggar/miz/actions/runs/33956340723) of
+`ubuntu2604-core-validation.yml` at source commit
+`590548fe813d45fae45e5d395026b8f448aee4ef`, x86_64 from job `101280282367` and
+AArch64 from job `101280282314`. The bounds that do coincide are the ones that
+are the same by construction -- zero forbidden content, zero unowned remainder,
+the reserves the disk plan derives from the same declared first-boot growth, and
+architecture-independent data files inside architecture-independent packages --
+and a test refuses any other coincidence.
+
+An architecture or flavor with no production measurement still has no budget.
+`budgetFor` returns nothing, and its builds evaluate as `candidate_baseline`:
+every metric is recorded, in the same document, with `baseline` and `limit` as
+`null`, for a reviewer to transcribe into the table. `baremetal` is in that
+state today.
 
 The two workflows therefore differ on purpose:
 
@@ -520,10 +544,8 @@ The two workflows therefore differ on purpose:
   or published. A candidate whose architecture has only a recorded baseline
   cannot be released.
 
-Until an AArch64 core build is measured and its numbers reviewed into
-`size_budget.zig`, `aarch64-core` is not publishable. That is the intended
-behavior: it is the difference between "not measured yet" and "measured and
-accepted".
+That is the intended behavior: it is the difference between "not measured yet"
+and "measured and accepted".
 
 ### Failures are attributable
 
@@ -532,8 +554,8 @@ failure line names the metric, the phase it came from, the observation, the
 bound it broke, the measurement the bound was derived from, and the delta:
 
 ```
-x86_64 core modules_bytes (root_build): observed 302178304 bytes exceeds the
-limit of 158646272 by 143532032 (measured baseline 151089152)
+x86_64 core modules_bytes (root_build): observed 310001664 bytes exceeds the
+limit of 162754560 by 147247104 (measured baseline 155000832)
 ```
 
 Given `--baseline`, a failing run additionally reports the per-package deltas
