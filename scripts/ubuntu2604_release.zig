@@ -59,6 +59,7 @@ const usage_text =
     \\  disk-geometry-verify          check a calculated core disk-geometry report
     \\  runtime-contract-verify       check a published runtime-contract document
     \\  runtime-contract-probe-verify check a guest runtime-contract probe report
+    \\  runtime-contract-requirement  check named requirements in a probe report
     \\  candidate-signing-env         export the candidate signing bindings
     \\  resolve-artifacts             select exact successful workflow artifacts
     \\  release-gate                  check the exact four-candidate release gate

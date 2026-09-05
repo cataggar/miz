@@ -472,13 +472,14 @@ Enforcement happens at three stages:
   `ubuntu-minimal` back fails the build that made it, naming the requirement or
   the returned package.
 - **QEMU and Azure acceptance.** A static probe
-  (`tests/ubuntu2604_runtime_contract_probe.zig`), cross-built for the guest
-  architecture and uploaded over the established SSH session, evaluates the
+  (`tests/ubuntu2604_runtime_contract_probe.zig`), cross-built for both guest
+  architectures and uploaded over the established SSH session, evaluates the
   whole contract with syscalls alone: `statx`, `faccessat`, `readlink`,
   `/proc/mounts`, `/proc/1/exe`, the `SecureBoot` efivar, the lockdown mode, and
   `/sys/module/<name>/taint`. It replaces the guest-side `findmnt`, `od`,
-  `grep`, `mountpoint`, and `cat` invocations acceptance used to depend on, and
-  it also reports `statfs` accounting for the `first_boot` size-inventory phase.
+  `grep`, `mountpoint`, `mount`, and `cat` invocations acceptance used to depend
+  on, and it also reports `statfs` accounting for the `first_boot`
+  size-inventory phase.
   The report is judged on the host, where a requirement that is not `ok`, a
   requirement the probe never reported, and an unparseable line are all
   refusals; a partial report never reads as agreement.
@@ -490,6 +491,51 @@ Enforcement happens at three stages:
 $ ubuntu2604_release runtime-contract-probe-verify \
     --report runtime-contract-report.txt
 ```
+
+### UEFI trust evidence without `mount(8)`
+
+Secure Boot, the UEFI signature database, and kernel lockdown live behind
+`efivarfs` and `securityfs`, which a minimal appliance has no reason to keep
+mounted. Acceptance used to expose them with `mount -t efivarfs ...` in the
+guest, which made `/usr/bin/mount` -- util-linux -- something the image had to
+carry so a test could pass. The minimized core closure does not install
+util-linux at all, and issue #677 step 6 is explicit that an acceptance command
+is not a runtime requirement.
+
+The same static probe answers those questions instead. `efivar` mounts
+`efivarfs` with `mount(2)` only when nothing already has it at
+`/sys/firmware/efi/efivars`, and then on its own deterministic mount point
+(`/run/miz-efivars`) rather than the conventional one, so the guest's view of
+`/sys` is exactly as the probe found it and the probe can only ever unmount what
+it mounted. It confirms the filesystem type from `/proc/mounts` rather than from
+the `mount(2)` return code, and prints one line per requested variable carrying
+the four UEFI attribute bytes and the data as hex:
+
+```console
+$ ubuntu2604-runtime-contract-probe efivar db-d719b2cb-3d3a-4596-a3bc-dad00e67656f
+efivar name=db-... status=ok mount=probe mount_point=/run/miz-efivars \
+  filesystem=efivarfs attributes=0x00000027 bytes=6533 data=a159c0a5...
+```
+
+`requirement <id>...` reports named contract requirements in the ordinary
+`runtime-contract` line format, which is how `secure-boot` and `kernel-lockdown`
+are checked on full and bare-metal candidates that have no core contract to
+evaluate. Both harnesses judge the result on the host:
+
+```console
+$ ubuntu2604_release azure-uefi-db \
+    --report uefi-variables.txt \
+    --certificate-sha256 "$certificate_sha256"
+$ ubuntu2604_release runtime-contract-requirement \
+    --report uefi-variables.txt --id secure-boot,kernel-lockdown
+```
+
+Nothing is skipped or weakened by the move. `db` must have been read through a
+real `efivarfs`, must carry
+`NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS | TIME_BASED_AUTHENTICATED_WRITE_ACCESS`
+-- a signature database anyone could rewrite is not a trust anchor -- and must
+contain the exact DER release signing certificate. `SecureBoot` must read `1`,
+and lockdown must be `integrity` or `confidentiality`.
 
 A contract change is therefore a reviewable change: it moves the contract
 digest, the published document, and the acceptance verdict together.

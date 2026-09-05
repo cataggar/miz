@@ -242,6 +242,18 @@ pub fn dispatch(
             diagnostic,
         );
     }
+    if (std.mem.eql(u8, command, "runtime-contract-requirement")) {
+        var options = try parse(allocator, argv, &.{ "--report", "--id" });
+        defer options.deinit();
+        return runtimeContractRequirement(
+            allocator,
+            io,
+            out,
+            try options.require("--report"),
+            try options.require("--id"),
+            diagnostic,
+        );
+    }
     if (std.mem.eql(u8, command, "candidate-signing-env")) {
         var options = try parse(allocator, argv, &.{
             "--manifest",
@@ -605,14 +617,14 @@ pub fn dispatch(
     }
     if (std.mem.eql(u8, command, "azure-uefi-db")) {
         var options = try parse(allocator, argv, &.{
-            "--db",
+            "--report",
             "--certificate-sha256",
         });
         defer options.deinit();
         return uefiDb(
             allocator,
             io,
-            try options.require("--db"),
+            try options.require("--report"),
             try options.require("--certificate-sha256"),
             diagnostic,
         );
@@ -1230,6 +1242,61 @@ pub fn runtimeContractProbeVerify(
     runtime_contract_document.verifyProbeReport(text, diagnostic) catch |err|
         return contractFailure(err);
     try out.print("runtime-contract satisfied\n", .{});
+}
+
+/// `runtime-contract-requirement`: judges one named requirement out of a
+/// partial probe report.
+///
+/// The full report is the core appliance's whole contract. Secure Boot and
+/// kernel lockdown are platform facts every flavor is held to, and acceptance
+/// asks the probe for those by name rather than mounting securityfs with a
+/// `mount(8)` the image would then have to keep. `--id` takes a
+/// comma-separated list, and every one of them must be present and `ok`: a
+/// requirement the report never mentioned is a refusal, not a pass.
+pub fn runtimeContractRequirement(
+    allocator: Allocator,
+    io: Io,
+    out: *Writer,
+    report_path: []const u8,
+    ids: []const u8,
+    diagnostic: *Diagnostic,
+) OutError!void {
+    const text = support.file_support.readBounded(
+        allocator,
+        io,
+        report_path,
+        runtime_contract_document.document_max_bytes,
+    ) catch |err| return fail(
+        diagnostic,
+        "cannot read runtime contract probe report {s}: {s}",
+        .{ report_path, @errorName(err) },
+    );
+    defer allocator.free(text);
+
+    var names = std.mem.splitScalar(u8, ids, ',');
+    var checked: usize = 0;
+    while (names.next()) |raw| {
+        const id = std.mem.trim(u8, raw, " \t");
+        if (id.len == 0) continue;
+        if (runtime_contract.lookup(id) == null) return fail(
+            diagnostic,
+            "{s} is not a runtime contract requirement",
+            .{id},
+        );
+        const status = runtime_contract.statusOf(text, id) orelse return fail(
+            diagnostic,
+            "the probe report never mentions {s}",
+            .{id},
+        );
+        if (status != .ok) return fail(
+            diagnostic,
+            "runtime contract requirement {s} is {s}",
+            .{ id, status.key() },
+        );
+        checked += 1;
+    }
+    if (checked == 0) return fail(diagnostic, "no requirement was named", .{});
+    try out.print("runtime-contract requirements satisfied\n", .{});
 }
 
 /// `size-inventory-compare`: the benchmark comparison #677 asks for before the
@@ -3168,7 +3235,7 @@ pub fn uefiDb(
     certificate_sha256: []const u8,
     diagnostic: *Diagnostic,
 ) Error!void {
-    const data = support.file_support.readBounded(
+    const text = support.file_support.readBounded(
         allocator,
         io,
         path,
@@ -3181,10 +3248,50 @@ pub fn uefiDb(
             .{ path, @errorName(err) },
         ),
     };
-    defer allocator.free(data);
+    defer allocator.free(text);
 
-    // The first four bytes are the variable's attributes, not signature data.
-    var offset: usize = 4;
+    // The report comes from the static guest probe rather than from a
+    // `mount -t efivarfs` plus `cat`: `mount` is util-linux, and issue #677
+    // forbids the image keeping a package because acceptance used it.
+    const line = (runtime_contract.efivarLine(
+        text,
+        runtime_contract.signature_database_variable,
+    ) catch return fail(
+        diagnostic,
+        "{s}: the UEFI variable report is unparseable",
+        .{path},
+    )) orelse return fail(
+        diagnostic,
+        "{s}: the UEFI variable report never mentions {s}",
+        .{ path, runtime_contract.signature_database_variable },
+    );
+    if (line.status != .ok) return fail(
+        diagnostic,
+        "{s}: UEFI db is {s}",
+        .{ path, line.status.key() },
+    );
+    if (!std.mem.eql(u8, line.filesystem, runtime_contract.efivars_filesystem)) return fail(
+        diagnostic,
+        "{s}: UEFI db was read through {s}, not {s}",
+        .{ path, line.filesystem, runtime_contract.efivars_filesystem },
+    );
+    // A `db` without time-based authenticated write access is a signature
+    // database anyone could rewrite, which is not a trust anchor.
+    if (!line.hasAttributes(runtime_contract.signature_database_attributes)) return fail(
+        diagnostic,
+        "{s}: UEFI db attributes are 0x{x:0>8}",
+        .{ path, line.attributes },
+    );
+
+    const data = try allocator.alloc(u8, line.data_hex.len / 2);
+    defer allocator.free(data);
+    _ = line.decode(data) catch return fail(
+        diagnostic,
+        "{s}: UEFI db data is not a byte string",
+        .{path},
+    );
+
+    var offset: usize = 0;
     var found = false;
     while (offset < data.len) {
         if (data.len - offset < 28) return fail(

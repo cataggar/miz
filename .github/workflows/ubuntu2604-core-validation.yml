@@ -953,7 +953,7 @@ jobs:
           path: |
             ${{ env.RESULT_DIR }}/*.json
             ${{ env.RESULT_DIR }}/boot.log
-            ${{ env.RESULT_DIR }}/uefi-db.bin
+            ${{ env.RESULT_DIR }}/uefi-variables.txt
           if-no-files-found: warn
           retention-days: 2
 

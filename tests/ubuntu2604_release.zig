@@ -2099,8 +2099,19 @@ test "the full Azure service contract matches Ubuntu 26.04" {
     try script.expectContains("Name=org.freedesktop.UDisks2");
     try script.expectContains("SystemdService=udisks2.service");
     try script.expectContains("udisks2-graphical-eager-start-absent");
+    // Issue #677 step 6: the UEFI signature database is read by the static
+    // contract probe, never by a `mount(8)` the image would have to keep.
+    try script.expectOmits("mount -t efivarfs");
+    try script.expectOmits("mount -t securityfs");
     try script.expectContains(
-        "mount -t efivarfs efivarfs /sys/firmware/efi/efivars",
+        "efivar db-d719b2cb-3d3a-4596-a3bc-dad00e67656f " ++
+            "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+    );
+    try script.expectContains("requirement secure-boot kernel-lockdown");
+    try script.expectContains("azure-uefi-db \\\n  --report \"$uefi_report\"");
+    try script.expectContains(
+        "runtime-contract-requirement \\\n  --report \"$uefi_report\" \\\n" ++
+            "  --id secure-boot,kernel-lockdown",
     );
     try script.expectContains("failed_units=$(systemctl --failed --no-legend --plain)");
     try script.expectContains("check no-failed-units test -z");

@@ -27,10 +27,11 @@
 //! into the static guest probe (`tests/ubuntu2604_runtime_contract_probe.zig`)
 //! that evaluates them inside a running guest over SSH. The probe replaces the
 //! shell utilities acceptance used to reach for -- `findmnt`, `od`, `grep`,
-//! `mountpoint`, `modprobe` -- so package minimization is never pressured into
-//! keeping a binary that only a test needed. The JSON document, the provenance
-//! binding, and the built-root gate live in `runtime_contract_document.zig`,
-//! which is host-only and may depend on the release tooling.
+//! `mountpoint`, `modprobe`, and `mount` -- so package minimization is never
+//! pressured into keeping a binary that only a test needed. The JSON document,
+//! the provenance binding, and the built-root gate live in
+//! `runtime_contract_document.zig`, which is host-only and may depend on the
+//! release tooling.
 
 const std = @import("std");
 
@@ -1197,6 +1198,230 @@ fn countField(text: []const u8, name: []const u8) error{Unparseable}!u64 {
     return std.fmt.parseInt(u64, value, 10) catch error.Unparseable;
 }
 
+// ---------------------------------------------------------------------------
+// UEFI variable reporting.
+//
+// Acceptance has to answer two questions no built root can answer: does the
+// firmware report Secure Boot enabled, and does the UEFI signature database
+// actually carry the release signing certificate. Both live in efivarfs, which
+// a minimal appliance has no reason to keep mounted, and the shell version of
+// the check reached for `mount(8)` to expose them -- a util-linux binary the
+// #677 closure does not install and must not be made to install for a test.
+//
+// The probe mounts efivarfs itself, reports each requested variable's
+// attributes and bytes, and unmounts only what it mounted. The wire format and
+// its parser live here so the guest probe and the host harness share one
+// definition.
+// ---------------------------------------------------------------------------
+
+pub const efivar_prefix = "efivar";
+
+/// Where efivarfs conventionally lives, and where the probe reads it from when
+/// something already mounted it there.
+pub const efivars_mount_point = "/sys/firmware/efi/efivars";
+
+/// The probe's own mount point, used only when `efivars_mount_point` is not
+/// already carrying efivarfs. It is deterministic so a probe run interrupted
+/// between mount and unmount leaves one findable directory rather than a
+/// scatter of temporary ones, and it is under `/run` so it never touches the
+/// firmware's conventional location in a way another reader could observe as
+/// permanent.
+pub const efivars_private_mount_point = "/run/miz-efivars";
+
+pub const efivars_filesystem = "efivarfs";
+
+/// `EFI_GLOBAL_VARIABLE` and `EFI_IMAGE_SECURITY_DATABASE_GUID`, both fixed by
+/// the UEFI specification, so the exact efivarfs file names are known without
+/// listing a directory.
+pub const efi_global_variable_guid = "8be4df61-93ca-11d2-aa0d-00e098032b8c";
+pub const efi_image_security_database_guid = "d719b2cb-3d3a-4596-a3bc-dad00e67656f";
+
+pub const secure_boot_variable = "SecureBoot-" ++ efi_global_variable_guid;
+pub const signature_database_variable = "db-" ++ efi_image_security_database_guid;
+
+pub const efi_variable_non_volatile: u32 = 0x0000_0001;
+pub const efi_variable_bootservice_access: u32 = 0x0000_0002;
+pub const efi_variable_runtime_access: u32 = 0x0000_0004;
+pub const efi_variable_time_based_authenticated_write_access: u32 = 0x0000_0020;
+
+/// The attributes UEFI mandates for `db`, and the ones miz's own variable
+/// store writes when it enrolls the release leaf. `db` without
+/// `TIME_BASED_AUTHENTICATED_WRITE_ACCESS` would be a signature database
+/// anyone could rewrite, so its presence is part of the assertion, not
+/// decoration; without `RUNTIME_ACCESS` the running kernel could not see it
+/// at all.
+pub const signature_database_attributes: u32 =
+    efi_variable_non_volatile |
+    efi_variable_bootservice_access |
+    efi_variable_runtime_access |
+    efi_variable_time_based_authenticated_write_access;
+
+/// Why a variable could not be reported. `ok` is the only status that carries
+/// attributes and data.
+pub const EfivarStatus = enum {
+    ok,
+    /// efivarfs is neither already mounted nor mountable, so the firmware's
+    /// variables are simply not reachable.
+    not_mounted,
+    /// Something is mounted where efivarfs should be, but it is not efivarfs.
+    wrong_filesystem,
+    /// `mount(2)` was refused for lack of privilege, which is a harness
+    /// mistake (the probe must run as root) rather than a firmware verdict.
+    permission_denied,
+    /// efivarfs is mounted and the variable is not in it.
+    missing,
+    /// The variable exists but could not be read.
+    unreadable,
+    /// The variable was read and is shorter than the four attribute bytes
+    /// every efivarfs variable begins with.
+    malformed,
+
+    pub fn key(self: EfivarStatus) []const u8 {
+        return switch (self) {
+            .ok => "ok",
+            .not_mounted => "not-mounted",
+            .wrong_filesystem => "wrong-filesystem",
+            .permission_denied => "permission-denied",
+            .missing => "missing",
+            .unreadable => "unreadable",
+            .malformed => "malformed",
+        };
+    }
+
+    pub fn parse(text: []const u8) ?EfivarStatus {
+        inline for (@typeInfo(EfivarStatus).@"enum".fields) |info| {
+            const candidate: EfivarStatus = @enumFromInt(info.value);
+            if (std.mem.eql(u8, text, candidate.key())) return candidate;
+        }
+        return null;
+    }
+};
+
+/// Whether the probe found efivarfs already mounted or had to mount it, which
+/// is reported so an operator can tell a firmware fact from a probe action.
+pub const EfivarMount = enum {
+    /// efivarfs was already mounted at `efivars_mount_point`.
+    existing,
+    /// The probe mounted efivarfs itself and unmounted it again.
+    probe,
+    /// No mount was established, so no variable could be read.
+    none,
+
+    pub fn key(self: EfivarMount) []const u8 {
+        return @tagName(self);
+    }
+
+    pub fn parse(text: []const u8) ?EfivarMount {
+        return std.meta.stringToEnum(EfivarMount, text);
+    }
+};
+
+pub const EfivarLine = struct {
+    name: []const u8,
+    status: EfivarStatus,
+    mount: EfivarMount,
+    /// The mount point the variable was read through, empty when none was.
+    mount_point: []const u8 = "",
+    /// The filesystem type actually found there, empty when none was.
+    filesystem: []const u8 = "",
+    /// The variable's four leading attribute bytes, present only when `ok`.
+    attributes: u32 = 0,
+    /// Lowercase hex of the variable's data with the attribute bytes removed,
+    /// present only when `ok`.
+    data_hex: []const u8 = "",
+
+    /// Whether every attribute in `required` is set.
+    pub fn hasAttributes(self: EfivarLine, required: u32) bool {
+        return self.attributes & required == required;
+    }
+
+    /// Decodes `data_hex` into `out`, which must be at least half its length.
+    pub fn decode(self: EfivarLine, out: []u8) error{Unparseable}![]const u8 {
+        return decodeHex(self.data_hex, out);
+    }
+};
+
+/// Decodes lowercase or uppercase hex into `out`.
+///
+/// Hex rather than base64 because the probe must produce it with no allocator
+/// and no libc, and the harness must reject anything that is not exactly a
+/// byte string.
+pub fn decodeHex(hex: []const u8, out: []u8) error{Unparseable}![]const u8 {
+    if (hex.len % 2 != 0) return error.Unparseable;
+    const decoded = hex.len / 2;
+    if (decoded > out.len) return error.Unparseable;
+    var index: usize = 0;
+    while (index < decoded) : (index += 1) {
+        const high = hexDigit(hex[index * 2]) orelse return error.Unparseable;
+        const low = hexDigit(hex[index * 2 + 1]) orelse return error.Unparseable;
+        out[index] = (high << 4) | low;
+    }
+    return out[0..decoded];
+}
+
+fn hexDigit(byte: u8) ?u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
+        else => null,
+    };
+}
+
+/// Parses one `efivar name=<name> status=<status> ...` line.
+///
+/// Allocation-free and total, so a truncated report, a firmware refusal, and a
+/// garbled variable are all unit-testable without a guest.
+pub fn parseEfivarLine(line: []const u8) error{Unparseable}!EfivarLine {
+    if (!std.mem.startsWith(u8, line, efivar_prefix ++ " ")) return error.Unparseable;
+    const rest = line[efivar_prefix.len + 1 ..];
+    const name = try namedField(rest, "name=") orelse return error.Unparseable;
+    if (name.len == 0) return error.Unparseable;
+    const status_text = try namedField(rest, "status=") orelse return error.Unparseable;
+    const status = EfivarStatus.parse(status_text) orelse return error.Unparseable;
+    const mount_text = try namedField(rest, "mount=") orelse return error.Unparseable;
+    const mount = EfivarMount.parse(mount_text) orelse return error.Unparseable;
+    var parsed: EfivarLine = .{ .name = name, .status = status, .mount = mount };
+    parsed.mount_point = try namedField(rest, "mount_point=") orelse "";
+    parsed.filesystem = try namedField(rest, "filesystem=") orelse "";
+    if (status != .ok) return parsed;
+    // Only an `ok` line promises attributes and data, and both are then
+    // mandatory: a status that claims success while omitting the evidence must
+    // never read as agreement.
+    const attributes_text = try namedField(rest, "attributes=") orelse
+        return error.Unparseable;
+    if (!std.mem.startsWith(u8, attributes_text, "0x")) return error.Unparseable;
+    parsed.attributes = std.fmt.parseInt(u32, attributes_text[2..], 16) catch
+        return error.Unparseable;
+    const bytes = try countField(rest, "bytes=");
+    const data = try namedField(rest, "data=") orelse return error.Unparseable;
+    if (data.len % 2 != 0) return error.Unparseable;
+    if (data.len / 2 != bytes) return error.Unparseable;
+    for (data) |byte| if (hexDigit(byte) == null) return error.Unparseable;
+    parsed.data_hex = data;
+    return parsed;
+}
+
+/// The line a report carries for `name`, or null when it never mentioned it.
+///
+/// An `efivar` line that does not parse fails the whole lookup rather than
+/// being skipped: a garbled report must never be indistinguishable from one
+/// that simply did not mention the variable.
+pub fn efivarLine(output: []const u8, name: []const u8) error{Unparseable}!?EfivarLine {
+    var lines = std.mem.splitScalar(u8, output, '\n');
+    var found: ?EfivarLine = null;
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0) continue;
+        if (!std.mem.startsWith(u8, line, efivar_prefix ++ " ")) continue;
+        const parsed = try parseEfivarLine(line);
+        if (!std.mem.eql(u8, parsed.name, name)) continue;
+        if (found != null) return error.Unparseable;
+        found = parsed;
+    }
+    return found;
+}
+
 /// Why a probe report was refused, with enough detail for one operator-facing
 /// line naming the offending requirement.
 pub const Reason = enum {
@@ -1718,4 +1943,220 @@ test "canonical serialization is one stable line per requirement" {
     // The forbidden set is not derivable from the requirements, so the digest
     // has to carry it or a quietly relaxed exclusion would go unnoticed.
     try std.testing.expectEqual(forbidden_packages.len, forbidden_lines);
+}
+
+// ---------------------------------------------------------------------------
+// UEFI variable report tests. Every one of these runs on the host with no
+// guest, which is the point: the shell version of this check could only ever
+// be exercised by booting a VM.
+// ---------------------------------------------------------------------------
+
+/// Builds one `efivar ... status=ok` line for `data`, the way the guest probe
+/// prints it, so the parser is tested against the exact producer shape.
+fn okEfivarLineAlloc(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    mount: EfivarMount,
+    mount_point: []const u8,
+    attributes: u32,
+    data: []const u8,
+) ![]u8 {
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer buffer.deinit();
+    try buffer.writer.print(
+        "{s} name={s} status=ok mount={s} mount_point={s} filesystem={s} " ++
+            "attributes=0x{x:0>8} bytes={d} data=",
+        .{
+            efivar_prefix,
+            name,
+            mount.key(),
+            mount_point,
+            efivars_filesystem,
+            attributes,
+            data.len,
+        },
+    );
+    for (data) |byte| try buffer.writer.print("{x:0>2}", .{byte});
+    return buffer.toOwnedSlice();
+}
+
+test "an ok efivar line round-trips through the parser" {
+    const allocator = std.testing.allocator;
+    const payload = [_]u8{ 0x01, 0xff, 0x00, 0xa5 };
+    const line = try okEfivarLineAlloc(
+        allocator,
+        signature_database_variable,
+        .existing,
+        efivars_mount_point,
+        signature_database_attributes,
+        &payload,
+    );
+    defer allocator.free(line);
+
+    const parsed = try parseEfivarLine(line);
+    try std.testing.expectEqualStrings(signature_database_variable, parsed.name);
+    try std.testing.expectEqual(EfivarStatus.ok, parsed.status);
+    try std.testing.expectEqual(EfivarMount.existing, parsed.mount);
+    try std.testing.expectEqualStrings(efivars_mount_point, parsed.mount_point);
+    try std.testing.expectEqualStrings(efivars_filesystem, parsed.filesystem);
+    try std.testing.expectEqual(signature_database_attributes, parsed.attributes);
+    try std.testing.expect(parsed.hasAttributes(efi_variable_runtime_access));
+    try std.testing.expect(parsed.hasAttributes(
+        efi_variable_time_based_authenticated_write_access,
+    ));
+    try std.testing.expect(!parsed.hasAttributes(0x0000_0100));
+
+    var decoded: [8]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &payload, try parsed.decode(&decoded));
+}
+
+test "a probe-established mount is reported as such" {
+    const allocator = std.testing.allocator;
+    const line = try okEfivarLineAlloc(
+        allocator,
+        secure_boot_variable,
+        .probe,
+        efivars_private_mount_point,
+        efi_variable_bootservice_access | efi_variable_runtime_access,
+        &[_]u8{1},
+    );
+    defer allocator.free(line);
+    const parsed = try parseEfivarLine(line);
+    try std.testing.expectEqual(EfivarMount.probe, parsed.mount);
+    try std.testing.expectEqualStrings(efivars_private_mount_point, parsed.mount_point);
+    var decoded: [1]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &[_]u8{1}, try parsed.decode(&decoded));
+}
+
+test "failed efivar lines parse without pretending to carry data" {
+    const failures = [_]struct { text: []const u8, status: EfivarStatus }{
+        .{ .text = "status=not-mounted mount=none", .status = .not_mounted },
+        .{ .text = "status=wrong-filesystem mount=none filesystem=sysfs", .status = .wrong_filesystem },
+        .{ .text = "status=permission-denied mount=none", .status = .permission_denied },
+        .{ .text = "status=missing mount=existing", .status = .missing },
+        .{ .text = "status=unreadable mount=existing", .status = .unreadable },
+        .{ .text = "status=malformed mount=probe", .status = .malformed },
+    };
+    var buffer: [256]u8 = undefined;
+    for (failures) |failure| {
+        const line = try std.fmt.bufPrint(
+            &buffer,
+            "{s} name={s} {s}",
+            .{ efivar_prefix, signature_database_variable, failure.text },
+        );
+        const parsed = try parseEfivarLine(line);
+        try std.testing.expectEqual(failure.status, parsed.status);
+        try std.testing.expectEqual(@as(u32, 0), parsed.attributes);
+        try std.testing.expectEqual(@as(usize, 0), parsed.data_hex.len);
+    }
+}
+
+test "malformed efivar lines are refused rather than silently downgraded" {
+    const prefix = efivar_prefix ++ " name=db status=ok mount=existing ";
+    const rejected = [_][]const u8{
+        // Not an efivar line at all.
+        "garbage",
+        "runtime-contract id=secure-boot status=ok",
+        // Missing mandatory fields.
+        efivar_prefix ++ " status=ok mount=existing",
+        efivar_prefix ++ " name=db mount=existing",
+        efivar_prefix ++ " name=db status=ok",
+        efivar_prefix ++ " name= status=ok mount=existing",
+        // Unknown vocabulary.
+        efivar_prefix ++ " name=db status=fine mount=existing",
+        efivar_prefix ++ " name=db status=ok mount=invented",
+        // `ok` without the evidence `ok` promises.
+        efivar_prefix ++ " name=db status=ok mount=existing bytes=1 data=00",
+        prefix ++ "attributes=0x00000027 data=00",
+        prefix ++ "attributes=0x00000027 bytes=1",
+        // Attributes that are not hex, or not prefixed.
+        prefix ++ "attributes=39 bytes=1 data=00",
+        prefix ++ "attributes=0xzz bytes=1 data=00",
+        // Data that is not a byte string, or disagrees with the length.
+        prefix ++ "attributes=0x00000027 bytes=1 data=0",
+        prefix ++ "attributes=0x00000027 bytes=1 data=zz",
+        prefix ++ "attributes=0x00000027 bytes=2 data=00",
+    };
+    for (rejected) |line| {
+        try std.testing.expectError(error.Unparseable, parseEfivarLine(line));
+    }
+}
+
+test "efivar lookup finds one variable and refuses a garbled or duplicated report" {
+    const allocator = std.testing.allocator;
+    const secure_boot = try okEfivarLineAlloc(
+        allocator,
+        secure_boot_variable,
+        .existing,
+        efivars_mount_point,
+        signature_database_attributes,
+        &[_]u8{1},
+    );
+    defer allocator.free(secure_boot);
+    const database = try okEfivarLineAlloc(
+        allocator,
+        signature_database_variable,
+        .existing,
+        efivars_mount_point,
+        signature_database_attributes,
+        &[_]u8{ 0xde, 0xad },
+    );
+    defer allocator.free(database);
+
+    const report = try std.mem.join(allocator, "\n", &.{ secure_boot, database, "" });
+    defer allocator.free(report);
+
+    const found = (try efivarLine(report, signature_database_variable)).?;
+    try std.testing.expectEqual(EfivarStatus.ok, found.status);
+    var decoded: [2]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xde, 0xad }, try found.decode(&decoded));
+    try std.testing.expect((try efivarLine(report, "Absent-0000")) == null);
+
+    const garbled = try std.mem.join(
+        allocator,
+        "\n",
+        &.{ secure_boot, efivar_prefix ++ " name=db status=ok", "" },
+    );
+    defer allocator.free(garbled);
+    try std.testing.expectError(
+        error.Unparseable,
+        efivarLine(garbled, secure_boot_variable),
+    );
+
+    const duplicated = try std.mem.join(allocator, "\n", &.{ database, database, "" });
+    defer allocator.free(duplicated);
+    try std.testing.expectError(
+        error.Unparseable,
+        efivarLine(duplicated, signature_database_variable),
+    );
+}
+
+test "hex decoding accepts both cases and rejects everything else" {
+    var out: [4]u8 = undefined;
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xab, 0xcd }, try decodeHex("abcd", &out));
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0xab, 0xcd }, try decodeHex("ABCD", &out));
+    try std.testing.expectEqualSlices(u8, &.{}, try decodeHex("", &out));
+    try std.testing.expectError(error.Unparseable, decodeHex("abc", &out));
+    try std.testing.expectError(error.Unparseable, decodeHex("zz", &out));
+    var small: [1]u8 = undefined;
+    try std.testing.expectError(error.Unparseable, decodeHex("abcd", &small));
+}
+
+test "the UEFI names the probe reads are the specification's own" {
+    try std.testing.expectEqualStrings(
+        "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+        secure_boot_variable,
+    );
+    try std.testing.expectEqualStrings(
+        "db-d719b2cb-3d3a-4596-a3bc-dad00e67656f",
+        signature_database_variable,
+    );
+    try std.testing.expectEqual(@as(u32, 0x27), signature_database_attributes);
+    // The probe's own mount point must not be the conventional one, or
+    // "unmount what the probe mounted" would tear down somebody else's mount.
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        efivars_mount_point,
+        efivars_private_mount_point,
+    ));
 }
