@@ -16,6 +16,7 @@ const core_contract = @import("ubuntu2604_runtime_contract");
 const disk_geometry = @import("ubuntu2604/disk_geometry.zig");
 const runtime_contract_document = @import("ubuntu2604/runtime_contract_document.zig");
 const size_inventory = @import("ubuntu2604/size_inventory.zig");
+const size_budget = @import("ubuntu2604/size_budget.zig");
 const uki_kernel_payload = @import("ubuntu2604_kernel_payload.zig");
 const uki_signing = @import("uki_signing.zig");
 
@@ -4624,6 +4625,12 @@ fn customizeRootWithDebz(
             // fails the build that produced it rather than being reported and
             // forgotten.
             .require_allowlisted_unowned = flavor.freshRoot(),
+            // #677 step 6: the same fail-closed reading applied to content
+            // classes. A fresh root that acquired apt state, cloud-init,
+            // WALinuxAgent, a systemd service manager, the initramfs generator,
+            // or a kernel build tree fails here, naming the paths, rather than
+            // shipping and being argued about later.
+            .require_absent_content = flavor.freshRoot(),
         },
     );
     initramfs_import.succeed();
@@ -4748,6 +4755,13 @@ const test_runtime_contract_binding: InventoryBinding = .{
 const test_disk_geometry_binding: InventoryBinding = .{
     .filename = @constCast("ubuntu2604-disk-geometry-core-x86_64.json"),
     .sha256 = @splat('8'),
+};
+
+/// The same stand-in for the size-budget verdict every fresh root binds since
+/// #677 step 6.
+const test_size_budget_binding: InventoryBinding = .{
+    .filename = @constCast("ubuntu2604-size-budget-core-x86_64.json"),
+    .sha256 = @splat('9'),
 };
 
 /// A plausible calculated core geometry for the provenance tests: a size no
@@ -5015,6 +5029,7 @@ fn writeFreshRootProvenance(
     inventory: InventoryBinding,
     runtime_contract: ?InventoryBinding,
     disk_geometry_binding: ?InventoryBinding,
+    size_budget_binding: ?InventoryBinding,
 ) !void {
     const package_roots = plan.guest;
     // Only core publishes a runtime contract: the explicit allowlist is a
@@ -5029,6 +5044,10 @@ fn writeFreshRootProvenance(
         return error.InvalidDiskGeometryBinding;
     if (flavor.calculatesGeometry() != (minimum_root_free_bytes != null))
         return error.InvalidDiskGeometryBinding;
+    // #677 step 6: every fresh root is judged against the reviewed budget, so
+    // every fresh root publishes the verdict. A provenance without it would be
+    // a build nobody gated.
+    if (size_budget_binding == null) return error.InvalidSizeBudgetBinding;
     var runtime_contract_buffer: [192]u8 = undefined;
     const runtime_contract_field: []const u8 = if (runtime_contract) |binding|
         try std.fmt.bufPrint(
@@ -5038,6 +5057,12 @@ fn writeFreshRootProvenance(
         )
     else
         "";
+    var budget_buffer: [192]u8 = undefined;
+    const budget_field: []const u8 = try std.fmt.bufPrint(
+        &budget_buffer,
+        ",\"size_budget\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}",
+        .{ size_budget_binding.?.filename, size_budget_binding.?.sha256 },
+    );
     var geometry_buffer: [192]u8 = undefined;
     const geometry_field: []const u8 = if (disk_geometry_binding) |binding|
         try std.fmt.bufPrint(
@@ -5056,7 +5081,7 @@ fn writeFreshRootProvenance(
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.print(
-        "{{\"schema\":1,\"type\":\"miz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"{s}\",\"release\":\"26.04\",\"size_inventory\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}{s}{s},\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"disk_layout\":{s},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[",
+        "{{\"schema\":1,\"type\":\"miz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"{s}\",\"release\":\"26.04\",\"size_inventory\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}{s}{s}{s},\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"disk_layout\":{s},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[",
         .{
             @tagName(profile.architecture),
             @tagName(flavor),
@@ -5064,6 +5089,7 @@ fn writeFreshRootProvenance(
             inventory.sha256,
             runtime_contract_field,
             geometry_field,
+            budget_field,
             virtual_size,
             minimum_root_free_bytes orelse root_free_bytes,
             root_free_bytes,
@@ -6448,6 +6474,75 @@ fn requireCoreRootPartitionGuid(
 /// Writes the geometry report beside the other provenance documents and
 /// returns its binding, so the calculated layout is hashed into build
 /// provenance exactly like the size inventory and the runtime contract.
+/// Evaluates the reviewed size budget against the finished measurement and
+/// publishes the gate document beside it (issue #677 step 6).
+///
+/// This runs at build time, where the failure is cheapest and the attribution
+/// is best: a core build that exceeds a reviewed bound stops here, naming the
+/// metric, the observation, the bound, and the measurement the bound was
+/// derived from, instead of producing an artifact for a later job to reject.
+///
+/// An architecture with no reviewed budget still gets a document. It records
+/// every metric as a candidate baseline for review and the release gate refuses
+/// to publish it, which is the difference between "not measured yet" and
+/// "measured and accepted".
+fn writeSizeBudget(
+    allocator: Allocator,
+    io: Io,
+    provenance_dir: []const u8,
+    report: *size_inventory.Report,
+    profile: *const Profile,
+    flavor: Flavor,
+) !InventoryBinding {
+    const identity = inventoryIdentity(profile, flavor);
+    const filename = try std.fmt.allocPrint(
+        allocator,
+        "ubuntu2604-size-budget-{s}-{s}.json",
+        .{ @tagName(flavor), @tagName(profile.architecture) },
+    );
+    errdefer allocator.free(filename);
+    const path = try std.fs.path.join(allocator, &.{ provenance_dir, filename });
+    defer allocator.free(path);
+
+    var diagnostic: size_budget.Diagnostic = .{};
+    const measured = report.value() catch |err|
+        return reportInventoryFailure(err, &diagnostic);
+    var evaluation = size_budget.evaluate(allocator, measured, .{
+        .architecture = @tagName(identity.architecture),
+        .flavor = @tagName(identity.flavor),
+    }, &diagnostic) catch |err| return reportBudgetFailure(err, &diagnostic);
+    defer evaluation.deinit();
+
+    if (evaluation.failures != 0) {
+        var buffer: [8 * 1024]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        size_budget.writeFailures(&evaluation, &writer) catch {};
+        std.debug.print("size budget:\n{s}", .{writer.buffered()});
+        return error.SizeBudgetExceeded;
+    }
+    size_budget.write(allocator, io, path, &evaluation, &diagnostic) catch |err|
+        return reportBudgetFailure(err, &diagnostic);
+
+    const metadata = try artifact_pipeline.hashFile(io, path);
+    return .{
+        .filename = filename,
+        .sha256 = artifact_pipeline.formatSha256(metadata.sha256),
+    };
+}
+
+fn reportBudgetFailure(
+    err: size_budget.Error,
+    diagnostic: *const size_budget.Diagnostic,
+) anyerror {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Failed => {
+            std.debug.print("size budget: {s}\n", .{diagnostic.message()});
+            return error.SizeBudgetFailed;
+        },
+    };
+}
+
 fn writeDiskGeometry(
     allocator: Allocator,
     io: Io,
@@ -7028,6 +7123,22 @@ fn buildImage(
     else
         null;
     defer if (geometry_binding) |binding| allocator.free(binding.filename);
+    // #677 step 6: the measurement is now judged before it leaves the builder.
+    // A fresh root that broke a reviewed bound fails here, where the failure
+    // still knows which metric moved; an architecture with no reviewed budget
+    // publishes the baseline the release gate then refuses to publish on.
+    const budget_binding: ?InventoryBinding = if (args.flavor.freshRoot())
+        try writeSizeBudget(
+            allocator,
+            io,
+            provenance_dir,
+            &debz_customization.inventory,
+            profile,
+            args.flavor,
+        )
+    else
+        null;
+    defer if (budget_binding) |binding| allocator.free(binding.filename);
 
     try writeSigningProvenance(
         allocator,
@@ -7064,6 +7175,7 @@ fn buildImage(
             inventory_binding,
             runtime_contract_binding,
             geometry_binding,
+            budget_binding,
         );
     } else {
         try writeProvenance(
@@ -9984,6 +10096,7 @@ test "fresh-root provenance binds flavor closure size and free-space evidence" {
             test_inventory_binding,
             if (flavor == .core) test_runtime_contract_binding else null,
             if (flavor.calculatesGeometry()) test_disk_geometry_binding else null,
+            test_size_budget_binding,
         );
         const document = try Dir.cwd().readFileAlloc(
             std.testing.io,
@@ -10113,6 +10226,7 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
         test_inventory_binding,
         null,
         null,
+        test_size_budget_binding,
     ));
     // Right count, wrong package: the last transaction names something core
     // never installs, which a count-only check would have accepted.
@@ -10134,6 +10248,7 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
         test_inventory_binding,
         test_runtime_contract_binding,
         test_disk_geometry_binding,
+        test_size_budget_binding,
     ));
     evidence[initialized - 1].package = restore;
 
@@ -10175,6 +10290,7 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
         test_inventory_binding,
         test_runtime_contract_binding,
         test_disk_geometry_binding,
+        test_size_budget_binding,
     ));
 
     // The runtime contract belongs to core alone (issue #677 step 2). A core
@@ -10198,6 +10314,7 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
             test_inventory_binding,
             null,
             test_disk_geometry_binding,
+            test_size_budget_binding,
         ),
     );
     // The binding is checked before the evidence is, so a non-core flavor
@@ -10221,6 +10338,7 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
             test_inventory_binding,
             test_runtime_contract_binding,
             null,
+            test_size_budget_binding,
         ),
     );
 }

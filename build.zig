@@ -1361,6 +1361,33 @@ pub fn build(b: *std.Build) void {
     ubuntu2604_size_inventory_step.dependOn(&run_ubuntu2604_size_inventory.step);
     ubuntu2604_release_test_step.dependOn(&run_ubuntu2604_size_inventory.step);
 
+    // ---- tests/ubuntu2604_size_budget.zig: behavioral coverage of the hard
+    // size and content gates (issue #677 step 6). Its subject is the reviewed
+    // budget itself -- that it is pinned, that every bound follows from a
+    // measurement, that an unmeasured architecture records a baseline it cannot
+    // publish -- so it owns a step of its own beside the measurement tests. ----
+    const ubuntu2604_size_budget_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/ubuntu2604_size_budget.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{
+                    .name = "ubuntu2604_release",
+                    .module = ubuntu2604_release_mod,
+                },
+            },
+        }),
+    });
+    const run_ubuntu2604_size_budget =
+        b.addRunArtifact(ubuntu2604_size_budget_tests);
+    const ubuntu2604_size_budget_step = b.step(
+        "test-ubuntu2604-size-budget",
+        "Run the Ubuntu 26.04 size and content budget tests",
+    );
+    ubuntu2604_size_budget_step.dependOn(&run_ubuntu2604_size_budget.step);
+    ubuntu2604_release_test_step.dependOn(&run_ubuntu2604_size_budget.step);
+
     // ---- tests/ubuntu2604_disk_geometry.zig: behavioral coverage of the
     // calculated core disk geometry (issue #677 step 5). Separate from the
     // planner's own unit tests because its subject is the shipped contract --
@@ -2284,6 +2311,8 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_ubuntu2604_release_tests.step);
         aggregate_test_step.dependOn(&run_ubuntu2604_release_behavior.step);
         aggregate_test_step.dependOn(&run_ubuntu2604_size_inventory.step);
+        aggregate_test_step.dependOn(&run_ubuntu2604_size_budget.step);
+        aggregate_test_step.dependOn(&run_ubuntu2604_disk_geometry.step);
         for (run_ubuntu2604_guards) |run_guard| {
             aggregate_test_step.dependOn(&run_guard.step);
         }

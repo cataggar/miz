@@ -19,6 +19,7 @@ const contracts = release.contracts;
 const disk_geometry = release.disk_geometry;
 const runtime_contract = release.runtime_contract;
 const runtime_contract_document = release.runtime_contract_document;
+const size_budget = release.size_budget;
 const size_inventory = release.size_inventory;
 const support = release.support;
 const miz = @import("miz");
@@ -834,6 +835,11 @@ fn writeProvenance(
             "disk_geometry",
             try writeDiskGeometry(tree, builder, key, provenance),
         );
+        try builder.put(
+            &document,
+            "size_budget",
+            try writeSizeBudget(tree, builder, key, provenance),
+        );
         try builder.putString(&document, "flavor", "core");
         try builder.putInteger(&document, "virtual_size", virtual_size);
         try builder.putInteger(&document, "minimum_root_free_bytes", 1024 * 1024);
@@ -1002,7 +1008,15 @@ fn writeSizeInventory(
             .path = size_inventory.package_lock_path,
             .contents = "alpha\t1.0-1\tamd64\n",
         },
-        .{ .path = "/var/lib/dpkg/info/alpha.list", .contents = "/usr/bin/alpha\n" },
+        .{
+            .path = "/var/lib/dpkg/info/alpha.list",
+            // #677 step 6 bounds the unowned remainder at zero, so the
+            // miniature root has to be a *complete* closure: the scaffolding
+            // directories and the kernel image are claimed here exactly as a
+            // real package claims them, rather than being tolerated.
+            .contents = "/boot\n/boot/vmlinuz-6.20.0-1001-azure\n/etc\n" ++
+                "/usr\n/usr/bin\n/usr/bin/alpha\n/var\n/var/lib\n",
+        },
         .{ .path = "/usr/bin/alpha", .contents = "owned payload" },
         .{ .path = "/etc/ld.so.cache", .contents = "generated cache" },
         .{ .path = "/boot/vmlinuz-6.20.0-1001-azure", .contents = "kernel" },
@@ -1044,22 +1058,42 @@ fn writeSizeInventory(
         &diagnostic,
     );
     try report.addPhase(.root_build, section, &diagnostic);
+    // The fresh-root flavors carry the filesystem accounting a real core build
+    // produced, because #677 step 6 bounds it: the reviewed budget requires the
+    // free-block and free-inode reserves the disk plan promised, and a fixture
+    // with a toy filesystem would exercise the schema without exercising the
+    // gate. `full` keeps its toy geometry, which is all its measurement is for.
+    const core_image: size_inventory.ImageBuild = .{
+        .virtual_size = 611_319_808,
+        .root = .{
+            .block_size = 4096,
+            .total_blocks = 119_795,
+            .free_blocks = 32_768,
+            .total_inodes = 29_952,
+            .free_inodes = 16_584,
+        },
+        .uki_bytes = 58_039_112,
+        .esp_partition_bytes = 118_489_088,
+        .esp_total_bytes = 116_621_312,
+        .esp_free_bytes = 58_580_480,
+    };
+    const full_image: size_inventory.ImageBuild = .{
+        .virtual_size = @intCast(virtual_size),
+        .root = .{
+            .block_size = 4096,
+            .total_blocks = 400,
+            .free_blocks = 120,
+            .total_inodes = 128,
+            .free_inodes = 64,
+        },
+        .uki_bytes = 32 * 1024,
+        .esp_partition_bytes = 256 * 1024,
+        .esp_total_bytes = 200 * 1024,
+        .esp_free_bytes = 100 * 1024,
+    };
     try report.addPhase(.image_build, try size_inventory.imageBuildValue(
         report.allocator(),
-        .{
-            .virtual_size = @intCast(virtual_size),
-            .root = .{
-                .block_size = 4096,
-                .total_blocks = 400,
-                .free_blocks = 120,
-                .total_inodes = 128,
-                .free_inodes = 64,
-            },
-            .uki_bytes = 32 * 1024,
-            .esp_partition_bytes = 256 * 1024,
-            .esp_total_bytes = 200 * 1024,
-            .esp_free_bytes = 100 * 1024,
-        },
+        if (flavor == .core) core_image else full_image,
         &diagnostic,
     ), &diagnostic);
     try report.addPhase(.publication, try size_inventory.publicationValue(
@@ -1083,6 +1117,73 @@ fn writeSizeInventory(
     defer allocator.free(text);
     try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text });
 
+    return fileBinding(builder, filename, &support.digest.hexBytes(text), null);
+}
+
+/// Evaluates the reviewed size budget against the fixture's own measurement
+/// and writes the verdict, exactly as a build does (issue #677 step 6).
+///
+/// Deriving it rather than hand-writing it is the point: an x86_64 fixture
+/// records `enforced`, an AArch64 fixture records `candidate_baseline`, and
+/// neither spelling can drift from what `size_budget.zig` actually reviews.
+fn writeSizeBudget(
+    tree: *const Tree,
+    builder: Builder,
+    key: []const u8,
+    provenance: []const u8,
+) !std.json.Value {
+    const allocator = tree.allocator;
+    const io = tree.io;
+    const entry = contracts.lookup(key).?;
+    const flavor = contracts.parseFlavor(entry.flavor).?;
+
+    var name_buffer: [96]u8 = undefined;
+    const inventory_name = try std.fmt.allocPrint(
+        allocator,
+        "ubuntu2604-size-inventory-{s}-{s}.json",
+        .{ @tagName(flavor), entry.architecture },
+    );
+    defer allocator.free(inventory_name);
+    const inventory_path = try std.fs.path.join(
+        allocator,
+        &.{ provenance, inventory_name },
+    );
+    defer allocator.free(inventory_path);
+    const measured = try Dir.cwd().readFileAlloc(
+        io,
+        inventory_path,
+        allocator,
+        .limited(size_inventory.document_max_bytes),
+    );
+    defer allocator.free(measured);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, measured, .{});
+    defer parsed.deinit();
+
+    var diagnostic: size_budget.Diagnostic = .{};
+    var evaluation = size_budget.evaluate(allocator, parsed.value, .{
+        .architecture = entry.architecture,
+        .flavor = entry.flavor,
+    }, &diagnostic) catch |err| {
+        std.debug.print("fixture size budget: {s}\n", .{diagnostic.message()});
+        return err;
+    };
+    defer evaluation.deinit();
+
+    const filename = contracts.sizeBudgetFilename(
+        &name_buffer,
+        flavor,
+        entry.architecture,
+    ).?;
+    const path = try std.fs.path.join(allocator, &.{ provenance, filename });
+    defer allocator.free(path);
+    try size_budget.write(allocator, io, path, &evaluation, &diagnostic);
+    const text = try Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(size_budget.document_max_bytes),
+    );
+    defer allocator.free(text);
     return fileBinding(builder, filename, &support.digest.hexBytes(text), null);
 }
 

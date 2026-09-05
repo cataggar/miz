@@ -27,6 +27,7 @@ const download = @import("download.zig");
 const provenance = @import("provenance.zig");
 const runtime_contract = @import("ubuntu2604_runtime_contract");
 const runtime_contract_document = @import("runtime_contract_document.zig");
+const size_budget = @import("size_budget.zig");
 const size_inventory = @import("size_inventory.zig");
 const support = @import("support.zig");
 
@@ -184,6 +185,29 @@ pub fn dispatch(
             diagnostic,
         );
     }
+    if (std.mem.eql(u8, command, "size-budget-verify")) {
+        var options = try parse(allocator, argv, &.{
+            "--budget",
+            "--report",
+            "--architecture",
+            "--flavor",
+            "--baseline",
+            "--require-status",
+        });
+        defer options.deinit();
+        return sizeBudgetVerify(
+            allocator,
+            io,
+            out,
+            options.get("--budget"),
+            try options.require("--report"),
+            options.get("--architecture"),
+            options.get("--flavor"),
+            options.get("--baseline"),
+            options.get("--require-status"),
+            diagnostic,
+        );
+    }
     if (std.mem.eql(u8, command, "size-inventory-compare")) {
         var options = try parse(allocator, argv, &.{
             "--baseline",
@@ -304,6 +328,7 @@ pub fn dispatch(
             "--source-commit",
             "--candidate-run-id",
             "--run-id",
+            "--require-size-budget",
         });
         defer options.deinit();
         return releaseGate(allocator, io, .{
@@ -316,6 +341,13 @@ pub fn dispatch(
             .source_commit = try options.require("--source-commit"),
             .candidate_run_id = try options.require("--candidate-run-id"),
             .run_id = try options.require("--run-id"),
+            // Spelled as the status it demands, so the workflow step reads as
+            // the contract it enforces rather than as a boolean nobody can
+            // interpret without reading this file.
+            .require_size_budget = if (options.get("--require-size-budget")) |text|
+                std.mem.eql(u8, text, "enforced")
+            else
+                false,
         }, diagnostic);
     }
     if (std.mem.eql(u8, command, "core-gate")) {
@@ -967,6 +999,181 @@ pub fn sizeInventoryVerify(
             summary.unexpected_unowned_count,
             summary.unowned_policy_sha256,
             summary.closure_sha256,
+        },
+    );
+}
+
+/// Translates a size-budget rejection into this module's failure shape.
+fn budgetFailure(err: size_budget.Error) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Failed => error.Failed,
+    };
+}
+
+/// `size-budget-verify`: re-checks a published size-budget gate document and
+/// the measurement it judged (issue #677 step 6).
+///
+/// The check is a re-derivation, not a read. The tool recomputes the reviewed
+/// budget's digest from its own compiled-in table, recomputes every limit from
+/// the recorded baseline and its named allowance, recomputes the verdict from
+/// the observations, and recomputes the status from whether a reviewed budget
+/// exists for the architecture at all. It then evaluates the size inventory
+/// itself and requires the two to agree, so a gate document cannot be presented
+/// beside a measurement it did not judge.
+///
+/// `--require-status enforced` is what publication passes. An architecture
+/// whose budget has never been reviewed builds and validates, and records every
+/// metric for review, but cannot be published on the strength of a baseline
+/// nobody read.
+///
+/// `--budget` is optional, and its absence means something specific rather than
+/// "skip the check". The builder publishes a verdict for the phases it can
+/// measure; the `first_boot` phase is measured later, by acceptance, which has
+/// no builder beside it to publish one. Called without `--budget`, this
+/// evaluates the inventory directly and requires the `first_boot` phase, which
+/// is how the measured first-boot growth is held to the bound the disk plan
+/// reserves against.
+///
+/// `--baseline` is optional and only affects failures: given an earlier
+/// inventory, a broken byte budget is followed by the per-package deltas from
+/// the same comparison the benchmark uses, so the failure names packages rather
+/// than only totals.
+pub fn sizeBudgetVerify(
+    allocator: Allocator,
+    io: Io,
+    out: *Writer,
+    budget_path: ?[]const u8,
+    report_path: []const u8,
+    architecture: ?[]const u8,
+    flavor: ?[]const u8,
+    baseline_path: ?[]const u8,
+    require_status: ?[]const u8,
+    diagnostic: *Diagnostic,
+) OutError!void {
+    const required_status: ?size_budget.Status = if (require_status) |text|
+        size_budget.Status.parse(text) orelse return fail(
+            diagnostic,
+            "--require-status must be enforced or candidate_baseline, not {s}",
+            .{text},
+        )
+    else
+        null;
+
+    // A first-boot document is produced by acceptance, which has no builder to
+    // publish a verdict beside it, so the phases the caller can expect follow
+    // from whether a published verdict was presented at all.
+    const required_phases: []const size_inventory.Phase = if (budget_path != null)
+        &.{ .root_build, .image_build, .publication }
+    else
+        &.{ .root_build, .image_build, .publication, .first_boot };
+    var inventory = size_inventory.readValidated(allocator, io, report_path, .{
+        .architecture = architecture,
+        .flavor = flavor,
+        .required_phases = required_phases,
+    }, diagnostic) catch |err| return inventoryFailure(err);
+    defer inventory.deinit();
+
+    // The document is judged against a *fresh* evaluation of the same
+    // measurement rather than against itself: this is where a build that
+    // published a stale or hand-edited gate is caught.
+    var evaluation = size_budget.evaluate(allocator, inventory.value, .{
+        .architecture = architecture orelse return fail(
+            diagnostic,
+            "--architecture is required to evaluate a size budget",
+            .{},
+        ),
+        .flavor = flavor orelse return fail(
+            diagnostic,
+            "--flavor is required to evaluate a size budget",
+            .{},
+        ),
+        .required_phases = required_phases,
+    }, diagnostic) catch |err| return budgetFailure(err);
+    defer evaluation.deinit();
+
+    if (evaluation.failures != 0) {
+        try size_budget.writeFailures(&evaluation, out);
+        if (baseline_path) |path| {
+            var baseline = size_inventory.readValidated(allocator, io, path, .{
+                .architecture = architecture,
+                .flavor = flavor,
+            }, diagnostic) catch |err| return inventoryFailure(err);
+            defer baseline.deinit();
+            size_budget.writePackageAttribution(
+                allocator,
+                baseline.value,
+                inventory.value,
+                out,
+                diagnostic,
+            ) catch |err| return budgetFailure(err);
+        }
+        return fail(
+            diagnostic,
+            "{s} {s} exceeded {d} reviewed size budget(s); see the " ++
+                "attributable deltas above",
+            .{
+                @tagName(evaluation.architecture),
+                @tagName(evaluation.flavor),
+                evaluation.failures,
+            },
+        );
+    }
+
+    const published = budget_path orelse {
+        // No published verdict to re-derive: report the evaluation this tool
+        // just performed, which is the whole check in the acceptance case.
+        if (required_status) |wanted| {
+            if (evaluation.status != wanted) return fail(
+                diagnostic,
+                "size budget status is {s} where {s} was required",
+                .{ evaluation.status.key(), wanted.key() },
+            );
+        }
+        try out.print(
+            "{s} {s} status={s} result={s} metrics={d} inventory={s}\n",
+            .{
+                @tagName(evaluation.architecture),
+                @tagName(evaluation.flavor),
+                evaluation.status.key(),
+                size_budget.resultOf(&evaluation).key(),
+                evaluation.observations.len,
+                evaluation.inventory_sha256,
+            },
+        );
+        return;
+    };
+    var parsed = size_budget.readValidated(allocator, io, published, .{
+        .architecture = architecture,
+        .flavor = flavor,
+        .inventory_sha256 = evaluation.inventory_sha256,
+        .require_enforced = required_status == .enforced,
+    }, diagnostic) catch |err| return budgetFailure(err);
+    defer parsed.deinit();
+    const summary = size_budget.validateDocument(allocator, parsed.value, .{
+        .architecture = architecture,
+        .flavor = flavor,
+        .inventory_sha256 = evaluation.inventory_sha256,
+        .require_enforced = required_status == .enforced,
+    }, diagnostic) catch |err| return budgetFailure(err);
+    if (required_status) |wanted| {
+        if (summary.status != wanted) return fail(
+            diagnostic,
+            "size budget status is {s} where {s} was required",
+            .{ summary.status.key(), wanted.key() },
+        );
+    }
+
+    try out.print(
+        "{s} {s} status={s} result={s} metrics={d} budget={s} inventory={s}\n",
+        .{
+            summary.architecture,
+            summary.flavor,
+            summary.status.key(),
+            summary.result.key(),
+            summary.metric_count,
+            summary.budget_sha256,
+            summary.inventory_sha256,
         },
     );
 }
@@ -1866,6 +2073,14 @@ pub const ReleaseGateOptions = struct {
     source_commit: []const u8,
     candidate_run_id: []const u8,
     run_id: []const u8,
+    /// Whether every core candidate must carry a *reviewed* size budget rather
+    /// than a recorded candidate baseline (issue #677 step 6).
+    ///
+    /// Publication passes this and nothing else should: a validation run exists
+    /// partly to produce the baseline a reviewer then transcribes into
+    /// `scripts/ubuntu2604/size_budget.zig`, and refusing it there would leave
+    /// nowhere for a new architecture's numbers to come from.
+    require_size_budget: bool = false,
 };
 
 fn loadArtifactSelection(
@@ -2179,6 +2394,18 @@ pub fn releaseGate(
             diagnostic,
         );
         defer candidate.deinit();
+        // #677 step 6: publication requires a *reviewed* budget. An
+        // architecture whose minimized closure has never been measured in
+        // production records a candidate baseline instead, which is exactly
+        // what must not be released on somebody's assumption that it is fine.
+        if (options.require_size_budget) try requireReviewedSizeBudget(
+            allocator,
+            io,
+            manifest_parent,
+            key,
+            entry,
+            diagnostic,
+        );
         try requireExactWorkflow(
             candidate.object().get("workflow"),
             options.candidate_run_id,
@@ -2232,6 +2459,93 @@ pub fn releaseGate(
             diagnostic,
         );
     }
+}
+
+/// The verdict a candidate's bound size-budget document carries, re-derived.
+const SizeBudgetVerdict = struct {
+    status: size_budget.Status,
+    digest: [64]u8,
+};
+
+fn sizeBudgetVerdict(
+    allocator: Allocator,
+    io: Io,
+    manifest_parent: []const u8,
+    key: []const u8,
+    identity: contracts.Candidate,
+    diagnostic: *Diagnostic,
+) Error!SizeBudgetVerdict {
+    const flavor = contracts.parseFlavor(identity.flavor) orelse return fail(
+        diagnostic,
+        "{s}: unexpected candidate flavor",
+        .{key},
+    );
+    var name_buffer: [96]u8 = undefined;
+    const filename = contracts.sizeBudgetFilename(
+        &name_buffer,
+        flavor,
+        identity.architecture,
+    ) orelse return fail(diagnostic, "{s}: invalid size-budget name", .{key});
+    const path = try support.joinPath(
+        allocator,
+        &.{ manifest_parent, "internal-provenance", filename },
+    );
+    defer allocator.free(path);
+    var parsed = size_budget.readValidated(allocator, io, path, .{
+        .architecture = identity.architecture,
+        .flavor = identity.flavor,
+    }, diagnostic) catch |err| return budgetFailure(err);
+    defer parsed.deinit();
+    const summary = size_budget.validateDocument(allocator, parsed.value, .{
+        .architecture = identity.architecture,
+        .flavor = identity.flavor,
+    }, diagnostic) catch |err| return budgetFailure(err);
+    var digest: [64]u8 = undefined;
+    @memcpy(&digest, summary.budget_sha256[0..64]);
+    return .{ .status = summary.status, .digest = digest };
+}
+
+/// Requires a candidate's bound size-budget verdict to be an enforced one.
+///
+/// The budget document is inside the candidate's own provenance tree, already
+/// digest-bound and already re-derived by `verifyCandidate`. What this adds is
+/// the publication decision: a recorded candidate baseline is a measurement
+/// waiting for review, and shipping it would mean shipping an image whose size
+/// nobody agreed to.
+///
+/// Only the fresh-root flavors carry the document. `full` is Canonical's
+/// server root, which #677 measures rather than minimizes.
+fn requireReviewedSizeBudget(
+    allocator: Allocator,
+    io: Io,
+    manifest_parent: []const u8,
+    key: []const u8,
+    identity: contracts.Candidate,
+    diagnostic: *Diagnostic,
+) Error!void {
+    const flavor = contracts.parseFlavor(identity.flavor) orelse return fail(
+        diagnostic,
+        "{s}: unexpected candidate flavor",
+        .{key},
+    );
+    if (flavor != .core) return;
+    var name_buffer: [96]u8 = undefined;
+    const filename = contracts.sizeBudgetFilename(
+        &name_buffer,
+        flavor,
+        identity.architecture,
+    ) orelse return fail(diagnostic, "{s}: invalid size-budget name", .{key});
+    const path = try support.joinPath(
+        allocator,
+        &.{ manifest_parent, "internal-provenance", filename },
+    );
+    defer allocator.free(path);
+    var parsed = size_budget.readValidated(allocator, io, path, .{
+        .architecture = identity.architecture,
+        .flavor = identity.flavor,
+        .require_enforced = true,
+    }, diagnostic) catch |err| return budgetFailure(err);
+    parsed.deinit();
 }
 
 fn loadReleaseByKey(
@@ -2606,6 +2920,20 @@ pub fn coreGate(
         try builder.putString(&record, "key", key);
         try builder.putString(&record, "asset_name", entry.asset_name);
         try builder.putString(&record, "candidate_sha256", verified.sha256);
+        // #677 step 6: core validation is where a candidate baseline is
+        // *produced*, so it records the verdict rather than refusing it. The
+        // release gate is where an unreviewed budget stops being acceptable,
+        // and this is the field a reviewer reads to know which is which.
+        const budget = try sizeBudgetVerdict(
+            allocator,
+            io,
+            manifest_parent,
+            key,
+            entry,
+            diagnostic,
+        );
+        try builder.putString(&record, "size_budget_status", budget.status.key());
+        try builder.putString(&record, "size_budget_sha256", budget.digest[0..]);
         try builder.putString(
             &record,
             "candidate_manifest_sha256",

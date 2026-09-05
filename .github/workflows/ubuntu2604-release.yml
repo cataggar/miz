@@ -366,6 +366,31 @@ jobs:
           printf 'Size inventory `%s`: `%s`\n' "$CANDIDATE_KEY" "$measured" \
             >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Enforce the reviewed size and content budget
+        if: matrix.flavor == 'core'
+        run: |
+          set -euo pipefail
+          # Issue #677 step 6. The builder already judged this measurement
+          # against the reviewed budget and published the verdict; this
+          # re-derives all of it from the release tool's own compiled-in table,
+          # so a candidate cannot carry a verdict its own tooling would not
+          # reach. `--require-status enforced` is the publication decision: an
+          # architecture whose minimized closure has never been measured in
+          # production records a candidate baseline for review, and a baseline
+          # is not something to release.
+          budget="$BUNDLE_DIR/internal-provenance/ubuntu2604-size-budget-$FLAVOR-$ARCHITECTURE.json"
+          inventory="$BUNDLE_DIR/internal-provenance/ubuntu2604-size-inventory-$FLAVOR-$ARCHITECTURE.json"
+          test -f "$budget"
+          test -x "$RELEASE_TOOL"
+          judged=$("$RELEASE_TOOL" size-budget-verify \
+            --budget "$budget" \
+            --report "$inventory" \
+            --architecture "$ARCHITECTURE" \
+            --flavor "$FLAVOR" \
+            --require-status enforced)
+          printf 'Size budget `%s`: `%s`\n' "$CANDIDATE_KEY" "$judged" \
+            >> "$GITHUB_STEP_SUMMARY"
+
       - name: Verify the explicit runtime contract
         if: matrix.flavor == 'core'
         run: |
@@ -870,6 +895,26 @@ jobs:
           printf 'First-boot size inventory `%s`: `%s`\n' "$CANDIDATE_KEY" "$measured" \
             >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Enforce the measured first-boot growth bound
+        run: |
+          set -euo pipefail
+          # Issue #677 step 6. The disk plan reserves four times a declared
+          # 32 MiB first-boot growth; this is where the declaration is held to
+          # the measurement. There is no published verdict to re-derive here --
+          # the builder cannot measure a boot -- so the reviewed budget is
+          # evaluated directly against the inventory the guest produced, and the
+          # command requires the `first_boot` phase rather than accepting a
+          # document that never reached it.
+          first_boot="$RESULT_DIR/ubuntu2604-size-inventory-$FLAVOR-$ARCHITECTURE.first-boot.json"
+          test -f "$first_boot"
+          test -x "$RELEASE_TOOL"
+          grown=$("$RELEASE_TOOL" size-budget-verify \
+            --report "$first_boot" \
+            --architecture "$ARCHITECTURE" \
+            --flavor "$FLAVOR")
+          printf 'First-boot size budget `%s`: `%s`\n' "$CANDIDATE_KEY" "$grown" \
+            >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload QEMU acceptance failure diagnostics
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -1255,7 +1300,8 @@ jobs:
             --azure-selection "$SELECTIONS_DIR/azure.json" \
             --source-commit "$SOURCE_COMMIT" \
             --candidate-run-id "$CANDIDATE_RUN_ID" \
-            --run-id "$RUN_ID_VALUE"
+            --run-id "$RUN_ID_VALUE" \
+            --require-size-budget enforced
 
       - name: Publish exactly four accepted Ubuntu assets
         run: scripts/ubuntu2604_publish.sh

@@ -627,15 +627,14 @@ test "totals that do not equal their parts are refused" {
         .{},
     );
     defer parsed.deinit();
+    // The document's maps belong to the parser's arena, so a mutation that
+    // grows one has to allocate from the same arena.
+    const arena = parsed.arena.allocator();
     var root_build = parsed.value.object.get("root_build").?.object;
     const inflated = root_build.get("installed_bytes").?.integer + 4096;
-    try root_build.put(
-        std.testing.allocator,
-        "installed_bytes",
-        .{ .integer = inflated },
-    );
+    try root_build.put(arena, "installed_bytes", .{ .integer = inflated });
     var mutated = parsed.value.object;
-    try mutated.put(std.testing.allocator, "root_build", .{ .object = root_build });
+    try mutated.put(arena, "root_build", .{ .object = root_build });
 
     try std.testing.expectError(error.Failed, size_inventory.validateDocument(
         std.testing.allocator,
@@ -1527,17 +1526,14 @@ test "a document whose allowlist policy digest does not match is refused" {
     // A builder that widened its allowlist locally still has to publish the
     // digest of the table it classified with, and this tool recomputes the
     // reviewed one rather than believing the document.
+    const arena = parsed.arena.allocator();
     const unowned = field(parsed.value, &.{ "root_build", "unowned" }).object;
     var mutable = unowned;
-    try mutable.put(
-        std.testing.allocator,
-        "policy_sha256",
-        .{ .string = "0" ** 64 },
-    );
+    try mutable.put(arena, "policy_sha256", .{ .string = "0" ** 64 });
     var root_build = field(parsed.value, &.{"root_build"}).object;
-    try root_build.put(std.testing.allocator, "unowned", .{ .object = mutable });
+    try root_build.put(arena, "unowned", .{ .object = mutable });
     var document = parsed.value.object;
-    try document.put(std.testing.allocator, "root_build", .{ .object = root_build });
+    try document.put(arena, "root_build", .{ .object = root_build });
 
     try std.testing.expectError(error.Failed, size_inventory.validateDocument(
         std.testing.allocator,
