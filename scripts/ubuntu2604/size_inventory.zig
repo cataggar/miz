@@ -934,9 +934,9 @@ pub const absent_content_rules = [_]ContentRule{
         .id = "apt-state",
         .disposition = .absent,
         .patterns = &.{
-            "/etc/apt/auth.conf",     "/etc/apt/auth.conf.d/**",
-            "/etc/apt/preferences",   "/etc/apt/preferences.d/**",
-            "/etc/apt/sources.list",  "/etc/apt/sources.list.d/**",
+            "/etc/apt/auth.conf",    "/etc/apt/auth.conf.d/**",
+            "/etc/apt/preferences",  "/etc/apt/preferences.d/**",
+            "/etc/apt/sources.list", "/etc/apt/sources.list.d/**",
             "/var/lib/apt/**",
         },
         .reason = "apt resolves nothing in the appliance; its lists and " ++
@@ -953,8 +953,8 @@ pub const absent_content_rules = [_]ContentRule{
         .id = "apt-client",
         .disposition = .absent,
         .patterns = &.{
-            "/usr/bin/apt",      "/usr/bin/apt-cache", "/usr/bin/apt-get",
-            "/usr/bin/apt-key",  "/usr/bin/apt-mark",  "/usr/bin/aptitude",
+            "/usr/bin/apt",     "/usr/bin/apt-cache", "/usr/bin/apt-get",
+            "/usr/bin/apt-key", "/usr/bin/apt-mark",  "/usr/bin/aptitude",
             "/usr/lib/apt/**",
         },
         .reason = "the appliance installs nothing at runtime, so it carries " ++
@@ -964,8 +964,8 @@ pub const absent_content_rules = [_]ContentRule{
         .id = "cloud-init",
         .disposition = .absent,
         .patterns = &.{
-            "/etc/cloud/**",           "/usr/bin/cloud-init",
-            "/usr/lib/cloud-init/**",  "/usr/share/cloud-init/**",
+            "/etc/cloud/**",          "/usr/bin/cloud-init",
+            "/usr/lib/cloud-init/**", "/usr/share/cloud-init/**",
             "/var/lib/cloud/**",
         },
         .reason = "azagent provisions the appliance; the `no-cloud-init` " ++
@@ -997,11 +997,10 @@ pub const absent_content_rules = [_]ContentRule{
         .id = "systemd-service-manager",
         .disposition = .absent,
         .patterns = &.{
-            "/bin/systemctl",                "/lib/systemd/systemd",
-            "/usr/bin/journalctl",           "/usr/bin/systemctl",
-            "/usr/bin/systemd-run",          "/usr/lib/systemd/systemd",
-            "/usr/lib/systemd/systemd-executor",
-            "/usr/lib/systemd/systemd-journald",
+            "/bin/systemctl",                    "/lib/systemd/systemd",
+            "/usr/bin/journalctl",               "/usr/bin/systemctl",
+            "/usr/bin/systemd-run",              "/usr/lib/systemd/systemd",
+            "/usr/lib/systemd/systemd-executor", "/usr/lib/systemd/systemd-journald",
             "/usr/lib/systemd/systemd-logind",
         },
         .reason = "mizinit is PID 1; the `no-systemd-service-manager` " ++
@@ -1162,7 +1161,6 @@ pub fn contentPolicyDigest(allocator: Allocator) Error![64]u8 {
     _ = std.fmt.bufPrint(&hex, "{x}", .{&raw}) catch unreachable;
     return hex;
 }
-
 
 // ---------------------------------------------------------------------------
 // Rules derived from the root's own metadata.
