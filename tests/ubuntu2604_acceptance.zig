@@ -3760,11 +3760,23 @@ fn recordFirstBootInventory(
     written.deinit();
 }
 
+/// Writes the accepted candidate's identity, including the virtual size of the
+/// disk that was actually booted.
+///
+/// The size is *measured from the published image*, not taken from a table.
+/// Issue #677 step 5 made core calculate its own geometry, so there is no
+/// constant that could describe it -- but the release gate still has to bind
+/// the disk acceptance booted to the disk the candidate manifest published, and
+/// an omitted size cannot be bound to anything. For the flavors whose geometry
+/// is fixed by contract the measurement is additionally required to equal the
+/// declared size, so the contract keeps its meaning and gains a check that the
+/// published image really carries it.
 fn writeAcceptanceResult(
     allocator: Allocator,
     io: Io,
     result_path: []const u8,
     candidate: Candidate,
+    published_virtual_size: u64,
     source_sha256: miz.artifact_pipeline.Digest,
     certificate_sha256: miz.artifact_pipeline.Digest,
     uki_sha256: miz.artifact_pipeline.Digest,
@@ -3780,6 +3792,14 @@ fn writeAcceptanceResult(
         !std.mem.eql(u8, qemu_path, execution_profile.emulator))
     {
         return error.QemuExecutionIdentityMismatch;
+    }
+    if (published_virtual_size == 0 or
+        published_virtual_size % miz.gpt.sector_size != 0)
+    {
+        return error.InvalidPublishedVirtualSize;
+    }
+    if (candidate.expectedVirtualSize()) |declared| {
+        if (declared != published_virtual_size) return error.UnexpectedVirtualSize;
     }
     const source_sha256_hex = miz.artifact_pipeline.formatSha256(source_sha256);
     const certificate_sha256_hex = miz.artifact_pipeline.formatSha256(
@@ -3798,7 +3818,7 @@ fn writeAcceptanceResult(
             .flavor = @tagName(candidate.flavor),
             .asset_name = candidate.expectedFileName(),
             .source_commit = identity.source_commit,
-            .virtual_size = candidate.expectedVirtualSize(),
+            .virtual_size = published_virtual_size,
             .candidate_sha256 = &source_sha256_hex,
             .candidate_workflow = .{
                 .run_id = identity.candidate_run_id,
@@ -4207,6 +4227,9 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const candidate = Candidate{ .architecture = .aarch64, .flavor = .full };
+    // The size acceptance measured from the published image. For a
+    // preserved-geometry flavor it has to be the declared one.
+    const fixture_virtual_size: u64 = 5 * gib;
     var identity: AcceptanceResultIdentity = .{
         .source_commit = try allocator.dupe(u8, "a" ** 40),
         .candidate_run_id = try allocator.dupe(u8, "90"),
@@ -4234,6 +4257,7 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
             io,
             result_path,
             candidate,
+            fixture_virtual_size,
             source_digest,
             certificate_digest,
             uki_digest,
@@ -4247,6 +4271,7 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
         io,
         result_path,
         candidate,
+        fixture_virtual_size,
         source_digest,
         certificate_digest,
         uki_digest,
@@ -4306,6 +4331,113 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
     const workflow = result.get("workflow").?.object;
     try std.testing.expectEqualStrings("100", workflow.get("run_id").?.string);
     try std.testing.expectEqualStrings("2", workflow.get("run_attempt").?.string);
+}
+
+test "a core acceptance result publishes the calculated size it booted" {
+    // Issue #677 step 5 made core's disk a function of its own build, so the
+    // result cannot name a constant -- but it must still name a number. The
+    // release gate binds the size acceptance booted to the size the candidate
+    // manifest published, and an omitted size binds to nothing: it is how
+    // `x86_64-core` was rejected as "native acceptance identity is invalid" in
+    // release run 33960663048 after passing every acceptance contract.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const candidate = Candidate{ .architecture = .x86_64, .flavor = .core };
+    // The calculated 583 MiB disk the x86_64 core build of this tree produces.
+    const calculated_virtual_size: u64 = 611_319_808;
+    try std.testing.expect(candidate.calculatesGeometry());
+
+    var identity: AcceptanceResultIdentity = .{
+        .source_commit = try allocator.dupe(u8, "b" ** 40),
+        .candidate_run_id = try allocator.dupe(u8, "91"),
+        .candidate_run_attempt = try allocator.dupe(u8, "1"),
+        .run_id = try allocator.dupe(u8, "101"),
+        .run_attempt = try allocator.dupe(u8, "1"),
+    };
+    defer identity.deinit(allocator);
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [Dir.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    const result_path = try std.fs.path.join(
+        allocator,
+        &.{ root_buffer[0..root_length], "native-result.json" },
+    );
+    defer allocator.free(result_path);
+    const source_digest: miz.artifact_pipeline.Digest = @splat(0x44);
+    const certificate_digest: miz.artifact_pipeline.Digest = @splat(0x55);
+    const uki_digest: miz.artifact_pipeline.Digest = @splat(0x66);
+
+    // A size that is not a whole number of sectors is not a disk anyone
+    // measured, and zero is an unmeasured result wearing a number.
+    for ([_]u64{ 0, calculated_virtual_size + 1 }) |invalid| {
+        try std.testing.expectError(
+            error.InvalidPublishedVirtualSize,
+            writeAcceptanceResult(
+                allocator,
+                io,
+                result_path,
+                candidate,
+                invalid,
+                source_digest,
+                certificate_digest,
+                uki_digest,
+                &identity,
+                candidate.executionProfile(),
+                candidate.executionProfile().emulator,
+            ),
+        );
+    }
+
+    try writeAcceptanceResult(
+        allocator,
+        io,
+        result_path,
+        candidate,
+        calculated_virtual_size,
+        source_digest,
+        certificate_digest,
+        uki_digest,
+        &identity,
+        candidate.executionProfile(),
+        candidate.executionProfile().emulator,
+    );
+    const text = try Dir.cwd().readFileAlloc(
+        io,
+        result_path,
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(text);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+    defer parsed.deinit();
+    const result = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 9), result.get("schema").?.integer);
+    try std.testing.expectEqualStrings("x86_64-core", result.get("key").?.string);
+    try std.testing.expectEqual(
+        @as(i64, @intCast(calculated_virtual_size)),
+        result.get("virtual_size").?.integer,
+    );
+
+    // A preserved-geometry flavor still has to carry its declared size, so the
+    // fixed contract keeps its meaning and gains an image-read check.
+    const full = Candidate{ .architecture = .aarch64, .flavor = .full };
+    try std.testing.expectError(
+        error.UnexpectedVirtualSize,
+        writeAcceptanceResult(
+            allocator,
+            io,
+            result_path,
+            full,
+            calculated_virtual_size,
+            source_digest,
+            certificate_digest,
+            uki_digest,
+            &identity,
+            full.executionProfile(),
+            full.executionProfile().emulator,
+        ),
+    );
 }
 
 test "Ubuntu 26.04 configured QEMU prerequisites fail closed" {
@@ -5490,6 +5622,7 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         io,
         result_path,
         candidate,
+        published_geometry.virtual_size,
         source_sha256,
         certificate_sha256,
         uki_sha256,
