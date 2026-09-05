@@ -2161,16 +2161,21 @@ test "SSH process timeouts are command failures" {
     );
 }
 
+/// Whether the `db` signature database carries the release signing leaf.
+///
+/// `database` is the variable's data with the four efivarfs attribute bytes
+/// already removed, which is what the guest probe reports: the attributes are
+/// checked separately, as attributes, rather than being skipped over here.
 fn efiDbContainsCertificate(
-    variable: []const u8,
+    database: []const u8,
     certificate_sha256: miz.artifact_pipeline.Digest,
 ) bool {
     const efi_cert_x509_guid = [_]u8{
         0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
         0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
     };
-    if (variable.len < 4) return false;
-    var list_offset: usize = 4;
+    const variable = database;
+    var list_offset: usize = 0;
     while (list_offset < variable.len) {
         if (variable.len - list_offset < 28) return false;
         const is_x509 = std.mem.eql(
@@ -2215,13 +2220,94 @@ fn efiDbContainsCertificate(
     return false;
 }
 
-const uefi_db_command =
-    \\set -eu
-    \\if ! mountpoint -q /sys/firmware/efi/efivars; then
-    \\  sudo -n /usr/bin/mount -t efivarfs efivarfs /sys/firmware/efi/efivars
-    \\fi
-    \\sudo -n /bin/cat /sys/firmware/efi/efivars/db-*
-;
+// --- UEFI trust evidence ---
+//
+// Issue #677 step 6. Acceptance used to expose efivarfs and securityfs by
+// running `mount -t efivarfs ...` in the guest, which made `/usr/bin/mount`
+// -- util-linux -- a package the image had to keep so a test could pass. The
+// minimized core closure does not install util-linux at all, and retaining it
+// for acceptance is exactly the trade #677 and #679 forbid.
+//
+// The static runtime-contract probe reads the variables instead: it mounts
+// efivarfs itself when nothing already has, on its own deterministic
+// mountpoint, reports each variable's attributes and bytes, and unmounts only
+// what it mounted. The host still makes every judgement, on real firmware
+// data, so nothing is skipped or weakened.
+
+const secure_boot_variable = runtime_contract.secure_boot_variable;
+const signature_database_variable = runtime_contract.signature_database_variable;
+const lockdown_requirement_id = "kernel-lockdown";
+
+/// Reads the UEFI variables that carry Secure Boot state and the signature
+/// database, plus the kernel lockdown verdict, in one round trip.
+///
+/// The command deliberately ends in `exit 0`: a probe that could not report a
+/// variable says so in its own report, and swallowing the exit status is what
+/// lets the host print which variable failed and why instead of an opaque
+/// "SSH command failed". A report that does not carry the expected lines is
+/// still a failure -- it is just a better-described one.
+fn uefiEvidenceCommandAlloc(allocator: Allocator) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "sudo -n {s} efivar {s} {s}; sudo -n {s} requirement {s}; exit 0",
+        .{
+            runtime_contract_probe_remote_path,
+            secure_boot_variable,
+            signature_database_variable,
+            runtime_contract_probe_remote_path,
+            lockdown_requirement_id,
+        },
+    );
+}
+
+/// Requires `name` to have been reported as a readable variable living on a
+/// real efivarfs, and returns its data with the attribute bytes removed.
+///
+/// The caller owns the returned bytes.
+fn decodeReportedVariableAlloc(
+    allocator: Allocator,
+    report: []const u8,
+    name: []const u8,
+    required_attributes: u32,
+) ![]u8 {
+    const line = (runtime_contract.efivarLine(report, name) catch {
+        std.debug.print("UEFI probe emitted an unparseable report for {s}\n", .{name});
+        return error.GuestUefiVariableUnreadable;
+    }) orelse {
+        std.debug.print("UEFI probe never reported {s}\n", .{name});
+        return error.GuestUefiVariableUnreadable;
+    };
+    if (line.status != .ok) {
+        std.debug.print(
+            "UEFI variable {s} is {s} (mount={s} filesystem={s})\n",
+            .{ name, line.status.key(), line.mount.key(), line.filesystem },
+        );
+        return error.GuestUefiVariableUnreadable;
+    }
+    // The variable is only meaningful if it came off efivarfs; a report that
+    // read it through anything else is describing some other file.
+    if (!std.mem.eql(u8, line.filesystem, runtime_contract.efivars_filesystem)) {
+        std.debug.print(
+            "UEFI variable {s} was read through {s}, not {s}\n",
+            .{ name, line.filesystem, runtime_contract.efivars_filesystem },
+        );
+        return error.GuestUefiVariableUnreadable;
+    }
+    if (!line.hasAttributes(required_attributes)) {
+        std.debug.print(
+            "UEFI variable {s} has attributes 0x{x:0>8}, expected 0x{x:0>8} to be set\n",
+            .{ name, line.attributes, required_attributes },
+        );
+        return error.GuestUefiVariableAttributesWrong;
+    }
+    const data = try allocator.alloc(u8, line.data_hex.len / 2);
+    errdefer allocator.free(data);
+    _ = line.decode(data) catch {
+        std.debug.print("UEFI variable {s} carried undecodable data\n", .{name});
+        return error.GuestUefiVariableUnreadable;
+    };
+    return data;
+}
 
 fn verifyGuestSecureBoot(
     allocator: Allocator,
@@ -2230,27 +2316,65 @@ fn verifyGuestSecureBoot(
     instance: *const Instance,
     certificate_sha256: miz.artifact_pipeline.Digest,
 ) !void {
-    const db = try sshOutputAlloc(
+    try pushProbeBinary(
         allocator,
         io,
         ssh_path,
         instance,
-        uefi_db_command,
+        runtimeContractProbeHostPath(),
+        runtime_contract_probe_remote_path,
     );
-    defer allocator.free(db);
-    if (!efiDbContainsCertificate(db, certificate_sha256)) {
+
+    const evidence_command = try uefiEvidenceCommandAlloc(allocator);
+    defer allocator.free(evidence_command);
+    const report = try sshOutputAlloc(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        evidence_command,
+    );
+    defer allocator.free(report);
+
+    // `SecureBoot` is a firmware-owned boot-services variable, so runtime
+    // access is the only attribute the running kernel can rely on.
+    const secure_boot = try decodeReportedVariableAlloc(
+        allocator,
+        report,
+        secure_boot_variable,
+        runtime_contract.efi_variable_runtime_access,
+    );
+    defer allocator.free(secure_boot);
+    if (secure_boot.len < 1 or secure_boot[0] != 1) {
+        return error.GuestSecureBootDisabled;
+    }
+
+    const database = try decodeReportedVariableAlloc(
+        allocator,
+        report,
+        signature_database_variable,
+        runtime_contract.signature_database_attributes,
+    );
+    defer allocator.free(database);
+    if (!efiDbContainsCertificate(database, certificate_sha256)) {
         return error.SigningCertificateMissingFromDb;
+    }
+
+    const lockdown = runtime_contract.statusOf(report, lockdown_requirement_id) orelse {
+        std.debug.print("UEFI probe never reported {s}\n", .{lockdown_requirement_id});
+        return error.GuestSecureBootContractFailed;
+    };
+    if (lockdown != .ok) {
+        std.debug.print(
+            "kernel lockdown is {s}\n",
+            .{lockdown.key()},
+        );
+        return error.GuestSecureBootContractFailed;
     }
 
     const command = try std.fmt.allocPrint(
         allocator,
         \\set -eu
-        \\secure_boot=$(od -An -t u1 -j 4 -N 1 /sys/firmware/efi/efivars/SecureBoot-* | tr -d ' ')
-        \\test "$secure_boot" = 1
-        \\if ! test -r /sys/kernel/security/lockdown; then
-        \\  sudo -n /usr/bin/mount -t securityfs securityfs /sys/kernel/security
-        \\fi
-        \\grep -Eq '\[(integrity|confidentiality)\]' /sys/kernel/security/lockdown
         \\test -c /dev/tpm0
         \\test -c /dev/tpmrm0
         \\for module in crc_itu_t udf isofs; do
@@ -4288,8 +4412,8 @@ test "EFI db parser finds the exact enrolled DER certificate" {
         0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
     };
     const certificate = "DER certificate";
-    var variable = [_]u8{0} ** (4 + 28 + 16 + certificate.len);
-    const list_offset = 4;
+    var variable = [_]u8{0} ** (28 + 16 + certificate.len);
+    const list_offset = 0;
     @memcpy(variable[list_offset..][0..efi_cert_x509_guid.len], &efi_cert_x509_guid);
     std.mem.writeInt(
         u32,
@@ -4316,18 +4440,225 @@ test "EFI db parser finds the exact enrolled DER certificate" {
     try std.testing.expect(!efiDbContainsCertificate(&variable, digest));
 }
 
-test "Secure Boot evidence mounts efivarfs before reading db" {
-    const mount_index = std.mem.indexOf(
-        u8,
-        uefi_db_command,
-        "mount -t efivarfs efivarfs /sys/firmware/efi/efivars",
-    ).?;
-    const db_index = std.mem.indexOf(
-        u8,
-        uefi_db_command,
-        "cat /sys/firmware/efi/efivars/db-*",
-    ).?;
-    try std.testing.expect(mount_index < db_index);
+/// Builds one `efivar ... status=ok` report line the way the guest probe
+/// prints it, so the harness is tested against the exact producer shape.
+fn okEfivarLineAlloc(
+    allocator: Allocator,
+    name: []const u8,
+    mount: runtime_contract.EfivarMount,
+    mount_point: []const u8,
+    filesystem: []const u8,
+    attributes: u32,
+    data: []const u8,
+) ![]u8 {
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    errdefer buffer.deinit();
+    try buffer.writer.print(
+        "{s} name={s} status=ok mount={s} mount_point={s} filesystem={s} " ++
+            "attributes=0x{x:0>8} bytes={d} data=",
+        .{
+            runtime_contract.efivar_prefix,
+            name,
+            mount.key(),
+            mount_point,
+            filesystem,
+            attributes,
+            data.len,
+        },
+    );
+    for (data) |byte| try buffer.writer.print("{x:0>2}", .{byte});
+    try buffer.writer.writeByte('\n');
+    return buffer.toOwnedSlice();
+}
+
+/// A signature database carrying exactly one X.509 signature, which is the
+/// shape OVMF hands back once miz has enrolled the release leaf.
+fn signatureDatabaseAlloc(allocator: Allocator, certificate: []const u8) ![]u8 {
+    const efi_cert_x509_guid = [_]u8{
+        0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
+        0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
+    };
+    const database = try allocator.alloc(u8, 28 + 16 + certificate.len);
+    errdefer allocator.free(database);
+    @memset(database, 0);
+    @memcpy(database[0..efi_cert_x509_guid.len], &efi_cert_x509_guid);
+    std.mem.writeInt(u32, database[16..][0..4], @intCast(database.len), .little);
+    std.mem.writeInt(u32, database[20..][0..4], 0, .little);
+    std.mem.writeInt(u32, database[24..][0..4], @intCast(16 + certificate.len), .little);
+    @memcpy(database[28 + 16 ..], certificate);
+    return database;
+}
+
+test "the UEFI evidence command asks the static probe, never mount(8)" {
+    const allocator = std.testing.allocator;
+    const command = try uefiEvidenceCommandAlloc(allocator);
+    defer allocator.free(command);
+    // The whole point of #677 step 6: no util-linux, no coreutils byte dumper,
+    // and no shell-side knowledge of where efivarfs has to be mounted.
+    try std.testing.expect(std.mem.indexOf(u8, command, "mount") == null);
+    try std.testing.expect(std.mem.indexOf(u8, command, " od ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, command, "cat ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, command, "grep") == null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, command, runtime_contract_probe_remote_path) != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, command, secure_boot_variable) != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, command, signature_database_variable) != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, command, lockdown_requirement_id) != null);
+}
+
+test "an already-mounted efivarfs and a probe-established one are both accepted" {
+    const allocator = std.testing.allocator;
+    const mounts = [_]struct {
+        mount: runtime_contract.EfivarMount,
+        point: []const u8,
+    }{
+        .{ .mount = .existing, .point = runtime_contract.efivars_mount_point },
+        .{ .mount = .probe, .point = runtime_contract.efivars_private_mount_point },
+    };
+    for (mounts) |scenario| {
+        const line = try okEfivarLineAlloc(
+            allocator,
+            secure_boot_variable,
+            scenario.mount,
+            scenario.point,
+            runtime_contract.efivars_filesystem,
+            runtime_contract.signature_database_attributes,
+            &[_]u8{1},
+        );
+        defer allocator.free(line);
+        const data = try decodeReportedVariableAlloc(
+            allocator,
+            line,
+            secure_boot_variable,
+            runtime_contract.efi_variable_runtime_access,
+        );
+        defer allocator.free(data);
+        try std.testing.expectEqualSlices(u8, &[_]u8{1}, data);
+    }
+}
+
+test "a variable read through the wrong filesystem is refused" {
+    const allocator = std.testing.allocator;
+    const line = try okEfivarLineAlloc(
+        allocator,
+        secure_boot_variable,
+        .existing,
+        runtime_contract.efivars_mount_point,
+        "sysfs",
+        runtime_contract.signature_database_attributes,
+        &[_]u8{1},
+    );
+    defer allocator.free(line);
+    try std.testing.expectError(error.GuestUefiVariableUnreadable, decodeReportedVariableAlloc(
+        allocator,
+        line,
+        secure_boot_variable,
+        runtime_contract.efi_variable_runtime_access,
+    ));
+}
+
+test "a variable missing a required attribute is refused" {
+    const allocator = std.testing.allocator;
+    // Runtime access but no time-based authenticated write access: a `db`
+    // anyone could rewrite is not the trust anchor this check asserts.
+    const line = try okEfivarLineAlloc(
+        allocator,
+        signature_database_variable,
+        .existing,
+        runtime_contract.efivars_mount_point,
+        runtime_contract.efivars_filesystem,
+        runtime_contract.efi_variable_non_volatile |
+            runtime_contract.efi_variable_bootservice_access |
+            runtime_contract.efi_variable_runtime_access,
+        &[_]u8{ 0x00, 0x01 },
+    );
+    defer allocator.free(line);
+    try std.testing.expectError(
+        error.GuestUefiVariableAttributesWrong,
+        decodeReportedVariableAlloc(
+            allocator,
+            line,
+            signature_database_variable,
+            runtime_contract.signature_database_attributes,
+        ),
+    );
+}
+
+test "every probe-reported failure to reach efivarfs is a harness failure" {
+    const allocator = std.testing.allocator;
+    const statuses = [_]runtime_contract.EfivarStatus{
+        .not_mounted,
+        .wrong_filesystem,
+        .permission_denied,
+        .missing,
+        .unreadable,
+        .malformed,
+    };
+    var buffer: [256]u8 = undefined;
+    for (statuses) |status| {
+        const line = try std.fmt.bufPrint(
+            &buffer,
+            "{s} name={s} status={s} mount=none\n",
+            .{ runtime_contract.efivar_prefix, signature_database_variable, status.key() },
+        );
+        try std.testing.expectError(
+            error.GuestUefiVariableUnreadable,
+            decodeReportedVariableAlloc(
+                allocator,
+                line,
+                signature_database_variable,
+                runtime_contract.signature_database_attributes,
+            ),
+        );
+    }
+
+    // A report that never mentioned the variable, and one that mentioned it
+    // unparseably, must both fail rather than read as agreement.
+    try std.testing.expectError(error.GuestUefiVariableUnreadable, decodeReportedVariableAlloc(
+        allocator,
+        "",
+        signature_database_variable,
+        runtime_contract.signature_database_attributes,
+    ));
+    try std.testing.expectError(error.GuestUefiVariableUnreadable, decodeReportedVariableAlloc(
+        allocator,
+        runtime_contract.efivar_prefix ++ " name=db status=ok mount=existing\n",
+        signature_database_variable,
+        runtime_contract.signature_database_attributes,
+    ));
+}
+
+test "a probe report carries the enrolled signing certificate through to the db check" {
+    const allocator = std.testing.allocator;
+    const certificate = "DER certificate";
+    const database = try signatureDatabaseAlloc(allocator, certificate);
+    defer allocator.free(database);
+    const line = try okEfivarLineAlloc(
+        allocator,
+        signature_database_variable,
+        .probe,
+        runtime_contract.efivars_private_mount_point,
+        runtime_contract.efivars_filesystem,
+        runtime_contract.signature_database_attributes,
+        database,
+    );
+    defer allocator.free(line);
+
+    const decoded = try decodeReportedVariableAlloc(
+        allocator,
+        line,
+        signature_database_variable,
+        runtime_contract.signature_database_attributes,
+    );
+    defer allocator.free(decoded);
+    try std.testing.expectEqualSlices(u8, database, decoded);
+
+    const digest = miz.artifact_pipeline.sha256Bytes(certificate);
+    try std.testing.expect(efiDbContainsCertificate(decoded, digest));
+    try std.testing.expect(!efiDbContainsCertificate(decoded, [_]u8{0xff} ** 32));
 }
 
 test "signed Binder module script pins the module tree and requires evidence" {

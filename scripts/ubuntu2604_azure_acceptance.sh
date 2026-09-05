@@ -107,6 +107,14 @@ fi
 [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
 [[ -x "$MIZ" ]]
 [[ -x "$RELEASE_TOOL" ]]
+if [[ -z ${RUNTIME_CONTRACT_PROBE:-} ]]; then
+  echo "::error::Azure acceptance requires a runtime contract probe binary"
+  exit 1
+fi
+[[ -x "$RUNTIME_CONTRACT_PROBE" ]] || {
+  echo "::error::Runtime contract probe binary is not executable"
+  exit 1
+}
 if [[ "$FLAVOR" == core ]]; then
   if [[ -z ${BINDER_PROBE:-} ]]; then
     echo "::error::Core Azure acceptance requires a Binder device probe binary"
@@ -114,14 +122,6 @@ if [[ "$FLAVOR" == core ]]; then
   fi
   [[ -x "$BINDER_PROBE" ]] || {
     echo "::error::Binder device probe binary is not executable"
-    exit 1
-  }
-  if [[ -z ${RUNTIME_CONTRACT_PROBE:-} ]]; then
-    echo "::error::Core Azure acceptance requires a runtime contract probe binary"
-    exit 1
-  fi
-  [[ -x "$RUNTIME_CONTRACT_PROBE" ]] || {
-    echo "::error::Runtime contract probe binary is not executable"
     exit 1
   }
 fi
@@ -1031,22 +1031,37 @@ test -s /etc/machine-id
 test -s /etc/ssh/ssh_host_ed25519_key.pub
 GUEST
 
-uefi_db="$RESULT_DIR/uefi-db.bin"
+uefi_report="$RESULT_DIR/uefi-variables.txt"
+# Issue #677 step 6: the UEFI signature database is read by the static contract
+# probe, not by mounting efivarfs in the shell. `mount` is util-linux, which the
+# minimized core closure does not install, and retaining a package because
+# acceptance used it is exactly what #677 forbids. The probe mounts efivarfs
+# itself when nothing already has, on its own mountpoint, and unmounts only what
+# it mounted.
+runtime_contract_remote=/home/miztest/.miz-runtime-contract-probe
+runtime_contract_sha256=$(sha256sum "$RUNTIME_CONTRACT_PROBE" | awk '{print $1}')
+base64 -w0 "$RUNTIME_CONTRACT_PROBE" | ssh "${ssh_options[@]}" "$ssh_target" \
+  "set -eu; rm -f -- '$runtime_contract_remote'; umask 077; base64 -d >'$runtime_contract_remote'; chmod 0700 '$runtime_contract_remote'"
+runtime_contract_remote_sha256=$(
+  ssh "${ssh_options[@]}" "$ssh_target" "sha256sum '$runtime_contract_remote'" |
+    awk '{print $1}'
+)
+test "$runtime_contract_remote_sha256" = "$runtime_contract_sha256"
+
 ssh "${ssh_options[@]}" "$ssh_target" \
-  "set -eu; if ! mountpoint -q /sys/firmware/efi/efivars; then sudo -n /usr/bin/mount -t efivarfs efivarfs /sys/firmware/efi/efivars; fi; sudo -n /usr/bin/cat /sys/firmware/efi/efivars/db-*" >"$uefi_db"
+  "sudo -n '$runtime_contract_remote' efivar db-d719b2cb-3d3a-4596-a3bc-dad00e67656f SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c; sudo -n '$runtime_contract_remote' requirement secure-boot kernel-lockdown; exit 0" \
+  >"$uefi_report"
+test -s "$uefi_report"
 "$RELEASE_TOOL" azure-uefi-db \
-  --db "$uefi_db" \
+  --report "$uefi_report" \
   --certificate-sha256 "$certificate_sha256"
+"$RELEASE_TOOL" runtime-contract-requirement \
+  --report "$uefi_report" \
+  --id secure-boot,kernel-lockdown
 ssh "${ssh_options[@]}" "$ssh_target" \
   "/usr/bin/bash -s -- '$FLAVOR'" <<'GUEST'
 set -euo pipefail
 flavor=$1
-secure_boot=$(od -An -t u1 -j 4 -N 1 /sys/firmware/efi/efivars/SecureBoot-* | tr -d ' ')
-test "$secure_boot" = 1
-if ! test -r /sys/kernel/security/lockdown; then
-  sudo -n /usr/bin/mount -t securityfs securityfs /sys/kernel/security
-fi
-grep -Eq '\[(integrity|confidentiality)\]' /sys/kernel/security/lockdown
 test -c /dev/tpm0
 test -c /dev/tpmrm0
 for module in hv_netvsc crc_itu_t udf isofs; do
@@ -1137,26 +1152,18 @@ GUEST
   # `runtime-contract`: the explicit allowlist issue #677 step 2 defines,
   # evaluated inside the guest by a static probe rather than by shell
   # utilities, and judged on the host by the release tool so a partial or
-  # unparseable report can never read as agreement.
-  runtime_contract_remote=/home/miztest/.miz-runtime-contract-probe
-  runtime_contract_sha256=$(sha256sum "$RUNTIME_CONTRACT_PROBE" | awk '{print $1}')
-  base64 -w0 "$RUNTIME_CONTRACT_PROBE" | ssh "${ssh_options[@]}" "$ssh_target" \
-    "set -eu; rm -f -- '$runtime_contract_remote'; umask 077; base64 -d >'$runtime_contract_remote'; chmod 0700 '$runtime_contract_remote'"
-  runtime_contract_remote_sha256=$(
-    ssh "${ssh_options[@]}" "$ssh_target" "sha256sum '$runtime_contract_remote'" |
-      awk '{print $1}'
-  )
-  test "$runtime_contract_remote_sha256" = "$runtime_contract_sha256"
-
+  # unparseable report can never read as agreement. The probe is already in
+  # the guest: the UEFI variable read above uploaded and verified it.
   ssh "${ssh_options[@]}" "$ssh_target" \
     "sudo -n '$runtime_contract_remote' contract" \
     >"$RESULT_DIR/runtime-contract-report.txt"
   test -s "$RESULT_DIR/runtime-contract-report.txt"
   "$RELEASE_TOOL" runtime-contract-probe-verify \
     --report "$RESULT_DIR/runtime-contract-report.txt"
-  ssh "${ssh_options[@]}" "$ssh_target" \
-    "sudo -n /usr/bin/rm -f -- '$runtime_contract_remote'"
 fi
+
+ssh "${ssh_options[@]}" "$ssh_target" \
+  "sudo -n /usr/bin/rm -f -- '$runtime_contract_remote'"
 
 if [[ "$FLAVOR" == core ]]; then
   readarray -t core_identity < <(

@@ -463,7 +463,7 @@ test "core BinderFS, Binder devices, and DMA heap are probed" {
     defer script.deinit();
     const binder = try script.section(
         "if [[ \"$FLAVOR\" == core ]]; then\n  binder_probe_remote=",
-        "\nfi\n\nif",
+        "\nfi\n\nssh",
     );
     const needles = [_][]const u8{
         "binder_probe_sha256=$(sha256sum",
@@ -479,9 +479,6 @@ test "core BinderFS, Binder devices, and DMA heap are probed" {
         "miz-acceptance-probe",
         // The runtime contract probe replaces the shell utilities the guest
         // block used to need, and its report is judged on the host.
-        "runtime_contract_sha256=$(sha256sum",
-        "base64 -w0 \"$RUNTIME_CONTRACT_PROBE\"",
-        "test \"$runtime_contract_remote_sha256\" = \"$runtime_contract_sha256\"",
         "sudo -n '$runtime_contract_remote' contract",
         "runtime-contract-report.txt",
         "\"$RELEASE_TOOL\" runtime-contract-probe-verify",
@@ -496,13 +493,44 @@ test "core BinderFS, Binder devices, and DMA heap are probed" {
         "sudo -n test -w \"$dma_heap\"",
     };
     for (absent) |needle| try source.expectOmitsIn(binder, needle, "binder probe");
+
+    // The contract probe is uploaded and checksum-verified once, for every
+    // flavor, because reading the UEFI signature database needs it too.
+    try script.expectContains("runtime_contract_sha256=$(sha256sum");
+    try script.expectContains("base64 -w0 \"$RUNTIME_CONTRACT_PROBE\"");
+    try script.expectContains(
+        "test \"$runtime_contract_remote_sha256\" = \"$runtime_contract_sha256\"",
+    );
 }
 
-test "core Azure acceptance refuses to start without a runtime contract probe" {
+test "Azure acceptance refuses to start without a runtime contract probe" {
     var script = try open();
     defer script.deinit();
-    try script.expectContains("Core Azure acceptance requires a runtime contract probe binary");
+    try script.expectContains("Azure acceptance requires a runtime contract probe binary");
     try script.expectContains("[[ -x \"$RUNTIME_CONTRACT_PROBE\" ]] ||");
+}
+
+test "the UEFI signature database is read by the probe, never by mount(8)" {
+    var script = try open();
+    defer script.deinit();
+    // Issue #677 step 6: `mount` is util-linux, which the minimized core
+    // closure does not install, and no acceptance step may require it.
+    try script.expectOmits("mount -t efivarfs");
+    try script.expectOmits("mount -t securityfs");
+    try script.expectOmits("/sys/firmware/efi/efivars/db-*");
+    try script.expectOmits("od -An -t u1 -j 4 -N 1");
+    try script.expectContains(
+        "sudo -n '$runtime_contract_remote' efivar " ++
+            "db-d719b2cb-3d3a-4596-a3bc-dad00e67656f " ++
+            "SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c",
+    );
+    try script.expectContains(
+        "sudo -n '$runtime_contract_remote' requirement secure-boot kernel-lockdown",
+    );
+    try script.expectContains("\"$RELEASE_TOOL\" azure-uefi-db");
+    try script.expectContains("--report \"$uefi_report\"");
+    try script.expectContains("\"$RELEASE_TOOL\" runtime-contract-requirement");
+    try script.expectContains("--id secure-boot,kernel-lockdown");
 }
 
 test "the Binder probe binary targets the public UAPI constants" {
@@ -962,3 +990,328 @@ const Harness = struct {
         );
     }
 };
+
+// ---------------------------------------------------------------------------
+// The UEFI trust evidence the release tool judges (issue #677 step 6).
+//
+// The guest no longer hands acceptance a raw `db` blob obtained with
+// `mount -t efivarfs` plus `cat`; it hands over the static probe's report.
+// These tests run the real release tool against real report text, so the
+// producer's format, the parser, and every refusal are exercised together.
+// ---------------------------------------------------------------------------
+
+/// Writes `text` into a private file and returns its absolute path, owned by
+/// the caller.
+fn stageReportAlloc(
+    allocator: Allocator,
+    tmp: *std.testing.TmpDir,
+    text: []const u8,
+) ![]u8 {
+    const root = try source.rootAlloc(allocator);
+    defer allocator.free(root);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}/uefi-variables.txt",
+        .{ root, tmp.sub_path },
+    );
+    errdefer allocator.free(path);
+    try Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = text });
+    return path;
+}
+
+fn runTool(allocator: Allocator, arguments: []const []const u8) !Result {
+    const tool = try toolPath(allocator);
+    defer allocator.free(tool);
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(allocator);
+    try argv.append(allocator, tool);
+    try argv.appendSlice(allocator, arguments);
+    return runProcess(allocator, argv.items, &.{});
+}
+
+const db_variable = "db-d719b2cb-3d3a-4596-a3bc-dad00e67656f";
+/// `NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS |
+/// TIME_BASED_AUTHENTICATED_WRITE_ACCESS`, the attributes UEFI mandates for a
+/// signature database.
+const db_attributes = "0x00000027";
+
+/// One `EFI_SIGNATURE_LIST` of one X.509 certificate, hex-encoded exactly as
+/// the guest probe prints it, plus the certificate's SHA-256.
+fn signatureDatabaseHexAlloc(
+    allocator: Allocator,
+    certificate: []const u8,
+) !struct { hex: []u8, bytes: usize, digest: [64]u8 } {
+    const efi_cert_x509_guid = [_]u8{
+        0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
+        0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
+    };
+    const database = try allocator.alloc(u8, 28 + 16 + certificate.len);
+    defer allocator.free(database);
+    @memset(database, 0);
+    @memcpy(database[0..efi_cert_x509_guid.len], &efi_cert_x509_guid);
+    std.mem.writeInt(u32, database[16..][0..4], @intCast(database.len), .little);
+    std.mem.writeInt(u32, database[20..][0..4], 0, .little);
+    std.mem.writeInt(u32, database[24..][0..4], @intCast(16 + certificate.len), .little);
+    @memcpy(database[28 + 16 ..], certificate);
+
+    var raw: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(certificate, &raw, .{});
+    var digest: [64]u8 = undefined;
+    _ = try std.fmt.bufPrint(&digest, "{x}", .{&raw});
+
+    var hex: std.Io.Writer.Allocating = .init(allocator);
+    errdefer hex.deinit();
+    for (database) |byte| try hex.writer.print("{x:0>2}", .{byte});
+    return .{
+        .hex = try hex.toOwnedSlice(),
+        .bytes = database.len,
+        .digest = digest,
+    };
+}
+
+fn dbReportAlloc(
+    allocator: Allocator,
+    attributes: []const u8,
+    filesystem: []const u8,
+    hex: []const u8,
+    bytes: usize,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "efivar name={s} status=ok mount=probe mount_point=/run/miz-efivars " ++
+            "filesystem={s} attributes={s} bytes={d} data={s}\n" ++
+            "efivar name=SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c status=ok " ++
+            "mount=probe mount_point=/run/miz-efivars filesystem=efivarfs " ++
+            "attributes=0x00000007 bytes=1 data=01\n" ++
+            "runtime-contract id=secure-boot kind=secure_boot audience=guest_runtime " ++
+            "status=ok target=/sys/firmware/efi/efivars\n" ++
+            "runtime-contract id=kernel-lockdown kind=kernel_lockdown " ++
+            "audience=guest_runtime status=ok target=/sys/kernel/security/lockdown\n",
+        .{ db_variable, filesystem, attributes, bytes, hex },
+    );
+}
+
+test "azure-uefi-db accepts a probe report carrying the enrolled certificate" {
+    const allocator = std.testing.allocator;
+    const database = try signatureDatabaseHexAlloc(allocator, "DER certificate");
+    defer allocator.free(database.hex);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const report = try dbReportAlloc(
+        allocator,
+        db_attributes,
+        "efivarfs",
+        database.hex,
+        database.bytes,
+    );
+    defer allocator.free(report);
+    const path = try stageReportAlloc(allocator, &tmp, report);
+    defer allocator.free(path);
+
+    const accepted = try runTool(allocator, &.{
+        "azure-uefi-db",
+        "--report",
+        path,
+        "--certificate-sha256",
+        &database.digest,
+    });
+    defer accepted.deinit(allocator);
+    try std.testing.expect(accepted.succeeded());
+
+    // A different certificate is not the enrolled one.
+    const rejected = try runTool(allocator, &.{
+        "azure-uefi-db",
+        "--report",
+        path,
+        "--certificate-sha256",
+        "0" ** 64,
+    });
+    defer rejected.deinit(allocator);
+    try std.testing.expect(!rejected.succeeded());
+    try std.testing.expect(
+        std.mem.indexOf(u8, rejected.stderr, "absent from UEFI db") != null,
+    );
+}
+
+test "azure-uefi-db refuses a db that is unreachable, unauthenticated, or not from efivarfs" {
+    const allocator = std.testing.allocator;
+    const database = try signatureDatabaseHexAlloc(allocator, "DER certificate");
+    defer allocator.free(database.hex);
+
+    const cases = [_]struct {
+        report: []const u8,
+        needle: []const u8,
+        allocated: bool = false,
+    }{
+        // The probe could not mount efivarfs at all.
+        .{
+            .report = "efivar name=" ++ db_variable ++ " status=not-mounted mount=none\n",
+            .needle = "not-mounted",
+        },
+        // It is not root, which is a harness mistake, not a firmware verdict.
+        .{
+            .report = "efivar name=" ++ db_variable ++
+                " status=permission-denied mount=none\n",
+            .needle = "permission-denied",
+        },
+        // Firmware never enrolled the variable.
+        .{
+            .report = "efivar name=" ++ db_variable ++ " status=missing mount=existing\n",
+            .needle = "missing",
+        },
+        // A report that never mentions `db` must not read as agreement.
+        .{
+            .report = "efivar name=SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c " ++
+                "status=ok mount=existing mount_point=/sys/firmware/efi/efivars " ++
+                "filesystem=efivarfs attributes=0x00000007 bytes=1 data=01\n",
+            .needle = "never mentions",
+        },
+        // A garbled line is a refusal, not a skip.
+        .{
+            .report = "efivar name=" ++ db_variable ++ " status=ok mount=existing\n",
+            .needle = "unparseable",
+        },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try stageReportAlloc(allocator, &tmp, case.report);
+        defer allocator.free(path);
+        const result = try runTool(allocator, &.{
+            "azure-uefi-db",
+            "--report",
+            path,
+            "--certificate-sha256",
+            &database.digest,
+        });
+        defer result.deinit(allocator);
+        try std.testing.expect(!result.succeeded());
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, case.needle) != null);
+    }
+
+    // Read through something that is not efivarfs.
+    var wrong_fs_tmp = std.testing.tmpDir(.{});
+    defer wrong_fs_tmp.cleanup();
+    const wrong_fs_report = try dbReportAlloc(
+        allocator,
+        db_attributes,
+        "sysfs",
+        database.hex,
+        database.bytes,
+    );
+    defer allocator.free(wrong_fs_report);
+    const wrong_fs_path = try stageReportAlloc(allocator, &wrong_fs_tmp, wrong_fs_report);
+    defer allocator.free(wrong_fs_path);
+    const wrong_fs = try runTool(allocator, &.{
+        "azure-uefi-db",
+        "--report",
+        wrong_fs_path,
+        "--certificate-sha256",
+        &database.digest,
+    });
+    defer wrong_fs.deinit(allocator);
+    try std.testing.expect(!wrong_fs.succeeded());
+    try std.testing.expect(std.mem.indexOf(u8, wrong_fs.stderr, "not efivarfs") != null);
+
+    // A `db` without time-based authenticated write access is rewritable by
+    // anyone, so it is not the trust anchor this check asserts.
+    var attributes_tmp = std.testing.tmpDir(.{});
+    defer attributes_tmp.cleanup();
+    const attributes_report = try dbReportAlloc(
+        allocator,
+        "0x00000007",
+        "efivarfs",
+        database.hex,
+        database.bytes,
+    );
+    defer allocator.free(attributes_report);
+    const attributes_path = try stageReportAlloc(
+        allocator,
+        &attributes_tmp,
+        attributes_report,
+    );
+    defer allocator.free(attributes_path);
+    const attributes = try runTool(allocator, &.{
+        "azure-uefi-db",
+        "--report",
+        attributes_path,
+        "--certificate-sha256",
+        &database.digest,
+    });
+    defer attributes.deinit(allocator);
+    try std.testing.expect(!attributes.succeeded());
+    try std.testing.expect(
+        std.mem.indexOf(u8, attributes.stderr, "attributes are 0x00000007") != null,
+    );
+}
+
+test "runtime-contract-requirement judges named requirements out of a partial report" {
+    const allocator = std.testing.allocator;
+    const satisfied =
+        "runtime-contract id=secure-boot kind=secure_boot audience=guest_runtime " ++
+        "status=ok target=/sys/firmware/efi/efivars\n" ++
+        "runtime-contract id=kernel-lockdown kind=kernel_lockdown " ++
+        "audience=guest_runtime status=ok target=/sys/kernel/security/lockdown\n";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try stageReportAlloc(allocator, &tmp, satisfied);
+    defer allocator.free(path);
+    const accepted = try runTool(allocator, &.{
+        "runtime-contract-requirement",
+        "--report",
+        path,
+        "--id",
+        "secure-boot,kernel-lockdown",
+    });
+    defer accepted.deinit(allocator);
+    try std.testing.expect(accepted.succeeded());
+
+    // A requirement the report never mentioned is a refusal, not a pass.
+    const missing = try runTool(allocator, &.{
+        "runtime-contract-requirement",
+        "--report",
+        path,
+        "--id",
+        "secure-boot,binderfs-mount",
+    });
+    defer missing.deinit(allocator);
+    try std.testing.expect(!missing.succeeded());
+    try std.testing.expect(
+        std.mem.indexOf(u8, missing.stderr, "never mentions binderfs-mount") != null,
+    );
+
+    // An identifier that is not in the contract at all is a caller error.
+    const invented = try runTool(allocator, &.{
+        "runtime-contract-requirement",
+        "--report",
+        path,
+        "--id",
+        "invented",
+    });
+    defer invented.deinit(allocator);
+    try std.testing.expect(!invented.succeeded());
+
+    var disabled_tmp = std.testing.tmpDir(.{});
+    defer disabled_tmp.cleanup();
+    const disabled_path = try stageReportAlloc(
+        allocator,
+        &disabled_tmp,
+        "runtime-contract id=secure-boot kind=secure_boot audience=guest_runtime " ++
+            "status=disabled target=/sys/firmware/efi/efivars\n",
+    );
+    defer allocator.free(disabled_path);
+    const disabled = try runTool(allocator, &.{
+        "runtime-contract-requirement",
+        "--report",
+        disabled_path,
+        "--id",
+        "secure-boot",
+    });
+    defer disabled.deinit(allocator);
+    try std.testing.expect(!disabled.succeeded());
+    try std.testing.expect(
+        std.mem.indexOf(u8, disabled.stderr, "secure-boot is disabled") != null,
+    );
+}

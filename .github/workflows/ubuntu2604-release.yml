@@ -1035,12 +1035,14 @@ jobs:
           test -x "$BINDER_PROBE"
 
       - name: Build the guest runtime contract probe
-        if: matrix.flavor == 'core'
         run: |
           set -euo pipefail
           # The probe shares the contract module with the release tooling, so it
           # is built through the build graph rather than an ad hoc build-exe
           # that could compile a different table than the one being enforced.
+          # Every flavor needs it: it is how acceptance reads the UEFI signature
+          # database without a `mount(8)` in the guest, not only how the core
+          # runtime contract is evaluated.
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           zig build install-ubuntu2604-runtime-contract-probes
@@ -1097,7 +1099,7 @@ jobs:
             ${{ env.RESULT_DIR }}/boot.log
             ${{ env.RESULT_DIR }}/boot-screenshot.png
             ${{ env.RESULT_DIR }}/boot-diagnostics-errors.log
-            ${{ env.RESULT_DIR }}/uefi-db.bin
+            ${{ env.RESULT_DIR }}/uefi-variables.txt
           if-no-files-found: warn
           retention-days: 2
 

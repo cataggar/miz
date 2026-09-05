@@ -177,13 +177,16 @@ fn addUbuntu2604RuntimeContractModule(
     });
 }
 
-/// A statically linked binary that Ubuntu 26.04 core acceptance pushes into
-/// the running guest to evaluate the runtime contract with syscalls alone.
+/// A statically linked binary that Ubuntu 26.04 acceptance pushes into the
+/// running guest to evaluate the runtime contract and read UEFI variables with
+/// syscalls alone.
 ///
 /// It exists so acceptance never needs `findmnt`, `od`, `grep`, `mountpoint`,
-/// or `modprobe` in the guest: retaining a package because a test used it is
-/// precisely what issue #677 forbids. Acceptance tooling, not an image
-/// artifact -- `build_generalized_ubuntu2604` never receives it.
+/// `modprobe`, or `mount` in the guest: retaining a package because a test
+/// used it is precisely what issue #677 forbids, and `mount` is util-linux,
+/// which the minimized core closure does not install at all. Acceptance
+/// tooling, not an image artifact -- `build_generalized_ubuntu2604` never
+/// receives it.
 fn addUbuntu2604RuntimeContractProbe(
     b: *std.Build,
     architecture: Ubuntu2604Architecture,
@@ -1437,6 +1440,36 @@ pub fn build(b: *std.Build) void {
         install_ubuntu2604_runtime_contract_probes.dependOn(&install_probe.step);
     }
 
+    // The probe's report is what acceptance parses, so the parts of it that
+    // decide what a report says -- `/proc/mounts` interpretation and the exact
+    // bytes of an `efivar` line -- are unit-tested against the same contract
+    // module the harness parses with. The probe is a guest binary, but those
+    // parts are pure, so the tests build for the host.
+    const ubuntu2604_runtime_contract_probe_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/ubuntu2604_runtime_contract_probe.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{
+                .name = "ubuntu2604_runtime_contract",
+                .module = ubuntu2604_runtime_contract_mod,
+            }},
+        }),
+    });
+    const run_ubuntu2604_runtime_contract_probe_tests =
+        b.addRunArtifact(ubuntu2604_runtime_contract_probe_tests);
+    ubuntu2604_runtime_contract_step.dependOn(
+        &run_ubuntu2604_runtime_contract_probe_tests.step,
+    );
+    ubuntu2604_release_test_step.dependOn(
+        &run_ubuntu2604_runtime_contract_probe_tests.step,
+    );
+    // Cross-building the probe for both guest architectures is itself part of
+    // the contract: the same source has to compile for x86_64 and AArch64
+    // guests, and a syscall shape that only exists on one of them must fail
+    // here rather than in an acceptance run.
+    ubuntu2604_runtime_contract_step.dependOn(install_ubuntu2604_runtime_contract_probes);
+
     // ---- tests/ubuntu2604_workflow.zig, tests/ubuntu2604_core_workflow.zig,
     // tests/ubuntu2604_azure_acceptance.zig: structural guards over the Ubuntu
     // release workflows and harnesses. Their subject is the tracked source, so
@@ -2110,7 +2143,7 @@ pub fn build(b: *std.Build) void {
             @tagName(ubuntu2604_flavor),
         );
         // Binder device usability is a core-only QEMU acceptance contract,
-        // so the probe is only cross-built for the core flavor; the option
+        // so that probe is only cross-built for the core flavor; the option
         // resolves to an empty path otherwise and the acceptance test never
         // reads it in that case.
         if (ubuntu2604_flavor == .core) {
@@ -2119,26 +2152,24 @@ pub fn build(b: *std.Build) void {
                 "ubuntu2604_binder_probe_path",
                 ubuntu2604_binder_probe.getEmittedBin(),
             );
-            // The runtime contract is core-only for the same reason, and the
-            // probe that evaluates it is cross-built beside the Binder probe.
-            const ubuntu2604_contract_probe =
-                addUbuntu2604RuntimeContractProbe(b, ubuntu2604_architecture);
-            ubuntu2604_acceptance_options.addOptionPath(
-                "ubuntu2604_runtime_contract_probe_path",
-                ubuntu2604_contract_probe.getEmittedBin(),
-            );
         } else {
             ubuntu2604_acceptance_options.addOption(
                 []const u8,
                 "ubuntu2604_binder_probe_path",
                 "",
             );
-            ubuntu2604_acceptance_options.addOption(
-                []const u8,
-                "ubuntu2604_runtime_contract_probe_path",
-                "",
-            );
         }
+        // The runtime-contract probe is cross-built for every flavor, not just
+        // core. The full contract report is core-only, but the same binary is
+        // how acceptance reads UEFI variables and platform trust state without
+        // a `mount(8)` in the guest, and Secure Boot is asserted on full and
+        // bare-metal candidates too.
+        const ubuntu2604_contract_probe =
+            addUbuntu2604RuntimeContractProbe(b, ubuntu2604_architecture);
+        ubuntu2604_acceptance_options.addOptionPath(
+            "ubuntu2604_runtime_contract_probe_path",
+            ubuntu2604_contract_probe.getEmittedBin(),
+        );
         const ubuntu2604_acceptance_tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tests/ubuntu2604_acceptance.zig"),
