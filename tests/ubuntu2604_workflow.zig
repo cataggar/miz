@@ -768,6 +768,33 @@ test "the release workflow publishes and re-checks the core runtime contract" {
     );
 }
 
+test "every first-boot step is gated on the flavor that has a first-boot phase" {
+    // Only core plans a disk against a declared first-boot growth, and only
+    // core acceptance emits the `first_boot` phase. An ungated step made every
+    // full candidate fail on `test -f` for a document that is never written,
+    // which is how `x86_64-full` failed acceptance in run 33960663048.
+    var workflow = try open();
+    defer workflow.deinit();
+    const native = try workflow.section("\n  native_qemu:\n", "\n  azure_acceptance:\n");
+    const gated = [_][]const u8{
+        "- name: Verify the measured first-boot size inventory",
+        "- name: Enforce the measured first-boot growth bound",
+    };
+    for (gated) |name| {
+        const start = try source.indexOfIn(native, name, workflow_path);
+        const rest = native[start..];
+        const step = rest[0 .. std.mem.indexOfPos(
+            u8,
+            rest,
+            name.len,
+            "      - name:",
+        ) orelse rest.len];
+        try source.expectContainsIn(step, "if: matrix.flavor == 'core'", workflow_path);
+        // The guard has to precede the body it guards.
+        try source.expectOrder(step, "if: matrix.flavor == 'core'", "run: |", workflow_path);
+    }
+}
+
 test "the build job re-validates the size inventory it measured" {
     var workflow = try open();
     defer workflow.deinit();
