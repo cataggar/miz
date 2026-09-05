@@ -333,6 +333,21 @@ pub fn diskGeometryFilename(
     ) catch null;
 }
 
+/// The size-budget verdict a fresh-root candidate carries (issue #677 step 6).
+/// Named the same way as its siblings so a document can only ever be bound by
+/// the flavor and architecture it judged.
+pub fn sizeBudgetFilename(
+    buffer: []u8,
+    flavor: Flavor,
+    architecture: []const u8,
+) ?[]const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        "ubuntu2604-size-budget-{s}-{s}.json",
+        .{ @tagName(flavor), architecture },
+    ) catch null;
+}
+
 pub const debz_api_commit = "beac3f20dd93fd98863af71e8fe621d47db663f6";
 pub const full_debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
 

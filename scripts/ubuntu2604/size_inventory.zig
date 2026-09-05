@@ -56,7 +56,11 @@ pub fn fail(
     return error.Failed;
 }
 
-pub const schema_version: i64 = 1;
+/// Schema 2 adds `root_build.content`: the typed forbidden-content scan issue
+/// #677 step 6 gates on. A schema-1 document cannot be upgraded by reading it,
+/// because the scan is a measurement of a root tree that no longer exists, so
+/// the version is bumped rather than the field made optional.
+pub const schema_version: i64 = 2;
 pub const document_type = "miz-ubuntu2604-size-inventory";
 pub const comparison_type = "miz-ubuntu2604-size-inventory-comparison";
 pub const release_id = "26.04";
@@ -560,20 +564,7 @@ pub const UnownedRule = struct {
     origin: []const u8 = contract_origin,
 
     fn matchesPattern(self: UnownedRule, path: []const u8) bool {
-        if (std.mem.endsWith(u8, self.pattern, "/**")) {
-            const subtree = self.pattern[0 .. self.pattern.len - 2];
-            const directory = self.pattern[0 .. self.pattern.len - 3];
-            // The directory a subtree rule names is part of the subtree it
-            // names. A root's own `/var/lib/miz` is exactly as attributable as
-            // the provenance inside it, and a rule that covered the contents
-            // but not the container would leave a directory nobody can explain.
-            return std.mem.eql(u8, directory, path) or
-                std.mem.startsWith(u8, path, subtree);
-        }
-        if (std.mem.endsWith(u8, self.pattern, "*")) {
-            return std.mem.startsWith(u8, path, self.pattern[0 .. self.pattern.len - 1]);
-        }
-        return std.mem.eql(u8, self.pattern, path);
+        return matchesPathPattern(self.pattern, path);
     }
 
     fn lessThan(_: void, left: UnownedRule, right: UnownedRule) bool {
@@ -850,6 +841,325 @@ pub fn unownedRulesAlloc(allocator: Allocator, flavor: Flavor) Error![]UnownedRu
     @memcpy(rules[shared_unowned_rules.len..], extra);
     std.mem.sort(UnownedRule, rules, {}, UnownedRule.lessThan);
     return rules;
+}
+
+// ---------------------------------------------------------------------------
+// The typed content policy (issue #677 step 6).
+//
+// The unowned allowlist answers "who put this file here". It cannot answer
+// "should this class of content be in an appliance at all", because the content
+// #677 names -- apt state, caches, locales, manuals, documentation, cloud-init,
+// WALinuxAgent, a systemd service manager -- is *package-owned* when it is
+// present, and package-owned content never reaches the unowned remainder.
+//
+// So the content policy is a second, independent classification of the same
+// walk, and it splits into exactly two dispositions. A class the appliance must
+// not contain at all is `absent`, and one matching path is a build failure that
+// names it. A class that exists only because #677 omits packages rather than
+// deleting their files is `bounded`: it is measured, it is published with the
+// justification for keeping it, and the reviewed size budget caps it, so it can
+// be argued about with numbers instead of growing quietly.
+// ---------------------------------------------------------------------------
+
+/// What the policy requires of a content class.
+pub const ContentDisposition = enum {
+    /// The appliance must not contain the class. Any match fails the gate.
+    absent,
+    /// The class is package-owned residue of packages the runtime contract
+    /// requires. It is kept because deleting a package's files would break the
+    /// exact-closure guarantee, and it is bounded by the size budget instead.
+    bounded,
+
+    pub fn key(self: ContentDisposition) []const u8 {
+        return @tagName(self);
+    }
+
+    pub fn parse(text: []const u8) ?ContentDisposition {
+        inline for (@typeInfo(ContentDisposition).@"enum".fields) |field| {
+            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        }
+        return null;
+    }
+};
+
+/// One reviewed content class.
+pub const ContentRule = struct {
+    /// Stable identifier. Budgets name classes by this, and a failure quotes
+    /// it, so it is part of the reviewed contract and not a display string.
+    id: []const u8,
+    disposition: ContentDisposition,
+    /// Patterns with the same meaning they have in `UnownedRule`: an exact
+    /// path, a `path/**` subtree, or a `prefix*`.
+    patterns: []const []const u8,
+    /// Why the class is forbidden, or -- for a bounded class -- why the
+    /// appliance keeps it anyway.
+    reason: []const u8,
+
+    fn matches(self: ContentRule, path: []const u8) bool {
+        for (self.patterns) |pattern| {
+            if (matchesPathPattern(pattern, path)) return true;
+        }
+        return false;
+    }
+};
+
+/// Shared by the unowned allowlist and the content policy so the two tables
+/// cannot mean different things by the same spelling.
+fn matchesPathPattern(pattern: []const u8, path: []const u8) bool {
+    if (std.mem.endsWith(u8, pattern, "/**")) {
+        const subtree = pattern[0 .. pattern.len - 2];
+        const directory = pattern[0 .. pattern.len - 3];
+        return std.mem.eql(u8, directory, path) or
+            std.mem.startsWith(u8, path, subtree);
+    }
+    if (std.mem.endsWith(u8, pattern, "*")) {
+        return std.mem.startsWith(u8, path, pattern[0 .. pattern.len - 1]);
+    }
+    return std.mem.eql(u8, pattern, path);
+}
+
+/// Content no Ubuntu 26.04 appliance image may contain.
+///
+/// Each entry is the payload of a package the runtime contract already forbids,
+/// or state that only a forbidden package writes. Naming the *paths* as well as
+/// the packages is deliberate: a closure check proves a package is not
+/// installed, and this proves its content did not arrive some other way.
+///
+/// Paths are exact wherever a near neighbour is legitimate. `/usr/lib/systemd`
+/// still holds `systemd-udevd`, which is a symlink to `udevadm` and part of the
+/// contract, so the service manager is named file by file rather than by a
+/// subtree that would take the whole directory with it.
+pub const absent_content_rules = [_]ContentRule{
+    .{
+        .id = "apt-state",
+        .disposition = .absent,
+        .patterns = &.{
+            "/etc/apt/auth.conf",    "/etc/apt/auth.conf.d/**",
+            "/etc/apt/preferences",  "/etc/apt/preferences.d/**",
+            "/etc/apt/sources.list", "/etc/apt/sources.list.d/**",
+            "/var/lib/apt/**",
+        },
+        .reason = "apt resolves nothing in the appliance; its lists and " ++
+            "source configuration are build-host state",
+    },
+    .{
+        .id = "apt-cache",
+        .disposition = .absent,
+        .patterns = &.{ "/var/cache/apt/**", "/var/cache/debz/**" },
+        .reason = "downloaded archives are build inputs and are never part " ++
+            "of a published root",
+    },
+    .{
+        .id = "apt-client",
+        .disposition = .absent,
+        .patterns = &.{
+            "/usr/bin/apt",     "/usr/bin/apt-cache", "/usr/bin/apt-get",
+            "/usr/bin/apt-key", "/usr/bin/apt-mark",  "/usr/bin/aptitude",
+            "/usr/lib/apt/**",
+        },
+        .reason = "the appliance installs nothing at runtime, so it carries " ++
+            "no package-manager client",
+    },
+    .{
+        .id = "cloud-init",
+        .disposition = .absent,
+        .patterns = &.{
+            "/etc/cloud/**",          "/usr/bin/cloud-init",
+            "/usr/lib/cloud-init/**", "/usr/share/cloud-init/**",
+            "/var/lib/cloud/**",
+        },
+        .reason = "azagent provisions the appliance; the `no-cloud-init` " ++
+            "acceptance contract requires cloud-init to be absent",
+    },
+    .{
+        .id = "walinuxagent",
+        .disposition = .absent,
+        .patterns = &.{
+            "/etc/logrotate.d/waagent",
+            "/usr/lib/python3/dist-packages/azurelinuxagent/**",
+            "/usr/sbin/waagent",
+            "/var/lib/waagent/**",
+        },
+        .reason = "azagent replaces WALinuxAgent; the `no-walinuxagent` " ++
+            "acceptance contract requires its payload to be absent",
+    },
+    .{
+        .id = "snap",
+        .disposition = .absent,
+        .patterns = &.{
+            "/snap/**",          "/usr/bin/snap",
+            "/usr/lib/snapd/**", "/var/lib/snapd/**",
+        },
+        .reason = "no snap runtime exists in the closure and none may arrive " ++
+            "through a dependency",
+    },
+    .{
+        .id = "systemd-service-manager",
+        .disposition = .absent,
+        .patterns = &.{
+            "/bin/systemctl",                    "/lib/systemd/systemd",
+            "/usr/bin/journalctl",               "/usr/bin/systemctl",
+            "/usr/bin/systemd-run",              "/usr/lib/systemd/systemd",
+            "/usr/lib/systemd/systemd-executor", "/usr/lib/systemd/systemd-journald",
+            "/usr/lib/systemd/systemd-logind",
+        },
+        .reason = "mizinit is PID 1; the `no-systemd-service-manager` " ++
+            "acceptance contract requires the manager and its daemons to be " ++
+            "absent, whatever inert unit files packages ship",
+    },
+    .{
+        .id = "initramfs-generator",
+        .disposition = .absent,
+        .patterns = &.{
+            "/etc/initramfs-tools/**",
+            "/usr/sbin/mkinitramfs",
+            "/usr/sbin/update-initramfs",
+            "/usr/share/initramfs-tools/scripts/**",
+        },
+        .reason = "#677 step 4 generates the initramfs in a staging root; " ++
+            "the generator must not be in the guest that boots it",
+    },
+    .{
+        .id = "kernel-build-tree",
+        .disposition = .absent,
+        .patterns = &.{
+            "/usr/lib/modules/*/build",
+            "/usr/src/*",
+        },
+        .reason = "the appliance compiles nothing; kernel headers and module " ++
+            "build trees are build-time content",
+    },
+};
+
+/// Content the appliance keeps, with the reason it keeps it.
+///
+/// Nothing here is wanted. Every entry is content that arrives inside a package
+/// the runtime contract requires, and #677 is explicit that a package is
+/// omitted rather than installed and stripped, because a root assembled by
+/// deleting a package's files no longer equals its closure. So the policy
+/// records the class, publishes why it survives, and lets the size budget cap
+/// it: a doubling of the manual pages is then a reviewable number rather than
+/// an invisible one.
+pub const bounded_content_rules = [_]ContentRule{
+    .{
+        .id = "documentation",
+        .disposition = .bounded,
+        .patterns = &.{"/usr/share/doc/**"},
+        .reason = "copyright files are a distribution obligation and the rest " ++
+            "of /usr/share/doc arrives in the same package payload",
+    },
+    .{
+        .id = "manual-pages",
+        .disposition = .bounded,
+        .patterns = &.{"/usr/share/man/**"},
+        .reason = "shipped inside required packages; removing them would " ++
+            "break the exact-closure guarantee",
+    },
+    .{
+        .id = "info-pages",
+        .disposition = .bounded,
+        .patterns = &.{"/usr/share/info/**"},
+        .reason = "shipped inside required packages; removing them would " ++
+            "break the exact-closure guarantee",
+    },
+    .{
+        .id = "locale-data",
+        .disposition = .bounded,
+        .patterns = &.{
+            "/usr/lib/locale/**",
+            "/usr/share/i18n/**",
+            "/usr/share/locale/**",
+        },
+        .reason = "the `locales` package is forbidden; what remains is " ++
+            "message catalogues inside required packages",
+    },
+    .{
+        .id = "packaging-metadata",
+        .disposition = .bounded,
+        .patterns = &.{
+            "/etc/apt/apt.conf.d/**",
+            "/usr/share/bug/**",
+            "/usr/share/lintian/**",
+            "/usr/share/menu/**",
+            "/usr/share/pixmaps/**",
+        },
+        .reason = "maintainer metadata inside required packages; inert " ++
+            "without the tooling that reads it, which the closure excludes",
+    },
+    .{
+        .id = "inert-systemd-units",
+        .disposition = .bounded,
+        .patterns = &.{
+            "/etc/systemd/system/**",
+            "/etc/systemd/user/**",
+            "/usr/lib/systemd/system/**",
+            "/usr/lib/systemd/system-generators/**",
+            "/usr/lib/systemd/user/**",
+        },
+        .reason = "unit files and generators shipped by openssh-server, sudo " ++
+            "and e2fsprogs; nothing starts them because the service manager " ++
+            "is absent, which the absent policy above enforces separately",
+    },
+    .{
+        .id = "build-tool-hooks",
+        .disposition = .bounded,
+        .patterns = &.{"/usr/share/initramfs-tools/**"},
+        .reason = "hook fragments shipped by required packages such as kmod; " ++
+            "the generator that would run them is absent",
+    },
+    .{
+        .id = "debconf-state",
+        .disposition = .bounded,
+        .patterns = &.{"/var/cache/debconf/**"},
+        .reason = "the configuration database maintainer scripts wrote during " ++
+            "installation; regenerable, never read at runtime",
+    },
+};
+
+/// Every content rule, absent classes first.
+///
+/// The order is the policy: an absent rule must win over a bounded rule that
+/// would otherwise cover the same path, which is what lets
+/// `/usr/share/initramfs-tools/**` be bounded while
+/// `/usr/share/initramfs-tools/scripts/**` is forbidden.
+pub fn contentRulesAlloc(allocator: Allocator) Error![]ContentRule {
+    const rules = try allocator.alloc(
+        ContentRule,
+        absent_content_rules.len + bounded_content_rules.len,
+    );
+    @memcpy(rules[0..absent_content_rules.len], &absent_content_rules);
+    @memcpy(rules[absent_content_rules.len..], &bounded_content_rules);
+    return rules;
+}
+
+/// `sha256` over the content policy, rendered one field-separated line per
+/// pattern.
+///
+/// Bound exactly like the unowned policy digest, and for the same reason: the
+/// builder publishes the digest of the table it classified with, every later
+/// validator recomputes it from its own compiled-in table, and a measurement
+/// taken against a widened policy is refused rather than believed.
+pub fn contentPolicyDigest(allocator: Allocator) Error![64]u8 {
+    var hash: std.crypto.hash.sha2.Sha256 = .init(.{});
+    const tables = [_][]const ContentRule{ &absent_content_rules, &bounded_content_rules };
+    for (&tables) |table| {
+        for (table) |rule| {
+            for (rule.patterns) |pattern| {
+                const line = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}\t{s}\t{s}\t{s}\n",
+                    .{ rule.id, rule.disposition.key(), pattern, rule.reason },
+                );
+                defer allocator.free(line);
+                hash.update(line);
+            }
+        }
+    }
+    var raw: [32]u8 = undefined;
+    hash.final(&raw);
+    var hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&hex, "{x}", .{&raw}) catch unreachable;
+    return hex;
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,6 +1523,15 @@ pub const RootMeasurementOptions = struct {
     /// `full` flavor inherits Canonical's server root and is measured, not
     /// gated, so this stays opt-in rather than becoming the default.
     require_allowlisted_unowned: bool = false,
+    /// Whether a path in an `absent` content class is a build failure rather
+    /// than a reported measurement.
+    ///
+    /// Issue #677 step 6: the appliance must not contain apt state or caches,
+    /// cloud-init, WALinuxAgent, a systemd service manager, the initramfs
+    /// generator, or a kernel build tree, whichever package would own them.
+    /// The `full` flavor is Canonical's server root and legitimately carries
+    /// most of that list, so this is opt-in exactly like the unowned gate.
+    require_absent_content: bool = false,
 };
 
 /// One measured path that exists only in the finished image.
@@ -1329,6 +1648,9 @@ pub fn measureRootBuild(
     @memcpy(rules[static_rules.len..], derived_rules);
     std.mem.sort(UnownedRule, rules, {}, UnownedRule.lessThan);
 
+    const content_rules = try contentRulesAlloc(scratch);
+    defer scratch.free(content_rules);
+
     var walk: Walk = .{
         .scratch = scratch,
         .io = io,
@@ -1337,6 +1659,8 @@ pub fn measureRootBuild(
         .packages = packages.items,
         .rules = rules,
         .rule_buckets = try scratch.alloc(Bucket, rules.len),
+        .content_rules = content_rules,
+        .content_buckets = try scratch.alloc(Bucket, content_rules.len),
         .unexpected_limit = options.unexpected_path_limit,
         .kernel_path = try std.fmt.allocPrint(
             scratch,
@@ -1355,9 +1679,12 @@ pub fn measureRootBuild(
         ),
     };
     @memset(walk.rule_buckets, .{});
+    @memset(walk.content_buckets, .{});
     defer {
         scratch.free(walk.rule_buckets);
+        scratch.free(walk.content_buckets);
         walk.unexpected.deinit(scratch);
+        walk.absent_paths.deinit(scratch);
     }
     try walk.run(diagnostic);
     for (options.injected) |entry| try walk.recordInjected(entry);
@@ -1379,6 +1706,30 @@ pub fn measureRootBuild(
                 walk.unexpected_bucket.usage.logical_bytes,
                 writer.buffered(),
                 if (named.len < walk.unexpected.items.len or walk.unexpected_truncated)
+                    " ..."
+                else
+                    "",
+            },
+        );
+    }
+
+    if (options.require_absent_content and walk.absent_content.file_count != 0) {
+        std.mem.sort([]const u8, walk.absent_paths.items, {}, lessThanPath);
+        const named = walk.absent_paths.items[0..@min(walk.absent_paths.items.len, 8)];
+        var buffer: [1024]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        for (named, 0..) |path, position| {
+            writer.print("{s}{s}", .{ if (position == 0) "" else " ", path }) catch break;
+        }
+        return fail(
+            diagnostic,
+            "{d} path(s) totalling {d} bytes belong to content classes the " ++
+                "appliance must not contain: {s}{s}",
+            .{
+                walk.absent_content.file_count,
+                walk.absent_content.usage.logical_bytes,
+                writer.buffered(),
+                if (named.len < walk.absent_paths.items.len or walk.absent_truncated)
                     " ..."
                 else
                     "",
@@ -1468,6 +1819,35 @@ pub fn measureRootBuild(
         directories.appendAssumeCapacity(.{ .object = item });
     }
     try builder.put(&section, "root_directories", .{ .array = directories });
+
+    var content = builder.object();
+    const content_policy = try contentPolicyDigest(scratch);
+    try builder.putString(&content, "policy_sha256", &content_policy);
+    var content_classes = builder.array();
+    try content_classes.ensureTotalCapacity(content_rules.len);
+    for (content_rules, walk.content_buckets) |rule, bucket| {
+        var item = builder.object();
+        try builder.putString(&item, "id", rule.id);
+        try builder.putString(&item, "disposition", rule.disposition.key());
+        try builder.putString(&item, "reason", rule.reason);
+        try builder.putCount(&item, "file_count", bucket.file_count);
+        try builder.putCount(&item, "installed_bytes", bucket.usage.logical_bytes);
+        try builder.putCount(&item, "allocated_bytes", bucket.usage.allocated_bytes);
+        content_classes.appendAssumeCapacity(.{ .object = item });
+    }
+    try builder.put(&content, "classes", .{ .array = content_classes });
+    var absent_section = try bucketObject(builder, walk.absent_content);
+    std.mem.sort([]const u8, walk.absent_paths.items, {}, lessThanPath);
+    var absent_paths = builder.array();
+    try absent_paths.ensureTotalCapacity(walk.absent_paths.items.len);
+    for (walk.absent_paths.items) |path| {
+        absent_paths.appendAssumeCapacity(try builder.string(path));
+    }
+    try builder.put(&absent_section, "paths", .{ .array = absent_paths });
+    try builder.put(&absent_section, "truncated", .{ .bool = walk.absent_truncated });
+    try builder.put(&content, "absent", .{ .object = absent_section });
+    try builder.put(&content, "bounded", try bucketValue(builder, walk.bounded_content));
+    try builder.put(&section, "content", .{ .object = content });
 
     var boot = builder.object();
     try builder.putString(&boot, "kernel_release", options.kernel_release);
@@ -1830,6 +2210,8 @@ const Walk = struct {
     packages: []PackageEntry,
     rules: []const UnownedRule,
     rule_buckets: []Bucket,
+    content_rules: []const ContentRule,
+    content_buckets: []Bucket,
     unexpected_limit: usize,
     kernel_path: []const u8,
     initramfs_path: []const u8,
@@ -1843,6 +2225,10 @@ const Walk = struct {
     unexpected_bucket: Bucket = .{},
     unexpected: std.ArrayList([]const u8) = .empty,
     unexpected_truncated: bool = false,
+    absent_content: Bucket = .{},
+    bounded_content: Bucket = .{},
+    absent_paths: std.ArrayList([]const u8) = .empty,
+    absent_truncated: bool = false,
     unreadable: u64 = 0,
     directories: std.ArrayList(NamedBucket) = .empty,
     kernel: Usage = .{},
@@ -1910,6 +2296,7 @@ const Walk = struct {
                 null,
         };
         try self.attribute(guest, usage, observed);
+        try self.attributeContent(guest, usage);
         try self.attributeBoot(guest, usage);
         if (kind != .directory) return;
 
@@ -1953,6 +2340,7 @@ const Walk = struct {
             .kind = entry.kind,
             .link_target = entry.link_target,
         });
+        try self.attributeContent(entry.path, usage);
         try self.attributeBoot(entry.path, usage);
         const end = std.mem.indexOfScalarPos(u8, entry.path, 1, '/') orelse
             entry.path.len;
@@ -2011,6 +2399,36 @@ const Walk = struct {
         self.unexpected.append(self.scratch, copy) catch {
             self.unexpected_truncated = true;
         };
+    }
+
+    /// Classifies one path against the reviewed content policy.
+    ///
+    /// This is independent of ownership on purpose. The content #677 forbids is
+    /// package-owned wherever it appears, so a classification that only looked
+    /// at the unowned remainder would never see it.
+    fn attributeContent(self: *Walk, guest: []const u8, usage: Usage) Error!void {
+        for (self.content_rules, self.content_buckets) |rule, *bucket| {
+            if (!rule.matches(guest)) continue;
+            bucket.record(usage);
+            switch (rule.disposition) {
+                .bounded => self.bounded_content.record(usage),
+                .absent => {
+                    self.absent_content.record(usage);
+                    if (self.absent_paths.items.len >= self.unexpected_limit) {
+                        self.absent_truncated = true;
+                        return;
+                    }
+                    const copy = self.scratch.dupe(u8, guest) catch {
+                        self.absent_truncated = true;
+                        return;
+                    };
+                    self.absent_paths.append(self.scratch, copy) catch {
+                        self.absent_truncated = true;
+                    };
+                },
+            }
+            return;
+        }
     }
 
     fn attributeBoot(self: *Walk, guest: []const u8, usage: Usage) Error!void {
@@ -2152,6 +2570,10 @@ pub const Summary = struct {
     /// Digest of the reviewed unowned allowlist the document was measured
     /// against, re-derived rather than copied out of the document.
     unowned_policy_sha256: []const u8 = "",
+    /// Paths in content classes the appliance must not contain at all.
+    absent_content_count: u64 = 0,
+    /// Digest of the reviewed content policy, re-derived the same way.
+    content_policy_sha256: []const u8 = "",
 
     pub fn has(self: Summary, phase: Phase) bool {
         return self.phases[@intFromEnum(phase)];
@@ -2171,6 +2593,7 @@ const root_build_fields = [_][]const u8{
     "allocated_bytes",
     "boot",
     "closure_sha256",
+    "content",
     "file_count",
     "installed_bytes",
     "owned",
@@ -2188,6 +2611,13 @@ const bucket_fields = [_][]const u8{
     "allocated_bytes",
     "file_count",
     "installed_bytes",
+};
+
+const content_fields = [_][]const u8{
+    "absent",
+    "bounded",
+    "classes",
+    "policy_sha256",
 };
 
 const image_build_fields = [_][]const u8{
@@ -2680,6 +3110,8 @@ fn validateRootBuild(
         .{},
     );
 
+    try validateContent(allocator, object.get("content"), summary, diagnostic);
+
     const directories = arrayOf(object.get("root_directories")) orelse return fail(
         diagnostic,
         "size inventory root directories are invalid",
@@ -2757,6 +3189,159 @@ fn validateRootBuild(
     summary.allocated_bytes = total.usage.allocated_bytes;
     summary.unexpected_unowned_count = unexpected.file_count;
     summary.unowned_policy_sha256 = declared_policy;
+}
+
+/// Full check over `root_build.content`, the typed content policy scan.
+///
+/// Strict in the same three ways the rest of the document is: the class list
+/// must be exactly the reviewed policy in exactly its order, the totals must
+/// equal the classes they aggregate, and the published policy digest must equal
+/// the one this tool computes from its own tables. A measurement taken against
+/// a policy somebody widened locally is refused rather than believed, which is
+/// what makes the gate a contract change instead of a snapshot refresh.
+fn validateContent(
+    allocator: Allocator,
+    value: ?std.json.Value,
+    summary: *Summary,
+    diagnostic: *Diagnostic,
+) Error!void {
+    const content = objectOf(value) orelse return fail(
+        diagnostic,
+        "size inventory content policy scan is invalid",
+        .{},
+    );
+    if (!hasExactFields(content, &content_fields)) return fail(
+        diagnostic,
+        "size inventory content policy scan has unexpected fields",
+        .{},
+    );
+    const declared_policy = stringOf(content.get("policy_sha256")) orelse return fail(
+        diagnostic,
+        "size inventory content policy digest is invalid",
+        .{},
+    );
+    const expected_policy = try contentPolicyDigest(allocator);
+    if (!std.mem.eql(u8, declared_policy, &expected_policy)) return fail(
+        diagnostic,
+        "size inventory content policy digest {s} does not match the reviewed " ++
+            "policy {s}",
+        .{ declared_policy, expected_policy },
+    );
+
+    const rules = try contentRulesAlloc(allocator);
+    defer allocator.free(rules);
+    const classes = arrayOf(content.get("classes")) orelse return fail(
+        diagnostic,
+        "size inventory content classes are invalid",
+        .{},
+    );
+    if (classes.len != rules.len) return fail(
+        diagnostic,
+        "size inventory reports {d} content class(es) where the reviewed " ++
+            "policy declares {d}",
+        .{ classes.len, rules.len },
+    );
+    var absent_sum: Bucket = .{};
+    var bounded_sum: Bucket = .{};
+    for (classes, rules) |entry, rule| {
+        const item = objectOf(entry) orelse return fail(
+            diagnostic,
+            "size inventory content class is invalid",
+            .{},
+        );
+        const bucket = try requireBucket(
+            entry,
+            "content class",
+            &.{ "disposition", "id", "reason" },
+            diagnostic,
+        );
+        const id = stringOf(item.get("id")) orelse return fail(
+            diagnostic,
+            "size inventory content class is invalid",
+            .{},
+        );
+        // Order is part of the policy: an absent rule wins over a bounded rule
+        // covering the same subtree, so a document whose classes are permuted
+        // was not measured against this policy at all.
+        if (!std.mem.eql(u8, id, rule.id) or
+            !stringIs(item.get("disposition"), rule.disposition.key()) or
+            !stringIs(item.get("reason"), rule.reason))
+        {
+            return fail(
+                diagnostic,
+                "size inventory content class {s} does not match the reviewed " ++
+                    "policy class {s}",
+                .{ id, rule.id },
+            );
+        }
+        switch (rule.disposition) {
+            .absent => accumulate(&absent_sum, bucket),
+            .bounded => accumulate(&bounded_sum, bucket),
+        }
+    }
+
+    const absent_object = objectOf(content.get("absent")) orelse return fail(
+        diagnostic,
+        "size inventory absent-content totals are invalid",
+        .{},
+    );
+    const absent = try requireBucket(
+        content.get("absent"),
+        "absent-content totals",
+        &.{ "paths", "truncated" },
+        diagnostic,
+    );
+    const paths = arrayOf(absent_object.get("paths")) orelse return fail(
+        diagnostic,
+        "size inventory absent-content paths are invalid",
+        .{},
+    );
+    const truncated = switch (absent_object.get("truncated") orelse std.json.Value.null) {
+        .bool => |flag| flag,
+        else => return fail(
+            diagnostic,
+            "size inventory absent-content paths are invalid",
+            .{},
+        ),
+    };
+    for (paths) |entry| {
+        const path = stringOf(entry) orelse return fail(
+            diagnostic,
+            "size inventory absent-content paths are invalid",
+            .{},
+        );
+        if (path.len < 2 or path[0] != '/') return fail(
+            diagnostic,
+            "size inventory absent-content path {s} is invalid",
+            .{path},
+        );
+    }
+    if (!truncated and paths.len != absent.file_count) return fail(
+        diagnostic,
+        "size inventory absent-content paths are incomplete",
+        .{},
+    );
+    if (truncated and paths.len >= absent.file_count) return fail(
+        diagnostic,
+        "size inventory absent-content paths are not truncated",
+        .{},
+    );
+    const bounded = try requireBucket(
+        content.get("bounded"),
+        "bounded-content totals",
+        &.{},
+        diagnostic,
+    );
+    if (!bucketsEqual(absent, absent_sum) or !bucketsEqual(bounded, bounded_sum)) {
+        return fail(
+            diagnostic,
+            "size inventory content totals do not match their classes",
+            .{},
+        );
+    }
+
+    summary.absent_content_count = absent.file_count;
+    summary.content_policy_sha256 = declared_policy;
 }
 
 fn validateFilesystemSection(

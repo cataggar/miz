@@ -762,6 +762,55 @@ test "the build job re-validates the size inventory it measured" {
     try source.expectContainsIn(step, "set -euo pipefail", workflow_path);
 }
 
+test "publication is gated on a reviewed size and content budget" {
+    // Issue #677 step 6. Two independent enforcement points, because they
+    // answer different questions: the per-candidate step re-derives the verdict
+    // this build published, and the release gate refuses to publish any core
+    // candidate whose architecture has only a recorded baseline.
+    var workflow = try open();
+    defer workflow.deinit();
+    const build_job = try workflow.section("\n  build:\n", "\n  native_qemu:\n");
+    try source.expectOrder(
+        build_job,
+        "- name: Enforce the reviewed size and content budget",
+        "- name: Create and verify exact candidate bundle",
+        workflow_path,
+    );
+    const start = try source.indexOfIn(
+        build_job,
+        "- name: Enforce the reviewed size and content budget",
+        workflow_path,
+    );
+    const rest = build_job[start..];
+    const step = rest[0 .. std.mem.indexOfPos(
+        u8,
+        rest,
+        "- name: Enforce".len,
+        "- name:",
+    ) orelse rest.len];
+    try source.expectContainsIn(step, "size-budget-verify", workflow_path);
+    try source.expectContainsIn(step, "--require-status enforced", workflow_path);
+    try source.expectContainsIn(step, "ubuntu2604-size-budget-", workflow_path);
+    try source.expectContainsIn(step, "if: matrix.flavor == 'core'", workflow_path);
+    try source.expectContainsIn(step, "set -euo pipefail", workflow_path);
+
+    const publish_job = try workflow.section("\n  publish:\n", null);
+    try source.expectContainsIn(publish_job, "release-gate", workflow_path);
+    try source.expectContainsIn(
+        publish_job,
+        "--require-size-budget enforced",
+        workflow_path,
+    );
+    // The gate runs before anything is staged or published, which is the only
+    // ordering that makes it a gate.
+    try source.expectOrder(
+        publish_job,
+        "--require-size-budget enforced",
+        "- name: Publish exactly four accepted Ubuntu assets",
+        workflow_path,
+    );
+}
+
 test "the build job validates the QCOW2 and publishes its metadata natively" {
     var workflow = try open();
     defer workflow.deinit();

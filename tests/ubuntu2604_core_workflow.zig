@@ -68,6 +68,83 @@ test "the core build job re-validates the size inventory it measured" {
     try source.expectContainsIn(step, "--max-unexpected-unowned 0", workflow_path);
 }
 
+test "core validation records the size and content budget without publishing it" {
+    // Issue #677 step 6. Core validation is where a candidate baseline for an
+    // architecture nobody has measured yet is produced, so it re-derives the
+    // verdict but does not demand a reviewed one. The release workflow, which
+    // publishes, is the one that does.
+    var workflow = try open();
+    defer workflow.deinit();
+    const build_job = try job(&workflow, "build", "native_qemu");
+    try source.expectOrder(
+        build_job,
+        "- name: Record and re-derive the size and content budget",
+        "- name: Create and verify exact core candidate bundle",
+        workflow_path,
+    );
+    const start = try source.indexOfIn(
+        build_job,
+        "- name: Record and re-derive the size and content budget",
+        workflow_path,
+    );
+    const rest = build_job[start..];
+    const step = rest[0 .. std.mem.indexOfPos(
+        u8,
+        rest,
+        "- name: Record".len,
+        "- name:",
+    ) orelse rest.len];
+    try source.expectContainsIn(step, "size-budget-verify", workflow_path);
+    try source.expectContainsIn(step, "ubuntu2604-size-budget-", workflow_path);
+    if (std.mem.indexOf(u8, step, "--require-status enforced") != null) {
+        std.debug.print(
+            "{s}: core validation must not demand a reviewed budget; it is " ++
+                "where a candidate baseline is produced\n",
+            .{workflow_path},
+        );
+        return error.CoreValidationDemandsReviewedBudget;
+    }
+}
+
+test "acceptance holds the measured first-boot growth to the declared bound" {
+    // Issue #677 step 6. The disk plan reserves four times a declared 32 MiB
+    // first-boot growth; the declaration is only worth something if the boot
+    // that happens is checked against it.
+    var workflow = try open();
+    defer workflow.deinit();
+    const native = try job(&workflow, "native_qemu", "azure_acceptance");
+    try source.expectOrder(
+        native,
+        "- name: Verify the measured first-boot size inventory",
+        "- name: Enforce the measured first-boot growth bound",
+        workflow_path,
+    );
+    const start = try source.indexOfIn(
+        native,
+        "- name: Enforce the measured first-boot growth bound",
+        workflow_path,
+    );
+    const rest = native[start..];
+    const step = rest[0 .. std.mem.indexOfPos(
+        u8,
+        rest,
+        "- name: Enforce".len,
+        "- name:",
+    ) orelse rest.len];
+    try source.expectContainsIn(step, "size-budget-verify", workflow_path);
+    try source.expectContainsIn(step, ".first-boot.json", workflow_path);
+    // No published verdict is presented, because the builder cannot measure a
+    // boot; the reviewed budget is evaluated against what the guest produced.
+    if (std.mem.indexOf(u8, step, "--budget ") != null) {
+        std.debug.print(
+            "{s}: the first-boot growth bound has no published verdict to " ++
+                "re-derive\n",
+            .{workflow_path},
+        );
+        return error.FirstBootBudgetPresentsAVerdict;
+    }
+}
+
 test "the core build job re-validates the runtime contract it published" {
     var workflow = try open();
     defer workflow.deinit();

@@ -2766,24 +2766,12 @@ test "Ubuntu provenance binds a complete size inventory" {
     ));
 
     // Issue #677 step 3: the fresh-root bound the core workflows pass. The
-    // fixture root deliberately carries a kernel no package claims, so the
-    // bound the core workflows use refuses it by name rather than reporting it.
-    try std.testing.expectError(error.Failed, release.workflow.sizeInventoryVerify(
-        allocator,
-        io,
-        &writer,
-        inventory,
-        "x86_64",
-        "core",
-        "root_build,image_build,publication",
-        "0",
-        &diagnostic,
-    ));
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        diagnostic.message(),
-        "outside the explicit allowlist",
-    ) != null);
+    // fixture root is a complete closure -- every path it carries is claimed by
+    // a package or named by the injected-file allowlist -- so the zero bound
+    // the core workflows use is satisfied rather than merely reported. Step 6
+    // makes that bound part of the budget as well, so a bundle whose root
+    // carried a remainder could no longer be built at all; the refusal path is
+    // covered by the measurement and budget tests.
     writer.end = 0;
     try release.workflow.sizeInventoryVerify(
         allocator,
@@ -2793,7 +2781,7 @@ test "Ubuntu provenance binds a complete size inventory" {
         "x86_64",
         "core",
         "root_build,image_build,publication",
-        "1024",
+        "0",
         &diagnostic,
     );
     // A malformed bound is refused rather than silently ignored.

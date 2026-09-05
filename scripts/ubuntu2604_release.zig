@@ -29,6 +29,7 @@ pub const provenance = @import("ubuntu2604/provenance.zig");
 pub const runtime_contract = @import("ubuntu2604_runtime_contract");
 pub const disk_geometry = @import("ubuntu2604/disk_geometry.zig");
 pub const runtime_contract_document = @import("ubuntu2604/runtime_contract_document.zig");
+pub const size_budget = @import("ubuntu2604/size_budget.zig");
 pub const size_inventory = @import("ubuntu2604/size_inventory.zig");
 pub const support = @import("ubuntu2604/support.zig");
 pub const workflow = @import("ubuntu2604/workflow.zig");
@@ -56,6 +57,7 @@ const usage_text =
     \\  verify-image-info             check a miz image-info document
     \\  size-inventory-verify         check a measured size-inventory document
     \\  size-inventory-compare        report size deltas between two inventories
+    \\  size-budget-verify            check a published size-budget gate document
     \\  disk-geometry-verify          check a calculated core disk-geometry report
     \\  runtime-contract-verify       check a published runtime-contract document
     \\  runtime-contract-probe-verify check a guest runtime-contract probe report
@@ -127,6 +129,11 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(usage_exit_code);
         },
         error.Failed => {
+            // Whatever the command printed before it refused is part of the
+            // refusal: a size budget writes its attributable per-metric deltas
+            // to stdout and then fails with a one-line summary, and a gate
+            // whose attribution is discarded is a gate nobody can act on.
+            try out.flush();
             try err_out.print("{s}\n", .{context.diagnostic.message()});
             try err_out.flush();
             std.process.exit(failure_exit_code);
@@ -416,6 +423,7 @@ test {
     _ = @import("ubuntu2604/download.zig");
     _ = @import("ubuntu2604/keys.zig");
     _ = @import("ubuntu2604/provenance.zig");
+    _ = @import("ubuntu2604/size_budget.zig");
     _ = @import("ubuntu2604/size_inventory.zig");
     _ = @import("ubuntu2604/support.zig");
     _ = @import("ubuntu2604/url.zig");

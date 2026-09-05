@@ -23,6 +23,7 @@ const disk_geometry = @import("disk_geometry.zig");
 const keys = @import("keys.zig");
 const runtime_contract = @import("ubuntu2604_runtime_contract");
 const runtime_contract_document = @import("runtime_contract_document.zig");
+const size_budget = @import("size_budget.zig");
 const size_inventory = @import("size_inventory.zig");
 const support = @import("support.zig");
 const url = @import("url.zig");
@@ -416,6 +417,57 @@ fn validateDiskGeometry(
     parsed.deinit();
 }
 
+/// Re-checks the size-budget verdict a fresh root binds (issue #677 step 6).
+///
+/// The verdict is not read; it is re-derived. `size_budget.readValidated`
+/// recomputes the reviewed budget's digest from this tool's own tables,
+/// recomputes every limit from its recorded baseline, and recomputes the
+/// verdict from the observations, so a candidate carrying a hand-written
+/// `"result": "pass"` is refused by an unmodified release tool.
+///
+/// Requiring a *reviewed* budget rather than a recorded baseline is the
+/// publication decision, and it belongs to the release gate rather than here: a
+/// core validation run exists partly to produce that baseline.
+fn validateSizeBudget(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    object: *const std.json.ObjectMap,
+    architecture: []const u8,
+    flavor: contracts.Flavor,
+    diagnostic: *Diagnostic,
+) Error!void {
+    var name_buffer: [96]u8 = undefined;
+    const expected_name = contracts.sizeBudgetFilename(
+        &name_buffer,
+        flavor,
+        architecture,
+    ) orelse return fail(diagnostic, "Ubuntu size-budget binding is invalid", .{});
+    const binding = try requireFileBinding(
+        object.get("size_budget"),
+        "Ubuntu size budget",
+        expected_name,
+        diagnostic,
+    );
+    const path = try requireBoundProvenanceFile(
+        allocator,
+        io,
+        root,
+        binding,
+        "Ubuntu size budget",
+        diagnostic,
+    );
+    defer allocator.free(path);
+    var parsed = size_budget.readValidated(allocator, io, path, .{
+        .architecture = architecture,
+        .flavor = @tagName(flavor),
+    }, diagnostic) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Failed => return error.Failed,
+    };
+    parsed.deinit();
+}
+
 /// `validate_ubuntu_disk_layout`.
 fn validateDiskLayout(
     value: ?std.json.Value,
@@ -576,6 +628,7 @@ pub fn validateUbuntu(
         "disk_geometry",
         "minimum_root_free_bytes",
         "runtime_contract",
+        "size_budget",
         "validated_root_free_bytes",
         "flavor",
         "virtual_size",
@@ -676,6 +729,15 @@ pub fn validateUbuntu(
             diagnostic,
         );
         try validateDiskGeometry(
+            allocator,
+            io,
+            root,
+            object,
+            architecture,
+            flavor,
+            diagnostic,
+        );
+        try validateSizeBudget(
             allocator,
             io,
             root,

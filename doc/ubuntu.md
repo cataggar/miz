@@ -294,8 +294,10 @@ Every build measures where its bytes came from and binds the measurement into
 its own provenance as
 `internal-provenance/ubuntu2604-size-inventory-<flavor>-<architecture>.json`,
 digest-bound from `ubuntu2604-build-provenance.json`. The document is the
-input for reviewing a closure change: it is a measurement, not a budget, and
-no size gate is derived from it yet.
+input for reviewing a closure change, and since step 6 it is also the input the
+[reviewed size and content budget](#hard-size-and-content-budgets) is evaluated
+against. The measurement itself states no bounds; the budget states all of
+them, in one reviewed table.
 
 The document is *phase aware* because the facts arrive at different stages,
 and `phases_present` names exactly the phases a document carries. A phase that
@@ -303,7 +305,7 @@ has not happened is absent rather than zero.
 
 | phase | recorded by | contents |
 | --- | --- | --- |
-| `root_build` | the builder, while the root is still a host tree | installed and allocated bytes per package, package count and exact closure digest, shared and unmatched payload, the typed unowned-file allowlist and its policy digest with the remainder named, top-level root usage, and kernel, initramfs, module-tree, and firmware bytes |
+| `root_build` | the builder, while the root is still a host tree | installed and allocated bytes per package, package count and exact closure digest, shared and unmatched payload, the typed unowned-file allowlist and its policy digest with the remainder named, the typed content-policy scan and its policy digest, top-level root usage, and kernel, initramfs, module-tree, and firmware bytes |
 | `image_build` | the builder, once the image is finalized | ext4 used and free blocks and inodes before first boot, the signed UKI's size, and ESP occupancy |
 | `publication` | the builder, once the artifact exists | compressed QCOW2 length and its host allocation |
 | `first_boot` | core QEMU acceptance, once the guest has booted and grown its root | the same ext4 accounting measured inside the running guest with `statfs`, which is what makes measured growth possible |
@@ -394,6 +396,40 @@ $ ubuntu2604_release size-inventory-verify \
     --max-unexpected-unowned 0
 ```
 
+### The typed content policy
+
+The unowned allowlist answers "who put this file here". It cannot answer
+"should this class of content be in an appliance at all", because the content
+issue #677 names -- apt state, caches, locales, manuals, documentation,
+cloud-init, WALinuxAgent, a systemd service manager -- is *package-owned* when
+it is present, and package-owned content never reaches the unowned remainder.
+
+So `root_build.content` is a second, independent classification of the same
+walk, with its own `policy_sha256` recomputed by every validator from its own
+compiled-in table. Each class carries a disposition:
+
+| disposition | meaning | classes |
+| --- | --- | --- |
+| `absent` | the appliance must not contain the class at all; one matching path fails the build that produced it, by name | `apt-state`, `apt-cache`, `apt-client`, `cloud-init`, `walinuxagent`, `snap`, `systemd-service-manager`, `initramfs-generator`, `kernel-build-tree` |
+| `bounded` | package-owned residue of packages the runtime contract requires, kept because a package is omitted rather than installed and stripped, and capped by the size budget instead | `documentation`, `manual-pages`, `info-pages`, `locale-data`, `packaging-metadata`, `inert-systemd-units`, `build-tool-hooks`, `debconf-state` |
+
+Absent classes are evaluated first, so a forbidden subtree wins over a bounded
+parent: `/usr/share/initramfs-tools/**` is bounded because required packages
+such as `kmod` ship hook fragments there, while
+`/usr/share/initramfs-tools/scripts/**` is forbidden because that is the
+generator step 4 moved into a staging root.
+
+Paths are exact wherever a near neighbour is legitimate. `/usr/lib/systemd`
+still holds `systemd-udevd`, which is a symlink to `udevadm` and part of the
+runtime contract, so the service manager is named file by file rather than by a
+subtree that would take the whole directory with it. Likewise `/etc/waagent.conf`
+is *not* in the `walinuxagent` class: it is the resource-disk policy the miz
+builder writes for `azagent`, and the class names WALinuxAgent's own payload.
+
+Nothing in the `bounded` list is wanted. It survives because deleting a
+package's files would break the exact-closure guarantee the whole plan rests
+on, so the appliance keeps it, publishes why, and bounds it.
+
 `size-inventory-compare` reports what moved between two measured images --
 closure identity, package count, installed and allocated bytes, per-package
 additions, removals, and deltas, and the later phases both documents carry --
@@ -403,6 +439,115 @@ and refuses to compare documents that do not describe the same image:
 $ ubuntu2604_release size-inventory-compare \
     --baseline before.json --candidate after.json \
     --output size-comparison.json --step-summary "$GITHUB_STEP_SUMMARY"
+```
+
+## Hard size and content budgets
+
+Issue #677 step 6. Steps 1 through 5 made the appliance small and made it
+measurable; nothing so far stopped it growing back. `scripts/ubuntu2604/size_budget.zig`
+is the reviewed table that does, and every core build publishes its verdict as
+`internal-provenance/ubuntu2604-size-budget-<flavor>-<architecture>.json`,
+digest-bound from `ubuntu2604-build-provenance.json` beside the size inventory,
+the runtime contract, and the disk geometry.
+
+### Every bound follows from a measurement
+
+A limit is never a round number somebody liked. It is a `baseline` -- an
+observation from a real build of this tree -- plus a named allowance, and the
+limit is *computed* from the two:
+
+| allowance | limit | used for |
+| --- | --- | --- |
+| `exact` | the measurement itself | forbidden content, the unowned remainder, firmware no package ships, and the reserves the disk plan promised to deliver |
+| `security_update_percent: 5` | the measurement plus 5%, rounded up to a whole 4 KiB block | every byte and count that a same-snapshot security update can legitimately move |
+| `plus: n` | the measurement plus `n` of the metric's own units | the package count |
+
+Five percent is not a preference. The largest single move the pinned snapshot
+can hand this appliance without a closure change is a kernel point release,
+which republishes the image, the module tree, and therefore the initramfs. Five
+percent covers the moves Canonical's `-azure` kernel has made inside a series
+while still failing a package addition, which is the smallest closure change
+worth catching. The package count allows two: a republished package can gain one
+direct dependency, and a library transition can split one package in two.
+
+### What is bounded
+
+| phase | metrics |
+| --- | --- |
+| `root_build` | package count, installed and allocated bytes, file count, unowned remainder (0), absent-content paths (0), kernel, initramfs, module-tree and firmware bytes, and each bounded content class |
+| `image_build` | virtual size, signed UKI bytes, ESP used and partition bytes, root total and used blocks, root free blocks (a *minimum*), root used inodes, root free inodes (a *minimum*) |
+| `publication` | compressed artifact bytes and QCOW2 host allocation |
+| `first_boot` | first-boot growth in blocks and inodes, measured as the difference from `image_build` and bounded by the growth the disk plan reserves against |
+
+Minima are floors the image promised to deliver, so they carry no allowance:
+widening one downwards would be the opposite of a margin. A metric whose phase
+the document does not carry is **skipped, not passed** -- treating an absent
+phase as zero would turn "not measured yet" into "measured as nothing".
+
+### Budget changes are contract changes
+
+`reviewed_budget_sha256` pins the digest of the whole table. Any edit to a
+baseline, an allowance, a direction, a basis, or the set of budgeted
+architectures moves the digest and fails the test that pins it until a reviewer
+updates the pin in the same change. There is no refresh mode, no
+`--update-baseline`, and no success-shaped fallback: a document that cannot be
+evaluated is a failure, not a pass.
+
+Nothing about the published verdict is taken on its own word either. Every
+validator recomputes the budget digest from its own compiled-in table,
+recomputes each limit from the recorded baseline and its allowance, recomputes
+the verdict from the observations, and recomputes the status from whether a
+reviewed budget exists at all. A candidate carrying a hand-written
+`"result": "pass"` is refused by an unmodified release tool.
+
+### Architectures without a measurement
+
+x86_64 core is budgeted from a real x86_64 core build. **AArch64 core has no
+production measurement of the minimized closure**, and its kernel, module tree
+and UKI are not x86_64's, so borrowing x86_64's numbers would state a
+measurement nobody took. Instead `budgetFor` returns nothing for it, and its
+builds evaluate as `candidate_baseline`: every metric is recorded, in the same
+document, with `baseline` and `limit` as `null`, for a reviewer to transcribe
+into the table.
+
+The two workflows therefore differ on purpose:
+
+- **Core validation** re-derives the verdict and accepts a recorded baseline.
+  It is where a new architecture's numbers come from, so refusing one there
+  would leave nowhere for them to come from.
+- **The release workflow** passes `--require-status enforced` per candidate and
+  `--require-size-budget enforced` to `release-gate`, before anything is staged
+  or published. A candidate whose architecture has only a recorded baseline
+  cannot be released.
+
+Until an AArch64 core build is measured and its numbers reviewed into
+`size_budget.zig`, `aarch64-core` is not publishable. That is the intended
+behavior: it is the difference between "not measured yet" and "measured and
+accepted".
+
+### Failures are attributable
+
+A gate that says "the image got bigger" is a gate nobody can act on. Each
+failure line names the metric, the phase it came from, the observation, the
+bound it broke, the measurement the bound was derived from, and the delta:
+
+```
+x86_64 core modules_bytes (root_build): observed 302178304 bytes exceeds the
+limit of 158646272 by 143532032 (measured baseline 151089152)
+```
+
+Given `--baseline`, a failing run additionally reports the per-package deltas
+from the same `size-inventory-compare` machinery the benchmark uses, so a
+failure names packages rather than only totals. A path in an `absent` content
+class fails at measurement time, inside the builder, listing the paths it found.
+
+```console
+$ ubuntu2604_release size-budget-verify \
+    --budget internal-provenance/ubuntu2604-size-budget-core-x86_64.json \
+    --report internal-provenance/ubuntu2604-size-inventory-core-x86_64.json \
+    --architecture x86_64 --flavor core \
+    --require-status enforced
+x86_64 core status=enforced result=pass metrics=31 budget=... inventory=...
 ```
 
 ## Explicit runtime contract
