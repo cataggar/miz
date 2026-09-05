@@ -22,15 +22,16 @@
 //! success-shaped fallback: a document that cannot be evaluated is a failure,
 //! not a pass.
 //!
-//! **Bounds are per architecture, and absence is explicit.** x86_64 core is
-//! budgeted from a real x86_64 core build. AArch64 core has no production
-//! measurement of the minimized closure yet, so it has no budget, and inventing
-//! one from x86_64's numbers would be a fabrication: its kernel, module tree,
-//! and UKI differ. Instead it evaluates as `candidate_baseline` -- the build
-//! still records every metric, in the same document, for review -- and the
-//! release gate refuses to publish a candidate whose budget was never reviewed.
-//! Publication is blocked until somebody reads the recorded numbers and writes
-//! them into this table.
+//! **Bounds are per architecture, and absence is explicit.** Each published
+//! core architecture is budgeted from a build of its own. x86_64 and AArch64
+//! share no baseline: the AArch64 kernel, module tree and UKI are larger, so
+//! its table was transcribed from the candidate baseline an AArch64 production
+//! build recorded, not derived from x86_64's numbers. An architecture that has
+//! never been measured has no budget and evaluates as `candidate_baseline` --
+//! the build still records every metric, in the same document, for review --
+//! and the release gate refuses to publish a candidate whose budget was never
+//! reviewed. That is still how a new architecture's numbers come into this
+//! table, and it is still the only way.
 //!
 //! **Bounds are phase aware.** The size inventory records `root_build`,
 //! `image_build`, `publication`, and `first_boot` as separate phases because
@@ -309,6 +310,26 @@ pub const security_update_percent: u8 = 5;
 /// transition can split one package into two. Three would be a closure change.
 pub const package_count_allowance: u64 = 2;
 
+/// Where every baseline in this file came from.
+///
+/// Both tables below are transcribed from one production core validation run
+/// of the commit that introduced them, so the numbers are observations of the
+/// tree that carries them rather than of some earlier tree that happened to be
+/// measured once:
+///
+/// * run `33956340723`, workflow `ubuntu2604-core-validation.yml`, source
+///   commit `590548fe813d45fae45e5d395026b8f448aee4ef`, attempt 1;
+/// * x86_64 from job `101280282367`, recorded in
+///   `ubuntu2604-core-failed-provenance-x86_64-core-590548fe…-1`;
+/// * AArch64 from job `101280282314`, recorded in the candidate bundle
+///   `ubuntu2604-core-candidate-aarch64-core-590548fe…-1`.
+///
+/// Both architectures resolved 100 packages against the pinned
+/// `20260731T000000Z` snapshot with kernel `7.0.0-1010-azure`.
+pub const measurement_run_id = "33956340723";
+pub const measurement_source_commit =
+    "590548fe813d45fae45e5d395026b8f448aee4ef";
+
 /// The measured x86_64 core budget.
 ///
 /// Every baseline below is an observation of a real, unmodified x86_64 core
@@ -316,6 +337,11 @@ pub const package_count_allowance: u64 = 2;
 /// `linux-image-7.0.0-1010-azure`, a 583 MiB calculated disk, and a 281 MiB
 /// published artifact. They are recorded as the exact integers that build
 /// produced, not rounded, so the diff of a future change shows the real move.
+///
+/// The first table shipped in #686 was measured on an earlier tree, and the
+/// build that first enforced it failed six content-class bounds it had never
+/// actually been checked against. These are the numbers the production build
+/// named above produced.
 const x86_64_core_limits = [_]Limit{
     // ---- root_build: the closure and what it puts on disk ----
     .{
@@ -329,7 +355,7 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .installed_bytes,
         .direction = .at_most,
-        .baseline = 305_796_307,
+        .baseline = 312_455_680,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured root tree; absorbs a kernel point release without " ++
             "absorbing a package addition",
@@ -337,7 +363,7 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .allocated_bytes,
         .direction = .at_most,
-        .baseline = 328_962_048,
+        .baseline = 335_888_384,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured root allocation, which is what the ext4 minimum " ++
             "and therefore the disk plan follow from",
@@ -383,7 +409,7 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .modules_bytes,
         .direction = .at_most,
-        .baseline = 151_089_152,
+        .baseline = 155_000_832,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured module tree, the single largest thing in the root",
     },
@@ -403,7 +429,7 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .{ .content_class_bytes = "documentation" },
         .direction = .at_most,
-        .baseline = 3_588_634,
+        .baseline = 4_043_205,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured /usr/share/doc, kept because copyright files are a " ++
             "distribution obligation shipped in the same payload",
@@ -411,7 +437,7 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .{ .content_class_bytes = "manual-pages" },
         .direction = .at_most,
-        .baseline = 3_890_957,
+        .baseline = 4_173_089,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured /usr/share/man inside required packages",
     },
@@ -425,7 +451,7 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .{ .content_class_bytes = "locale-data" },
         .direction = .at_most,
-        .baseline = 6_550_535,
+        .baseline = 7_184_724,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured message catalogues; the `locales` package itself " ++
             "is forbidden by the runtime contract",
@@ -433,7 +459,7 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .{ .content_class_bytes = "packaging-metadata" },
         .direction = .at_most,
-        .baseline = 51_577,
+        .baseline = 84_120,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured lintian, bug, menu, pixmap and apt.conf.d " ++
             "fragments inside required packages",
@@ -441,7 +467,7 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .{ .content_class_bytes = "inert-systemd-units" },
         .direction = .at_most,
-        .baseline = 299_251,
+        .baseline = 351_824,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured unit files and generators shipped by " ++
             "openssh-server, sudo and e2fsprogs; nothing starts them because " ++
@@ -450,7 +476,7 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .{ .content_class_bytes = "build-tool-hooks" },
         .direction = .at_most,
-        .baseline = 1_087,
+        .baseline = 9_242,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured initramfs hook fragments shipped by kmod; the " ++
             "generator that would run them is absent",
@@ -458,7 +484,7 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .{ .content_class_bytes = "debconf-state" },
         .direction = .at_most,
-        .baseline = 1_181_350,
+        .baseline = 1_185_333,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured debconf database written during installation",
     },
@@ -474,7 +500,7 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .uki_bytes,
         .direction = .at_most,
-        .baseline = 58_039_112,
+        .baseline = 58_015_648,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured signed UKI; the ESP is sized from it, so its " ++
             "growth is the ESP's growth",
@@ -482,7 +508,7 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .esp_used_bytes,
         .direction = .at_most,
-        .baseline = 58_040_832,
+        .baseline = 58_017_280,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured ESP occupancy, which is one signed UKI plus FAT32 " ++
             "rounding",
@@ -498,14 +524,14 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .root_total_blocks,
         .direction = .at_most,
-        .baseline = 119_795,
+        .baseline = 119_797,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "the planned 468 MiB root filesystem in 4 KiB blocks",
     },
     .{
         .measure = .root_used_blocks,
         .direction = .at_most,
-        .baseline = 87_027,
+        .baseline = 87_029,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured used blocks before first boot",
     },
@@ -544,7 +570,7 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .qcow2_allocated_bytes,
         .direction = .at_most,
-        .baseline = 294_260_736,
+        .baseline = 294_256_640,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured host allocation of the published artifact",
     },
@@ -574,21 +600,296 @@ const x86_64_core_budget: Budget = .{
     .limits = &x86_64_core_limits,
 };
 
+/// The measured AArch64 core budget.
+///
+/// Recorded from the candidate baseline the production build named above
+/// published, and from nowhere else. Every number differs from x86_64's, which
+/// is exactly why borrowing x86_64's would have been a fabrication: the AArch64
+/// closure installs the same 100 packages but a larger kernel (21 MiB against
+/// 16), a larger module tree (162 MiB against 147), an initramfs that follows
+/// it (56 MiB against 38), and a UKI that carries all of it (124 MiB against
+/// 55). The disk the plan then calculates is 781 MiB rather than 583, and the
+/// published artifact is 336 MiB rather than 281.
+///
+/// The allowances are the same named margins x86_64 uses, because the reasons
+/// are the same: a pinned snapshot moves for a security update, and the largest
+/// such move is a kernel point release. The bounds that carry no allowance are
+/// the ones the disk plan promised rather than measured, and those are
+/// architecture-independent by construction -- `disk_geometry` derives the
+/// reserve from the same declared first-boot growth on both architectures.
+const aarch64_core_limits = [_]Limit{
+    // ---- root_build: the closure and what it puts on disk ----
+    .{
+        .measure = .package_count,
+        .direction = .at_most,
+        .baseline = 100,
+        .allowance = .{ .plus = package_count_allowance },
+        .basis = "measured closure of the reviewed package roots; the same " ++
+            "roots resolve to the same count on both architectures",
+    },
+    .{
+        .measure = .installed_bytes,
+        .direction = .at_most,
+        .baseline = 367_523_299,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured root tree; absorbs a kernel point release without " ++
+            "absorbing a package addition",
+    },
+    .{
+        .measure = .allocated_bytes,
+        .direction = .at_most,
+        .baseline = 394_268_672,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured root allocation, which is what the ext4 minimum " ++
+            "and therefore the disk plan follow from",
+    },
+    .{
+        .measure = .file_count,
+        .direction = .at_most,
+        .baseline = 15_134,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured path count; the inode reserve is sized from it",
+    },
+    .{
+        .measure = .unexpected_unowned_files,
+        .direction = .at_most,
+        .baseline = 0,
+        .allowance = .exact,
+        .basis = "#677 step 3: every path is package-owned or named by the " ++
+            "typed injected-file allowlist, so the remainder is zero",
+    },
+    .{
+        .measure = .absent_content_files,
+        .direction = .at_most,
+        .baseline = 0,
+        .allowance = .exact,
+        .basis = "#677 step 6: apt state and caches, cloud-init, " ++
+            "WALinuxAgent, a systemd service manager, the initramfs " ++
+            "generator, and kernel build trees are absent, not bounded",
+    },
+    .{
+        .measure = .kernel_bytes,
+        .direction = .at_most,
+        .baseline = 22_024_192,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured signed kernel image; a point release moves it",
+    },
+    .{
+        .measure = .initramfs_bytes,
+        .direction = .at_most,
+        .baseline = 58_855_424,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured staged initramfs; it follows the module tree",
+    },
+    .{
+        .measure = .modules_bytes,
+        .direction = .at_most,
+        .baseline = 170_225_664,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured module tree, the single largest thing in the root",
+    },
+    .{
+        .measure = .firmware_bytes,
+        .direction = .at_most,
+        .baseline = 0,
+        .allowance = .exact,
+        .basis = "the closure installs no firmware package; a byte here is a " ++
+            "closure change and not a size drift",
+    },
+    // ---- root_build: the bounded content classes ----
+    .{
+        .measure = .{ .content_class_bytes = "documentation" },
+        .direction = .at_most,
+        .baseline = 4_043_225,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured /usr/share/doc, kept because copyright files are a " ++
+            "distribution obligation shipped in the same payload",
+    },
+    .{
+        .measure = .{ .content_class_bytes = "manual-pages" },
+        .direction = .at_most,
+        .baseline = 4_173_065,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured /usr/share/man inside required packages",
+    },
+    .{
+        .measure = .{ .content_class_bytes = "info-pages" },
+        .direction = .at_most,
+        .baseline = 575_134,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured /usr/share/info inside required packages",
+    },
+    .{
+        .measure = .{ .content_class_bytes = "locale-data" },
+        .direction = .at_most,
+        .baseline = 7_184_724,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured message catalogues; the `locales` package itself " ++
+            "is forbidden by the runtime contract",
+    },
+    .{
+        .measure = .{ .content_class_bytes = "packaging-metadata" },
+        .direction = .at_most,
+        .baseline = 84_120,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured lintian, bug, menu, pixmap and apt.conf.d " ++
+            "fragments inside required packages",
+    },
+    .{
+        .measure = .{ .content_class_bytes = "inert-systemd-units" },
+        .direction = .at_most,
+        .baseline = 392_672,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured unit files and generators shipped by " ++
+            "openssh-server, sudo and e2fsprogs; nothing starts them because " ++
+            "the service manager is in the absent classes",
+    },
+    .{
+        .measure = .{ .content_class_bytes = "build-tool-hooks" },
+        .direction = .at_most,
+        .baseline = 9_242,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured initramfs hook fragments shipped by kmod; the " ++
+            "generator that would run them is absent",
+    },
+    .{
+        .measure = .{ .content_class_bytes = "debconf-state" },
+        .direction = .at_most,
+        .baseline = 1_185_333,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured debconf database written during installation",
+    },
+    // ---- image_build: the disk the plan produced ----
+    .{
+        .measure = .virtual_size,
+        .direction = .at_most,
+        .baseline = 818_937_856,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "the calculated 781 MiB core disk; the geometry validator " ++
+            "separately refuses the retired 3584 MiB inherited size",
+    },
+    .{
+        .measure = .uki_bytes,
+        .direction = .at_most,
+        .baseline = 130_871_200,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured signed UKI; the ESP is sized from it, so its " ++
+            "growth is the ESP's growth",
+    },
+    .{
+        .measure = .esp_used_bytes,
+        .direction = .at_most,
+        .baseline = 130_872_832,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured ESP occupancy, which is one signed UKI plus FAT32 " ++
+            "rounding",
+    },
+    .{
+        .measure = .esp_partition_bytes,
+        .direction = .at_most,
+        .baseline = 266_338_304,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "the planned ESP, sized to hold two resident UKI copies so " ++
+            "an update writes the new one before removing the booting one",
+    },
+    .{
+        .measure = .root_total_blocks,
+        .direction = .at_most,
+        .baseline = 134_310,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "the planned 524 MiB root filesystem in 4 KiB blocks",
+    },
+    .{
+        .measure = .root_used_blocks,
+        .direction = .at_most,
+        .baseline = 101_542,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured used blocks before first boot",
+    },
+    .{
+        .measure = .root_free_blocks,
+        .direction = .at_least,
+        .baseline = 32_768,
+        .allowance = .exact,
+        .basis = "the 128 MiB reserve the disk plan promised: four times the " ++
+            "declared 32 MiB first-boot growth, floored at 64 MiB",
+    },
+    .{
+        .measure = .root_used_inodes,
+        .direction = .at_most,
+        .baseline = 15_156,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured used inodes before first boot",
+    },
+    .{
+        .measure = .root_free_inodes,
+        .direction = .at_least,
+        .baseline = 4_096,
+        .allowance = .exact,
+        .basis = "the free-inode floor the disk plan requires, which first " ++
+            "boot and root growth both draw from",
+    },
+    // ---- publication: what is actually shipped ----
+    .{
+        .measure = .compressed_artifact_bytes,
+        .direction = .at_most,
+        .baseline = 352_911_360,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "the measured published zstd QCOW2, which is the number the " ++
+            "release is judged by",
+    },
+    .{
+        .measure = .qcow2_allocated_bytes,
+        .direction = .at_most,
+        .baseline = 352_792_576,
+        .allowance = .{ .security_update_percent = security_update_percent },
+        .basis = "measured host allocation of the published artifact",
+    },
+    // ---- first_boot: the growth the disk plan reserved against ----
+    .{
+        .measure = .first_boot_growth_blocks,
+        .direction = .at_most,
+        .baseline = 8_192,
+        .allowance = .exact,
+        .basis = "the declared 32 MiB first-boot growth bound the root " ++
+            "reserve is four times; exceeding it invalidates the plan rather " ++
+            "than merely the size",
+    },
+    .{
+        .measure = .first_boot_growth_inodes,
+        .direction = .at_most,
+        .baseline = 512,
+        .allowance = .exact,
+        .basis = "the declared first-boot inode growth bound from the same " ++
+            "plan",
+    },
+};
+
+const aarch64_core_budget: Budget = .{
+    .architecture = .aarch64,
+    .flavor = .core,
+    .limits = &aarch64_core_limits,
+};
+
 /// The reviewed budget for an architecture and flavor, or `null` when none has
 /// been reviewed.
 ///
-/// `null` is a real answer, not a gap to be papered over. AArch64 core has no
-/// production measurement of the minimized closure: its kernel, module tree,
-/// and UKI are not x86_64's, so borrowing x86_64's numbers would state a
-/// measurement that was never taken. Its builds record a candidate baseline
-/// instead, and the release gate refuses them until this function returns a
-/// table somebody reviewed.
+/// `null` is a real answer, not a gap to be papered over. Both published core
+/// architectures are now budgeted, each from its own production measurement:
+/// AArch64's kernel, module tree and UKI are not x86_64's, so its table was
+/// transcribed from the candidate baseline an AArch64 build recorded rather
+/// than derived from x86_64's numbers.
 ///
-/// `full` has no budget either, and for a different reason: it is Canonical's
-/// server root, which #677 measures rather than minimizes.
+/// Everything else still returns nothing, and the release gate still refuses to
+/// publish a core candidate whose architecture has only a recorded baseline.
+/// `full` is Canonical's server root, which #677 measures rather than
+/// minimizes; `baremetal` is not published by this release.
 pub fn budgetFor(flavor: Flavor, architecture: Architecture) ?Budget {
-    if (flavor == .core and architecture == .x86_64) return x86_64_core_budget;
-    return null;
+    if (flavor != .core) return null;
+    return switch (architecture) {
+        .x86_64 => x86_64_core_budget,
+        .aarch64 => aarch64_core_budget,
+    };
 }
 
 pub fn statusFor(flavor: Flavor, architecture: Architecture) Status {
@@ -646,7 +947,7 @@ pub fn budgetDigest(allocator: Allocator) Error![64]u8 {
 /// refresh that quietly re-recorded whatever the last build measured is
 /// therefore impossible: there is nowhere for it to write.
 pub const reviewed_budget_sha256 =
-    "649e9c4455f790438b5dfa221917a4329326d62b1baf4ddd17fd9b2df019a8d4";
+    "9efaa413fb22dc96a5c33a27b413b79cfb65dc2ba9e86681b3d8b85a9e717914";
 
 // ---------------------------------------------------------------------------
 // Evaluation.

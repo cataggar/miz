@@ -1123,9 +1123,10 @@ fn writeSizeInventory(
 /// Evaluates the reviewed size budget against the fixture's own measurement
 /// and writes the verdict, exactly as a build does (issue #677 step 6).
 ///
-/// Deriving it rather than hand-writing it is the point: an x86_64 fixture
-/// records `enforced`, an AArch64 fixture records `candidate_baseline`, and
-/// neither spelling can drift from what `size_budget.zig` actually reviews.
+/// Deriving it rather than hand-writing it is the point: the recorded status
+/// and verdict are whatever `size_budget.zig` actually reviews for that
+/// architecture and flavor, so a fixture cannot claim a status the shipped
+/// table would not reach.
 fn writeSizeBudget(
     tree: *const Tree,
     builder: Builder,

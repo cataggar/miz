@@ -28,48 +28,120 @@ fn expectContains(haystack: []const u8, needle: []const u8) !void {
     }
 }
 
-/// The measured x86_64 core build the reviewed budget is derived from.
+/// One architecture's real core build, as the production workflow measured it.
 ///
 /// These are the numbers a real, unmodified core build of this tree produced,
 /// so a document assembled from them is the document the gate has to pass. A
 /// fixture that merely satisfied the schema would prove the validator parses;
 /// this proves the shipped appliance fits its own budget.
-const measured = struct {
-    const package_count: u64 = 100;
-    const installed_bytes: u64 = 305_796_307;
-    const allocated_bytes: u64 = 328_962_048;
-    const file_count: u64 = 13_346;
-    const kernel_bytes: u64 = 17_403_904;
-    const initramfs_bytes: u64 = 40_538_112;
-    const modules_bytes: u64 = 151_089_152;
-    const virtual_size: u64 = 611_319_808;
-    const uki_bytes: u64 = 58_039_112;
-    const esp_partition_bytes: u64 = 118_489_088;
-    const esp_total_bytes: u64 = 116_621_312;
-    const esp_free_bytes: u64 = 58_580_480;
-    const root_block_size: u64 = 4096;
-    const root_total_blocks: u64 = 119_795;
-    const root_free_blocks: u64 = 32_768;
-    const root_total_inodes: u64 = 29_952;
-    const root_free_inodes: u64 = 16_584;
-    const compressed_artifact_bytes: u64 = 294_322_176;
-    const qcow2_allocated_bytes: u64 = 294_260_736;
+const Measured = struct {
+    deb_architecture: []const u8,
+    kernel_release: []const u8,
+    artifact_name: []const u8,
+    package_count: u64,
+    installed_bytes: u64,
+    allocated_bytes: u64,
+    file_count: u64,
+    kernel_bytes: u64,
+    initramfs_bytes: u64,
+    modules_bytes: u64,
+    virtual_size: u64,
+    uki_bytes: u64,
+    esp_partition_bytes: u64,
+    esp_total_bytes: u64,
+    esp_free_bytes: u64,
+    root_block_size: u64 = 4096,
+    root_total_blocks: u64,
+    root_free_blocks: u64,
+    root_total_inodes: u64,
+    root_free_inodes: u64,
+    compressed_artifact_bytes: u64,
+    qcow2_allocated_bytes: u64,
 };
 
-/// The bounded content classes as the same build measured them.
-const measured_content = [_]struct { id: []const u8, bytes: u64 }{
-    .{ .id = "documentation", .bytes = 3_588_634 },
-    .{ .id = "manual-pages", .bytes = 3_890_957 },
+const ContentBytes = struct { id: []const u8, bytes: u64 };
+
+/// The measured x86_64 core build the reviewed x86_64 budget is derived from.
+const x86_64_measured: Measured = .{
+    .deb_architecture = "amd64",
+    .kernel_release = "7.0.0-1010-azure",
+    .artifact_name = "Ubuntu-26.04-x86_64.core.qcow2",
+    .package_count = 100,
+    .installed_bytes = 312_455_680,
+    .allocated_bytes = 335_888_384,
+    .file_count = 13_346,
+    .kernel_bytes = 17_403_904,
+    .initramfs_bytes = 40_538_112,
+    .modules_bytes = 155_000_832,
+    .virtual_size = 611_319_808,
+    .uki_bytes = 58_015_648,
+    .esp_partition_bytes = 118_489_088,
+    .esp_total_bytes = 116_621_312,
+    .esp_free_bytes = 58_604_032,
+    .root_total_blocks = 119_797,
+    .root_free_blocks = 32_768,
+    .root_total_inodes = 29_952,
+    .root_free_inodes = 16_584,
+    .compressed_artifact_bytes = 294_322_176,
+    .qcow2_allocated_bytes = 294_256_640,
+};
+
+/// The bounded content classes as the same x86_64 build measured them.
+const x86_64_content = [_]ContentBytes{
+    .{ .id = "documentation", .bytes = 4_043_205 },
+    .{ .id = "manual-pages", .bytes = 4_173_089 },
     .{ .id = "info-pages", .bytes = 575_134 },
-    .{ .id = "locale-data", .bytes = 6_550_535 },
-    .{ .id = "packaging-metadata", .bytes = 51_577 },
-    .{ .id = "inert-systemd-units", .bytes = 299_251 },
-    .{ .id = "build-tool-hooks", .bytes = 1_087 },
-    .{ .id = "debconf-state", .bytes = 1_181_350 },
+    .{ .id = "locale-data", .bytes = 7_184_724 },
+    .{ .id = "packaging-metadata", .bytes = 84_120 },
+    .{ .id = "inert-systemd-units", .bytes = 351_824 },
+    .{ .id = "build-tool-hooks", .bytes = 9_242 },
+    .{ .id = "debconf-state", .bytes = 1_185_333 },
 };
 
-fn contentBytes(id: []const u8) u64 {
-    for (measured_content) |entry| {
+/// The measured AArch64 core build the reviewed AArch64 budget is derived from.
+///
+/// Recorded from the candidate baseline the same production run published for
+/// `aarch64-core`. It shares no byte count with x86_64, which is the point: a
+/// fixture that reused x86_64's numbers would prove nothing about the table
+/// that AArch64 candidates are actually judged against.
+const aarch64_measured: Measured = .{
+    .deb_architecture = "arm64",
+    .kernel_release = "7.0.0-1010-azure",
+    .artifact_name = "Ubuntu-26.04-aarch64.core.qcow2",
+    .package_count = 100,
+    .installed_bytes = 367_523_299,
+    .allocated_bytes = 394_268_672,
+    .file_count = 15_134,
+    .kernel_bytes = 22_024_192,
+    .initramfs_bytes = 58_855_424,
+    .modules_bytes = 170_225_664,
+    .virtual_size = 818_937_856,
+    .uki_bytes = 130_871_200,
+    .esp_partition_bytes = 266_338_304,
+    .esp_total_bytes = 262_160_384,
+    .esp_free_bytes = 131_287_552,
+    .root_total_blocks = 134_310,
+    .root_free_blocks = 32_768,
+    .root_total_inodes = 33_600,
+    .root_free_inodes = 18_444,
+    .compressed_artifact_bytes = 352_911_360,
+    .qcow2_allocated_bytes = 352_792_576,
+};
+
+/// The bounded content classes as the same AArch64 build measured them.
+const aarch64_content = [_]ContentBytes{
+    .{ .id = "documentation", .bytes = 4_043_225 },
+    .{ .id = "manual-pages", .bytes = 4_173_065 },
+    .{ .id = "info-pages", .bytes = 575_134 },
+    .{ .id = "locale-data", .bytes = 7_184_724 },
+    .{ .id = "packaging-metadata", .bytes = 84_120 },
+    .{ .id = "inert-systemd-units", .bytes = 392_672 },
+    .{ .id = "build-tool-hooks", .bytes = 9_242 },
+    .{ .id = "debconf-state", .bytes = 1_185_333 },
+};
+
+fn contentBytes(table: []const ContentBytes, id: []const u8) u64 {
+    for (table) |entry| {
         if (std.mem.eql(u8, entry.id, id)) return entry.bytes;
     }
     return 0;
@@ -107,6 +179,11 @@ const Builder = struct {
 const Overrides = struct {
     architecture: []const u8 = "x86_64",
     flavor: []const u8 = "core",
+    /// The production measurement the document is assembled from. Naming it
+    /// per test is what lets one fixture speak for either architecture instead
+    /// of quietly presenting x86_64's numbers as somebody else's.
+    measured: *const Measured = &x86_64_measured,
+    content: []const ContentBytes = &x86_64_content,
     installed_bytes: ?u64 = null,
     package_count: ?u64 = null,
     modules_bytes: ?u64 = null,
@@ -121,14 +198,15 @@ const Overrides = struct {
     first_boot_used_inodes: ?u64 = null,
 };
 
-/// Builds a structurally valid size-inventory document carrying the measured
-/// x86_64 core numbers, with one field optionally bent.
+/// Builds a structurally valid size-inventory document carrying a named
+/// architecture's measured core numbers, with one field optionally bent.
 ///
 /// It is assembled rather than measured because a budget is a statement about
 /// numbers: a real walk would re-derive the same document far more slowly and
 /// would tie the budget tests to a root tree they are not about.
 fn inventory(arena: Allocator, overrides: Overrides) !Value {
     const builder: Builder = .{ .arena = arena };
+    const measured = overrides.measured.*;
     const installed = overrides.installed_bytes orelse measured.installed_bytes;
     const packages_count = overrides.package_count orelse measured.package_count;
 
@@ -160,7 +238,7 @@ fn inventory(arena: Allocator, overrides: Overrides) !Value {
         var item = builder.object();
         try builder.text(&item, "name", name);
         try builder.text(&item, "version", "1.0-1");
-        try builder.text(&item, "architecture", "amd64");
+        try builder.text(&item, "architecture", measured.deb_architecture);
         try builder.number(&item, "file_count", if (carries) measured.file_count else 0);
         try builder.number(&item, "installed_bytes", if (carries) installed else 0);
         try builder.number(
@@ -186,9 +264,9 @@ fn inventory(arena: Allocator, overrides: Overrides) !Value {
         const bytes = switch (rule.disposition) {
             .absent => 0,
             .bounded => if (std.mem.eql(u8, rule.id, "documentation"))
-                overrides.documentation_bytes orelse contentBytes(rule.id)
+                overrides.documentation_bytes orelse contentBytes(overrides.content, rule.id)
             else
-                contentBytes(rule.id),
+                contentBytes(overrides.content, rule.id),
         };
         const files: u64 = switch (rule.disposition) {
             .absent => overrides.absent_content_files,
@@ -221,11 +299,18 @@ fn inventory(arena: Allocator, overrides: Overrides) !Value {
         .object = try builder.bucket(bounded_files, bounded_bytes, bounded_bytes),
     });
 
+    const flavor_tag: size_inventory.Flavor =
+        if (std.mem.eql(u8, overrides.flavor, "full"))
+            .full
+        else if (std.mem.eql(u8, overrides.flavor, "baremetal"))
+            .baremetal
+        else
+            .core;
     var unowned = try builder.bucket(overrides.unexpected_unowned_files, 0, 0);
-    const unowned_policy = try size_inventory.unownedPolicyDigest(arena, .core);
+    const unowned_policy = try size_inventory.unownedPolicyDigest(arena, flavor_tag);
     try builder.text(&unowned, "policy_sha256", try arena.dupe(u8, &unowned_policy));
     var allowed: std.json.Array = .init(arena);
-    const unowned_rules = try size_inventory.unownedRulesAlloc(arena, .core);
+    const unowned_rules = try size_inventory.unownedRulesAlloc(arena, flavor_tag);
     for (unowned_rules) |rule| {
         var item = builder.object();
         var target_buffer: [512]u8 = undefined;
@@ -257,7 +342,7 @@ fn inventory(arena: Allocator, overrides: Overrides) !Value {
     try builder.put(&unowned, "unexpected", .{ .object = unexpected });
 
     var boot = builder.object();
-    try builder.text(&boot, "kernel_release", "7.0.0-1010-azure");
+    try builder.text(&boot, "kernel_release", measured.kernel_release);
     try builder.number(&boot, "kernel_bytes", measured.kernel_bytes);
     try builder.number(&boot, "initramfs_bytes", measured.initramfs_bytes);
     try builder.number(
@@ -336,7 +421,7 @@ fn inventory(arena: Allocator, overrides: Overrides) !Value {
     try builder.number(&image_build, "esp_free_bytes", measured.esp_free_bytes);
 
     var publication = builder.object();
-    try builder.text(&publication, "artifact_name", "Ubuntu-26.04-x86_64.core.qcow2");
+    try builder.text(&publication, "artifact_name", measured.artifact_name);
     try builder.number(
         &publication,
         "compressed_artifact_bytes",
@@ -415,9 +500,10 @@ test "the reviewed budget is pinned by digest so it cannot widen quietly" {
 }
 
 test "every limit follows from its recorded measurement and named allowance" {
-    const budget = size_budget.budgetFor(.core, .x86_64).?;
     var saw_percent = false;
     var saw_minimum = false;
+    for ([_]size_budget.Architecture{ .x86_64, .aarch64 }) |architecture| {
+    const budget = size_budget.budgetFor(.core, architecture).?;
     for (budget.limits) |limit| {
         switch (limit.allowance) {
             .exact => try std.testing.expectEqual(limit.baseline, limit.value()),
@@ -445,8 +531,81 @@ test "every limit follows from its recorded measurement and named allowance" {
             try std.testing.expectEqual(limit.baseline, limit.value());
         }
     }
+    }
     try std.testing.expect(saw_percent);
     try std.testing.expect(saw_minimum);
+}
+
+test "the two architectures are budgeted from separate measurements" {
+    // The AArch64 table exists because AArch64 was measured, not because
+    // x86_64 was. Every quantity that depends on the architecture -- the tree,
+    // the kernel, the module tree, the initramfs, the UKI, the disk the plan
+    // calculated from them, and the artifact that came out -- has to differ. A
+    // future edit that copied one table into the other fails here.
+    const x86 = size_budget.budgetFor(.core, .x86_64).?;
+    const arm = size_budget.budgetFor(.core, .aarch64).?;
+    try std.testing.expectEqual(x86.limits.len, arm.limits.len);
+
+    const architecture_dependent = [_][]const u8{
+        "installed_bytes",
+        "allocated_bytes",
+        "file_count",
+        "kernel_bytes",
+        "initramfs_bytes",
+        "modules_bytes",
+        "virtual_size",
+        "uki_bytes",
+        "esp_used_bytes",
+        "esp_partition_bytes",
+        "root_total_blocks",
+        "root_used_blocks",
+        "root_used_inodes",
+        "compressed_artifact_bytes",
+        "qcow2_allocated_bytes",
+    };
+    var checked: usize = 0;
+    for (x86.limits, arm.limits) |left, right| {
+        var left_id: [128]u8 = undefined;
+        var right_id: [128]u8 = undefined;
+        const id = left.measure.id(&left_id);
+        // The two tables bound the same metrics in the same order, so a
+        // reviewer diffs numbers rather than structure.
+        try std.testing.expectEqualStrings(id, right.measure.id(&right_id));
+        try std.testing.expectEqual(left.direction, right.direction);
+        for (architecture_dependent) |name| {
+            if (!std.mem.eql(u8, id, name)) continue;
+            checked += 1;
+            if (left.baseline == right.baseline) {
+                std.debug.print(
+                    "{s} is identical on both architectures: {d}\n",
+                    .{ id, left.baseline },
+                );
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+    try std.testing.expectEqual(architecture_dependent.len, checked);
+
+    // The bounds that do coincide are the ones that are the same by
+    // construction: zero content, zero unowned remainder, the reserves the
+    // disk plan promises from the same declared first-boot growth, and the
+    // architecture-independent data files inside architecture-independent
+    // packages. None of them is a measurement borrowed from elsewhere.
+    for (x86.limits, arm.limits) |left, right| {
+        if (left.baseline != right.baseline) continue;
+        var id_buffer: [128]u8 = undefined;
+        const id = left.measure.id(&id_buffer);
+        const shared_by_construction =
+            left.baseline == 0 or
+            left.allowance == .exact or
+            left.direction == .at_least or
+            std.mem.startsWith(u8, id, "content.") or
+            std.mem.eql(u8, id, "package_count");
+        if (!shared_by_construction) {
+            std.debug.print("{s} coincides without a reason\n", .{id});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
 
 test "the measured x86_64 core build passes every reviewed bound" {
@@ -464,6 +623,35 @@ test "the measured x86_64 core build passes every reviewed bound" {
     try std.testing.expect(
         observationOf(&evaluation, "content.documentation.installed_bytes") != null,
     );
+}
+
+test "the measured AArch64 core build passes every reviewed bound" {
+    // The same proof for the architecture #677 could not publish until now:
+    // the document assembled from the AArch64 candidate baseline passes the
+    // AArch64 table, and does so as `enforced` rather than as a recording.
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var diagnostic: Diagnostic = .{};
+    var evaluation = try evaluate(arena.allocator(), .{
+        .architecture = "aarch64",
+        .measured = &aarch64_measured,
+        .content = &aarch64_content,
+    }, &diagnostic);
+    defer evaluation.deinit();
+    try std.testing.expectEqual(size_budget.Status.enforced, evaluation.status);
+    try std.testing.expectEqual(@as(usize, 0), evaluation.failures);
+    try std.testing.expectEqual(size_budget.Result.pass, size_budget.resultOf(&evaluation));
+    // And the AArch64 image is judged against AArch64's bounds: its root does
+    // not fit inside x86_64's, so a table that had been copied across would
+    // fail here rather than pass.
+    var against_x86: Diagnostic = .{};
+    var wrong = try evaluate(arena.allocator(), .{
+        .architecture = "x86_64",
+        .measured = &aarch64_measured,
+        .content = &aarch64_content,
+    }, &against_x86);
+    defer wrong.deinit();
+    try std.testing.expect(wrong.failures > 0);
 }
 
 test "each maximum holds exactly at its bound and fails one unit past it" {
@@ -514,7 +702,7 @@ test "a minimum fails when the promised reserve is not delivered" {
     var diagnostic: Diagnostic = .{};
     var evaluation = try evaluate(
         arena.allocator(),
-        .{ .root_free_blocks = measured.root_free_blocks - 1 },
+        .{ .root_free_blocks = x86_64_measured.root_free_blocks - 1 },
         &diagnostic,
     );
     defer evaluation.deinit();
@@ -529,7 +717,7 @@ test "a failure names the metric, the observation, the bound, and the delta" {
     var diagnostic: Diagnostic = .{};
     var evaluation = try evaluate(
         arena.allocator(),
-        .{ .modules_bytes = measured.modules_bytes * 2 },
+        .{ .modules_bytes = x86_64_measured.modules_bytes * 2 },
         &diagnostic,
     );
     defer evaluation.deinit();
@@ -545,8 +733,8 @@ test "a failure names the metric, the observation, the bound, and the delta" {
     try expectContains(text, "bytes");
     // The recorded measurement the bound came from is quoted, so a reader can
     // tell a widened bound from a grown image, and so is the delta.
-    try expectContains(text, "measured baseline 151089152");
-    try expectContains(text, "by 143532032");
+    try expectContains(text, "measured baseline 155000832");
+    try expectContains(text, "by 147247104");
 }
 
 test "a metric whose phase is absent is skipped rather than passed as zero" {
@@ -569,7 +757,7 @@ test "first-boot growth is a difference and is bounded by the declared growth" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const used = measured.root_total_blocks - measured.root_free_blocks;
+    const used = x86_64_measured.root_total_blocks - x86_64_measured.root_free_blocks;
     for ([_]struct { blocks: u64, failures: usize }{
         .{ .blocks = used + 8_192, .failures = 0 },
         .{ .blocks = used + 8_193, .failures = 1 },
@@ -590,18 +778,20 @@ test "first-boot growth is a difference and is bounded by the declared growth" {
     }
 }
 
-test "an architecture with no reviewed budget records a baseline instead" {
+test "a flavor with no reviewed budget records a baseline instead" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     var diagnostic: Diagnostic = .{};
-    // No AArch64 core measurement of the minimized closure exists, so there is
-    // no AArch64 budget and none is invented from x86_64's numbers.
-    try std.testing.expect(size_budget.budgetFor(.core, .aarch64) == null);
+    // Both published core architectures are measured now, so the unmeasured
+    // case is the fresh-root flavor this release does not publish. The
+    // mechanism is unchanged: no table, no judgement, a recording instead.
+    try std.testing.expect(size_budget.budgetFor(.baremetal, .x86_64) == null);
+    try std.testing.expect(size_budget.budgetFor(.baremetal, .aarch64) == null);
     var evaluation = try evaluate(arena.allocator(), .{
-        .architecture = "aarch64",
-        // Numbers that would break every x86_64 bound, to prove the recorded
+        .flavor = "baremetal",
+        // Numbers that would break every core bound, to prove the recorded
         // baseline is not being judged against a budget that is not its own.
-        .installed_bytes = measured.installed_bytes * 4,
+        .installed_bytes = x86_64_measured.installed_bytes * 4,
     }, &diagnostic);
     defer evaluation.deinit();
     try std.testing.expectEqual(size_budget.Status.candidate_baseline, evaluation.status);
@@ -613,7 +803,7 @@ test "an architecture with no reviewed budget records a baseline instead" {
     const observation = observationOf(&evaluation, "installed_bytes").?;
     try std.testing.expect(observation.baseline == null);
     try std.testing.expect(observation.limit == null);
-    try std.testing.expectEqual(measured.installed_bytes * 4, observation.observed);
+    try std.testing.expectEqual(x86_64_measured.installed_bytes * 4, observation.observed);
 }
 
 test "a recorded baseline cannot be published" {
@@ -621,21 +811,21 @@ test "a recorded baseline cannot be published" {
     defer arena.deinit();
     const allocator = arena.allocator();
     var diagnostic: Diagnostic = .{};
-    var evaluation = try evaluate(allocator, .{ .architecture = "aarch64" }, &diagnostic);
+    var evaluation = try evaluate(allocator, .{ .flavor = "baremetal" }, &diagnostic);
     defer evaluation.deinit();
     const document = try size_budget.documentValue(allocator, &evaluation);
 
     // Validation accepts it, because a baseline is a legitimate thing for a
     // validation run to produce...
     _ = try size_budget.validateDocument(allocator, document, .{
-        .architecture = "aarch64",
-        .flavor = "core",
+        .architecture = "x86_64",
+        .flavor = "baremetal",
     }, &diagnostic);
     // ...and publication refuses it, because nobody has reviewed the numbers.
     try std.testing.expectError(error.Failed, size_budget.validateDocument(
         allocator,
         document,
-        .{ .architecture = "aarch64", .flavor = "core", .require_enforced = true },
+        .{ .architecture = "x86_64", .flavor = "baremetal", .require_enforced = true },
         &diagnostic,
     ));
     try expectContains(diagnostic.message(), "no reviewed size budget");
@@ -721,7 +911,7 @@ test "a bounded content class cannot grow past its measured bound" {
     var diagnostic: Diagnostic = .{};
     var evaluation = try evaluate(
         arena.allocator(),
-        .{ .documentation_bytes = contentBytes("documentation") * 2 },
+        .{ .documentation_bytes = contentBytes(&x86_64_content, "documentation") * 2 },
         &diagnostic,
     );
     defer evaluation.deinit();
