@@ -27,6 +27,7 @@ pub const execution = @import("ubuntu2604/execution.zig");
 pub const keys = @import("ubuntu2604/keys.zig");
 pub const provenance = @import("ubuntu2604/provenance.zig");
 pub const runtime_contract = @import("ubuntu2604_runtime_contract");
+pub const disk_geometry = @import("ubuntu2604/disk_geometry.zig");
 pub const runtime_contract_document = @import("ubuntu2604/runtime_contract_document.zig");
 pub const size_inventory = @import("ubuntu2604/size_inventory.zig");
 pub const support = @import("ubuntu2604/support.zig");
@@ -55,6 +56,7 @@ const usage_text =
     \\  verify-image-info             check a miz image-info document
     \\  size-inventory-verify         check a measured size-inventory document
     \\  size-inventory-compare        report size deltas between two inventories
+    \\  disk-geometry-verify          check a calculated core disk-geometry report
     \\  runtime-contract-verify       check a published runtime-contract document
     \\  runtime-contract-probe-verify check a guest runtime-contract probe report
     \\  candidate-signing-env         export the candidate signing bindings
@@ -408,6 +410,7 @@ test {
     _ = @import("ubuntu2604/cli.zig");
     _ = @import("ubuntu2604/commands.zig");
     _ = @import("ubuntu2604/contracts.zig");
+    _ = @import("ubuntu2604/disk_geometry.zig");
     _ = @import("ubuntu2604/documents.zig");
     _ = @import("ubuntu2604/download.zig");
     _ = @import("ubuntu2604/keys.zig");

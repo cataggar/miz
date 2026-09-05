@@ -16,6 +16,7 @@ const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
 const Io = std.Io;
 const contracts = release.contracts;
+const disk_geometry = release.disk_geometry;
 const runtime_contract = release.runtime_contract;
 const runtime_contract_document = release.runtime_contract_document;
 const size_inventory = release.size_inventory;
@@ -819,7 +820,7 @@ fn writeProvenance(
     try builder.put(
         &document,
         "disk_layout",
-        try diskLayout(builder, entry.architecture),
+        try diskLayout(builder, entry.architecture, flavor),
     );
     try builder.put(&document, "debz", .{ .object = debz });
     if (flavor == .core) {
@@ -827,6 +828,11 @@ fn writeProvenance(
             &document,
             "runtime_contract",
             try writeRuntimeContract(tree, builder, key, provenance),
+        );
+        try builder.put(
+            &document,
+            "disk_geometry",
+            try writeDiskGeometry(tree, builder, key, provenance),
         );
         try builder.putString(&document, "flavor", "core");
         try builder.putInteger(&document, "virtual_size", virtual_size);
@@ -849,6 +855,85 @@ fn writeProvenance(
     );
 
     try writeSigning(tree, key, provenance, options);
+}
+
+/// The measurements the fixture's calculated geometry stands on.
+///
+/// Small but structurally real: an ESP that holds two copies of a modest UKI,
+/// and a root fitted above its own minimum plus the reserve the policy derives
+/// from the measured first-boot growth. The document is produced by the same
+/// planner and writer the builder uses, so a change to either lands in the
+/// fixture and in the shipped image at once.
+pub const fixture_geometry_measurements = disk_geometry.Measurements{
+    .signed_uki_bytes = 48 * 1024 * 1024,
+    .esp_minimum_bytes = 100 * 1024 * 1024,
+    .root_minimum_bytes = 512 * 1024 * 1024,
+    .root_fitted_bytes = 641 * 1024 * 1024,
+    .first_boot = undefined,
+};
+
+pub fn fixtureGeometryPlan(architecture: []const u8) !disk_geometry.Plan {
+    const parsed = disk_geometry.Architecture.parse(architecture).?;
+    var measurements = fixture_geometry_measurements;
+    measurements.first_boot = disk_geometry.firstBootGrowth(parsed);
+    return disk_geometry.plan(.{
+        .architecture = parsed,
+        .measurements = measurements,
+        .root_name = "cloudimg-rootfs",
+    });
+}
+
+const fixture_geometry_identity = disk_geometry.Identity{
+    .disk_guid = "6d697a20-2604-4c6f-b165-000000000164",
+    .esp_type_guid = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+    .esp_partition_guid = "6d697a20-2604-4573-9001-000000000164",
+    .esp_volume_id = 0x2604_0164,
+    .esp_volume_label = "UEFI",
+    .root_type_guid = "4f68bce3-e8cd-4db1-96e7-fbcaf984b709",
+    .root_partition_guid = "6d697a20-2604-526f-a074-000000000164",
+    .root_filesystem_uuid = "6d697a20-2604-4573-9001-0000000001ff",
+    .root_filesystem_label = "cloudimg-rootfs",
+};
+
+/// Writes the calculated disk-geometry document for `key` (issue #677 step 5)
+/// and returns its binding.
+fn writeDiskGeometry(
+    tree: *const Tree,
+    builder: Builder,
+    key: []const u8,
+    provenance: []const u8,
+) !std.json.Value {
+    const allocator = tree.allocator;
+    const io = tree.io;
+    const entry = contracts.lookup(key).?;
+    const flavor = contracts.parseFlavor(entry.flavor).?;
+
+    var name_buffer: [96]u8 = undefined;
+    const filename = contracts.diskGeometryFilename(
+        &name_buffer,
+        flavor,
+        entry.architecture,
+    ).?;
+    const path = try std.fs.path.join(allocator, &.{ provenance, filename });
+    defer allocator.free(path);
+    var diagnostic: disk_geometry.Diagnostic = .{};
+    try disk_geometry.write(
+        allocator,
+        io,
+        path,
+        @tagName(flavor),
+        try fixtureGeometryPlan(entry.architecture),
+        fixture_geometry_identity,
+        &diagnostic,
+    );
+    const text = try Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(disk_geometry.max_document_bytes),
+    );
+    defer allocator.free(text);
+    return fileBinding(builder, filename, &support.digest.hexBytes(text), null);
 }
 
 /// Writes the real runtime-contract document for `key` and returns its binding.
@@ -1020,8 +1105,20 @@ fn fileBinding(
     return .{ .object = binding };
 }
 
-fn diskLayout(builder: Builder, architecture: []const u8) !std.json.Value {
+fn diskLayout(
+    builder: Builder,
+    architecture: []const u8,
+    flavor: contracts.Flavor,
+) !std.json.Value {
     var layout = builder.object();
+    // #677 step 5: core writes its own GPT on both architectures, so its
+    // layout provenance describes that rather than an edit to Canonical's.
+    if (flavor == .core) {
+        try builder.putString(&layout, "source", disk_geometry.provenance_source);
+        try builder.putString(&layout, "transform", disk_geometry.provenance_transform);
+        try builder.put(&layout, "inherits_source_geometry", .{ .bool = false });
+        return .{ .object = layout };
+    }
     try builder.putString(&layout, "source", "canonical-gen2-gpt");
     if (std.mem.eql(u8, architecture, "x86_64")) {
         try builder.putString(&layout, "transform", "preserved");

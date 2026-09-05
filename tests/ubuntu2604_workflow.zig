@@ -807,8 +807,18 @@ test "the build job validates the QCOW2 and publishes its metadata natively" {
     );
     try source.expectContainsIn(build_job, "virtual_size: 5368709120", workflow_path);
     try source.expectContainsIn(build_job, "virtual_size_label: 5 GiB", workflow_path);
-    try source.expectContainsIn(build_job, "virtual_size: 3758096384", workflow_path);
-    try source.expectContainsIn(build_job, "virtual_size_label: 3584 MiB", workflow_path);
+    // #677 step 5: the core rows carry no size. Their planned geometry is
+    // published by the build and bound afterwards, so a size in the matrix
+    // would be a second, unchecked source of truth.
+    try source.expectContainsIn(build_job, "virtual_size: \"\"", workflow_path);
+    try source.expectContainsIn(build_job, "virtual_size_label: \"\"", workflow_path);
+    try source.expectOmitsIn(build_job, "3758096384", workflow_path);
+    try source.expectContainsIn(
+        build_job,
+        "- name: Bind this flavor's virtual size",
+        workflow_path,
+    );
+    try source.expectContainsIn(build_job, "disk-geometry-verify", workflow_path);
     try source.expectContainsIn(build_job, "FLAVOR: ${{ matrix.flavor }}", workflow_path);
     try source.expectOmitsIn(build_job, source.interpreter, workflow_path);
 }

@@ -127,22 +127,24 @@ jobs:
             flavor: core
             runner: ubuntu-24.04
             asset_name: Ubuntu-26.04-x86_64.core.qcow2
-            virtual_size: 3758096384
-            virtual_size_label: 3584 MiB
+            # Issue #677 step 5: core plans its own geometry, so the matrix
+            # names none and the planned size is bound after the build.
+            virtual_size: ""
+            virtual_size_label: ""
           - key: aarch64-core
             architecture: aarch64
             flavor: core
             runner: ubuntu-24.04-arm
             asset_name: Ubuntu-26.04-aarch64.core.qcow2
-            virtual_size: 3758096384
-            virtual_size_label: 3584 MiB
+            virtual_size: ""
+            virtual_size_label: ""
     env:
       CANDIDATE_KEY: ${{ matrix.key }}
       ARCHITECTURE: ${{ matrix.architecture }}
       FLAVOR: ${{ matrix.flavor }}
       ASSET_NAME: ${{ matrix.asset_name }}
-      VIRTUAL_SIZE: ${{ matrix.virtual_size }}
-      VIRTUAL_SIZE_LABEL: ${{ matrix.virtual_size_label }}
+      MATRIX_VIRTUAL_SIZE: ${{ matrix.virtual_size }}
+      MATRIX_VIRTUAL_SIZE_LABEL: ${{ matrix.virtual_size_label }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       WORK_DIR: .scratch/ubuntu2604-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       BUNDLE_DIR: artifact-staging/candidates/${{ matrix.key }}
@@ -273,7 +275,7 @@ jobs:
             --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
             --provenance-dir "$GITHUB_WORKSPACE/$BUNDLE_DIR/internal-provenance" \
             --output "$GITHUB_WORKSPACE/$BUNDLE_DIR/$ASSET_NAME" \
-            --size "$VIRTUAL_SIZE" \
+            ${MATRIX_VIRTUAL_SIZE:+--size "$MATRIX_VIRTUAL_SIZE"} \
             --uki-signing-certificate "$UKI_SIGNING_CERTIFICATE" \
             --uki-signing-certificate-sha256 "$UKI_SIGNING_CERTIFICATE_SHA256" \
             --uki-sign-command "$UKI_SIGN_COMMAND" \
@@ -281,6 +283,29 @@ jobs:
             2>&1 | tee "$build_log"
           sudo chown -R "$(id -u):$(id -g)" "$WORK_DIR" "$BUNDLE_DIR"
           cp "$build_log" "$BUNDLE_DIR/internal-provenance/build.log"
+
+      - name: Bind this flavor's virtual size
+        run: |
+          set -euo pipefail
+          # Issue #677 step 5: `full` is still built at the exact size the
+          # matrix names; `core` plans its own and publishes the plan, so its
+          # size is read back from that document rather than written down
+          # twice. Either way, exactly one number reaches every later step.
+          test -x "$RELEASE_TOOL"
+          if [[ -n "$MATRIX_VIRTUAL_SIZE" ]]; then
+            printf 'VIRTUAL_SIZE=%s\n' "$MATRIX_VIRTUAL_SIZE" >> "$GITHUB_ENV"
+            printf 'VIRTUAL_SIZE_LABEL=%s\n' "$MATRIX_VIRTUAL_SIZE_LABEL" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          geometry="$BUNDLE_DIR/internal-provenance/ubuntu2604-disk-geometry-$FLAVOR-$ARCHITECTURE.json"
+          test -f "$geometry"
+          planned=$("$RELEASE_TOOL" disk-geometry-verify \
+            --geometry "$geometry" \
+            --architecture "$ARCHITECTURE" \
+            --flavor "$FLAVOR" \
+            --github-env "$GITHUB_ENV")
+          printf 'Disk geometry `%s`: `%s`\n' "$CANDIDATE_KEY" "$planned" \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Validate standalone zstd QCOW2 and exact flavor size
         run: |
@@ -301,6 +326,14 @@ jobs:
             --info "$BUNDLE_DIR/internal-provenance/image-info.json" \
             --virtual-size "$VIRTUAL_SIZE" \
             --virtual-size-label "$VIRTUAL_SIZE_LABEL"
+          if [[ "$FLAVOR" == core ]]; then
+            # The plan and the published disk are bound in both directions.
+            "$RELEASE_TOOL" disk-geometry-verify \
+              --geometry "$BUNDLE_DIR/internal-provenance/ubuntu2604-disk-geometry-$FLAVOR-$ARCHITECTURE.json" \
+              --architecture "$ARCHITECTURE" \
+              --flavor "$FLAVOR" \
+              --virtual-size "$VIRTUAL_SIZE"
+          fi
           digest=$(sha256sum "$asset" | awk '{print $1}')
           [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
           printf '%s\n' "$digest" > "$BUNDLE_DIR/internal-provenance/build-validated-digest"

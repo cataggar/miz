@@ -18,6 +18,7 @@ const Dir = std.Io.Dir;
 const Io = std.Io;
 const release = @import("../release/root.zig");
 
+pub const contract = release.contract;
 pub const Diagnostic = release.contract.Diagnostic;
 pub const digest = release.digest;
 pub const file_support = release.file;

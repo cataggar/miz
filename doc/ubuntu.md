@@ -6,8 +6,8 @@
 | --- | --- | --- | --- | --- | --- |
 | full | `x86_64` | `amd64` | `Ubuntu-26.04-x86_64.qcow2` | 5 GiB | systemd, cloud-init, WALinuxAgent |
 | full | `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.qcow2` | 5 GiB | systemd, cloud-init, WALinuxAgent |
-| core | `x86_64` | `amd64` | `Ubuntu-26.04-x86_64.core.qcow2` | 3584 MiB | mizinit, azagent |
-| core | `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.core.qcow2` | 3584 MiB | mizinit, azagent |
+| core | `x86_64` | `amd64` | `Ubuntu-26.04-x86_64.core.qcow2` | calculated per build | mizinit, azagent |
+| core | `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.core.qcow2` | calculated per build | mizinit, azagent |
 | baremetal | `aarch64` | `arm64` | `Ubuntu-26.04-aarch64.baremetal.qcow2` | 5 GiB | mizinit, baked administrator |
 
 Bare metal is `aarch64` only: the kernel it names is published for `arm64`
@@ -239,7 +239,8 @@ never copied between runs.
 
 The root partition is selected by the validated GPT name
 `cloudimg-rootfs` and the ext4 filesystem label, not by a fixed `/dev/sdaN`
-slot; Canonical's populated partition slots differ between image revisions.
+slot; Canonical's populated partition slots differ between image revisions, and
+core's calculated layout places the root in a slot of its own.
 
 The following inputs are compiled into the builder:
 
@@ -496,18 +497,89 @@ digest, the published document, and the acceptance verdict together.
 ## Guest and disk contract
 
 Each output is a standalone, zstd-compressed QCOW2. Full has an exact default
-virtual size of 5 GiB. Core is exactly 3584 MiB: the size of the pinned signed
-substrate, 30% smaller than full. Its fresh root must retain at least 768 MiB
-free after package installation and final injection; the measured free bytes,
-minimum, and virtual size are provenance fields and validation gates.
+virtual size of 5 GiB.
 
-The root remains `/dev/sda1` and the EFI system partition remains
-`/dev/sda15`. x86_64 retains Canonical's Gen2 partition geometry. Arm64
-rebuilds `/dev/sda15` as a 512 MiB FAT32 ESP in the same GPT slot, preserving
-its first LBA, partition GUID, and FAT volume ID; the obsolete Canonical
-XBOOTLDR entry at `/dev/sda13` is cleared without moving the root or changing
-the disk size. The rebuilt Arm64 ESP contains only
+Core has no fixed size at all. Its disk is planned by the build that produces
+it, from three measurements and a small set of named margins; see
+[Calculated core disk geometry](#calculated-core-disk-geometry) below. Passing
+`--size` to a core build is refused rather than ignored, and no workflow names
+a core size: the planned size is read back from the published geometry report
+and is the only size the finished artifact is checked against.
+
+For full and bare metal, the root remains `/dev/sda1` and the EFI system
+partition remains `/dev/sda15`; x86_64 retains Canonical's Gen2 partition
+geometry. Arm64 rebuilds `/dev/sda15` as a 512 MiB FAT32 ESP in the same GPT
+slot, preserving its first LBA, partition GUID, and FAT volume ID; the obsolete
+Canonical XBOOTLDR entry at `/dev/sda13` is cleared without moving the root or
+changing the disk size. The rebuilt Arm64 ESP contains only
 `EFI/BOOT/BOOTAA64.EFI`, not Canonical's stale shim/GRUB tree.
+
+## Calculated core disk geometry
+
+Issue #677 step 5 retired the last inherited number in the core image. Core
+used to *be* Canonical's disk: the builder copied the signed 3584 MiB QCOW2,
+emptied its root partition, refilled it, and published the result at the
+source's geometry, with a 768 MiB free-space rule nobody had measured.
+
+The signed publication is still downloaded, signature-verified,
+checksum-pinned, and mined for the guest's Ubuntu archive keyring -- it is the
+substrate every package in the image is trusted through -- but its partition
+table is now evidence rather than output. The core build writes a new GPT of
+its own, from measurements:
+
+| Input | Where it comes from |
+| --- | --- |
+| signed UKI length | measured after signing, per architecture |
+| ESP minimum | the FAT32 writer's own solver, over a volume holding the resident UKI copies |
+| root minimum | `ext4.minimumPopulateLengthAtLeast` over the finished root tree, with the exact options the root is then written with |
+| first-boot growth bound | declared, and re-checked against the guest's own `statfs` on every QEMU acceptance run |
+
+and a small set of named margins:
+
+| Margin | Value | Why |
+| --- | --- | --- |
+| resident UKI copies | 2 | the ESP holds one file that matters, and replacing it safely means writing the new copy before removing the one that currently boots |
+| first-boot growth reserve | 4x the bound | the growth itself, plus three times over; a change in first-boot behaviour has to more than quadruple before the image is short |
+| free-byte floor | 64 MiB | so an unusually small measurement cannot plan a root with no working room |
+| free-inode floor | 4096 | carried across from the value the builder has always validated |
+| alignment | 1 MiB | Azure requires a whole number of MiB, and it is what the rest of miz plans with |
+
+The resulting table has exactly two entries, and every clause of its shape is a
+consumer contract:
+
+- the ESP is partition 1, because `mizinit` looks for the ESP on partition 1
+  and nowhere else;
+- the root is partition 2, is last on the disk, and ends at the last usable
+  LBA, because `azagent`'s first-boot growth calls `gpt.growPartitionToEnd`,
+  which refuses a partition that has anything after it;
+- there is no XBOOTLDR and no BIOS boot entry, because nothing in an
+  appliance that boots a UKI from an ESP reads either;
+- the root keeps Canonical's root type GUID, name `cloudimg-rootfs`, and ext4
+  label, so root selection and `root_resize` are unchanged; and
+- the disk GUID, both partition GUIDs, the root filesystem UUID, and the ESP
+  volume ID are fixed per architecture, so two builds of the same inputs
+  produce the same bytes.
+
+x86_64 and AArch64 are planned independently. Nothing forces them onto a common
+size, and no consumer contract asks for one.
+
+Every build publishes
+`internal-provenance/ubuntu2604-disk-geometry-core-<architecture>.json`,
+digest-bound from `ubuntu2604-build-provenance.json` beside the size inventory
+and the runtime contract. It records every measurement, every margin, the
+requirements they imply, both partitions with their type and unique GUIDs,
+first and last LBA, offsets and lengths, the disk's GUID, usable range, backup
+header LBA, and virtual size, and it states that the geometry is not inherited.
+
+`ubuntu2604_release disk-geometry-verify` re-derives the whole plan from the
+document's own measurements and refuses any report whose published offsets do
+not follow from them -- or that lands back on the retired 3584 MiB size:
+
+```console
+ubuntu2604_release disk-geometry-verify \
+  --geometry internal-provenance/ubuntu2604-disk-geometry-core-x86_64.json \
+  --architecture x86_64 --flavor core --virtual-size "$VIRTUAL_SIZE"
+```
 The matching legacy `/boot` and `/boot/efi` mounts are removed from Arm64
 `fstab`, and the full image disables GRUB's initrd-fallback helper because
 firmware boots the signed UKI directly rather than maintaining GRUB state.
@@ -759,9 +831,9 @@ sudo -E zig build -Dubuntu2604-arch=aarch64 generalized-ubuntu2604 -- \
   --uki-signing-key test.key
 ```
 
-Build core explicitly for both architectures; the flavor selects the exact
-3584 MiB size, core asset name, static guest binaries, and empty-root package
-policy:
+Build core explicitly for both architectures; the flavor selects the calculated
+disk geometry, core asset name, static guest binaries, and empty-root package
+policy. Core takes no `--size`:
 
 ```console
 sudo -E zig build \
@@ -1302,8 +1374,8 @@ wrong-source, or unsuccessful evidence fails closed. Reused candidates still
 rerun QEMU and Azure acceptance.
 
 The build matrix passes flavor explicitly. Full candidates retain the exact
-5 GiB virtual-size contract; core remains exactly 3584 MiB, or 3.5 GiB and 30%
-smaller. Every leg records host capacity before the build, preserves the #611
+5 GiB virtual-size contract; core candidates name no size at all, and the
+planned size is bound from the published geometry report after the build. Every leg records host capacity before the build, preserves the #611
 post-failure `df`/largest-path diagnostics, and unconditionally removes
 privileged build state and signing material.
 

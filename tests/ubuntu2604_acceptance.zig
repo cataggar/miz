@@ -20,6 +20,7 @@ const release = @import("ubuntu2604_release");
 const execution = release.execution;
 const runtime_contract = release.runtime_contract;
 const runtime_contract_document = release.runtime_contract_document;
+const disk_geometry = release.disk_geometry;
 const size_inventory = release.size_inventory;
 
 const Allocator = std.mem.Allocator;
@@ -116,6 +117,13 @@ const Architecture = enum {
         };
     }
 
+    fn fallbackUkiName(self: Architecture) []const u8 {
+        return switch (self) {
+            .x86_64 => "BOOTX64.EFI",
+            .aarch64 => "BOOTAA64.EFI",
+        };
+    }
+
     fn serialConsole(self: Architecture) []const u8 {
         return switch (self) {
             .x86_64 => "console=ttyS0,115200n8",
@@ -204,7 +212,13 @@ const core_contracts = [_][]const u8{
 const FlavorPolicy = struct {
     x86_64_file_name: []const u8,
     aarch64_file_name: []const u8,
-    virtual_size: u64,
+    /// The exact virtual size this flavor is published at, or null when the
+    /// flavor calculates its own. Issue #677 step 5 made `core` calculate:
+    /// its disk is planned from the signed UKI, the measured ext4 minimum,
+    /// and the measured first-boot growth of the build that produced it, so
+    /// no number written here could describe it. What acceptance asserts
+    /// instead is the *shape* of a calculated disk, read from the image.
+    virtual_size: ?u64,
     result_schema: u32,
     contracts: []const []const u8,
 };
@@ -224,7 +238,7 @@ const Flavor = enum {
 const core_policy: FlavorPolicy = .{
     .x86_64_file_name = "Ubuntu-26.04-x86_64.core.qcow2",
     .aarch64_file_name = "Ubuntu-26.04-aarch64.core.qcow2",
-    .virtual_size = 3584 * mib,
+    .virtual_size = null,
     .result_schema = 9,
     .contracts = &core_contracts,
 };
@@ -262,8 +276,14 @@ const Candidate = struct {
         };
     }
 
-    fn expectedVirtualSize(self: Candidate) u64 {
+    fn expectedVirtualSize(self: Candidate) ?u64 {
         return self.flavor.policy().virtual_size;
+    }
+
+    /// Whether this flavor's disk geometry is planned by the build rather
+    /// than fixed by contract.
+    fn calculatesGeometry(self: Candidate) bool {
+        return self.flavor.policy().virtual_size == null;
     }
 
     fn contracts(self: Candidate) []const []const u8 {
@@ -275,8 +295,55 @@ const Candidate = struct {
     }
 };
 
+/// The disk the candidate actually shipped, measured once from the image.
+///
+/// The preserved-geometry flavors could state these numbers up front, and
+/// still do through `FlavorPolicy.virtual_size`. A calculated-geometry flavor
+/// cannot: its size is a function of what its own build measured. So growth is
+/// checked against what the published image *is*, which is the honest baseline
+/// for "the root grew past the size it was published at" either way.
+const PublishedGeometry = struct {
+    virtual_size: u64,
+    root_first_lba: u64,
+    root_last_lba: u64,
+
+    fn rootSize(self: PublishedGeometry) !u64 {
+        if (self.root_last_lba < self.root_first_lba)
+            return error.InvalidExpectedRootGeometry;
+        const sectors = self.root_last_lba - self.root_first_lba + 1;
+        return std.math.mul(u64, sectors, miz.gpt.sector_size);
+    }
+};
+
+/// Reads the geometry the candidate was published at, straight from the image.
+fn readPublishedGeometry(
+    allocator: Allocator,
+    io: Io,
+    image_path: []const u8,
+    candidate: Candidate,
+) !PublishedGeometry {
+    var file = try Dir.cwd().openFile(io, image_path, .{ .mode = .read_only });
+    var image = try miz.Image.openStandaloneQcow2File(io, file);
+    defer image.close(io);
+    file = undefined;
+    var parsed = try miz.gpt.readVerifiedGpt(
+        image,
+        io,
+        allocator,
+        miz.gpt.default_max_partition_array_bytes,
+    );
+    defer parsed.deinit(allocator);
+    const root = try findRootPartition(parsed.partitions, candidate.architecture);
+    return .{
+        .virtual_size = image.virtual_size,
+        .root_first_lba = root.first_lba,
+        .root_last_lba = root.last_lba,
+    };
+}
+
 fn expectedOriginalRootSize(candidate: Candidate) !u64 {
-    const virtual_size = candidate.expectedVirtualSize();
+    const virtual_size = candidate.expectedVirtualSize() orelse
+        return error.FlavorCalculatesItsOwnGeometry;
     if (virtual_size == 0 or virtual_size % miz.gpt.sector_size != 0)
         return error.InvalidExpectedVirtualSize;
 
@@ -1021,6 +1088,76 @@ fn partitionGeometryMatches(
         partition.last_lba == expected.last_lba;
 }
 
+/// One alignment unit, which every calculated partition boundary and the
+/// calculated disk itself land on.
+const calculated_alignment: u64 = mib;
+/// The virtual size the core flavor used to inherit from Canonical's cloud
+/// image. Asserted against rather than for: a calculated disk that came out at
+/// exactly this size is a disk that started inheriting again.
+const retired_core_virtual_size: u64 = 3584 * mib;
+
+/// The partition table a calculated-geometry image must have.
+///
+/// Numbers are not written down, because they are a function of what the build
+/// measured. The *shape* is, and every clause of it is a consumer contract:
+///
+///   * exactly two entries -- an appliance that boots a UKI from an ESP and
+///     roots on ext4 needs no XBOOTLDR, no BIOS boot, and nothing else;
+///   * the ESP is partition 1, which is the only place `mizinit` looks for it;
+///   * the root is partition 2, is the last thing on the disk, and ends at the
+///     last usable LBA, which is what `azagent`'s `growPartitionToEnd` needs;
+///   * every boundary is 1 MiB aligned, which is what Azure's VHD upload and
+///     every hypervisor expect; and
+///   * the disk is smaller than the geometry it replaced.
+fn validateCalculatedPartitions(
+    partitions: []const miz.gpt.PartitionEntry,
+    architecture: Architecture,
+    last_usable_lba: u64,
+    virtual_size: u64,
+) !PreservedPartitions {
+    if (partitions.len != 2) return error.UnexpectedPartitionCount;
+    if (try findPartitionByType(partitions, miz.guid.bios_boot) != null)
+        return error.UnexpectedBiosBootPartition;
+    if (try findPartitionByType(partitions, miz.guid.linux_xbootldr) != null)
+        return error.UnexpectedXbootldrPartition;
+
+    const root = try findRootPartition(partitions, architecture);
+    const esp = try findEspPartition(partitions);
+    if (std.mem.eql(u8, &root.unique_partition_guid, &esp.unique_partition_guid))
+        return error.DuplicatePartitionGuid;
+    for (partitions) |partition| {
+        if (std.mem.eql(u8, &partition.unique_partition_guid, &miz.guid.nil))
+            return error.InvalidPartitionGuid;
+    }
+
+    if (esp.table_index != 0 or root.table_index != 1)
+        return error.UnexpectedCalculatedPartitionOrder;
+    if (!partitionNameEquals(esp, "ESP")) return error.UnexpectedAuxiliaryPartitionName;
+    if (esp.first_lba * miz.gpt.sector_size != calculated_alignment)
+        return error.UnexpectedEspGeometry;
+    if (esp.last_lba >= root.first_lba) return error.UnexpectedCalculatedPartitionOrder;
+    // The root is the last partition, and what follows it is only the tail the
+    // planner rounded up for the backup GPT -- under one alignment unit. That
+    // is what `growPartitionToEnd` needs: nothing after the root, and nothing
+    // meaningful left unallocated behind it either.
+    if (root.last_lba > last_usable_lba) return error.UnexpectedRootGeometry;
+    if (last_usable_lba - root.last_lba >= calculated_alignment / miz.gpt.sector_size)
+        return error.UnexpectedRootGeometry;
+
+    for ([_]miz.gpt.PartitionEntry{ esp, root }) |partition| {
+        const offset = partition.first_lba * miz.gpt.sector_size;
+        const length = (partition.last_lba - partition.first_lba + 1) * miz.gpt.sector_size;
+        if (offset % calculated_alignment != 0 or length % calculated_alignment != 0)
+            return error.UnalignedCalculatedPartition;
+    }
+    if (virtual_size % calculated_alignment != 0)
+        return error.UnalignedCalculatedVirtualSize;
+    if (virtual_size >= retired_core_virtual_size)
+        return error.CalculatedGeometryNotSmallerThanRetired;
+
+    return .{ .root = root, .xbootldr = null, .bios_boot = null, .esp = esp };
+}
+
 fn validatePreservedPartitions(
     partitions: []const miz.gpt.PartitionEntry,
     architecture: Architecture,
@@ -1131,10 +1268,16 @@ fn expectOnlyEspEntry(
     }
 }
 
-fn validateArm64EspContents(
+/// The ESP holds one file and nothing else: the signed fallback firmware
+/// loads. Applied to the Arm64 rebuilt ESP, and since #677 step 5 to every
+/// calculated ESP on either architecture -- an ESP sized from exactly this
+/// content has no room for anything nobody asked for, and a stray file in it
+/// is a build that stopped agreeing with its own plan.
+fn validateOnlySignedFallbackEsp(
     allocator: Allocator,
     io: Io,
     esp: *miz.fat32.FileSystem,
+    fallback_name: []const u8,
     uki_size: usize,
 ) !void {
     const size = std.math.cast(u32, uki_size) orelse return error.UkiTooLarge;
@@ -1145,10 +1288,19 @@ fn validateArm64EspContents(
         io,
         esp,
         "EFI/BOOT",
-        "BOOTAA64.EFI",
+        fallback_name,
         .file,
         size,
     );
+}
+
+fn validateArm64EspContents(
+    allocator: Allocator,
+    io: Io,
+    esp: *miz.fat32.FileSystem,
+    uki_size: usize,
+) !void {
+    try validateOnlySignedFallbackEsp(allocator, io, esp, "BOOTAA64.EFI", uki_size);
 }
 
 fn verifyUkiSignatures(
@@ -1397,8 +1549,9 @@ fn validateFinalizedImage(
     if (qcow2.backing_file_len != 0) return error.ImageHasBackingFile;
     if (qcow2.data_file_len != 0) return error.ImageHasExternalDataFile;
     if (qcow2.compression_type != 1) return error.MissingZstdCompression;
-    if (image.virtual_size != candidate.expectedVirtualSize())
-        return error.UnexpectedVirtualSize;
+    if (candidate.expectedVirtualSize()) |expected| {
+        if (image.virtual_size != expected) return error.UnexpectedVirtualSize;
+    }
 
     var parsed = try miz.gpt.readVerifiedGpt(
         image,
@@ -1407,12 +1560,20 @@ fn validateFinalizedImage(
         miz.gpt.default_max_partition_array_bytes,
     );
     defer parsed.deinit(allocator);
-    const preserved = try validatePreservedPartitions(
-        parsed.partitions,
-        candidate.architecture,
-        parsed.primary_header.last_usable_lba,
-    );
-    if (candidate.architecture == .aarch64) {
+    const preserved = if (candidate.calculatesGeometry())
+        try validateCalculatedPartitions(
+            parsed.partitions,
+            candidate.architecture,
+            parsed.primary_header.last_usable_lba,
+            image.virtual_size,
+        )
+    else
+        try validatePreservedPartitions(
+            parsed.partitions,
+            candidate.architecture,
+            parsed.primary_header.last_usable_lba,
+        );
+    if (candidate.architecture == .aarch64 and !candidate.calculatesGeometry()) {
         try validateClearedArm64XbootldrEntry(parsed);
     }
     const esp_partition = preserved.esp;
@@ -1429,7 +1590,15 @@ fn validateFinalizedImage(
         candidate.architecture.fallbackUkiPath(),
     );
     defer allocator.free(uki);
-    if (candidate.architecture == .aarch64) {
+    if (candidate.calculatesGeometry()) {
+        try validateOnlySignedFallbackEsp(
+            allocator,
+            io,
+            &esp,
+            candidate.architecture.fallbackUkiName(),
+            uki.len,
+        );
+    } else if (candidate.architecture == .aarch64) {
         try validateArm64EspContents(allocator, io, &esp, uki.len);
     }
 
@@ -3180,9 +3349,19 @@ fn verifyRootGrowth(
     ssh_path: []const u8,
     instance: *const Instance,
     candidate: Candidate,
+    published: PublishedGeometry,
 ) !void {
-    const original_size = candidate.expectedVirtualSize();
-    const original_root_size = try expectedOriginalRootSize(candidate);
+    // Both baselines come from the disk that was published. For a flavor with
+    // a fixed size they are also what the contract says; for a calculated one
+    // there is nothing else they could be, and cross-checking the fixed case
+    // keeps the measured baseline honest.
+    if (candidate.expectedVirtualSize()) |expected| {
+        if (published.virtual_size != expected) return error.UnexpectedVirtualSize;
+        if (try published.rootSize() != try expectedOriginalRootSize(candidate))
+            return error.InvalidExpectedRootGeometry;
+    }
+    const original_size = published.virtual_size;
+    const original_root_size = try published.rootSize();
     const minimum_grown_root_size = try std.math.add(
         u64,
         original_root_size,
@@ -3298,6 +3477,63 @@ fn writeAcceptanceResultValue(
     });
 }
 
+/// Fails when the guest's real first-boot growth exceeded the bound the disk
+/// was planned against.
+///
+/// The reserve on the root is several times the bound, so a breach here is not
+/// an out-of-space guest; it is the planner's stated input having gone stale,
+/// which is exactly what an acceptance run is for.
+fn verifyFirstBootGrowthBound(
+    bound_inventory: std.json.Value,
+    usage: size_inventory.FilesystemUsage,
+    candidate: Candidate,
+) !void {
+    const image = bound_inventory.object.get("image_build") orelse
+        return error.SizeInventoryUnusable;
+    const before = image.object;
+    const before_used_blocks = jsonCount(before.get("root_used_blocks")) orelse
+        return error.SizeInventoryUnusable;
+    const before_used_inodes = jsonCount(before.get("root_used_inodes")) orelse
+        return error.SizeInventoryUnusable;
+    const block_size = jsonCount(before.get("root_block_size")) orelse
+        return error.SizeInventoryUnusable;
+    const after_used_blocks = usage.total_blocks - usage.free_blocks;
+    const after_used_inodes = usage.total_inodes - usage.free_inodes;
+    // A first boot that freed space is not a growth breach; it is reported as
+    // zero growth rather than as an underflow.
+    const grown_blocks = after_used_blocks -| before_used_blocks;
+    const grown_inodes = after_used_inodes -| before_used_inodes;
+    const architecture: disk_geometry.Architecture = switch (candidate.architecture) {
+        .x86_64 => .x86_64,
+        .aarch64 => .aarch64,
+    };
+    disk_geometry.assertWithinFirstBootGrowthBound(
+        architecture,
+        grown_blocks * block_size,
+        grown_inodes,
+    ) catch |err| {
+        std.debug.print(
+            "first-boot growth {d} bytes / {d} inodes exceeds the planned bound of " ++
+                "{d} bytes / {d} inodes\n",
+            .{
+                grown_blocks * block_size,
+                grown_inodes,
+                disk_geometry.firstBootGrowth(architecture).bytes,
+                disk_geometry.firstBootGrowth(architecture).inodes,
+            },
+        );
+        return err;
+    };
+}
+
+fn jsonCount(value: ?std.json.Value) ?u64 {
+    const inner = value orelse return null;
+    return switch (inner) {
+        .integer => |number| if (number < 0) null else @intCast(number),
+        else => null,
+    };
+}
+
 /// Appends the measured `first_boot` phase to the candidate's size inventory.
 ///
 /// Issue #678 measured everything a build and a publication can see, and left
@@ -3345,6 +3581,14 @@ fn recordFirstBootInventory(
         return error.SizeInventoryUnusable;
     };
     defer parsed.deinit();
+    // Issue #677 step 5: the calculated disk reserves a multiple of a declared
+    // first-boot growth bound. This is where that bound stops being a claim:
+    // the guest's own accounting, before and after, is compared against it on
+    // every acceptance run and on both architectures. A breach fails the run
+    // that observed it rather than shipping a root planned against a figure
+    // that stopped being true.
+    if (candidate.calculatesGeometry())
+        try verifyFirstBootGrowthBound(parsed.value, usage, candidate);
 
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -3711,28 +3955,46 @@ test "Ubuntu 26.04 acceptance derives original root size from preserved GPT geom
             .flavor = .full,
         }),
     );
+    // #677 step 5: core has no preserved geometry to derive from. Asking for
+    // one is refused by name rather than answered with a stale number, and the
+    // growth baseline is measured from the published image instead.
+    for ([_]Architecture{ .x86_64, .aarch64 }) |architecture| {
+        try std.testing.expectError(
+            error.FlavorCalculatesItsOwnGeometry,
+            expectedOriginalRootSize(.{
+                .architecture = architecture,
+                .flavor = .core,
+            }),
+        );
+    }
+    const published = PublishedGeometry{
+        .virtual_size = 1536 * mib,
+        .root_first_lba = 2048 + 256 * 2048,
+        .root_last_lba = 1536 * 2048 - 34,
+    };
     try std.testing.expectEqual(
-        @as(u64, 2_567_945_728),
-        try expectedOriginalRootSize(.{
-            .architecture = .x86_64,
-            .flavor = .core,
-        }),
+        @as(u64, (1536 * 2048 - 34 - (2048 + 256 * 2048) + 1) * 512),
+        try published.rootSize(),
     );
-    try std.testing.expectEqual(
-        @as(u64, 2_683_289_088),
-        try expectedOriginalRootSize(.{
-            .architecture = .aarch64,
-            .flavor = .core,
-        }),
+    try std.testing.expectError(
+        error.InvalidExpectedRootGeometry,
+        (PublishedGeometry{
+            .virtual_size = 1536 * mib,
+            .root_first_lba = 100,
+            .root_last_lba = 99,
+        }).rootSize(),
     );
 }
 
 test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
     const full = Candidate{ .architecture = .x86_64, .flavor = .full };
     const core = Candidate{ .architecture = .x86_64, .flavor = .core };
-    try std.testing.expectEqual(@as(u64, 5 * gib), full.expectedVirtualSize());
-    try std.testing.expectEqual(@as(u64, 3584 * mib), core.expectedVirtualSize());
-    try std.testing.expect(core.expectedVirtualSize() < full.expectedVirtualSize());
+    try std.testing.expectEqual(@as(?u64, 5 * gib), full.expectedVirtualSize());
+    // #677 step 5: core no longer has a size written down anywhere. The
+    // retired 3584 MiB geometry is gone from the contract, not merely unused.
+    try std.testing.expect(core.expectedVirtualSize() == null);
+    try std.testing.expect(core.calculatesGeometry());
+    try std.testing.expect(!full.calculatesGeometry());
     try std.testing.expectEqual(@as(u32, 4), full.flavor.policy().result_schema);
     try std.testing.expectEqual(@as(u32, 9), core.flavor.policy().result_schema);
     try std.testing.expectEqual(@as(usize, 18), full.contracts().len);
@@ -4569,8 +4831,14 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
             &second,
         ),
     };
-    try verifyRootGrowth(allocator, io, ssh_path, &first, candidate);
-    try verifyRootGrowth(allocator, io, ssh_path, &second, candidate);
+    const published_geometry = try readPublishedGeometry(
+        allocator,
+        io,
+        absolute_image,
+        candidate,
+    );
+    try verifyRootGrowth(allocator, io, ssh_path, &first, candidate, published_geometry);
+    try verifyRootGrowth(allocator, io, ssh_path, &second, candidate, published_geometry);
     try verifyGuestSecureBoot(
         allocator,
         io,

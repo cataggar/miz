@@ -19,6 +19,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const contracts = @import("contracts.zig");
+const disk_geometry = @import("disk_geometry.zig");
 const keys = @import("keys.zig");
 const runtime_contract = @import("ubuntu2604_runtime_contract");
 const runtime_contract_document = @import("runtime_contract_document.zig");
@@ -362,10 +363,64 @@ fn validateRuntimeContract(
     parsed.deinit();
 }
 
+/// The calculated core geometry the build bound into its provenance (issue
+/// #677 step 5).
+///
+/// Checked exactly like the size inventory and the runtime contract: named,
+/// hashed, re-read from the candidate tree, and then fully re-validated --
+/// which for a geometry report means recomputing every offset and length from
+/// the document's own measurements and refusing a plan that lands back on the
+/// retired inherited size.
+///
+/// Binding the report to the *artifact's* virtual size is the workflows' job
+/// (`disk-geometry-verify --virtual-size`), where the finished asset is on
+/// disk to be measured. Doing it here as well would only compare the
+/// provenance's own two fields, which the builder writes from one plan.
+fn validateDiskGeometry(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    object: *const std.json.ObjectMap,
+    architecture: []const u8,
+    flavor: contracts.Flavor,
+    diagnostic: *Diagnostic,
+) Error!void {
+    var name_buffer: [96]u8 = undefined;
+    const expected_name = contracts.diskGeometryFilename(
+        &name_buffer,
+        flavor,
+        architecture,
+    ) orelse return fail(diagnostic, "Ubuntu disk-geometry binding is invalid", .{});
+    const binding = try requireFileBinding(
+        object.get("disk_geometry"),
+        "Ubuntu disk geometry",
+        expected_name,
+        diagnostic,
+    );
+    const path = try requireBoundProvenanceFile(
+        allocator,
+        io,
+        root,
+        binding,
+        "Ubuntu disk geometry",
+        diagnostic,
+    );
+    defer allocator.free(path);
+    var parsed = disk_geometry.readValidated(allocator, io, path, .{
+        .architecture = architecture,
+        .flavor = @tagName(flavor),
+    }, diagnostic) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Failed => return error.Failed,
+    };
+    parsed.deinit();
+}
+
 /// `validate_ubuntu_disk_layout`.
 fn validateDiskLayout(
     value: ?std.json.Value,
     architecture: []const u8,
+    flavor: contracts.Flavor,
     diagnostic: *Diagnostic,
 ) Error!void {
     const layout = support.objectOf(value) orelse return fail(
@@ -373,6 +428,26 @@ fn validateDiskLayout(
         "Ubuntu disk-layout provenance is invalid",
         .{},
     );
+    // #677 step 5: core writes its own GPT, so its disk-layout provenance says
+    // what it did rather than describing edits to Canonical's table. The same
+    // shape holds for both architectures, because neither inherits anything.
+    if (flavor == .core) {
+        const expected = [_][]const u8{ "inherits_source_geometry", "source", "transform" };
+        if (!support.hasExactFields(layout, &expected) or
+            !support.stringIs(layout.get("source"), disk_geometry.provenance_source) or
+            !support.stringIs(layout.get("transform"), disk_geometry.provenance_transform) or
+            layout.get("inherits_source_geometry") == null or
+            layout.get("inherits_source_geometry").? != .bool or
+            layout.get("inherits_source_geometry").?.bool)
+        {
+            return fail(
+                diagnostic,
+                "Ubuntu core disk-layout provenance does not declare a fresh output GPT",
+                .{},
+            );
+        }
+        return;
+    }
     if (std.mem.eql(u8, architecture, "x86_64")) {
         const expected = [_][]const u8{ "source", "transform" };
         if (!support.hasExactFields(layout, &expected) or
@@ -498,6 +573,7 @@ pub fn validateUbuntu(
         "type",
     };
     const core_fields = [_][]const u8{
+        "disk_geometry",
         "minimum_root_free_bytes",
         "runtime_contract",
         "validated_root_free_bytes",
@@ -587,10 +663,19 @@ pub fn validateUbuntu(
         "Ubuntu SHA256SUMS signature was not explicitly verified",
         .{},
     );
-    try validateDiskLayout(object.get("disk_layout"), architecture, diagnostic);
+    try validateDiskLayout(object.get("disk_layout"), architecture, flavor, diagnostic);
     try validateSizeInventory(allocator, io, root, object, architecture, flavor, diagnostic);
     if (flavor == .core) {
         try validateRuntimeContract(
+            allocator,
+            io,
+            root,
+            object,
+            architecture,
+            flavor,
+            diagnostic,
+        );
+        try validateDiskGeometry(
             allocator,
             io,
             root,

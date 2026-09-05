@@ -1358,6 +1358,33 @@ pub fn build(b: *std.Build) void {
     ubuntu2604_size_inventory_step.dependOn(&run_ubuntu2604_size_inventory.step);
     ubuntu2604_release_test_step.dependOn(&run_ubuntu2604_size_inventory.step);
 
+    // ---- tests/ubuntu2604_disk_geometry.zig: behavioral coverage of the
+    // calculated core disk geometry (issue #677 step 5). Separate from the
+    // planner's own unit tests because its subject is the shipped contract --
+    // partition order, alignment, per-architecture independence, and the
+    // published report -- rather than the arithmetic. ----
+    const ubuntu2604_disk_geometry_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/ubuntu2604_disk_geometry.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{
+                    .name = "ubuntu2604_release",
+                    .module = ubuntu2604_release_mod,
+                },
+            },
+        }),
+    });
+    const run_ubuntu2604_disk_geometry =
+        b.addRunArtifact(ubuntu2604_disk_geometry_tests);
+    const ubuntu2604_disk_geometry_step = b.step(
+        "test-ubuntu2604-disk-geometry",
+        "Run the Ubuntu 26.04 calculated core disk-geometry tests",
+    );
+    ubuntu2604_disk_geometry_step.dependOn(&run_ubuntu2604_disk_geometry.step);
+    ubuntu2604_release_test_step.dependOn(&run_ubuntu2604_disk_geometry.step);
+
     // ---- scripts/ubuntu2604/runtime_contract.zig and
     // tests/ubuntu2604_runtime_contract.zig: the explicit runtime contract
     // (issue #677 step 2) and its enforcement. The contract tables are their
