@@ -148,6 +148,7 @@ jobs:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       WORK_DIR: .scratch/ubuntu2604-release-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       BUNDLE_DIR: artifact-staging/candidates/${{ matrix.key }}
+      FAILED_PROVENANCE_DIR: artifact-staging/failed-provenance/${{ matrix.key }}
       RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
       SIGNING_PROBE_DIR: ${{ github.workspace }}/signing-probe-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       UKI_SIGN_COMMAND: ${{ github.workspace }}/zig-out/bin/miz
@@ -480,6 +481,33 @@ jobs:
             2>/dev/null | sort -h | tail -n 30
           echo "::endgroup::"
 
+      - name: Preserve the measurement that failed the build
+        if: failure()
+        run: |
+          set -uo pipefail
+          # A size-inventory, budget, geometry or contract failure is only
+          # actionable with the document that produced it, and the privileged
+          # cleanup below removes the bundle it was written into. The builder
+          # writes provenance before it judges it, so whatever exists here is
+          # the measurement the failure was reached from.
+          rm -rf -- "$FAILED_PROVENANCE_DIR"
+          mkdir -p -- "$FAILED_PROVENANCE_DIR"
+          if [ -d "$BUNDLE_DIR/internal-provenance" ]; then
+            sudo cp -a -- "$BUNDLE_DIR/internal-provenance/." \
+              "$FAILED_PROVENANCE_DIR/" || true
+            sudo chown -R "$(id -u):$(id -g)" -- "$FAILED_PROVENANCE_DIR" || true
+          fi
+          exit 0
+
+      - name: Upload the measurement that failed the build
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ubuntu2604-failed-provenance-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.FAILED_PROVENANCE_DIR }}/
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: Clean privileged build state
         if: always()
         run: |
@@ -489,7 +517,7 @@ jobs:
           # the original build failure recorded on the build steps above.
           set -uo pipefail
           status=0
-          sudo rm -rf -- "$WORK_DIR" "$BUNDLE_DIR" || status=1
+          sudo rm -rf -- "$WORK_DIR" "$BUNDLE_DIR" "$FAILED_PROVENANCE_DIR" || status=1
           rm -rf -- "$SIGNING_PROBE_DIR" || status=1
           rm -f -- "${UKI_SIGNING_CERTIFICATE:-}" || status=1
           exit "$status"

@@ -712,6 +712,51 @@ test "artifacts are commit, attempt, and digest bound" {
     );
 }
 
+test "a failed build publishes the measurement it failed on" {
+    // Issue #677 step 6 makes failures attributable, and a budget or inventory
+    // rejection is only attributable with the document that produced it. The
+    // privileged cleanup removes the bundle, so the provenance is copied out
+    // and uploaded on the failure path, before that cleanup runs.
+    var workflow = try open();
+    defer workflow.deinit();
+
+    const build = try job(&workflow, "build", "native_qemu");
+    try source.expectContainsIn(
+        build,
+        "FAILED_PROVENANCE_DIR: artifact-staging/core-failed-provenance/${{ matrix.key }}",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        build,
+        "- name: Preserve the measurement that failed the build\n        if: failure()",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        build,
+        "- name: Upload the measurement that failed the build\n        if: failure()",
+        workflow_path,
+    );
+    try source.expectContainsIn(build, "name: ubuntu2604-core-failed-provenance-", workflow_path);
+    try source.expectContainsIn(
+        build,
+        "path: ${{ env.FAILED_PROVENANCE_DIR }}/",
+        workflow_path,
+    );
+    // Evidence has to be captured before the privileged cleanup deletes the
+    // bundle it is copied from.
+    const preserve = std.mem.indexOf(
+        u8,
+        build,
+        "- name: Preserve the measurement that failed the build",
+    ).?;
+    const cleanup = std.mem.indexOf(
+        u8,
+        build,
+        "- name: Clean privileged build state",
+    ).?;
+    try std.testing.expect(preserve < cleanup);
+}
+
 test "cleanup is unconditional and reports its own failures" {
     var workflow = try open();
     defer workflow.deinit();
@@ -725,7 +770,7 @@ test "cleanup is unconditional and reports its own failures" {
     try source.expectContainsIn(build, "set -uo pipefail", workflow_path);
     try source.expectContainsIn(
         build,
-        "sudo rm -rf -- \"$WORK_DIR\" \"$BUNDLE_DIR\" || status=1",
+        "sudo rm -rf -- \"$WORK_DIR\" \"$BUNDLE_DIR\" \"$FAILED_PROVENANCE_DIR\" || status=1",
         workflow_path,
     );
     try source.expectContainsIn(build, "exit \"$status\"", workflow_path);

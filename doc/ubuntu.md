@@ -550,6 +550,14 @@ $ ubuntu2604_release size-budget-verify \
 x86_64 core status=enforced result=pass metrics=31 budget=... inventory=...
 ```
 
+A build that fails a bound is deleted along with the privileged staging it was
+assembled in, so both production workflows copy the provenance directory out
+and upload it as `ubuntu2604-core-failed-provenance-<key>-<commit>-<attempt>`
+(core validation) or `ubuntu2604-failed-provenance-<key>-<commit>-<attempt>`
+(release) before that cleanup runs. The builder writes the size inventory
+before it judges it, so the rejected measurement itself is what a reviewer
+reads -- not a log line quoting part of it.
+
 ## Explicit runtime contract
 
 Core publishes what it needs. `scripts/ubuntu2604/runtime_contract.zig` is a
@@ -771,6 +779,16 @@ ubuntu2604_release disk-geometry-verify \
   --geometry internal-provenance/ubuntu2604-disk-geometry-core-x86_64.json \
   --architecture x86_64 --flavor core --virtual-size "$VIRTUAL_SIZE"
 ```
+
+The published disk is then read back and judged against that same plan, on both
+architectures: exactly two partitions, the ESP and the root at the planned
+table indices, first and last LBAs, names, and architecture-correct root type
+GUID. The inherited Arm64 layout assertions -- root at table index 0 and LBA
+2099200, a 512 MiB ESP, a cleared `xbootldr` entry -- describe Canonical's
+substrate and now apply only to the flavors that publish it. Applying them to a
+core disk rejected every AArch64 core image that was otherwise exactly what the
+plan asked for.
+
 The matching legacy `/boot` and `/boot/efi` mounts are removed from Arm64
 `fstab`, and the full image disables GRUB's initrd-fallback helper because
 firmware boots the signed UKI directly rather than maintaining GRUB state.
