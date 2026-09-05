@@ -884,11 +884,11 @@ const sysv_runlevel_directories = [_][]const u8{
 /// keeps `/usr/lib/modules/<release>/` from becoming a directory anything can
 /// be dropped into.
 const depmod_index_names = [_][]const u8{
-    "modules.alias",       "modules.alias.bin",
+    "modules.alias",             "modules.alias.bin",
     "modules.builtin.alias.bin", "modules.builtin.bin",
-    "modules.dep",         "modules.dep.bin",
-    "modules.devname",     "modules.softdep",
-    "modules.symbols",     "modules.symbols.bin",
+    "modules.dep",               "modules.dep.bin",
+    "modules.devname",           "modules.softdep",
+    "modules.symbols",           "modules.symbols.bin",
     "modules.weakdep",
 };
 
