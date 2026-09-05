@@ -629,6 +629,11 @@ fn runDeadlineIntegration(
     var request = base_request;
     request.output.path = output_path;
     request.hooks = &hooks;
+    // A hook paired with declared repositories is a network consumer even
+    // when the package transaction was copied from a cache-only request. This
+    // deadline test is about stopping the hook, not that mixed networking
+    // policy, so let its package setup use the ordinary online path.
+    request.packages.cache = .online;
     request.execution.deadline_seconds = deadline_integration_seconds;
 
     var resolved = try miz.customize.resolve(allocator, &request, .{

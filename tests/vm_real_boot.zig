@@ -58,7 +58,6 @@ const partition_length = @as(u64, partition_sectors) * miz.mbr.sector_size;
 /// root filesystem, mounted it writable, and executed a binary out of it.
 const marker_path = guest_stub.marker_path;
 const marker_bytes = guest_stub.marker_bytes;
-const installed_nevra = guest_stub.installed_nevra;
 
 /// The hook the run declares: a script the host reads, carries through the
 /// control document, and the guest executes with the image's own interpreter.
@@ -287,8 +286,11 @@ fn runBoot(
 
     const preserved = result.provenance.execution.preserved orelse
         return error.MissingPreservedProvenance;
-    try ensure(preserved.installed_packages.len == 1);
-    try ensure(std.mem.eql(u8, preserved.installed_packages[0], installed_nevra));
+    // This run executes a package-shaped stub as the hook interpreter but
+    // declares no package action or package-manager trust. The inventory must
+    // therefore be omitted rather than inferred from an unrelated executable.
+    try ensure(!preserved.package_inventory_collected);
+    try ensure(preserved.installed_packages.len == 0);
 
     // The hook is recorded by the host's own account of what it sent: the name
     // and phase the caller declared, and the digest of the bytes read here. The
