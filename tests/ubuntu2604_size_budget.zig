@@ -503,34 +503,34 @@ test "every limit follows from its recorded measurement and named allowance" {
     var saw_percent = false;
     var saw_minimum = false;
     for ([_]size_budget.Architecture{ .x86_64, .aarch64 }) |architecture| {
-    const budget = size_budget.budgetFor(.core, architecture).?;
-    for (budget.limits) |limit| {
-        switch (limit.allowance) {
-            .exact => try std.testing.expectEqual(limit.baseline, limit.value()),
-            .plus => |amount| try std.testing.expectEqual(
-                limit.baseline + amount,
-                limit.value(),
-            ),
-            .security_update_percent => |percent| {
-                saw_percent = true;
-                // The margin is a real margin and a narrow one: strictly above
-                // the measurement, and never more than one percent past the
-                // percentage it claims once block rounding is included.
-                try std.testing.expect(limit.value() > limit.baseline);
-                try std.testing.expect(
-                    limit.value() <= limit.baseline + (limit.baseline / 100) * (percent + 1) + 4096,
-                );
-            },
+        const budget = size_budget.budgetFor(.core, architecture).?;
+        for (budget.limits) |limit| {
+            switch (limit.allowance) {
+                .exact => try std.testing.expectEqual(limit.baseline, limit.value()),
+                .plus => |amount| try std.testing.expectEqual(
+                    limit.baseline + amount,
+                    limit.value(),
+                ),
+                .security_update_percent => |percent| {
+                    saw_percent = true;
+                    // The margin is a real margin and a narrow one: strictly above
+                    // the measurement, and never more than one percent past the
+                    // percentage it claims once block rounding is included.
+                    try std.testing.expect(limit.value() > limit.baseline);
+                    try std.testing.expect(
+                        limit.value() <= limit.baseline + (limit.baseline / 100) * (percent + 1) + 4096,
+                    );
+                },
+            }
+            // A bound with no stated reason is a number nobody reviewed.
+            try std.testing.expect(limit.basis.len > 0);
+            if (limit.direction == .at_least) {
+                saw_minimum = true;
+                // A minimum is a floor the image promised to deliver, so an
+                // allowance would only ever weaken it.
+                try std.testing.expectEqual(limit.baseline, limit.value());
+            }
         }
-        // A bound with no stated reason is a number nobody reviewed.
-        try std.testing.expect(limit.basis.len > 0);
-        if (limit.direction == .at_least) {
-            saw_minimum = true;
-            // A minimum is a floor the image promised to deliver, so an
-            // allowance would only ever weaken it.
-            try std.testing.expectEqual(limit.baseline, limit.value());
-        }
-    }
     }
     try std.testing.expect(saw_percent);
     try std.testing.expect(saw_minimum);
