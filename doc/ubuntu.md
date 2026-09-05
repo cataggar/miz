@@ -192,10 +192,12 @@ inventory the image carries at `/var/lib/miz/ubuntu2604-package-lock.tsv` must
 equal the final reviewed debz lock member for member, in both directions, so a
 package that arrived and a package that failed to arrive are both build
 failures. And every file a fresh root carries must be claimed by a package in
-that closure or matched by an explicit unowned-file rule that names the reason
-it exists: the builder measures the finished tree with
+that closure or matched by an explicit, typed unowned-file rule that names the
+reason it exists, what produced it, the filesystem type it must have and, for a
+symlink, where it may point: the builder measures the finished tree with
 `require_allowlisted_unowned`, and both Ubuntu workflows re-check the published
-inventory with `size-inventory-verify --max-unexpected-unowned 0`.
+inventory with `size-inventory-verify --max-unexpected-unowned 0`, which also
+re-derives the allowlist policy digest.
 
 Minimization removes packages, not files out of packages. The fresh-root
 generalization step reads dpkg's own file lists before it deletes anything --
@@ -300,7 +302,7 @@ has not happened is absent rather than zero.
 
 | phase | recorded by | contents |
 | --- | --- | --- |
-| `root_build` | the builder, while the root is still a host tree | installed and allocated bytes per package, package count and exact closure digest, shared and unmatched payload, the explicit unowned-file allowlist with the remainder named, top-level root usage, and kernel, initramfs, module-tree, and firmware bytes |
+| `root_build` | the builder, while the root is still a host tree | installed and allocated bytes per package, package count and exact closure digest, shared and unmatched payload, the typed unowned-file allowlist and its policy digest with the remainder named, top-level root usage, and kernel, initramfs, module-tree, and firmware bytes |
 | `image_build` | the builder, once the image is finalized | ext4 used and free blocks and inodes before first boot, the signed UKI's size, and ESP occupancy |
 | `publication` | the builder, once the artifact exists | compressed QCOW2 length and its host allocation |
 | `first_boot` | core QEMU acceptance, once the guest has booted and grown its root | the same ext4 accounting measured inside the running guest with `statfs`, which is what makes measured growth possible |
@@ -324,12 +326,57 @@ reported under `unmatched` rather than hidden. The fresh-root flavors write
 directly into the filesystem, so those are measured from the image and
 attributed by the same rules as everything else.
 
-Unowned files are split into an explicit allowlist -- each rule carrying the
-reason it is allowed, and a `path/**` rule covering the directory it names as
-well as everything beneath it -- and a named remainder under
+Ownership is read the way dpkg states it, which is in three places rather than
+one: each package's unpacked file list, its `conffiles` record (including
+`remove-on-upgrade`-flagged entries), and the `diversions` database, whose
+*diverted-to* path is a real file no file list names. A local diversion --
+package `:` -- belongs to no package and is therefore never treated as owned.
+
+Unowned files are split into an explicit allowlist and a named remainder under
 `unowned.unexpected`. For the fresh-root flavors that remainder is zero and is
 enforced: measurement fails the build when a path is neither package-owned nor
 matched by a rule, and names the paths it found.
+
+Every allowlist rule is typed. Besides its pattern and the reason it exists, a
+rule carries a `category` (what the path is), a `source` (what produced it), a
+`kind` (the filesystem type the path must have), a `target` (for a symlink,
+either the exact text `readlink` must return or the requirement that the target
+resolve -- through the merged `/usr` -- to package-owned content, optionally
+under the same name), and an `origin`. A rule whose pattern matches but whose
+type or target does not is **not** a match: the path falls through to the
+remaining rules and, failing those, into the remainder. That is what keeps an
+allowlisted name from being a place to put something else.
+
+Rules come from two places, and `origin` says which:
+
+- `contract` -- stated by the reviewed source. `path/**` covers the directory it
+  names as well as everything beneath it; `prefix*` covers any path with that
+  prefix.
+- an absolute path -- derived from a metadata file inside the root being
+  measured. Which alternatives a closure registers, which units its maintainer
+  scripts enable, and which kernel release it boots are facts of the resolved
+  closure, not of the source, so those classes are enumerated from the record
+  the producer itself wrote and then constrained:
+
+| Class | Enumerated from | Constraint |
+| --- | --- | --- |
+| `alternatives_link` | `/var/lib/dpkg/alternatives/<group>` | the registered link must be a symlink to `/etc/alternatives/<name>`, and that selection must be a symlink to package-owned content |
+| `sysv_service_link` | `/etc/rc?.d` cross-checked against `/etc/init.d` | name must be `[KS]NN<service>`, entry must be a symlink to exactly `../init.d/<service>`, and that script must be package-owned |
+| `systemd_service_link` | `/var/lib/systemd/deb-systemd-helper[-user]-enabled` | only enabled farms and links exist; each link must be a symlink to package-owned content of the same name |
+| `kernel_boot_symlink` | the active kernel release | `/boot/vmlinuz[.old]` and `/boot/initrd.img[.old]` must be symlinks to exactly the release the root boots |
+| `generated_state` (module index) | the active kernel release | only `depmod`'s own index files, each a regular file |
+
+None of these admits a regular file except the initramfs and the module index,
+both of which are named exactly. `full` inherits Canonical's server root, is
+measured rather than gated, and keeps the broad subtree rules that make that
+root describable at all.
+
+The allowlist is a published policy, not a builder detail. `root_build.unowned`
+carries `policy_sha256`, the digest of the flavor's static rule table rendered
+one field-separated line per rule, and `size-inventory-verify` recomputes it
+from its own compiled-in tables. A document produced against a widened or
+locally patched allowlist is refused by an unmodified release tool rather than
+accepted on the strength of its own claim.
 
 Aggregates must equal their parts. `size-inventory-verify` refuses a document
 whose totals do not add up, whose sections and `phases_present` disagree, or

@@ -100,7 +100,15 @@ pub const Phase = enum {
 pub const phase_order = [_]Phase{ .root_build, .image_build, .publication, .first_boot };
 
 pub const Architecture = enum { x86_64, aarch64 };
-pub const Flavor = enum { full, core, baremetal };
+pub const Flavor = enum {
+    full,
+    core,
+    baremetal,
+
+    pub fn key(self: Flavor) []const u8 {
+        return @tagName(self);
+    }
+};
 
 pub const Identity = struct {
     architecture: Architecture,
@@ -402,21 +410,156 @@ fn pathUsage(path: [:0]const u8) ?Usage {
     };
 }
 
+/// The filesystem object type a rule accepts.
+///
+/// A rule that named a path but not its type would let a regular file take the
+/// place of a symlink the build expects, which is exactly how payload hides
+/// behind an allowlist entry that reads innocently.
+pub const PathKind = enum {
+    any,
+    regular_file,
+    directory,
+    symlink,
+
+    pub fn key(self: PathKind) []const u8 {
+        return @tagName(self);
+    }
+
+    pub fn parse(text: []const u8) ?PathKind {
+        inline for (@typeInfo(PathKind).@"enum".fields) |field| {
+            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        }
+        return null;
+    }
+
+    fn accepts(self: PathKind, observed: std.Io.File.Kind) bool {
+        return switch (self) {
+            .any => true,
+            .regular_file => observed == .file,
+            .directory => observed == .directory,
+            .symlink => observed == .sym_link,
+        };
+    }
+};
+
+/// What a generated unowned path *is*. The category is the reviewable claim: a
+/// reader who disagrees with `alternatives_link` can check the whole class at
+/// once instead of arguing about one path at a time.
+pub const UnownedCategory = enum {
+    /// The static guest binaries and symlinks miz injects.
+    injected_guest,
+    /// An empty directory that exists to have something mounted on it.
+    mount_point,
+    /// State a package's own tooling generated inside the root.
+    generated_state,
+    /// The package manager's database and its bookkeeping.
+    package_database,
+    /// An `update-alternatives` link, or the `/etc/alternatives` entry it
+    /// points at.
+    alternatives_link,
+    /// A `/etc/rc?.d` runlevel link `update-rc.d` created.
+    sysv_service_link,
+    /// A `.wants`/`.requires` link farm `deb-systemd-helper` created.
+    systemd_service_link,
+    /// The canonical `/boot` symlinks a kernel package maintains.
+    kernel_boot_symlink,
+    /// The installer's own transaction metadata.
+    installer_metadata,
+    /// A directory or link the FHS requires and a maintainer script creates.
+    filesystem_hierarchy,
+
+    pub fn key(self: UnownedCategory) []const u8 {
+        return @tagName(self);
+    }
+
+    pub fn parse(text: []const u8) ?UnownedCategory {
+        inline for (@typeInfo(UnownedCategory).@"enum".fields) |field| {
+            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        }
+        return null;
+    }
+};
+
+/// Who put the path there. Distinct from the category: two categories can share
+/// a producer, and a producer nobody expects is a finding on its own.
+pub const UnownedSource = enum {
+    miz_builder,
+    debz_installer,
+    maintainer_script,
+    dpkg_alternatives,
+    deb_systemd_helper,
+    update_rc_d,
+    kernel_package,
+
+    pub fn key(self: UnownedSource) []const u8 {
+        return @tagName(self);
+    }
+
+    pub fn parse(text: []const u8) ?UnownedSource {
+        inline for (@typeInfo(UnownedSource).@"enum".fields) |field| {
+            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        }
+        return null;
+    }
+};
+
+/// What a symlink rule requires of its target.
+///
+/// The point of the constraint is that a link is not payload: it costs an inode
+/// and points at something a package already ships. Once a rule pins where a
+/// link may point, an attacker who owns the allowlisted path still cannot put
+/// bytes behind it.
+pub const LinkTarget = union(enum) {
+    /// Not a symlink rule, or a target the rule deliberately does not bind.
+    unconstrained,
+    /// `readlink` must return exactly this string.
+    literal: []const u8,
+    /// The target, resolved against the link's directory and normalized for
+    /// the merged `/usr`, must be claimed by a package in the exact closure.
+    package_owned,
+    /// `package_owned`, and the target's last component must equal the link's.
+    package_owned_same_name,
+
+    /// The stable text the document publishes and the digest covers.
+    pub fn label(self: LinkTarget, buffer: []u8) []const u8 {
+        return switch (self) {
+            .unconstrained => "unconstrained",
+            .literal => |text| std.fmt.bufPrint(buffer, "literal:{s}", .{text}) catch
+                "literal:<overlong>",
+            .package_owned => "package_owned",
+            .package_owned_same_name => "package_owned_same_name",
+        };
+    }
+};
+
+/// The `origin` of a rule that the reviewed source states outright, as opposed
+/// to one derived from a metadata file inside the root being measured.
+pub const contract_origin = "contract";
+
 /// One rule in the explicit unowned-file allowlist.
 ///
 /// Every file in a finished root that no package claims is either something
 /// this image put there on purpose -- the injected `mizinit` and `azagent`, the
 /// provenance it carries, the generated initramfs and module index -- or state
-/// a maintainer script wrote. Naming each one with the reason it is allowed is
-/// what makes the remainder reviewable, and the remainder is what later steps
-/// of #677 drive to zero.
+/// a maintainer script wrote. Naming each one with the reason, the category,
+/// the producer, the filesystem type it must have, and where a link may point
+/// is what makes the remainder reviewable, and the remainder is what later
+/// steps of #677 drive to zero.
 pub const UnownedRule = struct {
     /// `path` matches exactly, `path/**` matches that directory and everything
     /// beneath it, and `prefix*` matches any path with that prefix.
     pattern: []const u8,
     reason: []const u8,
+    category: UnownedCategory,
+    source: UnownedSource,
+    kind: PathKind = .any,
+    target: LinkTarget = .unconstrained,
+    /// `contract_origin`, or the absolute guest path of the metadata file this
+    /// rule was read out of. A derived rule that cannot name its source is not
+    /// a rule; it is an exemption.
+    origin: []const u8 = contract_origin,
 
-    fn matches(self: UnownedRule, path: []const u8) bool {
+    fn matchesPattern(self: UnownedRule, path: []const u8) bool {
         if (std.mem.endsWith(u8, self.pattern, "/**")) {
             const subtree = self.pattern[0 .. self.pattern.len - 2];
             const directory = self.pattern[0 .. self.pattern.len - 3];
@@ -432,102 +575,615 @@ pub const UnownedRule = struct {
         }
         return std.mem.eql(u8, self.pattern, path);
     }
+
+    fn lessThan(_: void, left: UnownedRule, right: UnownedRule) bool {
+        if (!std.mem.eql(u8, left.pattern, right.pattern)) {
+            return lessThanPath({}, left.pattern, right.pattern);
+        }
+        var left_buffer: [512]u8 = undefined;
+        var right_buffer: [512]u8 = undefined;
+        return std.mem.lessThan(
+            u8,
+            left.target.label(&left_buffer),
+            right.target.label(&right_buffer),
+        );
+    }
 };
+
+/// One walked path as the classifier sees it.
+pub const Observed = struct {
+    kind: std.Io.File.Kind = .file,
+    /// The raw `readlink` result for a symlink, and `null` for anything else.
+    link_target: ?[]const u8 = null,
+};
+
+/// Everything the typed rules need in order to decide, beyond the path itself.
+const Classifier = struct {
+    scratch: Allocator,
+    owners: *const std.StringHashMapUnmanaged(u32),
+
+    fn owned(self: Classifier, path: []const u8) bool {
+        return self.owners.contains(path);
+    }
+
+    /// Resolves a `readlink` result to an absolute guest path.
+    ///
+    /// The resolution is lexical -- the walk has already established that the
+    /// link exists, and a rule that followed the link through the host
+    /// filesystem would be answering a question about the build machine.
+    fn resolve(self: Classifier, link_path: []const u8, target: []const u8) Error!?[]const u8 {
+        if (target.len == 0) return null;
+        var stack: std.ArrayList([]const u8) = .empty;
+        defer stack.deinit(self.scratch);
+        if (target[0] != '/') {
+            const parent = std.fs.path.dirnamePosix(link_path) orelse return null;
+            var walk = std.mem.splitScalar(u8, parent, '/');
+            while (walk.next()) |part| {
+                if (part.len == 0) continue;
+                try stack.append(self.scratch, part);
+            }
+        }
+        var parts = std.mem.splitScalar(u8, target, '/');
+        while (parts.next()) |part| {
+            if (part.len == 0 or std.mem.eql(u8, part, ".")) continue;
+            if (std.mem.eql(u8, part, "..")) {
+                if (stack.items.len == 0) return null;
+                _ = stack.pop();
+                continue;
+            }
+            try stack.append(self.scratch, part);
+        }
+        if (stack.items.len == 0) return null;
+        var text: std.ArrayList(u8) = .empty;
+        errdefer text.deinit(self.scratch);
+        for (stack.items) |part| {
+            try text.append(self.scratch, '/');
+            try text.appendSlice(self.scratch, part);
+        }
+        // The result outlives this call, so the buffer is handed over rather
+        // than freed: a returned slice into a released arena block reads as a
+        // valid path right up until the allocation that overwrites it.
+        return try normalizeMergedUsr(self.scratch, try text.toOwnedSlice(self.scratch));
+    }
+
+    fn accepts(self: Classifier, rule: UnownedRule, path: []const u8, observed: Observed) Error!bool {
+        if (!rule.matchesPattern(path)) return false;
+        if (!rule.kind.accepts(observed.kind)) return false;
+        switch (rule.target) {
+            .unconstrained => return true,
+            .literal => |expected| {
+                const actual = observed.link_target orelse return false;
+                return std.mem.eql(u8, expected, actual);
+            },
+            .package_owned, .package_owned_same_name => {
+                const actual = observed.link_target orelse return false;
+                const resolved = (try self.resolve(path, actual)) orelse return false;
+                if (!self.owned(resolved)) return false;
+                if (rule.target == .package_owned) return true;
+                return std.mem.eql(
+                    u8,
+                    std.fs.path.basenamePosix(resolved),
+                    std.fs.path.basenamePosix(path),
+                );
+            },
+        }
+    }
+};
+
+/// The directories a merged-`/usr` root keeps only as compatibility symlinks.
+/// dpkg records the `/usr` form, so a link written the short way has to be
+/// rewritten before ownership can be asked about it.
+const merged_usr_aliases = [_][]const u8{ "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32" };
+
+fn normalizeMergedUsr(allocator: Allocator, path: []const u8) Error![]const u8 {
+    for (&merged_usr_aliases) |alias| {
+        if (!std.mem.startsWith(u8, path, alias)) continue;
+        if (path.len != alias.len and path[alias.len] != '/') continue;
+        return std.fmt.allocPrint(allocator, "/usr{s}", .{path});
+    }
+    return path;
+}
 
 /// Unowned payload every flavor is allowed to carry.
 pub const shared_unowned_rules = [_]UnownedRule{
-    .{ .pattern = "/etc/.pwd.lock", .reason = "dpkg account-database lock" },
-    .{ .pattern = "/etc/alternatives/**", .reason = "update-alternatives symlink farm" },
-    .{ .pattern = "/etc/group*", .reason = "account database written by maintainer scripts" },
-    .{ .pattern = "/etc/gshadow*", .reason = "account database written by maintainer scripts" },
-    .{ .pattern = "/etc/hostname", .reason = "generalized host identity" },
-    .{ .pattern = "/etc/hosts", .reason = "generalized host identity" },
-    .{ .pattern = "/etc/ld.so.cache", .reason = "ldconfig-generated linker cache" },
-    .{ .pattern = "/etc/machine-id", .reason = "cleared machine identity" },
-    .{ .pattern = "/etc/pam.d/common-*", .reason = "pam-auth-update generated PAM stacks" },
-    .{ .pattern = "/etc/passwd*", .reason = "account database written by maintainer scripts" },
-    .{ .pattern = "/etc/resolv.conf", .reason = "runtime resolver state" },
-    .{ .pattern = "/etc/shadow*", .reason = "account database written by maintainer scripts" },
-    .{ .pattern = "/etc/ssh/**", .reason = "sshd policy and per-machine host keys" },
-    .{ .pattern = "/etc/ssl/certs/**", .reason = "ca-certificates trust store" },
-    .{ .pattern = "/etc/subgid*", .reason = "account database written by maintainer scripts" },
-    .{ .pattern = "/etc/subuid*", .reason = "account database written by maintainer scripts" },
-    .{ .pattern = "/etc/waagent.conf", .reason = "Azure agent configuration" },
-    .{ .pattern = "/boot/initrd.img*", .reason = "initramfs generated for the installed kernel; for the fresh roots, by the discarded build stage of #677 step 4" },
-    .{ .pattern = "/dev/**", .reason = "runtime device tree mount point" },
-    .{ .pattern = "/home/**", .reason = "provisioned administrator home" },
-    .{ .pattern = "/media/**", .reason = "mount point" },
-    .{ .pattern = "/mnt/**", .reason = "mount point" },
-    .{ .pattern = "/opt/**", .reason = "mount point" },
-    .{ .pattern = "/proc/**", .reason = "runtime kernel filesystem mount point" },
-    .{ .pattern = "/root/**", .reason = "root account state" },
-    .{ .pattern = "/run/**", .reason = "runtime state mount point" },
-    .{ .pattern = "/srv/**", .reason = "mount point" },
-    .{ .pattern = "/sys/**", .reason = "runtime kernel filesystem mount point" },
-    .{ .pattern = "/tmp/**", .reason = "temporary state" },
-    .{ .pattern = "/usr/lib/modules/**", .reason = "depmod-generated module index" },
-    .{ .pattern = "/usr/share/info/dir*", .reason = "install-info generated index" },
-    .{ .pattern = "/var/cache/**", .reason = "package and tooling caches" },
-    .{ .pattern = "/var/lib/dbus/**", .reason = "cleared D-Bus machine identity" },
-    .{ .pattern = "/var/lib/dpkg/**", .reason = "package database and provenance" },
-    .{ .pattern = "/var/lib/misc/**", .reason = "maintainer-script bookkeeping" },
-    .{ .pattern = "/var/lib/miz/**", .reason = "miz provenance and exact package lock" },
-    .{ .pattern = "/var/lib/pam/**", .reason = "pam-auth-update profile bookkeeping" },
-    .{ .pattern = "/var/lib/systemd/**", .reason = "cleared systemd state" },
-    .{ .pattern = "/var/lib/ucf/**", .reason = "configuration-file bookkeeping" },
-    .{ .pattern = "/var/log/**", .reason = "cleared log state" },
-    .{ .pattern = "/var/tmp/**", .reason = "temporary state" },
+    .{ .pattern = "/etc/.pwd.lock", .reason = "dpkg account-database lock", .category = .package_database, .source = .maintainer_script, .kind = .regular_file },
+    .{ .pattern = "/etc/ca-certificates.conf", .reason = "ca-certificates postinst trust-store selection", .category = .generated_state, .source = .maintainer_script, .kind = .regular_file },
+    .{ .pattern = "/etc/dpkg/origins/default", .reason = "base-files postinst distribution-origin link", .category = .package_database, .source = .maintainer_script, .kind = .symlink, .target = .package_owned },
+    .{ .pattern = "/etc/environment", .reason = "libpam-modules postinst default environment", .category = .generated_state, .source = .maintainer_script, .kind = .regular_file },
+    .{ .pattern = "/etc/group*", .reason = "account database written by maintainer scripts", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/etc/gshadow*", .reason = "account database written by maintainer scripts", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/etc/hostname", .reason = "generalized host identity", .category = .generated_state, .source = .miz_builder, .kind = .regular_file },
+    .{ .pattern = "/etc/hosts", .reason = "generalized host identity", .category = .generated_state, .source = .miz_builder, .kind = .regular_file },
+    .{ .pattern = "/etc/hosts.allow", .reason = "libwrap0 postinst access-control default", .category = .generated_state, .source = .maintainer_script, .kind = .regular_file },
+    .{ .pattern = "/etc/hosts.deny", .reason = "libwrap0 postinst access-control default", .category = .generated_state, .source = .maintainer_script, .kind = .regular_file },
+    .{ .pattern = "/etc/inputrc", .reason = "readline-common postinst default keymap", .category = .generated_state, .source = .maintainer_script, .kind = .regular_file },
+    .{ .pattern = "/etc/ld.so.cache", .reason = "ldconfig-generated linker cache", .category = .generated_state, .source = .maintainer_script, .kind = .regular_file },
+    .{ .pattern = "/etc/machine-id", .reason = "cleared machine identity", .category = .generated_state, .source = .miz_builder, .kind = .regular_file },
+    .{ .pattern = "/etc/modules", .reason = "kmod postinst module list", .category = .generated_state, .source = .maintainer_script, .kind = .regular_file },
+    .{ .pattern = "/etc/networks", .reason = "base-files postinst network-name database", .category = .generated_state, .source = .maintainer_script, .kind = .regular_file },
+    .{ .pattern = "/etc/nsswitch.conf", .reason = "libc-bin postinst name-service switch", .category = .generated_state, .source = .maintainer_script, .kind = .regular_file },
+    .{ .pattern = "/etc/opt", .reason = "base-files postinst FHS directory", .category = .filesystem_hierarchy, .source = .maintainer_script, .kind = .directory },
+    .{ .pattern = "/etc/pam.d/common-*", .reason = "pam-auth-update generated PAM stacks", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/etc/passwd*", .reason = "account database written by maintainer scripts", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/etc/profile", .reason = "base-files postinst default login profile", .category = .generated_state, .source = .maintainer_script, .kind = .regular_file },
+    .{ .pattern = "/etc/resolv.conf", .reason = "runtime resolver state", .category = .generated_state, .source = .miz_builder },
+    .{ .pattern = "/etc/security/opasswd", .reason = "libpam-modules postinst password history", .category = .generated_state, .source = .maintainer_script, .kind = .regular_file },
+    .{ .pattern = "/etc/shadow*", .reason = "account database written by maintainer scripts", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/etc/shells", .reason = "debianutils update-shells registry", .category = .generated_state, .source = .maintainer_script, .kind = .regular_file },
+    .{ .pattern = "/etc/ssh/**", .reason = "sshd policy and per-machine host keys", .category = .generated_state, .source = .miz_builder },
+    .{ .pattern = "/etc/ssl/certs/**", .reason = "ca-certificates trust store", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/etc/subgid*", .reason = "account database written by maintainer scripts", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/etc/subuid*", .reason = "account database written by maintainer scripts", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/etc/waagent.conf", .reason = "Azure agent configuration", .category = .generated_state, .source = .miz_builder, .kind = .regular_file },
+    .{ .pattern = "/dev/**", .reason = "runtime device tree mount point", .category = .mount_point, .source = .miz_builder },
+    .{ .pattern = "/home/**", .reason = "provisioned administrator home", .category = .generated_state, .source = .miz_builder },
+    .{ .pattern = "/media/**", .reason = "mount point", .category = .mount_point, .source = .maintainer_script },
+    .{ .pattern = "/mnt/**", .reason = "mount point", .category = .mount_point, .source = .maintainer_script },
+    .{ .pattern = "/opt/**", .reason = "mount point", .category = .mount_point, .source = .maintainer_script },
+    .{ .pattern = "/proc/**", .reason = "runtime kernel filesystem mount point", .category = .mount_point, .source = .miz_builder },
+    .{ .pattern = "/root/**", .reason = "root account state", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/run/**", .reason = "runtime state mount point", .category = .mount_point, .source = .miz_builder },
+    .{ .pattern = "/srv/**", .reason = "mount point", .category = .mount_point, .source = .maintainer_script },
+    .{ .pattern = "/sys/**", .reason = "runtime kernel filesystem mount point", .category = .mount_point, .source = .miz_builder },
+    .{ .pattern = "/tmp/**", .reason = "temporary state", .category = .generated_state, .source = .miz_builder },
+    .{ .pattern = "/usr/share/info/dir*", .reason = "install-info generated index", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/var/cache/**", .reason = "package and tooling caches", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/var/lib/dbus/**", .reason = "cleared D-Bus machine identity", .category = .generated_state, .source = .miz_builder },
+    .{ .pattern = "/var/lib/debz/**", .reason = "debz transaction metadata for the exact closure", .category = .installer_metadata, .source = .debz_installer },
+    .{ .pattern = "/var/lib/dpkg/**", .reason = "package database and provenance", .category = .package_database, .source = .debz_installer },
+    .{ .pattern = "/var/lib/misc/**", .reason = "maintainer-script bookkeeping", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/var/lib/miz/**", .reason = "miz provenance and exact package lock", .category = .generated_state, .source = .miz_builder },
+    .{ .pattern = "/var/lib/pam/**", .reason = "pam-auth-update profile bookkeeping", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/var/lib/shells.state", .reason = "debianutils update-shells bookkeeping", .category = .generated_state, .source = .maintainer_script, .kind = .regular_file },
+    .{ .pattern = "/var/lib/systemd/**", .reason = "cleared systemd state and deb-systemd-helper bookkeeping", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/var/lib/ucf/**", .reason = "configuration-file bookkeeping", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/var/log/**", .reason = "cleared log state", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/var/mail", .reason = "base-files postinst FHS directory", .category = .filesystem_hierarchy, .source = .maintainer_script, .kind = .directory },
+    .{ .pattern = "/var/opt", .reason = "base-files postinst FHS directory", .category = .filesystem_hierarchy, .source = .maintainer_script, .kind = .directory },
+    .{ .pattern = "/var/spool/mail", .reason = "base-files postinst FHS compatibility link", .category = .filesystem_hierarchy, .source = .maintainer_script, .kind = .symlink, .target = .{ .literal = "../mail" } },
+    .{ .pattern = "/var/tmp/**", .reason = "temporary state", .category = .generated_state, .source = .miz_builder },
 };
 
 /// Unowned payload only the fresh-root flavors carry: the injected guest.
 ///
 /// Since #677 step 4 that no longer includes anything belonging to initramfs
-/// generation. The generated image itself is covered by the shared
-/// `/boot/initrd.img*` rule; its inputs and the generator's bookkeeping live in
-/// the staging root the guest never inherits.
+/// generation. The generated image itself is named by a derived rule bound to
+/// the kernel release the root actually boots; its inputs and the generator's
+/// bookkeeping live in the staging root the guest never inherits.
 pub const fresh_root_unowned_rules = [_]UnownedRule{
-    .{ .pattern = "/usr/sbin/mizinit", .reason = "injected miz PID 1" },
-    .{ .pattern = "/usr/sbin/azagent", .reason = "injected Azure provisioning agent" },
-    .{ .pattern = "/usr/sbin/init", .reason = "mizinit init symlink" },
-    .{ .pattern = "/usr/sbin/poweroff", .reason = "mizinit poweroff symlink" },
-    .{ .pattern = "/usr/sbin/reboot", .reason = "mizinit reboot symlink" },
-    .{ .pattern = "/usr/sbin/shutdown", .reason = "mizinit shutdown symlink" },
-    .{ .pattern = "/usr/local/**", .reason = "injected local access provider" },
+    .{ .pattern = "/usr/sbin/mizinit", .reason = "injected miz PID 1", .category = .injected_guest, .source = .miz_builder, .kind = .regular_file },
+    .{ .pattern = "/usr/sbin/azagent", .reason = "injected Azure provisioning agent", .category = .injected_guest, .source = .miz_builder, .kind = .regular_file },
+    .{ .pattern = "/usr/sbin/init", .reason = "mizinit init symlink", .category = .injected_guest, .source = .miz_builder, .kind = .symlink },
+    .{ .pattern = "/usr/sbin/poweroff", .reason = "mizinit poweroff symlink", .category = .injected_guest, .source = .miz_builder, .kind = .symlink },
+    .{ .pattern = "/usr/sbin/reboot", .reason = "mizinit reboot symlink", .category = .injected_guest, .source = .miz_builder, .kind = .symlink },
+    .{ .pattern = "/usr/sbin/shutdown", .reason = "mizinit shutdown symlink", .category = .injected_guest, .source = .miz_builder, .kind = .symlink },
+    .{ .pattern = "/usr/local/**", .reason = "injected local access provider", .category = .injected_guest, .source = .miz_builder },
 };
 
 /// Unowned payload only the full flavor carries: cloud-init, netplan, and the
 /// systemd unit overrides the Azure contract needs.
+///
+/// `full` inherits Canonical's server root rather than assembling one, so it is
+/// measured and not gated, and it keeps the broad subtree rules the fresh roots
+/// have replaced with derived, type- and target-bound ones.
 pub const full_unowned_rules = [_]UnownedRule{
-    .{ .pattern = "/etc/cloud/**", .reason = "cloud-init datasource configuration" },
+    .{ .pattern = "/boot/initrd.img*", .reason = "initramfs generated for the installed kernel", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/etc/alternatives/**", .reason = "update-alternatives symlink farm", .category = .alternatives_link, .source = .dpkg_alternatives },
+    .{ .pattern = "/etc/cloud/**", .reason = "cloud-init datasource configuration", .category = .generated_state, .source = .miz_builder },
     // Only `full` still installs the initramfs generator: it inherits
     // Canonical's server root. Issue #677 step 4 moved the fresh roots'
     // generation into a staging root, so neither the generator's bookkeeping
     // nor its configuration is allowlisted for them any more -- if either
     // reappears in a core or bare-metal image, the build fails.
-    .{ .pattern = "/var/lib/initramfs-tools/**", .reason = "initramfs generation bookkeeping" },
-    .{ .pattern = "/etc/netplan/**", .reason = "network configuration" },
-    .{ .pattern = "/etc/systemd/system/**", .reason = "systemd unit overrides" },
-    .{ .pattern = "/var/lib/cloud/**", .reason = "cleared cloud-init state" },
-    .{ .pattern = "/var/lib/waagent/**", .reason = "cleared Azure agent state" },
-    .{ .pattern = "/var/lib/dhcp/**", .reason = "cleared DHCP lease state" },
-    .{ .pattern = "/var/lib/NetworkManager/**", .reason = "cleared network state" },
+    .{ .pattern = "/var/lib/initramfs-tools/**", .reason = "initramfs generation bookkeeping", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/etc/netplan/**", .reason = "network configuration", .category = .generated_state, .source = .miz_builder },
+    .{ .pattern = "/etc/rc?.d/**", .reason = "sysv-rc runlevel link farm", .category = .sysv_service_link, .source = .update_rc_d },
+    .{ .pattern = "/etc/systemd/system/**", .reason = "systemd unit overrides", .category = .generated_state, .source = .miz_builder },
+    .{ .pattern = "/etc/systemd/user/**", .reason = "systemd user unit overrides", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/usr/lib/modules/**", .reason = "depmod-generated module index", .category = .generated_state, .source = .maintainer_script },
+    .{ .pattern = "/var/lib/cloud/**", .reason = "cleared cloud-init state", .category = .generated_state, .source = .miz_builder },
+    .{ .pattern = "/var/lib/waagent/**", .reason = "cleared Azure agent state", .category = .generated_state, .source = .miz_builder },
+    .{ .pattern = "/var/lib/dhcp/**", .reason = "cleared DHCP lease state", .category = .generated_state, .source = .miz_builder },
+    .{ .pattern = "/var/lib/NetworkManager/**", .reason = "cleared network state", .category = .generated_state, .source = .miz_builder },
 };
 
-/// The allowlist a flavor is measured against, as an owned slice.
-pub fn unownedRulesAlloc(allocator: Allocator, flavor: Flavor) Error![]UnownedRule {
-    const extra: []const UnownedRule = switch (flavor) {
+/// The rules the reviewed source states for a flavor, before anything is
+/// derived from the root being measured.
+pub fn staticUnownedRules(flavor: Flavor) []const UnownedRule {
+    return switch (flavor) {
         .full => &full_unowned_rules,
         .core, .baremetal => &fresh_root_unowned_rules,
     };
+}
+
+/// `sha256` over the flavor's static allowlist, rendered one field-separated
+/// line per rule and sorted.
+///
+/// This is what binds the published measurement to a reviewed policy: the
+/// builder writes the digest of the table it classified with, the release tool
+/// recomputes it from its own compiled-in table, and a build whose allowlist
+/// was widened -- by a local edit, a stale binary, or a patched checkout --
+/// cannot pass validation by an unmodified release tool.
+pub fn unownedPolicyDigest(allocator: Allocator, flavor: Flavor) Error![64]u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (lines.items) |line| allocator.free(line);
+        lines.deinit(allocator);
+    }
+    const tables = [_][]const UnownedRule{ &shared_unowned_rules, staticUnownedRules(flavor) };
+    for (&tables) |table| {
+        for (table) |rule| {
+            var buffer: [512]u8 = undefined;
+            try lines.append(allocator, try std.fmt.allocPrint(
+                allocator,
+                "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n",
+                .{
+                    rule.pattern,
+                    rule.category.key(),
+                    rule.source.key(),
+                    rule.kind.key(),
+                    rule.target.label(&buffer),
+                    rule.reason,
+                },
+            ));
+        }
+    }
+    std.mem.sort([]const u8, lines.items, {}, struct {
+        fn lessThan(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.lessThan);
+    var hash: std.crypto.hash.sha2.Sha256 = .init(.{});
+    for (lines.items) |line| hash.update(line);
+    var raw: [32]u8 = undefined;
+    hash.final(&raw);
+    var hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&hex, "{x}", .{&raw}) catch unreachable;
+    return hex;
+}
+
+/// The static allowlist a flavor is measured against, as an owned slice.
+pub fn unownedRulesAlloc(allocator: Allocator, flavor: Flavor) Error![]UnownedRule {
+    const extra = staticUnownedRules(flavor);
     const rules = try allocator.alloc(UnownedRule, shared_unowned_rules.len + extra.len);
     @memcpy(rules[0..shared_unowned_rules.len], &shared_unowned_rules);
     @memcpy(rules[shared_unowned_rules.len..], extra);
-    std.mem.sort(UnownedRule, rules, {}, struct {
-        fn lessThan(_: void, left: UnownedRule, right: UnownedRule) bool {
-            return lessThanPath({}, left.pattern, right.pattern);
-        }
-    }.lessThan);
+    std.mem.sort(UnownedRule, rules, {}, UnownedRule.lessThan);
     return rules;
+}
+
+// ---------------------------------------------------------------------------
+// Rules derived from the root's own metadata.
+//
+// The classes below are generated, unowned, and impossible to state as literal
+// paths in reviewed source: which alternatives a closure registers, which units
+// its maintainer scripts enable, and which kernel release it boots are all
+// facts of the resolved closure rather than of the source. Naming them with a
+// broad glob would have been an exemption for whole directories, so each class
+// is instead *enumerated from the metadata the producer itself wrote* and then
+// constrained: the path set comes from dpkg's alternatives database, from
+// deb-systemd-helper's enabled-link records, from the runlevel directories
+// cross-checked against package-owned init scripts, and from the active kernel
+// release. Every derived rule pins the filesystem type, and every symlink rule
+// pins either the exact target text or the requirement that the target be
+// package-owned. A payload file cannot hide behind any of them, because none of
+// them admits a file.
+// ---------------------------------------------------------------------------
+
+pub const dpkg_alternatives_path = "/var/lib/dpkg/alternatives";
+pub const dpkg_diversions_path = "/var/lib/dpkg/diversions";
+pub const systemd_helper_paths = [_]struct { state: []const u8, units: []const u8 }{
+    .{ .state = "/var/lib/systemd/deb-systemd-helper-enabled", .units = "/etc/systemd/system" },
+    .{ .state = "/var/lib/systemd/deb-systemd-user-helper-enabled", .units = "/etc/systemd/user" },
+};
+const sysv_runlevel_directories = [_][]const u8{
+    "/etc/rc0.d", "/etc/rc1.d", "/etc/rc2.d", "/etc/rc3.d",
+    "/etc/rc4.d", "/etc/rc5.d", "/etc/rc6.d", "/etc/rcS.d",
+};
+/// Exactly the index files `depmod` writes beside a module tree. Naming them
+/// keeps `/usr/lib/modules/<release>/` from becoming a directory anything can
+/// be dropped into.
+const depmod_index_names = [_][]const u8{
+    "modules.alias",       "modules.alias.bin",
+    "modules.builtin.alias.bin", "modules.builtin.bin",
+    "modules.dep",         "modules.dep.bin",
+    "modules.devname",     "modules.softdep",
+    "modules.symbols",     "modules.symbols.bin",
+    "modules.weakdep",
+};
+
+const DerivedRules = struct {
+    scratch: Allocator,
+    io: Io,
+    root_path: []const u8,
+    owners: *const std.StringHashMapUnmanaged(u32),
+    rules: *std.ArrayList(UnownedRule),
+
+    fn hostPath(self: DerivedRules, guest: []const u8) Error![]const u8 {
+        return std.fs.path.join(self.scratch, &.{ self.root_path, guest[1..] }) catch
+            error.OutOfMemory;
+    }
+
+    fn add(self: DerivedRules, rule: UnownedRule) Error!void {
+        try self.rules.append(self.scratch, rule);
+    }
+
+    /// `update-alternatives` maintains two links per name: the one a package's
+    /// dependants call (`/usr/bin/awk`) and the switchable one it points at
+    /// (`/etc/alternatives/awk`). dpkg records both in its own admin file, so
+    /// both are enumerated from it and neither is a glob.
+    fn alternatives(self: DerivedRules) Error!void {
+        const host = try self.hostPath(dpkg_alternatives_path);
+        var directory = Dir.cwd().openDir(self.io, host, .{ .iterate = true }) catch return;
+        defer directory.close(self.io);
+        var iterator = directory.iterate();
+        while (iterator.next(self.io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            const origin = try std.fmt.allocPrint(
+                self.scratch,
+                "{s}/{s}",
+                .{ dpkg_alternatives_path, entry.name },
+            );
+            const file = try std.fs.path.join(self.scratch, &.{ host, entry.name });
+            const contents = Dir.cwd().readFileAlloc(
+                self.io,
+                file,
+                self.scratch,
+                .limited(1024 * 1024),
+            ) catch continue;
+            var lines = std.mem.splitScalar(u8, contents, '\n');
+            const status = lines.next() orelse continue;
+            if (!std.mem.eql(u8, status, "auto") and !std.mem.eql(u8, status, "manual")) continue;
+            const master = lines.next() orelse continue;
+            if (master.len == 0 or master[0] != '/') continue;
+            try self.alternativePair(origin, entry.name, master);
+            // Slaves are `name`/`link` pairs until a blank line ends the group.
+            while (true) {
+                const name = lines.next() orelse break;
+                if (name.len == 0) break;
+                const link = lines.next() orelse break;
+                if (link.len == 0 or link[0] != '/') break;
+                try self.alternativePair(origin, name, link);
+            }
+        }
+    }
+
+    fn alternativePair(
+        self: DerivedRules,
+        origin: []const u8,
+        name: []const u8,
+        link: []const u8,
+    ) Error!void {
+        const switchable = try std.fmt.allocPrint(
+            self.scratch,
+            "/etc/alternatives/{s}",
+            .{name},
+        );
+        try self.add(.{
+            .pattern = link,
+            .reason = "update-alternatives link registered in dpkg's alternatives database",
+            .category = .alternatives_link,
+            .source = .dpkg_alternatives,
+            .kind = .symlink,
+            .target = .{ .literal = switchable },
+            .origin = origin,
+        });
+        try self.add(.{
+            .pattern = switchable,
+            .reason = "update-alternatives selection registered in dpkg's alternatives database",
+            .category = .alternatives_link,
+            .source = .dpkg_alternatives,
+            .kind = .symlink,
+            .target = .package_owned,
+            .origin = origin,
+        });
+    }
+
+    /// `update-rc.d` keeps no database, so the runlevel links are enumerated
+    /// from the runlevel directories and then bound three ways: the name has to
+    /// be a well-formed `[KS]NN<service>`, the entry has to be a symlink whose
+    /// target is exactly `../init.d/<service>`, and `/etc/init.d/<service>` has
+    /// to be claimed by a package in the closure. What that admits is one more
+    /// link to an init script the image already ships; what it refuses is any
+    /// file, any directory, and any link that points anywhere else.
+    fn sysvRunlevelLinks(self: DerivedRules) Error!void {
+        for (&sysv_runlevel_directories) |guest| {
+            const host = try self.hostPath(guest);
+            var directory = Dir.cwd().openDir(self.io, host, .{ .iterate = true }) catch continue;
+            defer directory.close(self.io);
+            var iterator = directory.iterate();
+            while (iterator.next(self.io) catch null) |entry| {
+                const name = entry.name;
+                if (name.len < 4) continue;
+                if (name[0] != 'K' and name[0] != 'S') continue;
+                if (!std.ascii.isDigit(name[1]) or !std.ascii.isDigit(name[2])) continue;
+                const service = name[3..];
+                if (std.mem.indexOfScalar(u8, service, '/') != null) continue;
+                const script = try std.fmt.allocPrint(
+                    self.scratch,
+                    "/etc/init.d/{s}",
+                    .{service},
+                );
+                if (!self.owners.contains(script)) continue;
+                try self.add(.{
+                    .pattern = try std.fmt.allocPrint(
+                        self.scratch,
+                        "{s}/{s}",
+                        .{ guest, name },
+                    ),
+                    .reason = "update-rc.d runlevel link to a package-owned init script",
+                    .category = .sysv_service_link,
+                    .source = .update_rc_d,
+                    .kind = .symlink,
+                    .target = .{ .literal = try std.fmt.allocPrint(
+                        self.scratch,
+                        "../init.d/{s}",
+                        .{service},
+                    ) },
+                    .origin = script,
+                });
+            }
+        }
+    }
+
+    /// `deb-systemd-helper` mirrors every link it enables under
+    /// `/var/lib/systemd/deb-systemd-helper-enabled`, so the `.wants` and
+    /// `.requires` farms in `/etc/systemd/system` are enumerated from that
+    /// record rather than from the farms themselves. A link nothing enabled is
+    /// not derived, and therefore fails.
+    fn systemdServiceLinks(self: DerivedRules) Error!void {
+        for (&systemd_helper_paths) |pair| {
+            const host = try self.hostPath(pair.state);
+            var directory = Dir.cwd().openDir(self.io, host, .{ .iterate = true }) catch continue;
+            defer directory.close(self.io);
+            var iterator = directory.iterate();
+            while (iterator.next(self.io) catch null) |entry| {
+                if (entry.kind != .directory) continue;
+                if (!std.mem.endsWith(u8, entry.name, ".wants") and
+                    !std.mem.endsWith(u8, entry.name, ".requires")) continue;
+                const farm = try std.fmt.allocPrint(
+                    self.scratch,
+                    "{s}/{s}",
+                    .{ pair.units, entry.name },
+                );
+                const record = try std.fmt.allocPrint(
+                    self.scratch,
+                    "{s}/{s}",
+                    .{ pair.state, entry.name },
+                );
+                try self.add(.{
+                    .pattern = farm,
+                    .reason = "deb-systemd-helper enabled-unit link directory",
+                    .category = .systemd_service_link,
+                    .source = .deb_systemd_helper,
+                    .kind = .directory,
+                    .origin = record,
+                });
+                const farm_host = try std.fs.path.join(self.scratch, &.{ host, entry.name });
+                var farm_dir = Dir.cwd().openDir(
+                    self.io,
+                    farm_host,
+                    .{ .iterate = true },
+                ) catch continue;
+                defer farm_dir.close(self.io);
+                var links = farm_dir.iterate();
+                while (links.next(self.io) catch null) |link| {
+                    if (link.kind != .file) continue;
+                    try self.add(.{
+                        .pattern = try std.fmt.allocPrint(
+                            self.scratch,
+                            "{s}/{s}",
+                            .{ farm, link.name },
+                        ),
+                        .reason = "deb-systemd-helper link to a package-owned unit",
+                        .category = .systemd_service_link,
+                        .source = .deb_systemd_helper,
+                        .kind = .symlink,
+                        .target = .package_owned_same_name,
+                        .origin = try std.fmt.allocPrint(
+                            self.scratch,
+                            "{s}/{s}",
+                            .{ record, link.name },
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    /// The kernel package maintains `/boot/vmlinuz` and `/boot/vmlinuz.old`,
+    /// and the initramfs the build installs is named for the same release. All
+    /// four links are pinned to the exact release the root boots, so a second
+    /// kernel's leftovers are not silently carried.
+    fn kernelBoot(self: DerivedRules, kernel_release: []const u8) Error!void {
+        const image = try std.fmt.allocPrint(
+            self.scratch,
+            "/boot/vmlinuz-{s}",
+            .{kernel_release},
+        );
+        const initramfs = try std.fmt.allocPrint(
+            self.scratch,
+            "initrd.img-{s}",
+            .{kernel_release},
+        );
+        if (self.owners.contains(image)) {
+            for ([_][]const u8{ "/boot/vmlinuz", "/boot/vmlinuz.old" }) |link| {
+                try self.add(.{
+                    .pattern = link,
+                    .reason = "kernel postinst link to the installed kernel image",
+                    .category = .kernel_boot_symlink,
+                    .source = .kernel_package,
+                    .kind = .symlink,
+                    .target = .{ .literal = std.fs.path.basenamePosix(image) },
+                    .origin = image,
+                });
+            }
+        }
+        try self.add(.{
+            .pattern = try std.fmt.allocPrint(self.scratch, "/boot/{s}", .{initramfs}),
+            .reason = "initramfs generated for the installed kernel by the discarded build stage of #677 step 4",
+            .category = .generated_state,
+            .source = .miz_builder,
+            .kind = .regular_file,
+            .origin = image,
+        });
+        for ([_][]const u8{ "/boot/initrd.img", "/boot/initrd.img.old" }) |link| {
+            try self.add(.{
+                .pattern = link,
+                .reason = "kernel postinst link to the generated initramfs",
+                .category = .kernel_boot_symlink,
+                .source = .kernel_package,
+                .kind = .symlink,
+                .target = .{ .literal = initramfs },
+                .origin = image,
+            });
+        }
+        for (&depmod_index_names) |name| {
+            try self.add(.{
+                .pattern = try std.fmt.allocPrint(
+                    self.scratch,
+                    "/usr/lib/modules/{s}/{s}",
+                    .{ kernel_release, name },
+                ),
+                .reason = "depmod-generated module index",
+                .category = .generated_state,
+                .source = .kernel_package,
+                .kind = .regular_file,
+                .origin = image,
+            });
+        }
+    }
+};
+
+/// Builds the rules that can only come from the root being measured.
+///
+/// `full` is excluded: it inherits Canonical's server root, is measured rather
+/// than gated, and keeps the broad subtree rules that make that root
+/// describable at all. Deriving for it would change what its report attributes
+/// without changing what it accepts.
+pub fn derivedUnownedRulesAlloc(
+    scratch: Allocator,
+    io: Io,
+    root_path: []const u8,
+    flavor: Flavor,
+    kernel_release: []const u8,
+    owners: *const std.StringHashMapUnmanaged(u32),
+) Error![]UnownedRule {
+    var rules: std.ArrayList(UnownedRule) = .empty;
+    errdefer rules.deinit(scratch);
+    if (flavor == .full) return rules.toOwnedSlice(scratch);
+    const derived: DerivedRules = .{
+        .scratch = scratch,
+        .io = io,
+        .root_path = root_path,
+        .owners = owners,
+        .rules = &rules,
+    };
+    try derived.alternatives();
+    try derived.sysvRunlevelLinks();
+    try derived.systemdServiceLinks();
+    try derived.kernelBoot(kernel_release);
+    return rules.toOwnedSlice(scratch);
 }
 
 pub const RootMeasurementOptions = struct {
@@ -564,7 +1220,23 @@ pub const InjectedEntry = struct {
     path: []const u8,
     logical_bytes: u64,
     allocated_bytes: u64,
+    /// Attributed by the same typed rules the walk applies, so an injected
+    /// path is held to the same type constraint as a walked one.
+    kind: std.Io.File.Kind = .file,
+    link_target: ?[]const u8 = null,
 };
+
+/// The raw target of a symlink, or `null` if it cannot be read.
+///
+/// A link whose target is unreadable classifies as if it had none, which means
+/// every rule that constrains a target rejects it. Failing closed on an
+/// unreadable link is the only safe reading: the alternative is trusting a
+/// path the measurement could not actually see.
+fn readLinkTarget(io: Io, host: []const u8, buffer: []u8) ?[]const u8 {
+    const length = Dir.cwd().readLink(io, host, buffer) catch return null;
+    if (length == 0 or length > buffer.len) return null;
+    return buffer[0..length];
+}
 
 const shared_owner = std.math.maxInt(u32);
 const unmatched_owner = shared_owner - 1;
@@ -636,8 +1308,26 @@ pub fn measureRootBuild(
     defer unmatched.deinit(scratch);
     try readOwnership(scratch, io, options.root_path, &index, &owners, &unmatched);
 
-    const rules = try unownedRulesAlloc(scratch, options.flavor);
+    // The static table states what the reviewed source allows; the derived
+    // rules state what this root's own dpkg, deb-systemd-helper, and kernel
+    // metadata account for. Both are published, both are typed, and a path
+    // that satisfies neither is the remainder the fresh roots fail on.
+    const static_rules = try unownedRulesAlloc(scratch, options.flavor);
+    defer scratch.free(static_rules);
+    const derived_rules = try derivedUnownedRulesAlloc(
+        scratch,
+        io,
+        options.root_path,
+        options.flavor,
+        options.kernel_release,
+        &owners,
+    );
+    defer scratch.free(derived_rules);
+    const rules = try scratch.alloc(UnownedRule, static_rules.len + derived_rules.len);
     defer scratch.free(rules);
+    @memcpy(rules[0..static_rules.len], static_rules);
+    @memcpy(rules[static_rules.len..], derived_rules);
+    std.mem.sort(UnownedRule, rules, {}, UnownedRule.lessThan);
 
     var walk: Walk = .{
         .scratch = scratch,
@@ -733,12 +1423,20 @@ pub fn measureRootBuild(
     try builder.put(&section, "unmatched", .{ .object = unmatched_section });
 
     var unowned = try bucketObject(builder, walk.unowned);
+    const policy = try unownedPolicyDigest(scratch, options.flavor);
+    try builder.putString(&unowned, "policy_sha256", &policy);
     var allowed = builder.array();
     try allowed.ensureTotalCapacity(rules.len);
     for (rules, walk.rule_buckets) |rule, bucket| {
+        var target_buffer: [512]u8 = undefined;
         var item = builder.object();
         try builder.putString(&item, "rule", rule.pattern);
         try builder.putString(&item, "reason", rule.reason);
+        try builder.putString(&item, "category", rule.category.key());
+        try builder.putString(&item, "source", rule.source.key());
+        try builder.putString(&item, "kind", rule.kind.key());
+        try builder.putString(&item, "target", rule.target.label(&target_buffer));
+        try builder.putString(&item, "origin", rule.origin);
         try builder.putCount(&item, "file_count", bucket.file_count);
         try builder.putCount(&item, "installed_bytes", bucket.usage.logical_bytes);
         try builder.putCount(&item, "allocated_bytes", bucket.usage.allocated_bytes);
@@ -954,35 +1652,124 @@ pub fn readOwnedPaths(allocator: Allocator, io: Io, root_path: []const u8) Error
     var result: OwnedPaths = .{ .arena = .init(allocator) };
     errdefer result.arena.deinit();
     const arena = result.arena.allocator();
-    const info_path = std.fs.path.join(
-        arena,
-        &.{ root_path, dpkg_info_path[1..] },
-    ) catch return error.OutOfMemory;
-    var directory = Dir.cwd().openDir(io, info_path, .{ .iterate = true }) catch return result;
-    defer directory.close(io);
-    var iterator = directory.iterate();
-    while (iterator.next(io) catch null) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".list")) continue;
-        const package = try arena.dupe(u8, entry.name[0 .. entry.name.len - ".list".len]);
-        const list_path = try std.fs.path.join(arena, &.{ info_path, entry.name });
-        const contents = Dir.cwd().readFileAlloc(
-            io,
-            list_path,
-            arena,
-            .limited(64 * 1024 * 1024),
-        ) catch continue;
-        var lines = std.mem.splitScalar(u8, contents, '\n');
-        while (lines.next()) |line| {
-            const path = std.mem.trimEnd(u8, line, "\r");
-            if (path.len == 0 or path[0] != '/') continue;
-            try result.owners.put(arena, path, package);
+    const Sink = struct {
+        arena: Allocator,
+        owned: *OwnedPaths,
+
+        fn record(self: @This(), path: []const u8, package: []const u8) Error!void {
+            try self.owned.owners.put(self.arena, path, package);
         }
-    }
+    };
+    try forEachOwnershipRecord(
+        arena,
+        io,
+        root_path,
+        Sink{ .arena = arena, .owned = &result },
+        Sink.record,
+    );
     return result;
 }
 
-/// Builds the path-to-package index from dpkg's per-package file lists. A list
+/// Every ownership claim a finished root's dpkg database makes, as
+/// `(path, package)` pairs.
+///
+/// dpkg states ownership in three places, and reading only the first is how a
+/// path a package really owns ends up in the unowned bucket:
+///
+///  * `<package>.list` -- the unpacked file list, which is where the vast
+///    majority of claims live and, for this snapshot, already includes the
+///    conffiles;
+///  * `<package>.conffiles` -- the configuration files dpkg tracks by digest.
+///    They are read as an independent source because dpkg treats a conffile as
+///    owned whether or not the list still names it, and because the format
+///    carries flag-prefixed entries (`remove-on-upgrade <path>`) a naive reader
+///    would either drop or mistake for a path;
+///  * `diversions` -- `from`/`to`/`package` triples. The *diverted-to* path is
+///    a real file on disk that no `.list` names, and dpkg attributes it to the
+///    diverting package. Skipping it would report a package's own relocated
+///    file as unattributable payload.
+///
+/// `strings` allocates the paths and package names the visitor keeps.
+fn forEachOwnershipRecord(
+    strings: Allocator,
+    io: Io,
+    root_path: []const u8,
+    context: anytype,
+    comptime visit: fn (@TypeOf(context), []const u8, []const u8) Error!void,
+) Error!void {
+    const info_path = std.fs.path.join(
+        strings,
+        &.{ root_path, dpkg_info_path[1..] },
+    ) catch return error.OutOfMemory;
+    if (Dir.cwd().openDir(io, info_path, .{ .iterate = true }) catch null) |constant| {
+        var directory = constant;
+        defer directory.close(io);
+        var iterator = directory.iterate();
+        while (iterator.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            const conffiles = std.mem.endsWith(u8, entry.name, ".conffiles");
+            const listed = std.mem.endsWith(u8, entry.name, ".list");
+            if (!conffiles and !listed) continue;
+            const suffix: usize = if (conffiles) ".conffiles".len else ".list".len;
+            const package = try strings.dupe(
+                u8,
+                entry.name[0 .. entry.name.len - suffix],
+            );
+            const file = try std.fs.path.join(strings, &.{ info_path, entry.name });
+            const contents = Dir.cwd().readFileAlloc(
+                io,
+                file,
+                strings,
+                .limited(64 * 1024 * 1024),
+            ) catch continue;
+            var lines = std.mem.splitScalar(u8, contents, '\n');
+            while (lines.next()) |line| {
+                const text = std.mem.trimEnd(u8, line, "\r");
+                const path = if (conffiles) conffilePath(text) orelse continue else text;
+                if (path.len == 0 or path[0] != '/') continue;
+                try visit(context, path, package);
+            }
+        }
+    }
+
+    const diversions_host = std.fs.path.join(
+        strings,
+        &.{ root_path, dpkg_diversions_path[1..] },
+    ) catch return error.OutOfMemory;
+    const diversions = Dir.cwd().readFileAlloc(
+        io,
+        diversions_host,
+        strings,
+        .limited(8 * 1024 * 1024),
+    ) catch return;
+    var lines = std.mem.splitScalar(u8, diversions, '\n');
+    while (true) {
+        const from = lines.next() orelse break;
+        if (from.len == 0) break;
+        const to = std.mem.trimEnd(u8, lines.next() orelse break, "\r");
+        const package = std.mem.trimEnd(u8, lines.next() orelse break, "\r");
+        if (to.len == 0 or to[0] != '/') continue;
+        // `:` is dpkg's spelling of a local administrator diversion, which no
+        // package owns and which a fresh root must therefore never carry.
+        if (package.len == 0 or std.mem.eql(u8, package, ":")) continue;
+        try visit(context, try strings.dupe(u8, to), try strings.dupe(u8, package));
+    }
+}
+
+/// The path named by one `conffiles` line, or `null` for a line that names no
+/// path. dpkg 1.20 added flag-prefixed entries; `remove-on-upgrade /etc/x` is
+/// still a statement that `/etc/x` belongs to the package.
+fn conffilePath(line: []const u8) ?[]const u8 {
+    const text = std.mem.trim(u8, line, " \t");
+    if (text.len == 0) return null;
+    if (text[0] == '/') return text;
+    const space = std.mem.indexOfScalar(u8, text, ' ') orelse return null;
+    const path = std.mem.trimStart(u8, text[space + 1 ..], " ");
+    if (path.len == 0 or path[0] != '/') return null;
+    return path;
+}
+
+/// Builds the path-to-package index from dpkg's own ownership records. A record
 /// naming a package the exact closure does not contain is recorded rather than
 /// refused: the closure is enforced elsewhere, and a measurement that refuses
 /// to report a discrepancy is how the discrepancy stays invisible.
@@ -994,43 +1781,44 @@ fn readOwnership(
     owners: *std.StringHashMapUnmanaged(u32),
     unmatched: *std.ArrayList([]const u8),
 ) Error!void {
-    const info_path = std.fs.path.join(
-        allocator,
-        &.{ root_path, dpkg_info_path[1..] },
-    ) catch return error.OutOfMemory;
-    defer allocator.free(info_path);
-    var directory = Dir.cwd().openDir(io, info_path, .{ .iterate = true }) catch return;
-    defer directory.close(io);
-    var iterator = directory.iterate();
-    while (iterator.next(io) catch null) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".list")) continue;
-        const stem = entry.name[0 .. entry.name.len - ".list".len];
-        const owner = index.get(stem) orelse blk: {
-            const name = try allocator.dupe(u8, stem);
-            try unmatched.append(allocator, name);
-            break :blk unmatched_owner;
-        };
-        const list_path = try std.fs.path.join(allocator, &.{ info_path, entry.name });
-        defer allocator.free(list_path);
-        const contents = Dir.cwd().readFileAlloc(
-            io,
-            list_path,
-            allocator,
-            .limited(64 * 1024 * 1024),
-        ) catch continue;
-        var lines = std.mem.splitScalar(u8, contents, '\n');
-        while (lines.next()) |line| {
-            const path = std.mem.trimEnd(u8, line, "\r");
-            if (path.len == 0 or path[0] != '/') continue;
-            const existing = try owners.getOrPut(allocator, path);
+    const Sink = struct {
+        allocator: Allocator,
+        index: *const std.StringHashMapUnmanaged(u32),
+        owners: *std.StringHashMapUnmanaged(u32),
+        unmatched: *std.ArrayList([]const u8),
+        seen: *std.StringHashMapUnmanaged(void),
+
+        fn record(self: @This(), path: []const u8, package: []const u8) Error!void {
+            const owner = self.index.get(package) orelse blk: {
+                const fresh = try self.seen.getOrPut(self.allocator, package);
+                if (!fresh.found_existing) {
+                    try self.unmatched.append(self.allocator, package);
+                }
+                break :blk unmatched_owner;
+            };
+            const existing = try self.owners.getOrPut(self.allocator, path);
             if (existing.found_existing) {
                 if (existing.value_ptr.* != owner) existing.value_ptr.* = shared_owner;
             } else {
                 existing.value_ptr.* = owner;
             }
         }
-    }
+    };
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(allocator);
+    try forEachOwnershipRecord(
+        allocator,
+        io,
+        root_path,
+        Sink{
+            .allocator = allocator,
+            .index = index,
+            .owners = owners,
+            .unmatched = unmatched,
+            .seen = &seen,
+        },
+        Sink.record,
+    );
 }
 
 /// Accumulating walk over the finished root tree.
@@ -1113,7 +1901,15 @@ const Walk = struct {
         };
         self.total.record(usage);
         top_level.record(usage);
-        self.attribute(guest, usage);
+        var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const observed: Observed = .{
+            .kind = kind,
+            .link_target = if (kind == .sym_link)
+                readLinkTarget(self.io, host, &link_buffer)
+            else
+                null,
+        };
+        try self.attribute(guest, usage, observed);
         try self.attributeBoot(guest, usage);
         if (kind != .directory) return;
 
@@ -1153,7 +1949,10 @@ const Walk = struct {
             .allocated_bytes = entry.allocated_bytes,
         };
         self.total.record(usage);
-        self.attribute(entry.path, usage);
+        try self.attribute(entry.path, usage, .{
+            .kind = entry.kind,
+            .link_target = entry.link_target,
+        });
         try self.attributeBoot(entry.path, usage);
         const end = std.mem.indexOfScalarPos(u8, entry.path, 1, '/') orelse
             entry.path.len;
@@ -1170,7 +1969,12 @@ const Walk = struct {
         });
     }
 
-    fn attribute(self: *Walk, guest: []const u8, usage: Usage) void {
+    fn attribute(
+        self: *Walk,
+        guest: []const u8,
+        usage: Usage,
+        observed: Observed,
+    ) Error!void {
         if (self.owners.get(guest)) |owner| {
             switch (owner) {
                 shared_owner => self.shared.record(usage),
@@ -1183,8 +1987,14 @@ const Walk = struct {
             return;
         }
         self.unowned.record(usage);
+        // A rule whose pattern matches but whose type or link target does not
+        // is *not* a match: the path falls through to the remaining rules and,
+        // if none of them accepts it either, into the remainder the fresh roots
+        // fail on. That is what stops an allowlisted name from being a place to
+        // put something else.
+        const classifier: Classifier = .{ .scratch = self.scratch, .owners = self.owners };
         for (self.rules, self.rule_buckets) |rule, *bucket| {
-            if (rule.matches(guest)) {
+            if (try classifier.accepts(rule, guest, observed)) {
                 bucket.record(usage);
                 return;
             }
@@ -1339,6 +2149,9 @@ pub const Summary = struct {
     installed_bytes: u64 = 0,
     allocated_bytes: u64 = 0,
     unexpected_unowned_count: u64 = 0,
+    /// Digest of the reviewed unowned allowlist the document was measured
+    /// against, re-derived rather than copied out of the document.
+    unowned_policy_sha256: []const u8 = "",
 
     pub fn has(self: Summary, phase: Phase) bool {
         return self.phases[@intFromEnum(phase)];
@@ -1503,7 +2316,13 @@ pub fn validateDocument(
         );
     }
 
-    try validateRootBuild(object.get("root_build"), &summary, diagnostic);
+    try validateRootBuild(
+        allocator,
+        std.meta.stringToEnum(Flavor, flavor_text).?,
+        object.get("root_build"),
+        &summary,
+        diagnostic,
+    );
     if (summary.has(.image_build)) {
         try validateImageBuild(object.get("image_build"), diagnostic);
     }
@@ -1523,6 +2342,15 @@ pub fn validateDocument(
         );
     }
     return summary;
+}
+
+/// The stable spellings `LinkTarget.label` produces. A validator that accepted
+/// any string here would accept a document whose links were bound to nothing.
+fn validTargetLabel(text: []const u8) bool {
+    if (std.mem.eql(u8, text, "unconstrained")) return true;
+    if (std.mem.eql(u8, text, "package_owned")) return true;
+    if (std.mem.eql(u8, text, "package_owned_same_name")) return true;
+    return std.mem.startsWith(u8, text, "literal:") and text.len > "literal:".len;
 }
 
 fn stringIs(value: ?std.json.Value, expected: []const u8) bool {
@@ -1593,6 +2421,8 @@ fn bucketsEqual(left: Bucket, right: Bucket) bool {
 }
 
 fn validateRootBuild(
+    allocator: Allocator,
+    flavor: Flavor,
     value: ?std.json.Value,
     summary: *Summary,
     diagnostic: *Diagnostic,
@@ -1720,8 +2550,25 @@ fn validateRootBuild(
     const unowned = try requireBucket(
         object.get("unowned"),
         "unowned totals",
-        &.{ "allowed", "unexpected" },
+        &.{ "allowed", "policy_sha256", "unexpected" },
         diagnostic,
+    );
+    // The reviewed allowlist is a *published* policy, not a builder detail:
+    // the digest here is recomputed from this tool's own compiled-in tables, so
+    // a document produced against a widened or locally patched allowlist is
+    // refused by an unmodified release tool rather than accepted on the
+    // strength of its own claim.
+    const declared_policy = stringOf(unowned_object.get("policy_sha256")) orelse return fail(
+        diagnostic,
+        "size inventory unowned allowlist policy digest is invalid",
+        .{},
+    );
+    const expected_policy = try unownedPolicyDigest(allocator, flavor);
+    if (!std.mem.eql(u8, declared_policy, &expected_policy)) return fail(
+        diagnostic,
+        "size inventory unowned allowlist policy digest {s} does not match the " ++
+            "reviewed {s} allowlist {s}",
+        .{ declared_policy, flavor.key(), expected_policy },
     );
     const allowed = arrayOf(unowned_object.get("allowed")) orelse return fail(
         diagnostic,
@@ -1738,14 +2585,41 @@ fn validateRootBuild(
         const bucket = try requireBucket(
             entry,
             "unowned allowlist entry",
-            &.{ "reason", "rule" },
+            &.{ "category", "kind", "origin", "reason", "rule", "source", "target" },
             diagnostic,
         );
-        if (stringOf(item.get("rule")) == null or stringOf(item.get("reason")) == null) {
+        const rule = stringOf(item.get("rule")) orelse return fail(
+            diagnostic,
+            "size inventory unowned allowlist entry is invalid",
+            .{},
+        );
+        const origin = stringOf(item.get("origin")) orelse return fail(
+            diagnostic,
+            "size inventory unowned allowlist entry is invalid",
+            .{},
+        );
+        const target = stringOf(item.get("target")) orelse return fail(
+            diagnostic,
+            "size inventory unowned allowlist entry is invalid",
+            .{},
+        );
+        if (stringOf(item.get("reason")) == null or
+            rule.len < 2 or rule[0] != '/' or
+            UnownedCategory.parse(stringOf(item.get("category")) orelse "") == null or
+            UnownedSource.parse(stringOf(item.get("source")) orelse "") == null or
+            PathKind.parse(stringOf(item.get("kind")) orelse "") == null or
+            !validTargetLabel(target) or
+            // A rule is either something the reviewed source states or
+            // something read out of a named metadata file in the measured
+            // root. There is no third kind, and an entry that claims one would
+            // be an exemption nobody can trace.
+            !(std.mem.eql(u8, origin, contract_origin) or
+                (origin.len >= 2 and origin[0] == '/')))
+        {
             return fail(
                 diagnostic,
-                "size inventory unowned allowlist entry is invalid",
-                .{},
+                "size inventory unowned allowlist entry {s} is invalid",
+                .{rule},
             );
         }
         accumulate(&unowned_sum, bucket);
@@ -1882,6 +2756,7 @@ fn validateRootBuild(
     summary.installed_bytes = total.usage.logical_bytes;
     summary.allocated_bytes = total.usage.allocated_bytes;
     summary.unexpected_unowned_count = unexpected.file_count;
+    summary.unowned_policy_sha256 = declared_policy;
 }
 
 fn validateFilesystemSection(

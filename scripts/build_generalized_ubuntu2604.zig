@@ -1862,6 +1862,20 @@ fn injectedAllocation(entry: miz.ext4_mountless.Entry) u64 {
     };
 }
 
+/// The inventory's typed rules hold an injected path to the same filesystem
+/// type constraint a walked one gets, so the image's own view of what it wrote
+/// has to be carried across rather than assumed to be a regular file.
+fn injectedKind(entry: miz.ext4_mountless.Entry) std.Io.File.Kind {
+    return switch (entry.kind) {
+        .directory => .directory,
+        .symlink => .sym_link,
+        .block_device => .block_device,
+        .char_device => .character_device,
+        .fifo => .named_pipe,
+        .file, .hardlink => .file,
+    };
+}
+
 fn collectInjectedInventory(
     allocator: Allocator,
     filesystem: *const miz.ext4_mountless.FileSystem,
@@ -1876,6 +1890,7 @@ fn collectInjectedInventory(
             .path = path,
             .logical_bytes = entry.size(),
             .allocated_bytes = injectedAllocation(entry),
+            .kind = injectedKind(entry),
         });
     }
     const listed = filesystem.list(allocator, "/var/lib/miz/provenance", 4096) catch |err|
@@ -1893,6 +1908,7 @@ fn collectInjectedInventory(
             .path = absolute,
             .logical_bytes = entry.size(),
             .allocated_bytes = injectedAllocation(entry),
+            .kind = injectedKind(entry),
         });
     }
 }
