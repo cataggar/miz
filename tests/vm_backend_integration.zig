@@ -28,7 +28,6 @@ const partition_length = @as(u64, partition_sectors) * miz.mbr.sector_size;
 
 const kernel_release = "6.12.0-1.integration";
 const kernel_bytes = "integration-kernel-image\n";
-const agent_bytes = "integration-guest-agent\n";
 /// Stand-ins for the EDK2 pair. Their only job is to be distinct, non-empty
 /// files whose digests provenance can be checked against.
 const firmware_code_bytes = "integration-edk2-code\n";
@@ -905,15 +904,39 @@ fn runVm(
     target: miz.preserved_image.RawMutationTarget,
     deadline: miz.customize.Deadline,
 ) !miz.customize.VmRuntimeReport {
+    var agent_bytes = testGuestAgentElf(plan.data.architectures.image);
     return miz.vm_backend.run(allocator, io, .{
         .deadline = deadline,
         .plan = plan,
         .transaction_path = plan.data.transaction_path,
         .target = target,
-        .agent = agent_bytes,
+        .agent = .{ .embedded_bytes = &agent_bytes },
         .console = if (captured_console == null) null else .{ .writeFn = captureConsole },
         .environ = testEnviron(),
     });
+}
+
+fn testGuestAgentElf(architecture: miz.customize.Architecture) [120]u8 {
+    var bytes = [_]u8{0} ** 120;
+    @memcpy(bytes[0..4], "\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    std.mem.writeInt(u16, bytes[16..18], 2, .little);
+    std.mem.writeInt(u16, bytes[18..20], switch (architecture) {
+        .x86_64 => 62,
+        .aarch64 => 183,
+    }, .little);
+    std.mem.writeInt(u64, bytes[24..32], 0x400000, .little);
+    std.mem.writeInt(u64, bytes[32..40], 64, .little);
+    std.mem.writeInt(u16, bytes[54..56], 56, .little);
+    std.mem.writeInt(u16, bytes[56..58], 1, .little);
+    std.mem.writeInt(u32, bytes[64..68], 1, .little);
+    std.mem.writeInt(u32, bytes[68..72], 5, .little);
+    std.mem.writeInt(u64, bytes[80..88], 0x400000, .little);
+    std.mem.writeInt(u64, bytes[96..104], bytes.len, .little);
+    std.mem.writeInt(u64, bytes[104..112], bytes.len, .little);
+    return bytes;
 }
 
 /// Where a failing run's console goes while a case is watching for it. The
@@ -1010,7 +1033,17 @@ fn runStubEmulator(
             control_json = entry.content;
         }
     }
-    if (!std.mem.eql(u8, agent orelse return error.MissingAgentMember, agent_bytes)) {
+    const expected_agent = if (std.mem.indexOf(u8, self_path, "aarch64") != null)
+        testGuestAgentElf(.aarch64)
+    else if (std.mem.indexOf(u8, self_path, "x86_64") != null)
+        testGuestAgentElf(.x86_64)
+    else
+        return error.UnknownStubArchitecture;
+    if (!std.mem.eql(
+        u8,
+        agent orelse return error.MissingAgentMember,
+        &expected_agent,
+    )) {
         return error.UnexpectedAgent;
     }
 
@@ -1114,6 +1147,7 @@ fn runStubEmulator(
                 },
             },
             .installed_packages = &.{"integration-package-0:1.0-1.noarch"},
+            .package_inventory_collected = true,
             .hooks = reported,
         },
     };

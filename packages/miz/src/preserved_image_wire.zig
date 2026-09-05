@@ -146,10 +146,16 @@ pub const RepositoryCredential = union(enum) {
     basic: BasicCredential,
 };
 
+pub const RepositoryUse = enum {
+    package_manager,
+    network_only,
+};
+
 pub const PackageRepository = struct {
     id: []const u8,
     urls: []const []const u8,
     trust: []const TrustSource = &.{},
+    use: RepositoryUse = .package_manager,
     credential: ?RepositoryCredential = null,
 };
 

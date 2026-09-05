@@ -355,9 +355,9 @@ fn runVm(
         .plan = plan,
         .transaction_path = plan.data.transaction_path,
         .target = target,
-        .agent = guest_agents.get(
+        .agent = .{ .embedded_bytes = guest_agents.get(
             @tagName(plan.data.architectures.runner),
-        ) orelse return error.VmGuestAgentUnavailable,
+        ) orelse return error.VmGuestAgentUnavailable },
         .console = .{ .writeFn = writeConsole },
     });
 }

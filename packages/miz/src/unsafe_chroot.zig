@@ -317,7 +317,13 @@ pub fn runParent(
             lease_active = false;
         },
     }
-    return loadParentReport(allocator, io, report_path, &argv);
+    return loadParentReport(
+        allocator,
+        io,
+        report_path,
+        &argv,
+        packageToolNeed(manifest.packages).database,
+    );
 }
 
 pub fn workerMain(init: std.process.Init, manifest_path: []const u8) !void {
@@ -399,6 +405,7 @@ const ExecutionResult = struct {
 const WorkerReport = struct {
     tools: []const customize.ToolRecord,
     installed_packages: []const []const u8,
+    package_inventory_collected: bool = false,
     /// Every package this transaction added or changed, at the exact identity
     /// it settled on. This is the lock a later run can state to get the same
     /// closure, which is why it is emitted whether or not one was declared:
@@ -526,6 +533,7 @@ fn executeManifest(
         .report = .{
             .tools = session.tools.items,
             .installed_packages = session.installed_packages.items,
+            .package_inventory_collected = session.package_inventory_collected,
             .package_lock = session.emitted_lock.items,
             .imported_trust_keys = session.imported_trust_keys.items,
             .hooks = session.hook_records.items,
@@ -575,6 +583,7 @@ const Session = struct {
     resolver_had_original: bool = false,
     tools: std.array_list.Managed(customize.ToolRecord),
     installed_packages: std.array_list.Managed([]const u8),
+    package_inventory_collected: bool = false,
     /// The installed set as it stood before the package actions ran, in the
     /// same `NAME-EPOCH:VERSION-RELEASE.ARCH` form as `installed_packages`.
     /// Populated only under an exact lock, which is the only policy that has a
@@ -612,7 +621,11 @@ const Session = struct {
     fn openAndRun(self: *Session) RunOutcome {
         self.open() catch |err| return classifyRunFailure(err);
         self.runPolicy() catch |err| return classifyRunFailure(err);
-        self.loadInstalledPackages() catch |err| return classifyRunFailure(err);
+        const package_tools = packageToolNeed(self.manifest.packages);
+        if (package_tools.database) {
+            self.loadInstalledPackages() catch |err| return classifyRunFailure(err);
+            self.package_inventory_collected = true;
+        }
         // After the rpm database has been read, and before `close` publishes
         // anything: a run whose lock did not hold must fail while the image is
         // still staging, not after it has been committed under a plan hash
@@ -756,16 +769,18 @@ const Session = struct {
         defer self.allocator.free(resolver_path);
         // `host_resolver` installs nothing when the host has no resolver of
         // its own to lend; a declared list is always installable because it
-        // does not depend on this machine. Either way a run with no package
-        // actions gets none: this is the package transaction's resolver, and
-        // a root that never resolves a name has no business carrying one.
+        // does not depend on this machine. A networked hook can consume the
+        // same declared repository policy even when miz runs no package
+        // transaction.
         // An offline transaction reaches no network, so it gets no resolver
         // at all. That is not tidiness: with no `/etc/resolv.conf` the target
         // cannot resolve a name even if something in it tried, so "offline"
         // is a property of the run rather than a flag it was asked to honour.
         // It layers with `--cacheonly` rather than replacing it.
-        const install_resolver = self.manifest.packages.actions.len != 0 and
-            !customize.offlinePackageCache(self.manifest.packages.cache) and
+        const install_resolver = customize.repositoryNetworkRequested(
+            self.manifest.packages,
+            self.manifest.hooks.len,
+        ) and
             switch (self.manifest.packages.resolver) {
                 .host_resolver => isRegularFileFollow(self.io, "/etc/resolv.conf"),
                 .nameservers => true,
@@ -1724,6 +1739,12 @@ const Session = struct {
     }
 
     fn writeRepositoryFiles(self: *Session) !void {
+        if (!packages_mod.needsManagerConfiguration(
+            self.manifest.packages.actions.len,
+            hasPackageManagerRepository(self.manifest.packages.repositories),
+        )) {
+            return;
+        }
         const directory = try repositoryHostDirectory(
             self.allocator,
             self.manifest.root_path,
@@ -1754,6 +1775,7 @@ const Session = struct {
             default_repository_permissions,
         );
         for (self.manifest.packages.repositories) |repository| {
+            if (repository.use != .package_manager) continue;
             const path = try repositoryHostPath(
                 self.allocator,
                 self.manifest.root_path,
@@ -1818,7 +1840,9 @@ const Session = struct {
     }
 
     fn removeRepositoryFiles(self: *Session) !void {
+        if (!hasPackageManagerRepository(self.manifest.packages.repositories)) return;
         for (self.manifest.packages.repositories) |repository| {
+            if (repository.use != .package_manager) continue;
             const path = try repositoryHostPath(
                 self.allocator,
                 self.manifest.root_path,
@@ -1866,10 +1890,7 @@ const Session = struct {
     /// with no package manager is a legitimate thing to customize as long as
     /// nothing asks it to install.
     fn requirePackageTools(self: *Session) !void {
-        const need = packages_mod.toolNeed(
-            self.manifest.packages.actions.len != 0,
-            self.declaresPackageTrust(),
-        );
+        const need = packageToolNeed(self.manifest.packages);
         if (need.none()) return;
 
         // Probed only for what is needed: a request that imports trust and
@@ -1906,16 +1927,10 @@ const Session = struct {
         }
     }
 
-    fn declaresPackageTrust(self: *Session) bool {
-        for (self.manifest.packages.repositories) |repository| {
-            if (repository.trust.len != 0) return true;
-        }
-        return false;
-    }
-
     fn importTrust(self: *Session) !void {
         var trust_index: usize = 0;
         for (self.manifest.packages.repositories) |repository| {
+            if (repository.use != .package_manager) continue;
             for (repository.trust) |trust| {
                 const guest_path = try packages_mod.trustPath(self.allocator, trust_index);
                 defer self.allocator.free(guest_path);
@@ -1953,7 +1968,7 @@ const Session = struct {
         defer ids.deinit();
         if (repositories) {
             for (self.manifest.packages.repositories) |repository| {
-                try ids.append(repository.id);
+                if (repository.use == .package_manager) try ids.append(repository.id);
             }
         }
         try packages_mod.appendTransactionArgv(&argv, .{
@@ -2964,6 +2979,13 @@ fn validLockEvr(evr: []const u8) bool {
     return true;
 }
 
+fn hasPackageManagerRepository(repositories: []const customize.PackageRepository) bool {
+    for (repositories) |repository| {
+        if (repository.use == .package_manager) return true;
+    }
+    return false;
+}
+
 fn validateManifestPolicy(manifest: Manifest) !void {
     if (!validManifestLock(manifest.packages.lock)) {
         return error.UnsupportedPackagePolicy;
@@ -2999,6 +3021,9 @@ fn validateManifestPolicy(manifest: Manifest) !void {
     }
     for (manifest.packages.repositories) |repository| {
         if (!validRepositoryId(repository.id)) return error.InvalidRepositoryId;
+        if (repository.use == .network_only and repository.credential != null) {
+            return error.NetworkOnlyRepositoryCredential;
+        }
         // The worker re-reads this manifest from JSON after re-execing as
         // root, so it checks the URLs on its own side of the boundary rather
         // than trusting the validator that already did. A userinfo component
@@ -3065,7 +3090,9 @@ fn validateManifestPolicy(manifest: Manifest) !void {
     // letting a no-op be reported as a completed policy. The request validator
     // already requires this; the worker repeats it because it sits across the
     // privilege boundary and does not trust the manifest it is handed.
-    if (needs_repository and manifest.packages.repositories.len == 0) {
+    if (needs_repository and
+        !hasPackageManagerRepository(manifest.packages.repositories))
+    {
         return error.PackageActionWithoutRepositories;
     }
     switch (manifest.initramfs) {
@@ -3703,6 +3730,7 @@ fn loadParentReport(
     io: Io,
     path: []const u8,
     worker_argv: []const []const u8,
+    expected_package_inventory: bool,
 ) !customize.UnsafeChrootRuntimeReport {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
@@ -3719,6 +3747,14 @@ fn loadParentReport(
         bytes,
         .{ .ignore_unknown_fields = false },
     );
+    if (parsed.value.package_inventory_collected != expected_package_inventory or
+        (!parsed.value.package_inventory_collected and
+            (parsed.value.installed_packages.len != 0 or
+                parsed.value.package_lock.len != 0 or
+                parsed.value.imported_trust_keys.len != 0)))
+    {
+        return error.UnexpectedPackageInventory;
+    }
     const tools = try report_allocator.alloc(
         customize.ToolRecord,
         parsed.value.tools.len + 1,
@@ -3741,6 +3777,7 @@ fn loadParentReport(
         .arena = arena,
         .tools = tools,
         .installed_packages = parsed.value.installed_packages,
+        .package_inventory_collected = parsed.value.package_inventory_collected,
         .imported_trust_keys = parsed.value.imported_trust_keys,
         .package_lock = parsed.value.package_lock,
         .hooks = parsed.value.hooks,
@@ -3750,6 +3787,17 @@ fn loadParentReport(
         .host_resolver = parsed.value.host_resolver,
         .initramfs = parsed.value.initramfs,
     };
+}
+
+fn packageToolNeed(policy: customize.PackagePolicy) packages_mod.ToolNeed {
+    var imports_trust = false;
+    for (policy.repositories) |repository| {
+        if (repository.use == .package_manager and repository.trust.len != 0) {
+            imports_trust = true;
+            break;
+        }
+    }
+    return packages_mod.toolNeed(policy.actions.len != 0, imports_trust);
 }
 
 fn findTool(io: Io, candidates: []const []const u8) ?[]const u8 {
@@ -4173,6 +4221,7 @@ test "worker executes policy with strict reverse cleanup" {
         @as(usize, 2),
         result.report.installed_packages.len,
     );
+    try std.testing.expect(result.report.package_inventory_collected);
     try std.testing.expectEqualStrings(
         "bash-0:5.2-1.aarch64",
         result.report.installed_packages[0],
@@ -5956,6 +6005,7 @@ test "worker refuses a target root outside the package family it can drive" {
     });
     try std.testing.expectEqual(RunOutcome.succeeded, quiet_result.outcome);
     try std.testing.expect(quiet_result.cleanup_complete);
+    try std.testing.expectEqual(@as(usize, 0), quiet_context.inventory_reads);
 }
 
 // A declared resolver has to reach the package transaction as bytes the

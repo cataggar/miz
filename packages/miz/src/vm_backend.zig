@@ -38,6 +38,11 @@ pub const credential_disk_index: u8 = 2;
 /// below the control-document limit rather than by the host's patience.
 pub const max_trust_bytes: usize = 1024 * 1024;
 
+/// Guest agents are small static executables. Bounding file-backed sources
+/// prevents a mistaken path from turning an arbitrary host file into initramfs
+/// content.
+pub const max_guest_agent_bytes: usize = 16 * 1024 * 1024;
+
 /// How much of the emulator's console is retained for diagnosis. A guest that
 /// fails is diagnosed from the tail of this, so it must be generous enough to
 /// hold a kernel panic and small enough that a chatty guest cannot exhaust
@@ -57,6 +62,8 @@ pub const Error = error{
     /// of sealing an answer, which is a different outcome from any answer.
     VmGuestSilent,
     VmGuestFailed,
+    InvalidGuestAgent,
+    GuestAgentArchitectureMismatch,
     /// The plan asked for a firmware boot and the named EDK2 files are not
     /// readable here. Never downgraded to a direct-kernel boot: that would
     /// bypass the boot chain the plan asked to exercise.
@@ -171,14 +178,22 @@ fn pathExists(io: Io, path: []const u8) bool {
 
 // ---- Execution --------------------------------------------------------
 
+/// How the caller supplies the guest agent.
+///
+/// A tagged source keeps a pathname and executable bytes from sharing the same
+/// `[]const u8` slot. File-backed agents are read by this module immediately
+/// before use, then validated as static ELF for the planned runner.
+pub const GuestAgentSource = union(enum) {
+    embedded_bytes: []const u8,
+    file_path: []const u8,
+};
+
 pub const RunOptions = struct {
     plan: *const customize.ResolvedPlan,
     transaction_path: []const u8,
     target: preserved_image.RawMutationTarget,
-    /// The guest agent built for the runner architecture. Supplied by the
-    /// caller rather than discovered on disk, so the bytes that boot are the
-    /// ones this build produced and provenance can say so.
-    agent: []const u8,
+    /// The guest agent built for the runner architecture.
+    agent: GuestAgentSource,
     /// Receives the emulator console when, and only when, a run fails. A guest
     /// that dies before it can seal a result leaves its kernel's last words
     /// here and nowhere else.
@@ -226,6 +241,8 @@ pub fn run(
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
     const work = scratch.allocator();
+    const agent = try loadGuestAgent(work, io, options.agent);
+    try validateGuestAgent(agent, data.architectures.runner);
 
     var lease = try transaction_guard.acquire(io, options.transaction_path);
     var lease_active = true;
@@ -299,7 +316,11 @@ pub fn run(
     // the emulator process. The guest cannot report this -- it never sees the
     // file -- and the control document carries only slirp's own address, which
     // says nothing about where the answers came from.
-    const host_resolver = if (resolvesThroughHost(data.packages, data.execution))
+    const host_resolver = if (resolvesThroughHost(
+        data.packages,
+        data.hooks.len,
+        data.execution,
+    ))
         hashHostResolver(work, io) catch null
     else
         null;
@@ -308,7 +329,7 @@ pub fn run(
     // the name of either, then the modules in the order they are inserted.
     var members: std.array_list.Managed(vm_payload.Member) = .init(work);
     try members.appendSlice(&.{
-        .{ .path = vm_control.agent_path, .bytes = options.agent },
+        .{ .path = vm_control.agent_path, .bytes = agent },
         .{ .path = vm_control.control_path, .bytes = control_json, .mode = 0o100600 },
     });
     for (drivers.modules) |module| {
@@ -386,6 +407,11 @@ pub fn run(
         reportConsole(work, options.console, outcome, failure);
         return error.VmGuestFailed;
     }
+    if (parsed.value.package_inventory_collected !=
+        vm_control.packageToolNeed(control.control).database)
+    {
+        return error.UnexpectedPackageInventory;
+    }
 
     const version = probeEmulatorVersion(work, io, policy.emulator_command);
 
@@ -432,16 +458,281 @@ pub fn run(
     });
 }
 
-/// Whether this run's package transaction resolves names through the build
-/// machine. The same condition the `read_host_resolver` capability is declared
-/// under, so the record and the declaration cannot disagree.
+fn loadGuestAgent(
+    allocator: Allocator,
+    io: Io,
+    source: GuestAgentSource,
+) ![]const u8 {
+    return switch (source) {
+        .embedded_bytes => |bytes| bytes,
+        .file_path => |path| Io.Dir.cwd().readFileAlloc(
+            io,
+            path,
+            allocator,
+            .limited(max_guest_agent_bytes),
+        ),
+    };
+}
+
+fn validateGuestAgent(bytes: []const u8, architecture: customize.Architecture) Error!void {
+    const elf_header_size = 64;
+    const program_header_size = 56;
+    if (bytes.len < elf_header_size or
+        !std.mem.eql(u8, bytes[0..4], "\x7fELF") or
+        bytes[4] != 2 or
+        bytes[5] != 1 or
+        bytes[6] != 1)
+    {
+        return error.InvalidGuestAgent;
+    }
+
+    const executable_type = std.mem.readInt(u16, bytes[16..18], .little);
+    if (executable_type != 2 and executable_type != 3) {
+        return error.InvalidGuestAgent;
+    }
+    const expected_machine: u16 = switch (architecture) {
+        .x86_64 => 62,
+        .aarch64 => 183,
+    };
+    if (std.mem.readInt(u16, bytes[18..20], .little) != expected_machine) {
+        return error.GuestAgentArchitectureMismatch;
+    }
+
+    const program_offset = std.mem.readInt(u64, bytes[32..40], .little);
+    const entry_point = std.mem.readInt(u64, bytes[24..32], .little);
+    const entry_size = std.mem.readInt(u16, bytes[54..56], .little);
+    const entry_count = std.mem.readInt(u16, bytes[56..58], .little);
+    if (entry_size != program_header_size or entry_count == 0) {
+        return error.InvalidGuestAgent;
+    }
+    const table_bytes = std.math.mul(u64, entry_size, entry_count) catch
+        return error.InvalidGuestAgent;
+    const table_end = std.math.add(u64, program_offset, table_bytes) catch
+        return error.InvalidGuestAgent;
+    if (table_end > bytes.len) return error.InvalidGuestAgent;
+
+    var entry_is_executable = false;
+    for (0..entry_count) |index| {
+        const offset = program_offset + @as(u64, entry_size) * index;
+        const header = bytes[@intCast(offset)..][0..program_header_size];
+        const segment_type = std.mem.readInt(u32, header[0..4], .little);
+        const flags = std.mem.readInt(u32, header[4..8], .little);
+        const file_offset = std.mem.readInt(u64, header[8..16], .little);
+        const virtual_address = std.mem.readInt(u64, header[16..24], .little);
+        const file_size = std.mem.readInt(u64, header[32..40], .little);
+        const memory_size = std.mem.readInt(u64, header[40..48], .little);
+        if (memory_size < file_size) return error.InvalidGuestAgent;
+        const file_end = std.math.add(u64, file_offset, file_size) catch
+            return error.InvalidGuestAgent;
+        if (file_end > bytes.len) return error.InvalidGuestAgent;
+
+        switch (segment_type) {
+            1 => {
+                const max_user_address: u64 = switch (architecture) {
+                    .x86_64 => 0x0000_8000_0000_0000,
+                    .aarch64 => 0x0001_0000_0000_0000,
+                };
+                const memory_end = std.math.add(
+                    u64,
+                    virtual_address,
+                    memory_size,
+                ) catch return error.InvalidGuestAgent;
+                if (memory_end > max_user_address) return error.InvalidGuestAgent;
+                const executable_end = std.math.add(
+                    u64,
+                    virtual_address,
+                    file_size,
+                ) catch return error.InvalidGuestAgent;
+                if ((flags & 1) != 0 and
+                    entry_point >= virtual_address and
+                    entry_point < executable_end)
+                {
+                    entry_is_executable = true;
+                }
+            },
+            3 => return error.InvalidGuestAgent,
+            2 => {
+                if (file_size % 16 != 0) return error.InvalidGuestAgent;
+                var dynamic_offset: usize = @intCast(file_offset);
+                const dynamic_end: usize = @intCast(file_end);
+                var terminated = false;
+                while (dynamic_offset < dynamic_end) : (dynamic_offset += 16) {
+                    const tag = std.mem.readInt(
+                        i64,
+                        bytes[dynamic_offset..][0..8],
+                        .little,
+                    );
+                    if (tag == 0) {
+                        terminated = true;
+                        break;
+                    }
+                    if (tag == 1) return error.InvalidGuestAgent;
+                }
+                if (!terminated) return error.InvalidGuestAgent;
+            },
+            else => {},
+        }
+    }
+    if (!entry_is_executable) return error.InvalidGuestAgent;
+}
+
+test "a file-backed guest agent loads executable bytes instead of its path" {
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var elf = testGuestAgentElf(183);
+    try temporary.dir.writeFile(io, .{
+        .sub_path = "miz-guest-agent",
+        .data = &elf,
+    });
+    const path = try temporary.dir.realPathFileAlloc(
+        io,
+        "miz-guest-agent",
+        std.testing.allocator,
+    );
+    defer std.testing.allocator.free(path);
+
+    const bytes = try loadGuestAgent(
+        std.testing.allocator,
+        io,
+        .{ .file_path = path },
+    );
+    defer std.testing.allocator.free(bytes);
+    try validateGuestAgent(bytes, .aarch64);
+    try std.testing.expectEqualSlices(u8, &elf, bytes);
+}
+
+test "guest agent validation rejects path text and the wrong architecture" {
+    try std.testing.expectError(
+        error.InvalidGuestAgent,
+        validateGuestAgent("./zig-out/bin/miz-guest-agent", .aarch64),
+    );
+    var x86_64_elf = testGuestAgentElf(62);
+    try std.testing.expectError(
+        error.GuestAgentArchitectureMismatch,
+        validateGuestAgent(&x86_64_elf, .aarch64),
+    );
+}
+
+test "guest agent validation requires an executable bounded static image" {
+    var empty_load = testGuestAgentElf(183);
+    std.mem.writeInt(u64, empty_load[96..104], 0, .little);
+    std.mem.writeInt(u64, empty_load[104..112], 0, .little);
+    try std.testing.expectError(
+        error.InvalidGuestAgent,
+        validateGuestAgent(&empty_load, .aarch64),
+    );
+
+    var out_of_bounds = testGuestAgentElf(183);
+    std.mem.writeInt(u64, out_of_bounds[72..80], out_of_bounds.len, .little);
+    try std.testing.expectError(
+        error.InvalidGuestAgent,
+        validateGuestAgent(&out_of_bounds, .aarch64),
+    );
+
+    var truncated_memory = testGuestAgentElf(183);
+    std.mem.writeInt(u64, truncated_memory[104..112], 119, .little);
+    try std.testing.expectError(
+        error.InvalidGuestAgent,
+        validateGuestAgent(&truncated_memory, .aarch64),
+    );
+
+    var bad_entry = testGuestAgentElf(183);
+    std.mem.writeInt(u64, bad_entry[24..32], 0, .little);
+    try std.testing.expectError(
+        error.InvalidGuestAgent,
+        validateGuestAgent(&bad_entry, .aarch64),
+    );
+
+    var impossible_mapping = testGuestAgentElf(183);
+    std.mem.writeInt(
+        u64,
+        impossible_mapping[104..112],
+        std.math.maxInt(u64),
+        .little,
+    );
+    try std.testing.expectError(
+        error.InvalidGuestAgent,
+        validateGuestAgent(&impossible_mapping, .aarch64),
+    );
+
+    var interpreter = testGuestAgentElf(183);
+    std.mem.writeInt(u32, interpreter[64..68], 3, .little);
+    try std.testing.expectError(
+        error.InvalidGuestAgent,
+        validateGuestAgent(&interpreter, .aarch64),
+    );
+
+    var oversized_program_header = testGuestAgentElf(183);
+    std.mem.writeInt(u16, oversized_program_header[54..56], 64, .little);
+    try std.testing.expectError(
+        error.InvalidGuestAgent,
+        validateGuestAgent(&oversized_program_header, .aarch64),
+    );
+
+    var dependency = testGuestAgentElfWithDynamicDependency(183);
+    try std.testing.expectError(
+        error.InvalidGuestAgent,
+        validateGuestAgent(&dependency, .aarch64),
+    );
+}
+
+fn testGuestAgentElf(machine: u16) [120]u8 {
+    var bytes = [_]u8{0} ** 120;
+    @memcpy(bytes[0..4], "\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    std.mem.writeInt(u16, bytes[16..18], 2, .little);
+    std.mem.writeInt(u16, bytes[18..20], machine, .little);
+    std.mem.writeInt(u64, bytes[32..40], 64, .little);
+    std.mem.writeInt(u16, bytes[54..56], 56, .little);
+    std.mem.writeInt(u16, bytes[56..58], 1, .little);
+    std.mem.writeInt(u64, bytes[24..32], 0x400000, .little);
+    std.mem.writeInt(u32, bytes[64..68], 1, .little);
+    std.mem.writeInt(u32, bytes[68..72], 5, .little);
+    std.mem.writeInt(u64, bytes[80..88], 0x400000, .little);
+    std.mem.writeInt(u64, bytes[96..104], bytes.len, .little);
+    std.mem.writeInt(u64, bytes[104..112], bytes.len, .little);
+    return bytes;
+}
+
+fn testGuestAgentElfWithDynamicDependency(machine: u16) [224]u8 {
+    var bytes = [_]u8{0} ** 224;
+    @memcpy(bytes[0..4], "\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    std.mem.writeInt(u16, bytes[16..18], 3, .little);
+    std.mem.writeInt(u16, bytes[18..20], machine, .little);
+    std.mem.writeInt(u64, bytes[24..32], 0x400000, .little);
+    std.mem.writeInt(u64, bytes[32..40], 64, .little);
+    std.mem.writeInt(u16, bytes[54..56], 56, .little);
+    std.mem.writeInt(u16, bytes[56..58], 2, .little);
+    std.mem.writeInt(u32, bytes[64..68], 1, .little);
+    std.mem.writeInt(u32, bytes[68..72], 5, .little);
+    std.mem.writeInt(u64, bytes[80..88], 0x400000, .little);
+    std.mem.writeInt(u64, bytes[96..104], bytes.len, .little);
+    std.mem.writeInt(u64, bytes[104..112], bytes.len, .little);
+    std.mem.writeInt(u32, bytes[120..124], 2, .little);
+    std.mem.writeInt(u64, bytes[128..136], 176, .little);
+    std.mem.writeInt(u64, bytes[152..160], 32, .little);
+    std.mem.writeInt(u64, bytes[160..168], 32, .little);
+    std.mem.writeInt(i64, bytes[176..184], 1, .little);
+    std.mem.writeInt(i64, bytes[192..200], 0, .little);
+    return bytes;
+}
+
+/// Whether this run resolves repository names through the build machine.
+/// The same condition the `read_host_resolver` capability is declared under,
+/// so the record and the declaration cannot disagree.
 fn resolvesThroughHost(
     packages: customize.PackagePolicy,
+    hook_count: usize,
     execution: customize.ExecutionPolicy,
 ) bool {
-    if (packages.actions.len == 0) return false;
+    if (!customize.repositoryNetworkRequested(packages, hook_count)) return false;
     if (packages.resolver != .host_resolver) return false;
-    if (customize.offlinePackageCache(packages.cache)) return false;
     const vm = execution.vm orelse return false;
     return vm.network == .declared_repositories;
 }
@@ -797,6 +1088,7 @@ fn controlFromPolicy(
         target.* = .{
             .id = source.id,
             .urls = source.urls,
+            .use = source.use,
             .trust_base64 = trust,
             // The index is the repository's position among the credentialed
             // repositories, in declaration order, which is the same order the
@@ -1824,6 +2116,7 @@ fn ownReport(allocator: Allocator, input: ReportInput) !customize.VmRuntimeRepor
         .arena = arena,
         .tools = tools,
         .installed_packages = packages,
+        .package_inventory_collected = input.result.package_inventory_collected,
         .imported_trust_keys = trust_keys,
         .host_resolver = input.host_resolver,
         .package_lock = emitted_lock,
@@ -2305,6 +2598,7 @@ test "an untouched result device is silence rather than an answer" {
     const sealed = try vm_control.seal(allocator, .{
         .tools = &.{.{ .name = "tdnf", .version = "3.5.8", .command = &.{"tdnf"} }},
         .installed_packages = &.{"strace-6.6-1.azl3.x86_64"},
+        .package_inventory_collected = true,
     });
     const file = try cwd.createFile(io, path, .{ .truncate = false });
     try file.writePositionalAll(io, sealed, 0);
@@ -2886,6 +3180,27 @@ test "the declared resolver replaces the topology's nameserver and nothing else"
         "nameserver 192.0.2.1\nnameserver 198.51.100.7\n",
         body,
     );
+}
+
+test "hook-only VM networking records its inherited host resolver" {
+    const packages = customize.PackagePolicy{
+        .repositories = &.{.{
+            .id = "hook-input",
+            .urls = &.{"https://example.invalid/snapshot"},
+            .trust = &.{.{ .inline_bytes = "inline-key" }},
+            .use = .network_only,
+        }},
+    };
+    const execution = customize.ExecutionPolicy{
+        .workspace_path = "/tmp/miz",
+        .backend = .vm,
+        .vm = .{
+            .emulator_command = "/usr/bin/qemu-system-x86_64",
+            .network = .declared_repositories,
+        },
+    };
+    try std.testing.expect(resolvesThroughHost(packages, 1, execution));
+    try std.testing.expect(!resolvesThroughHost(packages, 0, execution));
 }
 
 // The same reason as the destinations above: `vm_control` may import nothing

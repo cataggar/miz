@@ -39,8 +39,8 @@ const vm_control = @import("vm_control.zig");
 
 pub const legacy_api_version: u32 = 2;
 pub const current_api_version: u32 = 3;
-pub const plan_schema_version: u32 = 30;
-pub const provenance_schema_version: u32 = 32;
+pub const plan_schema_version: u32 = 31;
+pub const provenance_schema_version: u32 = 33;
 const mib: u64 = 1024 * 1024;
 
 comptime {
@@ -975,6 +975,7 @@ pub const PackageRepository = struct {
     id: []const u8,
     urls: []const []const u8,
     trust: []const TrustSource,
+    use: packages_mod.RepositoryUse = .package_manager,
     /// Authentication for every URL of this repository, or none. Declared per
     /// repository rather than globally because a credential that applied to
     /// whichever repository happened to ask would be sent to any of them.
@@ -1143,6 +1144,25 @@ pub const Hook = struct {
     source: HookSource,
     arguments: []const []const u8 = &.{},
 };
+
+/// Whether the declared operations can consume repository networking.
+///
+/// Remove-only package transactions use only the local database. Hooks may
+/// consume a declared network-only repository even when miz itself runs no
+/// package action.
+pub fn repositoryNetworkRequested(
+    policy: PackagePolicy,
+    hook_count: usize,
+) bool {
+    if (!offlinePackageCache(policy.cache)) {
+        for (policy.actions) |action| {
+            if (packages_mod.invocationFor(std.meta.activeTag(action)).repositories) {
+                return true;
+            }
+        }
+    }
+    return hook_count != 0 and policy.repositories.len != 0;
+}
 
 /// What an empty `kernels` list means when the target root turns out to carry
 /// no kernel at all -- a question only the run can answer, since the plan
@@ -1803,7 +1823,7 @@ pub fn validate(allocator: Allocator, request: *const Request) Allocator.Error!D
 
     try validateOsCustomization(&diagnostics, request.os);
     try validateExistingPathOperations(&diagnostics, request.existing_path_operations);
-    try validatePackagePolicy(&diagnostics, request.packages);
+    try validatePackagePolicy(&diagnostics, request.packages, request.hooks.len);
     try validateHooks(&diagnostics, request.hooks);
     try validateInitramfsPolicy(&diagnostics, request.initramfs);
     try validateSelinuxPolicy(&diagnostics, request.selinux);
@@ -1988,6 +2008,7 @@ fn validateExistingPathOperations(
 fn validatePackagePolicy(
     diagnostics: *std.array_list.Managed(Diagnostic),
     policy: PackagePolicy,
+    hook_count: usize,
 ) Allocator.Error!void {
     var needs_repository = false;
     for (policy.actions) |action| {
@@ -2017,7 +2038,10 @@ fn validatePackagePolicy(
             }
         }
     }
-    if (needs_repository and policy.repositories.len == 0) {
+    const has_package_repository = for (policy.repositories) |repository| {
+        if (repository.use == .package_manager) break true;
+    } else false;
+    if (needs_repository and !has_package_repository) {
         try diagnostics.append(validationError(
             .invalid_policy,
             "/packages/repositories",
@@ -2073,6 +2097,14 @@ fn validatePackagePolicy(
             },
         };
         if (repository.credential) |credential| {
+            if (repository.use == .network_only) {
+                try diagnostics.append(validationError(
+                    .invalid_policy,
+                    "/packages/repositories/credential",
+                    "network-only repositories cannot declare package-manager credentials",
+                    "move authenticated package operations into miz package actions",
+                ));
+            }
             try validateRepositoryCredential(diagnostics, credential, repository.urls);
         }
     }
@@ -2095,7 +2127,9 @@ fn validatePackagePolicy(
     // alongside one would be installed, unused and recorded -- a plan
     // asserting a dependence the run cannot have. The default `host_resolver`
     // is not refused, because it is what a caller who said nothing gets.
-    if (offlinePackageCache(policy.cache) and policy.resolver == .nameservers) {
+    if (!repositoryNetworkRequested(policy, hook_count) and
+        policy.resolver == .nameservers)
+    {
         try diagnostics.append(validationError(
             .invalid_policy,
             "/packages/resolver",
@@ -2922,14 +2956,15 @@ fn validateVmPolicy(
         ));
     };
     switch (policy.network) {
-        .offline => if (request.packages.actions.len != 0 and
-            !offlinePackageCache(request.packages.cache))
-        {
+        .offline => if (repositoryNetworkRequested(
+            request.packages,
+            request.hooks.len,
+        )) {
             try diagnostics.append(validationError(
                 .invalid_policy,
                 "/execution/vm/network",
-                "online package actions cannot run in an offline guest",
-                "attach declared_repositories networking or select a cache_only package policy",
+                "repository network consumers cannot run in an offline guest",
+                "attach declared_repositories networking, select a cache_only package policy, or remove the networked hook",
             ));
         },
         .declared_repositories => if (request.packages.repositories.len == 0) {
@@ -4487,6 +4522,7 @@ fn dupePackagePolicy(
             .id = try allocator.dupe(u8, repository.id),
             .urls = try dupeStrings(allocator, repository.urls),
             .trust = trust,
+            .use = repository.use,
             .credential = if (repository.credential) |credential| switch (credential) {
                 .basic => |basic| .{
                     .basic = .{
@@ -5329,8 +5365,12 @@ fn buildCapabilities(
         try capabilities.append(.{ .kind = .guest_execution, .path = "", .reason = "run the target package manager" });
     }
     if (packages.repositories.len != 0) {
-        try capabilities.append(.{ .kind = .repository_access, .path = "", .reason = "access only explicitly declared package repositories" });
+        try capabilities.append(.{ .kind = .repository_access, .path = "", .reason = "access only explicitly declared repositories" });
+    }
+    for (packages.repositories) |repository| {
+        if (repository.use != .package_manager) continue;
         try capabilities.append(.{ .kind = .repository_trust, .path = "", .reason = "install explicitly declared repository trust material" });
+        break;
     }
     if (packageCacheDirectory(packages.cache)) |directory| {
         try capabilities.append(.{
@@ -5355,14 +5395,13 @@ fn buildCapabilities(
     // Three terms rather than one, because the capability set has to be a
     // function of what the run does rather than of which refusal happens to
     // be in force.
-    const resolves_through_host = !offlinePackageCache(packages.cache) and
+    const resolves_through_host = repositoryNetworkRequested(packages, hooks.len) and
         switch (execution.backend) {
             .unsafe_chroot => true,
             .vm => if (execution.vm) |vm| vm.network == .declared_repositories else false,
             else => false,
         };
     if (resolves_through_host and
-        packages.actions.len != 0 and
         packages.resolver == .host_resolver)
     {
         try capabilities.append(.{
@@ -6038,6 +6077,7 @@ fn hashPackagePolicy(hash: *std.crypto.hash.sha2.Sha256, policy: PackagePolicy) 
     for (policy.repositories) |repository| {
         hashString(hash, repository.id);
         hashStrings(hash, repository.urls);
+        hashInt(hash, @intFromEnum(repository.use));
         hashInt(hash, repository.trust.len);
         for (repository.trust) |trust| {
             hashInt(hash, @intFromEnum(std.meta.activeTag(trust)));
@@ -7541,6 +7581,7 @@ pub const UnsafeChrootRuntimeReport = struct {
     arena: std.heap.ArenaAllocator,
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
+    package_inventory_collected: bool = false,
     imported_trust_keys: []const []const u8 = &.{},
     /// Present exactly when the run resolved package repository names through
     /// this machine's own resolver. Absent when the request declared its
@@ -7658,6 +7699,7 @@ pub const VmRuntimeReport = struct {
     arena: std.heap.ArenaAllocator,
     tools: []const ToolRecord,
     installed_packages: []const []const u8,
+    package_inventory_collected: bool = false,
     imported_trust_keys: []const []const u8 = &.{},
     /// Present exactly when the run resolved package repository names through
     /// this machine's own resolver. Absent when the request declared its
@@ -7938,6 +7980,9 @@ pub const PreservedExecutionRecord = struct {
     flattened_backing_chain: bool,
     operation_count: usize,
     installed_packages: []const []const u8,
+    /// Distinguishes a collected empty RPM database from a run that did not
+    /// declare any operation using RPM at all.
+    package_inventory_collected: bool = false,
     /// The trust rpm actually ended up holding because of this run, as
     /// `gpg-pubkey-<keyid>-<timestamp>`.
     ///
@@ -8338,6 +8383,15 @@ fn guestPackages(
     return &.{};
 }
 
+fn guestPackageInventoryCollected(
+    unsafe_report: ?*const UnsafeChrootRuntimeReport,
+    vm_report: ?*const VmRuntimeReport,
+) bool {
+    if (unsafe_report) |report| return report.package_inventory_collected;
+    if (vm_report) |report| return report.package_inventory_collected;
+    return false;
+}
+
 /// Same alternation, and for the same reason: one run, one inherited resolver.
 fn guestHostResolver(
     unsafe_report: ?*const UnsafeChrootRuntimeReport,
@@ -8633,6 +8687,10 @@ fn buildResult(
             .flattened_backing_chain = flattened,
             .operation_count = operation_count,
             .installed_packages = try dupeStrings(result_allocator, guestPackages(unsafe_report, vm_report)),
+            .package_inventory_collected = guestPackageInventoryCollected(
+                unsafe_report,
+                vm_report,
+            ),
             .imported_trust_keys = try dupeStrings(
                 result_allocator,
                 guestTrustKeys(unsafe_report, vm_report),
@@ -11103,6 +11161,7 @@ test "unsafe chroot platform executes the supported preserved subset" {
                     .context = .target_root,
                 }},
                 .installed_packages = &.{"base-files-0:1.0-1.x86_64"},
+                .package_inventory_collected = true,
             };
         }
     };
@@ -11149,6 +11208,9 @@ test "unsafe chroot platform executes the supported preserved subset" {
     try std.testing.expectEqualStrings(
         "base-files-0:1.0-1.x86_64",
         outcome.result.?.provenance.execution.preserved.?.installed_packages[0],
+    );
+    try std.testing.expect(
+        outcome.result.?.provenance.execution.preserved.?.package_inventory_collected,
     );
     _ = try Io.Dir.cwd().statFile(io, output_path, .{});
 }
@@ -14706,8 +14768,18 @@ test "the schema versions move only when the documents do" {
     // states; nothing about a run decides that value, so provenance has
     // nothing new to say about it beyond echoing the resolved configuration
     // it already carries.
-    try std.testing.expectEqual(@as(u32, 30), plan_schema_version);
-    try std.testing.expectEqual(@as(u32, 32), provenance_schema_version);
+    //
+    // The plan alone moved again for `packages.repositories[].use`: it
+    // changes whether a repository is configured for tdnf or exposed only to
+    // a reviewed hook, but adds no execution outcome beyond the resolved
+    // configuration provenance already records.
+    //
+    // Provenance moved for `package_inventory_collected`: an empty installed
+    // package list now says either that an empty RPM database was observed or
+    // that no RPM inventory was requested, instead of collapsing both into
+    // the same outcome.
+    try std.testing.expectEqual(@as(u32, 31), plan_schema_version);
+    try std.testing.expectEqual(@as(u32, 33), provenance_schema_version);
 }
 
 test "native-edit resolution is deterministic, deeply owned, and integrity checked" {
@@ -15885,6 +15957,50 @@ test "both executing backends declare inheriting the host resolver" {
         try std.testing.expect(!hasCapabilityKind(
             declared_resolved.plan.?.data.required_capabilities,
             .read_host_resolver,
+        ));
+    }
+
+    // A hook can be the only consumer. It still inherits the build host's
+    // resolver through either executing backend, so changing backend must not
+    // let the same dependency disappear from the plan.
+    const hooks = [_]Hook{.{
+        .name = "fetch",
+        .phase = .after_packages,
+        .source = .{ .inline_script = "#!/bin/sh\ntrue\n" },
+    }};
+    const hook_repositories = [_]PackageRepository{.{
+        .id = "hook-input",
+        .urls = &.{"https://packages.example.invalid"},
+        .trust = &.{.{ .inline_bytes = "test key" }},
+        .use = .network_only,
+    }};
+    for ([_]ExecutionBackend{ .unsafe_chroot, .vm }) |backend| {
+        var hook_only = resolverRequest(.host_resolver);
+        hook_only.packages.actions = &.{};
+        hook_only.packages.repositories = &hook_repositories;
+        hook_only.hooks = &hooks;
+        if (backend == .vm) {
+            hook_only.execution.backend = .vm;
+            hook_only.execution.vm = validVmPolicy();
+            hook_only.execution.vm.?.network = .declared_repositories;
+        }
+        var resolved = try resolve(
+            std.testing.allocator,
+            &hook_only,
+            .{ .host_architecture = .x86_64 },
+        );
+        defer resolved.deinit(std.testing.allocator);
+        try std.testing.expect(hasCapabilityKind(
+            resolved.plan.?.data.required_capabilities,
+            .read_host_resolver,
+        ));
+        try std.testing.expect(hasCapabilityKind(
+            resolved.plan.?.data.required_capabilities,
+            .repository_access,
+        ));
+        try std.testing.expect(!hasCapabilityKind(
+            resolved.plan.?.data.required_capabilities,
+            .repository_trust,
         ));
     }
 
