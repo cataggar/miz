@@ -23,7 +23,7 @@ const support = release.support;
 
 const allocator = std.testing.allocator;
 const io = std.testing.io;
-const publication_tag = "Ubuntu-26.04-20260829";
+const publication_tag = "Ubuntu-26.04-20260905";
 const Attempts = [contracts.release_order.len][]const u8;
 const attempt_one: Attempts = @splat("1");
 
