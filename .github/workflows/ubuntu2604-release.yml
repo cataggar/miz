@@ -924,6 +924,11 @@ jobs:
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: Enforce the measured first-boot growth bound
+        # Only core plans a disk against a declared first-boot growth, and only
+        # core acceptance produces a `first_boot` phase to hold it to. The full
+        # flavor publishes Canonical's 5 GiB geometry, so there is no bound to
+        # enforce and no document to enforce it against.
+        if: matrix.flavor == 'core'
         run: |
           set -euo pipefail
           # Issue #677 step 6. The disk plan reserves four times a declared
