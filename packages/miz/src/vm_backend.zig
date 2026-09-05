@@ -2468,7 +2468,14 @@ test "an offline guest is never handed package actions" {
     const allocator = arena.allocator();
 
     const control = try controlFromPolicy(allocator, std.testing.io, .{
-        .packages = .{ .actions = &.{.{ .install = &.{"strace"} }} },
+        .packages = .{
+            .actions = &.{.{ .install = &.{"strace"} }},
+            .repositories = &.{.{
+                .id = "base",
+                .urls = &.{"https://packages.example.invalid"},
+                .trust = &.{.{ .inline_bytes = "test key" }},
+            }},
+        },
         .initramfs = .unchanged,
         .network = .offline,
         .devices = .{ .root_device = "/dev/vda2", .result_device = "/dev/vdb" },
