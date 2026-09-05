@@ -715,6 +715,11 @@ pub const Summary = struct {
     flavor: []const u8,
     virtual_size: u64,
     esp_length_bytes: u64,
+    /// Where the planned root partition starts. Published because a consumer
+    /// that has to reason about the root's extent -- Azure acceptance measures
+    /// its growth from it -- must read it from the plan rather than name the
+    /// inherited offset core stopped using.
+    root_first_lba: u64,
     root_length_bytes: u64,
     root_free_bytes: u64,
     signed_uki_bytes: u64,
@@ -1044,6 +1049,7 @@ pub fn validateDocument(
         .flavor = flavor_text,
         .virtual_size = recomputed.virtual_size,
         .esp_length_bytes = esp.length_bytes,
+        .root_first_lba = root.firstLba(),
         .root_length_bytes = root.length_bytes,
         .root_free_bytes = recomputed.requirements.root_free_bytes,
         .signed_uki_bytes = measurements.signed_uki_bytes,

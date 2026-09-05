@@ -283,20 +283,54 @@ virtual_size=${candidate[2]}
 [[ "$qcow_sha256" =~ ^[0-9a-f]{64}$ ]]
 [[ "$qcow_bytes" =~ ^[0-9]+$ ]]
 [[ "$virtual_size" =~ ^[0-9]+$ ]]
-# Canonical's sparse GPT keeps root in entry 1 and boot partitions in later
-# slots, so root growth must be measured from its architecture-specific start.
-case "$ARCHITECTURE" in
-  x86_64) root_first_lba=2324480 ;;
-  aarch64) root_first_lba=2099200 ;;
-  *) echo "::error::Unsupported Ubuntu architecture: $ARCHITECTURE"; exit 1 ;;
-esac
 gpt_sector_size=512
 gpt_partition_array_sectors=32
 test "$((virtual_size % gpt_sector_size))" -eq 0
-total_sectors=$((virtual_size / gpt_sector_size))
-last_usable_lba=$((total_sectors - 2 - gpt_partition_array_sectors))
-test "$root_first_lba" -le "$last_usable_lba"
-original_root_size=$(((last_usable_lba - root_first_lba + 1) * gpt_sector_size))
+if [[ "$FLAVOR" == core ]]; then
+  # Issue #677 step 5: core no longer inherits Canonical's geometry, so its
+  # root starts where its own build's plan put it -- on a disk far smaller
+  # than the inherited root offset. The extent is re-derived from the
+  # candidate's own geometry document, which the release tool recomputes from
+  # that document's measurements before reporting anything.
+  geometry="$CANDIDATE_DIR/internal-provenance/ubuntu2604-disk-geometry-$FLAVOR-$ARCHITECTURE.json"
+  test -f "$geometry"
+  if ! geometry_summary=$(
+      "$RELEASE_TOOL" disk-geometry-verify \
+        --geometry "$geometry" \
+        --architecture "$ARCHITECTURE" \
+        --flavor "$FLAVOR" \
+        --virtual-size "$virtual_size"
+    )
+  then
+    echo "::error::Core disk geometry did not re-derive from its own plan" >&2
+    exit 1
+  fi
+  root_first_lba=$(grep -o ' root_first_lba=[0-9]*' <<<"$geometry_summary" |
+    cut -d= -f2)
+  original_root_size=$(grep -o ' root_bytes=[0-9]*' <<<"$geometry_summary" |
+    cut -d= -f2)
+  [[ "$root_first_lba" =~ ^[0-9]+$ ]]
+  [[ "$original_root_size" =~ ^[0-9]+$ ]]
+  test "$original_root_size" -gt 0
+  test "$((original_root_size % gpt_sector_size))" -eq 0
+  total_sectors=$((virtual_size / gpt_sector_size))
+  last_usable_lba=$((total_sectors - 2 - gpt_partition_array_sectors))
+  root_last_lba=$((root_first_lba + original_root_size / gpt_sector_size - 1))
+  test "$root_last_lba" -le "$last_usable_lba"
+else
+  # Canonical's sparse GPT keeps root in entry 1 and boot partitions in later
+  # slots, so root growth must be measured from its architecture-specific
+  # start. The preserved-geometry flavors still publish that disk.
+  case "$ARCHITECTURE" in
+    x86_64) root_first_lba=2324480 ;;
+    aarch64) root_first_lba=2099200 ;;
+    *) echo "::error::Unsupported Ubuntu architecture: $ARCHITECTURE"; exit 1 ;;
+  esac
+  total_sectors=$((virtual_size / gpt_sector_size))
+  last_usable_lba=$((total_sectors - 2 - gpt_partition_array_sectors))
+  test "$root_first_lba" -le "$last_usable_lba"
+  original_root_size=$(((last_usable_lba - root_first_lba + 1) * gpt_sector_size))
+fi
 minimum_grown_root_size=$((original_root_size + 1073741824))
 
 suffix=${CANDIDATE_KEY//_/-}

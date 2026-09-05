@@ -1250,13 +1250,14 @@ pub fn diskGeometryVerify(
         );
     }
     try out.print(
-        "{s} {s} virtual_size={d} esp_bytes={d} root_bytes={d} " ++
-            "root_free_bytes={d} uki_bytes={d}\n",
+        "{s} {s} virtual_size={d} esp_bytes={d} root_first_lba={d} " ++
+            "root_bytes={d} root_free_bytes={d} uki_bytes={d}\n",
         .{
             summary.architecture,
             summary.flavor,
             summary.virtual_size,
             summary.esp_length_bytes,
+            summary.root_first_lba,
             summary.root_length_bytes,
             summary.root_free_bytes,
             summary.signed_uki_bytes,

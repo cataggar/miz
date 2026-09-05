@@ -365,6 +365,47 @@ test "core contract checks are explicit and the full checks are preserved" {
     );
 }
 
+test "core root growth is measured from the plan, not the inherited offset" {
+    // Issue #677 step 5 gave core a disk of its own, roughly 583 MiB on
+    // x86_64. The inherited root offsets -- LBA 2324480 and 2099200, both past
+    // the end of that disk -- made every core candidate abort on
+    // `test "$root_first_lba" -le "$last_usable_lba"` before a VM was ever
+    // created. Core reads its extent from its own geometry document instead,
+    // and the release tool re-derives that document before reporting it.
+    var script = try open();
+    defer script.deinit();
+    const core = try script.section(
+        "if [[ \"$FLAVOR\" == core ]]; then\n  # Issue #677 step 5",
+        "\nelse\n  # Canonical's sparse GPT",
+    );
+    const required = [_][]const u8{
+        "ubuntu2604-disk-geometry-$FLAVOR-$ARCHITECTURE.json",
+        "\"$RELEASE_TOOL\" disk-geometry-verify",
+        "--virtual-size \"$virtual_size\"",
+        "root_first_lba=$(grep -o ' root_first_lba=[0-9]*'",
+        "original_root_size=$(grep -o ' root_bytes=[0-9]*'",
+        "test \"$root_last_lba\" -le \"$last_usable_lba\"",
+    };
+    for (required) |needle| try source.expectContainsIn(core, needle, script_path);
+    // Core must not name either inherited offset.
+    try source.expectOmitsIn(core, "2324480", script_path);
+    try source.expectOmitsIn(core, "2099200", script_path);
+
+    // The preserved-geometry flavors keep the offsets that describe the disk
+    // they still publish.
+    const preserved = try script.section(
+        "\nelse\n  # Canonical's sparse GPT",
+        "minimum_grown_root_size=",
+    );
+    try source.expectContainsIn(preserved, "x86_64) root_first_lba=2324480 ;;", script_path);
+    try source.expectContainsIn(preserved, "aarch64) root_first_lba=2099200 ;;", script_path);
+
+    // Both branches feed the one growth bound.
+    try script.expectContains(
+        "minimum_grown_root_size=$((original_root_size + 1073741824))",
+    );
+}
+
 test "failure diagnostics never persist boot diagnostic SAS URIs" {
     var script = try open();
     defer script.deinit();

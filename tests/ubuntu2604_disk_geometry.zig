@@ -241,6 +241,14 @@ test "a published report re-derives to the disk it describes" {
         try std.testing.expectEqual(plan.virtual_size, summary.virtual_size);
         try std.testing.expectEqual(plan.esp.length_bytes, summary.esp_length_bytes);
         try std.testing.expectEqual(plan.root.length_bytes, summary.root_length_bytes);
+        // Azure acceptance measures root growth from where the root starts, so
+        // the plan has to say where that is rather than leave a consumer to
+        // name the inherited offset core stopped using.
+        try std.testing.expectEqual(plan.root.firstLba(), summary.root_first_lba);
+        try std.testing.expect(
+            summary.root_first_lba * disk_geometry.sector_size +
+                summary.root_length_bytes <= summary.virtual_size,
+        );
     }
 }
 
