@@ -923,7 +923,7 @@ pub fn sizeInventoryVerify(
     }
     try out.print(
         "{s} {s} packages={d} installed_bytes={d} allocated_bytes={d} " ++
-            "unexpected_unowned={d} closure={s}\n",
+            "unexpected_unowned={d} unowned_policy={s} closure={s}\n",
         .{
             summary.architecture,
             summary.flavor,
@@ -931,6 +931,7 @@ pub fn sizeInventoryVerify(
             summary.installed_bytes,
             summary.allocated_bytes,
             summary.unexpected_unowned_count,
+            summary.unowned_policy_sha256,
             summary.closure_sha256,
         },
     );
