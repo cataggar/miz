@@ -1337,7 +1337,7 @@ test "a successful stage publishes exactly four full and core assets" {
         "systemd, cloud-init, WALinuxAgent",
         "mizinit, azagent, supervised OpenSSH",
         "exact 5 GiB",
-        "3584 MiB (3.5 GiB), 30% smaller",
+        "calculated per build from its signed UKI",
         "same-architecture QEMU acceptance (x86_64 KVM; AArch64 TCG)",
         "explicit multi-threaded TCG",
         "no accelerator probing or fallback",

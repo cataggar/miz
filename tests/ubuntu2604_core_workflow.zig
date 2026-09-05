@@ -34,7 +34,7 @@ test "the core build job re-validates the size inventory it measured" {
     const build_job = try job(&workflow, "build", "native_qemu");
     try source.expectOrder(
         build_job,
-        "- name: Validate standalone zstd QCOW2 and exact 3584 MiB size",
+        "- name: Validate standalone zstd QCOW2 and the calculated size",
         "- name: Verify the reproducible size inventory",
         workflow_path,
     );
@@ -299,9 +299,17 @@ test "core build and acceptance contracts are explicit" {
 
     const build = try job(&workflow, "build", "native_qemu");
     try source.expectContainsIn(build, "FLAVOR: core", workflow_path);
-    try source.expectContainsIn(build, "VIRTUAL_SIZE: 3758096384", workflow_path);
+    // #677 step 5: no size is written down. The planned size is exported from
+    // the geometry report the build published and is the only size checked.
+    if (std.mem.indexOf(u8, build, "VIRTUAL_SIZE: ") != null) {
+        std.debug.print("{s}: core build job names a virtual size\n", .{workflow_path});
+        return error.ForbiddenText;
+    }
+    try source.expectContainsIn(build, "disk-geometry-verify", workflow_path);
+    try source.expectContainsIn(build, "--github-env \"$GITHUB_ENV\"", workflow_path);
     try source.expectContainsIn(build, "-Dubuntu2604-flavor=\"$FLAVOR\"", workflow_path);
-    try source.expectContainsIn(build, "--virtual-size-label \"3584 MiB\"", workflow_path);
+    try source.expectContainsIn(build, "--virtual-size-label \"$VIRTUAL_SIZE_LABEL\"", workflow_path);
+    try source.expectContainsIn(build, "--virtual-size \"$VIRTUAL_SIZE\"", workflow_path);
     if (source.findForbiddenProductionTool(build)) |match| {
         std.debug.print("{s}: build job uses {s}\n", .{ workflow_path, match });
         return error.ForbiddenText;
@@ -581,7 +589,10 @@ test "the workflow has no external secret-bound smoke input dependency" {
     }
 }
 
-test "the core size contract is aligned across builder, acceptance, and workflow" {
+test "the retired 3584 MiB core geometry is gone from builder, acceptance, and workflow" {
+    // #677 step 5. The old contract was three copies of one number; the new one
+    // is that no copy exists. The builder keeps 3584 MiB only as the size of
+    // the *input* it refuses to accept any other publication for, and says so.
     var workflow = try open();
     defer workflow.deinit();
     var builder = try Source.open(
@@ -595,9 +606,14 @@ test "the core size contract is aligned across builder, acceptance, and workflow
     );
     defer acceptance.deinit();
 
-    try builder.expectContains("const core_virtual_size: u64 = 3584 * 1024 * 1024;");
-    try acceptance.expectContains(".virtual_size = 3584 * mib");
-    try workflow.expectContains("VIRTUAL_SIZE: 3758096384");
+    try builder.expectContains("const core_substrate_virtual_size: u64 = 3584 * 1024 * 1024;");
+    try builder.expectOmits("const core_virtual_size");
+    try builder.expectOmits("core_minimum_root_free_bytes");
+    try acceptance.expectOmits(".virtual_size = 3584 * mib");
+    try acceptance.expectContains("retired_core_virtual_size");
+    try workflow.expectOmits("3758096384");
+    try workflow.expectOmits("3584 MiB");
+    try workflow.expectContains("disk-geometry-verify");
 }
 
 test "artifacts are commit, attempt, and digest bound" {

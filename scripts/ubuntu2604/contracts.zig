@@ -318,6 +318,21 @@ pub fn runtimeContractFilename(
         .{ @tagName(flavor), architecture },
     ) catch null;
 }
+/// The calculated disk-geometry report a core candidate carries (issue #677
+/// step 5). Named the same way as the size inventory and the runtime contract
+/// so one flavor/architecture pair can only ever bind its own document.
+pub fn diskGeometryFilename(
+    buffer: []u8,
+    flavor: Flavor,
+    architecture: []const u8,
+) ?[]const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        "ubuntu2604-disk-geometry-{s}-{s}.json",
+        .{ @tagName(flavor), architecture },
+    ) catch null;
+}
+
 pub const debz_api_commit = "beac3f20dd93fd98863af71e8fe621d47db663f6";
 pub const full_debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
 

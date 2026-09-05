@@ -21,6 +21,7 @@ const File = std.Io.File;
 const Io = std.Io;
 const Writer = std.Io.Writer;
 const contracts = @import("contracts.zig");
+const disk_geometry = @import("disk_geometry.zig");
 const documents = @import("documents.zig");
 const download = @import("download.zig");
 const provenance = @import("provenance.zig");
@@ -159,6 +160,27 @@ pub fn dispatch(
             options.get("--flavor"),
             options.get("--require-phase"),
             options.get("--max-unexpected-unowned"),
+            diagnostic,
+        );
+    }
+    if (std.mem.eql(u8, command, "disk-geometry-verify")) {
+        var options = try parse(allocator, argv, &.{
+            "--geometry",
+            "--architecture",
+            "--flavor",
+            "--virtual-size",
+            "--github-env",
+        });
+        defer options.deinit();
+        return diskGeometryVerify(
+            allocator,
+            io,
+            out,
+            try options.require("--geometry"),
+            options.get("--architecture"),
+            options.get("--flavor"),
+            options.get("--virtual-size"),
+            options.get("--github-env"),
             diagnostic,
         );
     }
@@ -933,6 +955,92 @@ pub fn sizeInventoryVerify(
             summary.unexpected_unowned_count,
             summary.unowned_policy_sha256,
             summary.closure_sha256,
+        },
+    );
+}
+
+/// Translates a disk-geometry rejection into this module's failure shape. The
+/// geometry module already produced the operator-facing sentence.
+fn geometryFailure(err: disk_geometry.Error) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Failed => error.Failed,
+    };
+}
+
+/// `disk-geometry-verify`: re-checks a published core disk-geometry report
+/// (issue #677 step 5).
+///
+/// The check is not "does the file parse". The validator recomputes the whole
+/// plan from the document's own measurements and policy and requires the
+/// published offsets, lengths, and virtual size to be exactly what those
+/// inputs produce -- and refuses a plan that lands back on the retired
+/// inherited 3584 MiB geometry. `--virtual-size` binds the report to the
+/// artifact the same run measured, so a geometry document for some other
+/// build cannot be presented alongside this one.
+pub fn diskGeometryVerify(
+    allocator: Allocator,
+    io: Io,
+    out: *Writer,
+    geometry_path: []const u8,
+    architecture: ?[]const u8,
+    flavor: ?[]const u8,
+    virtual_size: ?[]const u8,
+    github_env: ?[]const u8,
+    diagnostic: *Diagnostic,
+) OutError!void {
+    const expected_size: ?u64 = if (virtual_size) |text|
+        std.fmt.parseInt(u64, text, 10) catch return fail(
+            diagnostic,
+            "--virtual-size must be a non-negative integer, not {s}",
+            .{text},
+        )
+    else
+        null;
+    var parsed = disk_geometry.readValidated(allocator, io, geometry_path, .{
+        .architecture = architecture,
+        .flavor = flavor,
+        .virtual_size = expected_size,
+    }, diagnostic) catch |err| return geometryFailure(err);
+    defer parsed.deinit();
+    const summary = disk_geometry.validateDocument(
+        parsed.value(),
+        .{
+            .architecture = architecture,
+            .flavor = flavor,
+            .virtual_size = expected_size,
+        },
+        diagnostic,
+    ) catch |err| return geometryFailure(err);
+    // The calculated size is the workflow's only source for the artifact size
+    // it then checks the image against: nothing in the workflow may name a
+    // size of its own, or the plan would stop being what the image is.
+    if (github_env) |path| {
+        const label = support.contract.formatMib(summary.virtual_size);
+        var lines: std.ArrayList(u8) = .empty;
+        defer lines.deinit(allocator);
+        try lines.print(
+            allocator,
+            "VIRTUAL_SIZE={d}\nVIRTUAL_SIZE_LABEL={s}\n",
+            .{ summary.virtual_size, label.slice() },
+        );
+        appendFile(io, path, lines.items) catch |err| return fail(
+            diagnostic,
+            "cannot write {s}: {s}",
+            .{ path, @errorName(err) },
+        );
+    }
+    try out.print(
+        "{s} {s} virtual_size={d} esp_bytes={d} root_bytes={d} " ++
+            "root_free_bytes={d} uki_bytes={d}\n",
+        .{
+            summary.architecture,
+            summary.flavor,
+            summary.virtual_size,
+            summary.esp_length_bytes,
+            summary.root_length_bytes,
+            summary.root_free_bytes,
+            summary.signed_uki_bytes,
         },
     );
 }

@@ -13,6 +13,7 @@ const std = @import("std");
 const miz = @import("miz");
 const image_phase_timing = @import("image_phase_timing.zig");
 const core_contract = @import("ubuntu2604_runtime_contract");
+const disk_geometry = @import("ubuntu2604/disk_geometry.zig");
 const runtime_contract_document = @import("ubuntu2604/runtime_contract_document.zig");
 const size_inventory = @import("ubuntu2604/size_inventory.zig");
 const uki_kernel_payload = @import("ubuntu2604_kernel_payload.zig");
@@ -48,11 +49,18 @@ const canonical_key_armor_sha256 = [_]u8{
 const sums_sha256 = "d562d59dac70f68d67d00e994db5cd89e49e9d93f7f80b4cb868a5eeb057ec36";
 const sums_signature_sha256 = "2bf5fae8be0c79cc30c5c10223f1d4790b6ef541240896bfe48c7ac57c3404ed";
 const default_virtual_size: u64 = 5 * 1024 * 1024 * 1024;
-// Both pinned Canonical QCOW2 inputs are exactly 3.5 GiB. Reusing that signed
-// GPT/ESP substrate without growing it gives core a 30% smaller virtual disk
-// than full while the fresh debz root leaves at least this much writable room.
-const core_virtual_size: u64 = 3584 * 1024 * 1024;
-const core_minimum_root_free_bytes: u64 = 768 * 1024 * 1024;
+// Both pinned Canonical QCOW2 inputs are exactly 3.5 GiB. That is now a fact
+// about the *input*: the builder still refuses a substrate of any other size,
+// because a different disk is a different publication, but issue #677 step 5
+// stopped shipping it. A core image's own geometry is planned by
+// `disk_geometry` from what the build measured, and a core build that ended up
+// at this size again would be a build that had quietly started inheriting it,
+// which `assembleCoreDisk` refuses by name.
+const core_substrate_virtual_size: u64 = 3584 * 1024 * 1024;
+comptime {
+    if (core_substrate_virtual_size != disk_geometry.retired_inherited_virtual_size)
+        @compileError("the retired core geometry and the pinned substrate size disagree");
+}
 const distro_bytes_per_inode: u32 = 16 * 1024;
 const minimum_root_free_inodes: u32 = 4096;
 // Bare metal carries the NVIDIA BaseOS kernel's modules -- about 183 MB
@@ -124,12 +132,23 @@ const Flavor = enum {
         return null;
     }
 
-    fn defaultSize(self: Flavor) u64 {
+    /// The virtual size this flavor is built at when the caller names none, or
+    /// null when the flavor calculates its own. Core calculates: since #677
+    /// step 5 its disk is planned from the measured UKI, the measured root, and
+    /// the measured first-boot growth, so there is no size for a caller to
+    /// default to -- or to override.
+    fn defaultSize(self: Flavor) ?u64 {
         return switch (self) {
             .full => default_virtual_size,
-            .core => core_virtual_size,
+            .core => null,
             .baremetal => baremetal_virtual_size,
         };
+    }
+
+    /// Whether the output disk's geometry is planned by this build rather than
+    /// inherited from the signed substrate or named on the command line.
+    fn calculatesGeometry(self: Flavor) bool {
+        return self == .core;
     }
 
     /// Whether the root is built from scratch with debz rather than inherited
@@ -260,9 +279,24 @@ fn testRootPlan(allocator: Allocator, flavor: Flavor) !RootPlan {
     return .{ .arena = arena, .guest = guest, .build = build, .kernel = kernel };
 }
 
-fn validateRootHeadroom(flavor: Flavor, free_bytes: u64, free_inodes: u32) !void {
-    if (flavor.freshRoot() and free_bytes < core_minimum_root_free_bytes)
-        return error.CoreRootFreeSpaceTooSmall;
+/// Refuses a root filesystem with less room than the plan reserved for it.
+///
+/// `required` is null for the flavors whose disk still comes from a named
+/// size; those only have to clear the inode floor. Core passes the
+/// requirements `disk_geometry` derived from its own measurements, so the
+/// check is against what this build calculated rather than against a figure
+/// carried over from a different image.
+fn validateRootHeadroom(
+    flavor: Flavor,
+    free_bytes: u64,
+    free_inodes: u32,
+    required: ?disk_geometry.Requirements,
+) !void {
+    if (required) |bounds| {
+        if (free_bytes < bounds.root_free_bytes) return error.CoreRootFreeSpaceTooSmall;
+        if (free_inodes < bounds.root_free_inodes) return error.RootFreeInodesTooSmall;
+    }
+    _ = flavor;
     if (free_inodes < minimum_root_free_inodes) return error.RootFreeInodesTooSmall;
 }
 
@@ -296,12 +330,20 @@ fn finalizeCompressedQcow2(
 
     var source = try miz.Image.openPathReadOnlyStandalone(io, mutable);
     defer source.close(io);
-    if (source.format != .qcow2) return error.InvalidFinalQcow2;
+    // Raw as well as QCOW2: the core flavor writes its calculated disk as a
+    // raw image and finalizes that, while the inherited-geometry flavors
+    // finalize the mutable QCOW2 they customized in place.
+    if (source.format != .qcow2 and source.format != .raw) return error.InvalidFinalQcow2;
     const expected_size = source.virtual_size;
-    const source_ctx = miz.qcow2.Qcow2SourceContext{
-        .file = source.file,
-        .info = &source.qcow2.?,
-    };
+    const qcow2_ctx: ?miz.qcow2.Qcow2SourceContext = if (source.format == .qcow2)
+        .{ .file = source.file, .info = &source.qcow2.? }
+    else
+        null;
+    const raw_ctx: ?miz.qcow2.RawSourceContext = if (source.format == .raw)
+        .{ .file = source.file, .readable_len = source.virtual_size }
+    else
+        null;
+    const source_reader = if (qcow2_ctx) |*ctx| ctx.reader() else raw_ctx.?.reader();
 
     const staged_file = try Dir.cwd().createFile(io, staged_output, .{ .read = true, .truncate = true });
     {
@@ -311,7 +353,7 @@ fn finalizeCompressedQcow2(
             io,
             staged_file,
             expected_size,
-            source_ctx.reader(),
+            source_reader,
             .{},
         );
     }
@@ -715,8 +757,10 @@ const Args = struct {
     output: ?[]const u8 = null,
     work_dir: ?[]const u8 = null,
     provenance_dir: ?[]const u8 = null,
-    size: u64 = default_virtual_size,
-    size_explicit: bool = false,
+    /// Null when the flavor plans its own geometry. `parseArgs` resolves an
+    /// unset size to the flavor's default and refuses an explicit one from a
+    /// flavor that calculates.
+    size: ?u64 = null,
     mizinit: ?[]const u8 = null,
     azagent: ?[]const u8 = null,
     signing_certificate: ?[]const u8 = null,
@@ -743,7 +787,7 @@ const help =
     \\  --output <path>                         output QCOW2
     \\  --work-dir <path>                       persistent download/work cache
     \\  --provenance-dir <path>                 release provenance sidecars
-    \\  --size <size>                           virtual size (full 5G, core 3584M, baremetal 5G)
+    \\  --size <size>                           virtual size (full 5G, baremetal 5G; core calculates its own)
     \\  --mizinit <path>                       static guest PID 1 (core, baremetal)
     \\  --azagent <path>                        static guest provisioning agent (core, baremetal)
     \\  --authorized-key <path>                 administrator public key (baremetal only)
@@ -979,7 +1023,6 @@ fn parseArgs(argv: []const []const u8) !Args {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
             args.size = try miz.parseSize(argv[i]);
-            args.size_explicit = true;
         } else if (std.mem.eql(u8, arg, "--mizinit")) {
             i += 1;
             if (i == argv.len) return error.MissingArgument;
@@ -1053,8 +1096,17 @@ fn parseArgs(argv: []const []const u8) !Args {
         } else return error.UnknownArgument;
     }
 
-    if (!args.size_explicit) args.size = args.flavor.defaultSize();
-    if (args.size < args.flavor.defaultSize()) return error.ImageTooSmall;
+    if (args.flavor.calculatesGeometry()) {
+        // Refused rather than ignored. A `--size` accepted here and then
+        // overruled by the planner would let a workflow believe it had pinned
+        // the geometry it used to pin, which is exactly the inheritance issue
+        // #677 step 5 removes.
+        if (args.size != null) return error.SizeIsCalculatedForThisFlavor;
+    } else {
+        const default_size = args.flavor.defaultSize().?;
+        if (args.size == null) args.size = default_size;
+        if (args.size.? < default_size) return error.ImageTooSmall;
+    }
     // The key is the only way into a bare-metal image, so a missing one is a
     // build that produces an unreachable machine. It is equally an error to
     // offer a key to a flavor that would refuse to bake it: silently ignoring
@@ -4546,7 +4598,7 @@ fn customizeRootWithDebz(
     );
     const filesystem_info = try native_root.finish();
     const root_free_bytes = @as(u64, filesystem_info.free_block_count) * 4096;
-    try validateRootHeadroom(flavor, root_free_bytes, filesystem_info.free_inode_count);
+    try validateRootHeadroom(flavor, root_free_bytes, filesystem_info.free_inode_count, null);
 
     // Measured now, while the root is still a walkable host tree: once it is
     // an image, per-package attribution would have to be reconstructed rather
@@ -4690,6 +4742,19 @@ const test_runtime_contract_binding: InventoryBinding = .{
     .filename = @constCast("ubuntu2604-runtime-contract-core-x86_64.json"),
     .sha256 = @splat('7'),
 };
+
+/// The same stand-in for the calculated geometry report core binds since #677
+/// step 5.
+const test_disk_geometry_binding: InventoryBinding = .{
+    .filename = @constCast("ubuntu2604-disk-geometry-core-x86_64.json"),
+    .sha256 = @splat('8'),
+};
+
+/// A plausible calculated core geometry for the provenance tests: a size no
+/// flavor inherits and a free-space reserve this build derived rather than
+/// carried over.
+const test_core_virtual_size: u64 = 1536 * 1024 * 1024;
+const test_core_planned_root_free_bytes: u64 = 128 * 1024 * 1024;
 
 /// Writes the size inventory beside the other provenance documents and
 /// returns the binding the build provenance carries, so the measurement is
@@ -4854,7 +4919,19 @@ fn restoreRestrictedRootEntry(
     try Dir.cwd().setFilePermissions(io, path, value, .{});
 }
 
-fn diskLayoutProvenance(profile: *const Profile) []const u8 {
+/// What the build did to the signed publication's partition table.
+///
+/// `core` no longer appears here by architecture: since #677 step 5 it does
+/// nothing to Canonical's table at all. It reads the substrate, plans a disk
+/// from its own measurements, and writes a new GPT -- so its provenance names
+/// the transform and points at the geometry report that explains it, rather
+/// than describing edits to a table this image does not ship.
+fn diskLayoutProvenance(profile: *const Profile, flavor: Flavor) []const u8 {
+    if (flavor.calculatesGeometry()) {
+        return "{\"source\":\"" ++ disk_geometry.provenance_source ++
+            "\",\"transform\":\"" ++ disk_geometry.provenance_transform ++
+            "\",\"inherits_source_geometry\":false}";
+    }
     return switch (profile.architecture) {
         .x86_64 =>
         \\{"source":"canonical-gen2-gpt","transform":"preserved"}
@@ -4891,7 +4968,7 @@ fn writeProvenance(
         source_digest,
         profile.manifest_name,
         profile.manifest_sha256,
-        diskLayoutProvenance(profile),
+        diskLayoutProvenance(profile, .full),
         package_family.debz_api_commit,
         evidence[0].package,
         std.fs.path.basename(evidence[0].lock_path),
@@ -4931,9 +5008,13 @@ fn writeFreshRootProvenance(
     evidence: []const DebzEvidence,
     stage: ?*const InitramfsStage,
     virtual_size: u64,
+    /// The free space this build's own plan required, or null for a flavor
+    /// whose disk still comes from a named size.
+    minimum_root_free_bytes: ?u64,
     root_free_bytes: u64,
     inventory: InventoryBinding,
     runtime_contract: ?InventoryBinding,
+    disk_geometry_binding: ?InventoryBinding,
 ) !void {
     const package_roots = plan.guest;
     // Only core publishes a runtime contract: the explicit allowlist is a
@@ -4941,11 +5022,27 @@ fn writeFreshRootProvenance(
     // claiming to describe another flavor would describe an image nobody
     // checked it against.
     if ((flavor == .core) != (runtime_contract != null)) return error.InvalidRuntimeContractBinding;
+    // A calculated geometry has to publish the document that explains it, and
+    // an inherited one has none to publish. Either mismatch is a provenance
+    // that describes an image nobody can check.
+    if (flavor.calculatesGeometry() != (disk_geometry_binding != null))
+        return error.InvalidDiskGeometryBinding;
+    if (flavor.calculatesGeometry() != (minimum_root_free_bytes != null))
+        return error.InvalidDiskGeometryBinding;
     var runtime_contract_buffer: [192]u8 = undefined;
     const runtime_contract_field: []const u8 = if (runtime_contract) |binding|
         try std.fmt.bufPrint(
             &runtime_contract_buffer,
             ",\"runtime_contract\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}",
+            .{ binding.filename, binding.sha256 },
+        )
+    else
+        "";
+    var geometry_buffer: [192]u8 = undefined;
+    const geometry_field: []const u8 = if (disk_geometry_binding) |binding|
+        try std.fmt.bufPrint(
+            &geometry_buffer,
+            ",\"disk_geometry\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}",
             .{ binding.filename, binding.sha256 },
         )
     else
@@ -4959,15 +5056,16 @@ fn writeFreshRootProvenance(
     var output: std.Io.Writer.Allocating = .init(allocator);
     errdefer output.deinit();
     try output.writer.print(
-        "{{\"schema\":1,\"type\":\"miz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"{s}\",\"release\":\"26.04\",\"size_inventory\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}{s},\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"disk_layout\":{s},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[",
+        "{{\"schema\":1,\"type\":\"miz-ubuntu2604-build-provenance\",\"architecture\":\"{s}\",\"flavor\":\"{s}\",\"release\":\"26.04\",\"size_inventory\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}{s}{s},\"virtual_size\":{d},\"minimum_root_free_bytes\":{d},\"validated_root_free_bytes\":{d},\"snapshot\":{{\"id\":\"release-{s}\",\"base_url\":\"{s}/\"}},\"canonical_key_fingerprint\":\"{s}\",\"sha256sums_signature_verified\":true,\"artifacts\":{{\"sha256sums\":{{\"filename\":\"SHA256SUMS\",\"sha256\":\"{s}\"}},\"sha256sums_signature\":{{\"filename\":\"SHA256SUMS.gpg\",\"sha256\":\"{s}\"}},\"source_image\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\",\"role\":\"signed-gpt-esp-substrate\"}},\"image_manifest\":{{\"filename\":\"{s}\",\"sha256\":\"{s}\"}}}},\"disk_layout\":{s},\"debz\":{{\"api_commit\":\"{s}\",\"baseline\":{{\"source\":\"empty-debz-root\",\"enforcement\":\"exact-final-closure\"}},\"package_roots\":[",
         .{
             @tagName(profile.architecture),
             @tagName(flavor),
             inventory.filename,
             inventory.sha256,
             runtime_contract_field,
+            geometry_field,
             virtual_size,
-            core_minimum_root_free_bytes,
+            minimum_root_free_bytes orelse root_free_bytes,
             root_free_bytes,
             release,
             release_base,
@@ -4978,7 +5076,7 @@ fn writeFreshRootProvenance(
             source_digest,
             profile.manifest_name,
             profile.manifest_sha256,
-            diskLayoutProvenance(profile),
+            diskLayoutProvenance(profile, flavor),
             package_family.debz_api_commit,
         },
     );
@@ -5788,6 +5886,607 @@ fn validateOnlySignedFallback(
     );
 }
 
+// ---------------------------------------------------------------------------
+// Issue #677 step 5: the fresh core disk.
+//
+// The core image no longer ships Canonical's partition table. The signed
+// publication is still downloaded, signature-verified, checksum-pinned, and
+// mined for the guest's archive keyring -- it is the substrate every package
+// in the image is trusted through -- but its GPT, its ESP and its 3584 MiB of
+// virtual size are evidence rather than output. What ships is a disk planned
+// here from three measurements: the signed UKI, the smallest ext4 that holds
+// the finished root, and the appliance's measured first-boot growth.
+//
+// Two placement facts are consumer contracts rather than preferences:
+//
+//   * the ESP is partition 1, because `mizinit`'s ESP mount tries partition-1
+//     device names and nothing else; and
+//   * the root is the last partition on the disk, because `azagent`'s
+//     first-boot growth calls `gpt.growPartitionToEnd`, which refuses a
+//     partition that has anything after it.
+//
+// GPT allows a partition array whose order differs from the on-disk order, but
+// `gpt.writeGptPlaced` deliberately does not: entries must be in ascending,
+// non-overlapping order. So the ESP is table index 0 and the root is table
+// index 1, and the guest sees `/dev/sda1` and `/dev/sda2`.
+// ---------------------------------------------------------------------------
+
+/// Fixed identifiers for the assembled core disk.
+///
+/// Written down rather than derived from the substrate: the whole point of
+/// planning a fresh disk is that its identity is this repository's, and a
+/// reproducible build needs the same bytes from the same inputs. They are
+/// distinct per architecture so two images can never be confused for each
+/// other by PARTUUID, and they are v4-shaped so nothing downstream has to
+/// treat them as a special case.
+const CoreDiskIdentity = struct {
+    disk_guid: guid.Guid,
+    esp_partition_guid: guid.Guid,
+    root_partition_guid: guid.Guid,
+    esp_volume_id: u32,
+    /// The FAT32 volume label Canonical's own ESP carries, kept so an
+    /// operator inspecting the disk sees the name they expect.
+    esp_volume_label: [11]u8,
+    root_filesystem_label: []const u8,
+};
+
+/// Both architectures' identities, built in one comptime evaluation.
+///
+/// Six GUID literals parsed hex pair by hex pair costs more comptime branches
+/// than the default quota allows, and a container-level constant is evaluated
+/// lazily in whichever function first refers to it -- so the quota has to be
+/// raised where the values are built, not where they are read.
+const core_identities = blk: {
+    @setEvalBranchQuota(20_000);
+    break :blk [_]CoreDiskIdentity{
+        .{
+            .disk_guid = guid.parse("6d697a20-2604-4c6f-b165-000000000164"),
+            .esp_partition_guid = guid.parse("6d697a20-2604-4573-9001-000000000164"),
+            .root_partition_guid = guid.parse("6d697a20-2604-526f-a074-000000000164"),
+            .esp_volume_id = 0x2604_0164,
+            .esp_volume_label = "UEFI       ".*,
+            .root_filesystem_label = miz.root_resize.default_filesystem_label,
+        },
+        .{
+            .disk_guid = guid.parse("6d697a20-2604-4c6f-b165-000000000aa6"),
+            .esp_partition_guid = guid.parse("6d697a20-2604-4573-9001-000000000aa6"),
+            .root_partition_guid = guid.parse("6d697a20-2604-526f-a074-000000000aa6"),
+            .esp_volume_id = 0x2604_0aa6,
+            .esp_volume_label = "UEFI       ".*,
+            .root_filesystem_label = miz.root_resize.default_filesystem_label,
+        },
+    };
+};
+
+fn coreDiskIdentity(architecture: Architecture) CoreDiskIdentity {
+    return switch (architecture) {
+        .x86_64 => core_identities[0],
+        .aarch64 => core_identities[1],
+    };
+}
+
+/// The core root filesystem's UUID.
+///
+/// Derived from the architecture's root partition GUID rather than invented
+/// separately, so there is exactly one identity constant per partition to
+/// review. Nothing in a core root names the filesystem by UUID -- there is no
+/// `/etc/fstab`, and the UKI's command line roots by `PARTUUID` -- so this is
+/// an identifier for tooling rather than a boot dependency, but it still has
+/// to be stable across builds for the image to be reproducible.
+fn coreRootFilesystemUuid(architecture: Architecture) [16]u8 {
+    var uuid = coreDiskIdentity(architecture).root_partition_guid;
+    // Flip the variant/version-adjacent byte pair so the filesystem UUID can
+    // never collide with the partition GUID it was derived from.
+    uuid[6] = (uuid[6] & 0x0F) | 0x40;
+    uuid[8] = (uuid[8] & 0x3F) | 0x80;
+    uuid[15] ^= 0xFF;
+    return uuid;
+}
+
+// The planner's constants have to be the image library's constants. They are
+// duplicated in `disk_geometry` only so that module can stay free of `miz`;
+// disagreeing copies would plan a table the writer could not place.
+comptime {
+    if (disk_geometry.sector_size != miz.gpt.sector_size or
+        disk_geometry.partition_array_sectors != miz.gpt.partition_array_sectors)
+    {
+        @compileError("disk_geometry and miz.gpt disagree about GPT geometry");
+    }
+}
+
+fn geometryArchitecture(architecture: Architecture) disk_geometry.Architecture {
+    return switch (architecture) {
+        .x86_64 => .x86_64,
+        .aarch64 => .aarch64,
+    };
+}
+
+fn imageReadAt(ctx: *const anyopaque, io: Io, buffer: []u8, offset: u64) anyerror!usize {
+    const image: *const miz.Image = @ptrCast(@alignCast(ctx));
+    return image.pread(io, buffer, offset);
+}
+
+/// Everything the fresh disk is planned and written from, plus what writing it
+/// established.
+const CoreDisk = struct {
+    plan: disk_geometry.Plan,
+    esp: EspUsage,
+    root: size_inventory.FilesystemUsage,
+    /// Text forms of the identifiers, owned by the caller's allocator, for the
+    /// geometry report.
+    identity_text: CoreIdentityText,
+
+    fn deinit(self: *CoreDisk, allocator: Allocator) void {
+        self.identity_text.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+/// The identifiers the assembled disk carries, in the text form the geometry
+/// report publishes. Held by value in `CoreDisk` so every slice in the
+/// published `disk_geometry.Identity` points into storage that outlives the
+/// document being written -- a FAT label borrowed from a by-value copy of the
+/// identity table would be a dangling slice by the time it was serialized.
+const CoreIdentityText = struct {
+    disk_guid: [36]u8 = undefined,
+    esp_type_guid: [36]u8 = undefined,
+    esp_partition_guid: [36]u8 = undefined,
+    root_type_guid: [36]u8 = undefined,
+    root_partition_guid: [36]u8 = undefined,
+    root_filesystem_uuid: [36]u8 = undefined,
+    esp_volume_label: [11]u8 = undefined,
+    esp_volume_label_len: usize = 0,
+    esp_volume_id: u32 = 0,
+    root_filesystem_label: []const u8 = "",
+
+    fn deinit(_: *CoreIdentityText, _: Allocator) void {}
+
+    fn geometryIdentity(self: *const CoreIdentityText) disk_geometry.Identity {
+        return .{
+            .disk_guid = &self.disk_guid,
+            .esp_type_guid = &self.esp_type_guid,
+            .esp_partition_guid = &self.esp_partition_guid,
+            .esp_volume_id = self.esp_volume_id,
+            .esp_volume_label = self.esp_volume_label[0..self.esp_volume_label_len],
+            .root_type_guid = &self.root_type_guid,
+            .root_partition_guid = &self.root_partition_guid,
+            .root_filesystem_uuid = &self.root_filesystem_uuid,
+            .root_filesystem_label = self.root_filesystem_label,
+        };
+    }
+};
+
+/// Formats a raw 16-byte filesystem UUID the way `blkid` prints it: plain
+/// big-endian hex, not GPT's mixed-endian GUID.
+fn formatFilesystemUuid(out: *[36]u8, uuid: [16]u8) void {
+    const groups = [_]struct { start: usize, len: usize }{
+        .{ .start = 0, .len = 4 },
+        .{ .start = 4, .len = 2 },
+        .{ .start = 6, .len = 2 },
+        .{ .start = 8, .len = 2 },
+        .{ .start = 10, .len = 6 },
+    };
+    var cursor: usize = 0;
+    for (groups, 0..) |group, index| {
+        if (index != 0) {
+            out[cursor] = '-';
+            cursor += 1;
+        }
+        for (uuid[group.start..][0..group.len]) |byte| {
+            _ = std.fmt.bufPrint(out[cursor..][0..2], "{x:0>2}", .{byte}) catch unreachable;
+            cursor += 2;
+        }
+    }
+    std.debug.assert(cursor == out.len);
+}
+
+/// The ext4 write options the fresh root is both sized and written with.
+///
+/// Sizing and writing must agree exactly: a length solved for one set of
+/// options is not a length the writer will accept under another. The source
+/// profile is carried across from the staged filesystem the content came from,
+/// which is how the fresh root keeps the pinned Canonical feature set --
+/// `resize_inode` included, which is what `azagent`'s online growth needs.
+fn coreRootPopulateOptions(
+    identity: miz.ext4.GeneralFilesystemIdentity,
+    root: miz.ext4.GeneralRoot,
+    label: []const u8,
+    uuid: [16]u8,
+) !miz.ext4.PopulateOptions {
+    if (identity.inode_size != 256 or identity.block_size != root_block_size)
+        return error.UnsupportedCoreRootProfile;
+    const pinned = identity.descriptor_size == 64;
+    return .{
+        .length = 0,
+        .block_size = identity.block_size,
+        .label = label,
+        .root_xattrs = root.xattrs,
+        .root_mode = root.mode,
+        .root_uid = root.uid,
+        .root_gid = root.gid,
+        .root_atime = root.atime,
+        .root_mtime = root.mtime,
+        .root_ctime = root.ctime,
+        .root_atime_nsec = root.atime_nsec,
+        .root_mtime_nsec = root.mtime_nsec,
+        .root_ctime_nsec = root.ctime_nsec,
+        .root_crtime = root.crtime,
+        .root_crtime_nsec = root.crtime_nsec,
+        .uuid = uuid,
+        .timestamp = std.math.cast(u32, root.mtime) orelse 0,
+        .journal = .{ .enabled = identity.has_journal },
+        .inodes = .{ .bytes_per_inode = distro_bytes_per_inode },
+        .preserve_feature_ro_compat = identity.feature_ro_compat,
+        .preserve_feature_compat = if (pinned) identity.feature_compat else null,
+        .preserve_feature_incompat = if (pinned) identity.feature_incompat else null,
+        .descriptor_size = identity.descriptor_size,
+        .preserve_checksum_seed = if (pinned) identity.checksum_seed else null,
+        .preserve_orphan_file_inode = identity.orphan_file_inode,
+    };
+}
+
+/// Solves for the smallest root filesystem that holds the tree *and* leaves the
+/// reserve free.
+///
+/// Not the same as sizing to `minimum + reserve`: a larger ext4 costs more
+/// metadata than a smaller one -- more block groups, a bigger inode table, and
+/// a journal chosen from `mke2fs`'s size-keyed ladder -- so a filesystem one
+/// reserve larger than the minimum has appreciably less than one reserve free.
+/// Each round asks the writer's own solver what a candidate length would
+/// actually leave free and raises the floor by exactly the shortfall, which
+/// converges in a couple of passes because the overhead is a small fraction of
+/// the addition.
+fn fitCoreRoot(
+    allocator: Allocator,
+    tree: *miz.root_tree.RootTree,
+    populate: miz.ext4.PopulateOptions,
+    required: disk_geometry.Requirements,
+) !miz.ext4.MinimumSize {
+    const max_rounds = 8;
+    var floor = required.root_floor_bytes;
+    var round: u8 = 0;
+    while (round < max_rounds) : (round += 1) {
+        const fit = try miz.ext4.minimumPopulateLengthAtLeast(
+            allocator,
+            try tree.cursor(),
+            populate,
+            floor,
+        );
+        const free_bytes = @as(u64, fit.free_blocks) * populate.block_size;
+        if (free_bytes >= required.root_free_bytes) return fit;
+        floor = try std.math.add(
+            u64,
+            fit.length,
+            required.root_free_bytes - free_bytes,
+        );
+    }
+    return error.CoreRootFreeSpaceUnsatisfiable;
+}
+
+/// Plans and writes the core image's own disk, then publishes it as the
+/// finalized compressed QCOW2.
+///
+/// The staged image is read, never written: its root filesystem is the content
+/// the fresh root is populated from, and its geometry is left behind.
+fn assembleCoreDisk(
+    allocator: Allocator,
+    io: Io,
+    staged_image: []const u8,
+    signed_uki_path: []const u8,
+    signed_uki_bytes: []const u8,
+    profile: *const Profile,
+    work_dir: []const u8,
+    output: []const u8,
+) !CoreDisk {
+    const identity = coreDiskIdentity(profile.architecture);
+    const limits: miz.limits.ImportLimits = .{};
+
+    var staged = try miz.Image.openPathReadOnly(io, staged_image);
+    defer staged.close(io);
+    const parsed = try miz.gpt.readGpt(staged, io, allocator);
+    defer allocator.free(parsed.partitions);
+    const staged_root = try findNamedRootPartition(parsed.partitions);
+    const staged_geometry = try partitionOffsetLength(staged_root);
+
+    var reader = try miz.ext4.openGeneralReadOnlySource(
+        io,
+        staged.file,
+        .{ .ctx = &staged, .read_at_fn = imageReadAt },
+        allocator,
+        .{ .offset = staged_geometry.offset },
+    );
+    defer reader.deinit();
+    var diagnostic: miz.limits.Diagnostic = .{};
+    var scan = try miz.ext4.scanReadable(&reader, io, allocator, .{
+        .available_length = staged_geometry.length,
+        .max_nodes = limits.max_nodes,
+        .max_path_bytes = limits.max_path_bytes,
+        .max_component_bytes = limits.max_component_bytes,
+        .max_file_bytes = limits.max_file_bytes,
+        .max_total_bytes = limits.max_total_bytes,
+        .max_xattrs_per_node = limits.max_xattrs_per_node,
+        .max_xattr_bytes_per_node = limits.max_xattr_bytes_per_node,
+        .max_scan_metadata_bytes = limits.max_scan_metadata_bytes,
+        .diagnostic = &diagnostic,
+    });
+    defer scan.deinit();
+    if (!labelEquals(scan.identity.label, identity.root_filesystem_label))
+        return error.UnexpectedStagedRootLabel;
+
+    // A memory tree with a borrowed import: only paths, metadata and xattrs are
+    // held here, and every byte of content is read back from the staged image
+    // as the writer asks for it. The scan outlives the tree, which is what a
+    // borrowed import requires, and copying the whole root through a spool to
+    // hand it straight to the writer would double the build's disk traffic for
+    // nothing.
+    var root_tree = miz.root_tree.RootTree.initMemory(allocator, io, limits.tree());
+    defer root_tree.deinit();
+    root_tree.diagnostic = &diagnostic;
+    try root_tree.importExt4GeneralBorrowed(&scan);
+
+    const root_uuid = coreRootFilesystemUuid(profile.architecture);
+    const populate = try coreRootPopulateOptions(
+        scan.identity,
+        scan.root,
+        identity.root_filesystem_label,
+        root_uuid,
+    );
+    const root_minimum = try miz.filesystem_writer.minimumLength(
+        allocator,
+        &root_tree,
+        .ext4,
+        .{ .ext4 = populate },
+    );
+    const required = try disk_geometry.requirements(
+        .{},
+        root_minimum.length,
+        disk_geometry.firstBootGrowth(geometryArchitecture(profile.architecture)),
+    );
+    const root_fit = try fitCoreRoot(allocator, &root_tree, populate, required);
+
+    // The ESP is sized from a tree that carries the resident copies the update
+    // policy calls for, and written from a tree that carries the one copy that
+    // boots. Sizing against the volume's real metadata cost is why the length
+    // comes from the FAT32 writer rather than from arithmetic here.
+    const fallback_path = try std.fmt.allocPrint(allocator, "EFI/BOOT/{s}", .{profile.efi_fallback});
+    defer allocator.free(fallback_path);
+    var esp_sizing = miz.root_tree.RootTree.initMemory(allocator, io, limits.tree());
+    defer esp_sizing.deinit();
+    var copy_buffer: [8]u64 = undefined;
+    const copies = try disk_geometry.espContentLengths(
+        .{},
+        signed_uki_bytes.len,
+        &copy_buffer,
+    );
+    try esp_sizing.putDirectory("EFI", .{ .mode = 0o755 });
+    try esp_sizing.putDirectory("EFI/BOOT", .{ .mode = 0o755 });
+    for (copies, 0..) |_, index| {
+        const name = try std.fmt.allocPrint(
+            allocator,
+            "EFI/BOOT/{s}.{d}",
+            .{ profile.efi_fallback, index },
+        );
+        defer allocator.free(name);
+        try esp_sizing.putFileFromPath(name, signed_uki_path, .{ .mode = 0o644 });
+    }
+    const esp_minimum = try miz.filesystem_writer.minimumLength(
+        allocator,
+        &esp_sizing,
+        .fat32,
+        .{ .fat32 = .{
+            .populate = .{ .metadata_policy = .lossy_posix_metadata },
+            .volume = .{ .alignment = disk_geometry.alignment },
+        } },
+    );
+
+    const plan = try disk_geometry.plan(.{
+        .architecture = geometryArchitecture(profile.architecture),
+        .measurements = .{
+            .signed_uki_bytes = signed_uki_bytes.len,
+            .esp_minimum_bytes = esp_minimum.length,
+            .root_minimum_bytes = root_minimum.length,
+            .root_fitted_bytes = root_fit.length,
+            .first_boot = disk_geometry.firstBootGrowth(
+                geometryArchitecture(profile.architecture),
+            ),
+        },
+        .root_name = identity.root_filesystem_label,
+    });
+    if (plan.virtual_size >= core_substrate_virtual_size)
+        return error.CoreGeometryNotSmallerThanSubstrate;
+
+    const raw_path = try std.fs.path.join(allocator, &.{ work_dir, "core-fresh.raw" });
+    defer allocator.free(raw_path);
+    Dir.cwd().deleteFile(io, raw_path) catch {};
+    errdefer Dir.cwd().deleteFile(io, raw_path) catch {};
+
+    var esp_usage: EspUsage = undefined;
+    var root_usage: size_inventory.FilesystemUsage = undefined;
+    {
+        var image = try miz.Image.createExclusive(io, raw_path, .raw, plan.virtual_size, .{});
+        var image_open = true;
+        defer if (image_open) image.close(io);
+
+        const specs = [_]miz.gpt.PlacedPartitionSpec{
+            .{
+                .type_guid = guid.esp,
+                .unique_guid = identity.esp_partition_guid,
+                .placement = .{
+                    .first_lba = plan.esp.firstLba(),
+                    .last_lba = plan.esp.lastLba(),
+                },
+                .name_utf16le = miz.gpt.asciiName(plan.esp.name),
+            },
+            .{
+                .type_guid = profile.root_partition_type_guid,
+                .unique_guid = identity.root_partition_guid,
+                .placement = .{
+                    .first_lba = plan.root.firstLba(),
+                    .last_lba = plan.root.lastLba(),
+                },
+                .name_utf16le = miz.gpt.asciiName(plan.root.name),
+            },
+        };
+        try miz.gpt.writeGptPlaced(&image, io, identity.disk_guid, &specs);
+
+        var esp_content = miz.root_tree.RootTree.initMemory(allocator, io, limits.tree());
+        defer esp_content.deinit();
+        try esp_content.putDirectory("EFI", .{ .mode = 0o755 });
+        try esp_content.putDirectory("EFI/BOOT", .{ .mode = 0o755 });
+        try esp_content.putFileBytes(fallback_path, signed_uki_bytes, .{ .mode = 0o644 });
+        _ = miz.filesystem_writer.formatAndPopulate(
+            io,
+            allocator,
+            &image,
+            &esp_content,
+            .fat32,
+            .{ .fat32 = .{
+                .format = .{
+                    .partition_offset = plan.esp.offset_bytes,
+                    .partition_len = plan.esp.length_bytes,
+                    .volume_id = identity.esp_volume_id,
+                    .volume_label = identity.esp_volume_label,
+                },
+                .populate = .{ .metadata_policy = .lossy_posix_metadata },
+            } },
+        ) catch |err| return translateGuestEspCapacity(err);
+
+        var root_populate = populate;
+        root_populate.offset = plan.root.offset_bytes;
+        root_populate.length = plan.root.filesystem_length_bytes;
+        const written = try miz.filesystem_writer.formatAndPopulate(
+            io,
+            allocator,
+            &image,
+            &root_tree,
+            .ext4,
+            .{ .ext4 = root_populate },
+        );
+        const info = switch (written) {
+            .ext4 => |value| value,
+            else => return error.UnexpectedCoreRootFilesystem,
+        };
+        root_usage = .{
+            .block_size = root_block_size,
+            .total_blocks = info.block_count,
+            .free_blocks = info.free_block_count,
+            .total_inodes = info.inode_count,
+            .free_inodes = info.free_inode_count,
+        };
+        try validateRootHeadroom(
+            .core,
+            @as(u64, info.free_block_count) * root_block_size,
+            info.free_inode_count,
+            required,
+        );
+
+        const esp = try miz.fat32.open(&image, io, .{
+            .offset = plan.esp.offset_bytes,
+            .length = plan.esp.length_bytes,
+        });
+        const cluster_size: u64 =
+            @as(u64, esp.info.bytes_per_sector) * esp.info.sectors_per_cluster;
+        esp_usage = .{
+            .partition_bytes = plan.esp.length_bytes,
+            .total_bytes = @as(u64, esp.info.data_cluster_count) * cluster_size,
+            .free_bytes = @as(u64, esp.free_cluster_count) * cluster_size,
+            .uki_bytes = signed_uki_bytes.len,
+        };
+        try image.file.sync(io);
+        image.close(io);
+        image_open = false;
+    }
+
+    try finalizeCompressedQcow2(allocator, io, raw_path, output);
+    Dir.cwd().deleteFile(io, raw_path) catch {};
+    // The command line inside the signed UKI names this partition by GUID, and
+    // the signature is already over those bytes: a disk whose root GUID drifted
+    // from the plan is a disk that cannot find its own root.
+    try requireCoreRootPartitionGuid(allocator, io, output, profile, identity);
+
+    var text: CoreIdentityText = .{};
+    text.esp_volume_label = identity.esp_volume_label;
+    text.esp_volume_label_len =
+        std.mem.trimEnd(u8, &identity.esp_volume_label, " ").len;
+    text.esp_volume_id = identity.esp_volume_id;
+    text.root_filesystem_label = identity.root_filesystem_label;
+    _ = guid.formatLower(&text.disk_guid, identity.disk_guid);
+    _ = guid.formatLower(&text.esp_type_guid, guid.esp);
+    _ = guid.formatLower(&text.esp_partition_guid, identity.esp_partition_guid);
+    _ = guid.formatLower(&text.root_type_guid, profile.root_partition_type_guid);
+    _ = guid.formatLower(&text.root_partition_guid, identity.root_partition_guid);
+    formatFilesystemUuid(&text.root_filesystem_uuid, root_uuid);
+
+    return .{
+        .plan = plan,
+        .esp = esp_usage,
+        .root = root_usage,
+        .identity_text = text,
+    };
+}
+
+/// Re-reads the published disk and fails unless its root partition carries the
+/// planned GUID, type, and name.
+fn requireCoreRootPartitionGuid(
+    allocator: Allocator,
+    io: Io,
+    image_path: []const u8,
+    profile: *const Profile,
+    identity: CoreDiskIdentity,
+) !void {
+    var image = try miz.Image.openPathReadOnly(io, image_path);
+    defer image.close(io);
+    const parsed = try miz.gpt.readGpt(image, io, allocator);
+    defer allocator.free(parsed.partitions);
+    const root = try findNamedRootPartition(parsed.partitions);
+    if (!std.mem.eql(u8, &root.partition_type_guid, &profile.root_partition_type_guid))
+        return error.RootPartitionTypeMismatch;
+    if (!std.mem.eql(u8, &root.unique_partition_guid, &identity.root_partition_guid))
+        return error.CoreRootPartitionGuidMismatch;
+}
+
+/// Writes the geometry report beside the other provenance documents and
+/// returns its binding, so the calculated layout is hashed into build
+/// provenance exactly like the size inventory and the runtime contract.
+fn writeDiskGeometry(
+    allocator: Allocator,
+    io: Io,
+    provenance_dir: []const u8,
+    profile: *const Profile,
+    flavor: Flavor,
+    disk: *const CoreDisk,
+) !InventoryBinding {
+    const filename = try std.fmt.allocPrint(
+        allocator,
+        "ubuntu2604-disk-geometry-{s}-{s}.json",
+        .{ @tagName(flavor), @tagName(profile.architecture) },
+    );
+    errdefer allocator.free(filename);
+    const path = try std.fs.path.join(allocator, &.{ provenance_dir, filename });
+    defer allocator.free(path);
+    var diagnostic: disk_geometry.Diagnostic = .{};
+    disk_geometry.write(
+        allocator,
+        io,
+        path,
+        @tagName(flavor),
+        disk.plan,
+        disk.identity_text.geometryIdentity(),
+        &diagnostic,
+    ) catch |err| {
+        std.debug.print("{s}\n", .{diagnostic.message()});
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.Failed => error.DiskGeometryUnpublishable,
+        };
+    };
+    const metadata = try artifact_pipeline.hashFile(io, path);
+    return .{
+        .filename = filename,
+        .sha256 = artifact_pipeline.formatSha256(metadata.sha256),
+    };
+}
+
 fn insertSignedUki(
     allocator: Allocator,
     io: Io,
@@ -6073,9 +6772,15 @@ fn buildImage(
     if (profile.architecture == .aarch64) {
         try validateArm64SourceSubstrate(allocator, io, &source_image);
     }
-    if (args.flavor.freshRoot() and source_image.virtual_size != core_virtual_size)
+    if (args.flavor.freshRoot() and source_image.virtual_size != core_substrate_virtual_size)
         return error.UnexpectedCoreSubstrateSize;
-    if (args.size < source_image.virtual_size) return error.ImageTooSmall;
+    // The staging copy is always the substrate's own size. For the flavors
+    // that publish it, that is the output geometry; for core it is only where
+    // the fresh root is assembled before being written onto a disk this build
+    // planned.
+    if (args.size) |requested| {
+        if (requested < source_image.virtual_size) return error.ImageTooSmall;
+    }
     var mutable_image = try miz.Image.createExclusive(
         io,
         mutable,
@@ -6085,16 +6790,18 @@ fn buildImage(
     );
     _ = try miz.copyAll(io, source_image, &mutable_image, allocator);
     mutable_image.close(io);
-    if (args.size > source_image.virtual_size) {
-        _ = try miz.root_resize.growExistingQcow2(
-            allocator,
-            io,
-            mutable,
-            .{
-                .target_size = args.size,
-                .filesystem_label = miz.root_resize.default_filesystem_label,
-            },
-        );
+    if (args.size) |requested| {
+        if (requested > source_image.virtual_size) {
+            _ = try miz.root_resize.growExistingQcow2(
+                allocator,
+                io,
+                mutable,
+                .{
+                    .target_size = requested,
+                    .filesystem_label = miz.root_resize.default_filesystem_label,
+                },
+            );
+        }
     }
     source_setup.succeed();
     var debz_customization = try customizeRootWithDebz(
@@ -6139,7 +6846,13 @@ fn buildImage(
     defer allocator.free(initrd_host);
     const os_release_host = try std.fs.path.join(allocator, &.{ extract_dir, "os-release" });
     defer allocator.free(os_release_host);
-    const root_partition_guid = try rootPartitionGuid(allocator, io, mutable, profile);
+    // A calculated disk chooses its own root PARTUUID before it exists, and the
+    // command line has to name *that* one: the staging image's is Canonical's,
+    // and a UKI signed against it would be a UKI that cannot find its root.
+    const root_partition_guid = if (args.flavor.calculatesGeometry())
+        coreDiskIdentity(profile.architecture).root_partition_guid
+    else
+        try rootPartitionGuid(allocator, io, mutable, profile);
     const cmdline = try ukiCmdline(allocator, root_partition_guid, profile, args.flavor);
     defer allocator.free(cmdline);
 
@@ -6207,16 +6920,35 @@ fn buildImage(
     var qcow2_finalization = timing.begin(.qcow2_finalization, null);
     defer qcow2_finalization.end();
     errdefer |err| qcow2_finalization.fail(@errorName(err));
-    const esp_usage = try insertSignedUki(
+    // #677 step 5: core plans and writes its own disk here; the other flavors
+    // keep publishing the substrate they customized in place.
+    var core_disk: ?CoreDisk = if (args.flavor.calculatesGeometry())
+        try assembleCoreDisk(
+            allocator,
+            io,
+            mutable,
+            signed_path,
+            signed.bytes,
+            profile,
+            work_dir,
+            output,
+        )
+    else
+        null;
+    defer if (core_disk) |*disk| disk.deinit(allocator);
+    const esp_usage = if (core_disk) |disk| disk.esp else try insertSignedUki(
         allocator,
         io,
         mutable,
         signed_path,
         profile,
-        args.size,
+        args.size.?,
     );
-    try finalizeCompressedQcow2(allocator, io, mutable, output);
-    try validateFinalQcow2(io, output, args.size);
+    const virtual_size = if (core_disk) |disk| disk.plan.virtual_size else size: {
+        try finalizeCompressedQcow2(allocator, io, mutable, output);
+        break :size args.size.?;
+    };
+    try validateFinalQcow2(io, output, virtual_size);
     try validateFinalNativeImage(allocator, io, output, signed.bytes, profile, cmdline);
     qcow2_finalization.succeed();
     var final_image_validation = timing.begin(.final_image_validation, null);
@@ -6265,8 +6997,8 @@ fn buildImage(
     // would mean recording a guess.
     try recordFinalizedInventory(
         &debz_customization.inventory,
-        debz_customization.root_filesystem,
-        args.size,
+        if (core_disk) |disk| disk.root else debz_customization.root_filesystem,
+        virtual_size,
         esp_usage,
         io,
         output,
@@ -6288,6 +7020,14 @@ fn buildImage(
     else
         null;
     defer if (runtime_contract_binding) |binding| allocator.free(binding.filename);
+    // #677 step 5: the calculated layout is published as evidence of its own,
+    // so a reviewer can read every input, margin, offset and length that
+    // produced this disk instead of inferring them from the image.
+    const geometry_binding: ?InventoryBinding = if (core_disk) |*disk|
+        try writeDiskGeometry(allocator, io, provenance_dir, profile, args.flavor, disk)
+    else
+        null;
+    defer if (geometry_binding) |binding| allocator.free(binding.filename);
 
     try writeSigningProvenance(
         allocator,
@@ -6315,10 +7055,15 @@ fn buildImage(
             &debz_customization.plan,
             debz_customization.evidence[0..debz_customization.evidence_count],
             if (debz_customization.stage) |*built| built else null,
-            args.size,
-            debz_customization.root_free_bytes,
+            virtual_size,
+            if (core_disk) |disk| disk.plan.requirements.root_free_bytes else null,
+            if (core_disk) |disk|
+                @as(u64, disk.root.free_blocks) * disk.root.block_size
+            else
+                debz_customization.root_free_bytes,
             inventory_binding,
             runtime_contract_binding,
+            geometry_binding,
         );
     } else {
         try writeProvenance(
@@ -7628,9 +8373,16 @@ test "flavor defaults preserve full names and isolate core outputs" {
     try std.testing.expectEqual(default_virtual_size, full.size);
     const core_args = try parseArgs(&.{ "--flavor", "core" });
     try std.testing.expectEqual(Flavor.core, core_args.flavor);
-    try std.testing.expectEqual(core_virtual_size, core_args.size);
+    // #677 step 5: core has no default size to inherit and no size to be
+    // given. Any `--size` at all is refused, including the one it used to be
+    // built at, so no caller can reintroduce the retired geometry.
+    try std.testing.expect(core_args.size == null);
     try std.testing.expectError(
-        error.ImageTooSmall,
+        error.SizeIsCalculatedForThisFlavor,
+        parseArgs(&.{ "--flavor", "core", "--size", "3584M" }),
+    );
+    try std.testing.expectError(
+        error.SizeIsCalculatedForThisFlavor,
         parseArgs(&.{ "--flavor", "core", "--size", "3G" }),
     );
     try std.testing.expectEqualStrings(
@@ -7654,14 +8406,43 @@ test "flavor defaults preserve full names and isolate core outputs" {
 test "root headroom rejects inode exhaustion for every flavor" {
     try std.testing.expectError(
         error.RootFreeInodesTooSmall,
-        validateRootHeadroom(.full, 0, minimum_root_free_inodes - 1),
+        validateRootHeadroom(.full, 0, minimum_root_free_inodes - 1, null),
     );
-    try validateRootHeadroom(.full, 0, minimum_root_free_inodes);
+    try validateRootHeadroom(.full, 0, minimum_root_free_inodes, null);
+}
+
+test "core root headroom is checked against this build's own plan" {
+    // The bound is whatever `disk_geometry` derived from the measurements of
+    // the build under way, not a constant carried over from another image.
+    const required = try disk_geometry.requirements(
+        .{},
+        512 * 1024 * 1024,
+        disk_geometry.firstBootGrowth(.x86_64),
+    );
     try std.testing.expectError(
         error.CoreRootFreeSpaceTooSmall,
-        validateRootHeadroom(.core, core_minimum_root_free_bytes - 1, minimum_root_free_inodes),
+        validateRootHeadroom(
+            .core,
+            required.root_free_bytes - 1,
+            required.root_free_inodes,
+            required,
+        ),
     );
-    try validateRootHeadroom(.core, core_minimum_root_free_bytes, minimum_root_free_inodes);
+    try std.testing.expectError(
+        error.RootFreeInodesTooSmall,
+        validateRootHeadroom(
+            .core,
+            required.root_free_bytes,
+            required.root_free_inodes - 1,
+            required,
+        ),
+    );
+    try validateRootHeadroom(
+        .core,
+        required.root_free_bytes,
+        required.root_free_inodes,
+        required,
+    );
 }
 
 test "bare metal is named apart from core and requires exactly one administrator key" {
@@ -9197,10 +9978,12 @@ test "fresh-root provenance binds flavor closure size and free-space evidence" {
             &plan,
             evidence[0..package_roots.len],
             null,
-            flavor.defaultSize(),
-            core_minimum_root_free_bytes + 4096,
+            flavor.defaultSize() orelse test_core_virtual_size,
+            if (flavor.calculatesGeometry()) test_core_planned_root_free_bytes else null,
+            test_core_planned_root_free_bytes + 4096,
             test_inventory_binding,
             if (flavor == .core) test_runtime_contract_binding else null,
+            if (flavor.calculatesGeometry()) test_disk_geometry_binding else null,
         );
         const document = try Dir.cwd().readFileAlloc(
             std.testing.io,
@@ -9213,7 +9996,7 @@ test "fresh-root provenance binds flavor closure size and free-space evidence" {
         defer parsed.deinit();
         try std.testing.expectEqualStrings(@tagName(flavor), parsed.value.object.get("flavor").?.string);
         try std.testing.expectEqual(
-            @as(i64, @intCast(flavor.defaultSize())),
+            @as(i64, @intCast(flavor.defaultSize() orelse test_core_virtual_size)),
             parsed.value.object.get("virtual_size").?.integer,
         );
         const debz_object = parsed.value.object.get("debz").?.object;
@@ -9231,17 +10014,54 @@ test "fresh-root provenance binds flavor closure size and free-space evidence" {
             debz_object.get("baseline").?.object.get("source").?.string,
         );
         const disk_layout = parsed.value.object.get("disk_layout").?.object;
-        try std.testing.expectEqualStrings(
-            "arm64-esp-rebuild-v1",
-            disk_layout.get("transform").?.string,
-        );
-        try std.testing.expectEqual(
-            @as(i64, 1_050_623),
-            disk_layout.get("esp").?.object.get("last_lba").?.integer,
-        );
-        try std.testing.expect(
-            disk_layout.get("retired_xbootldr").?.object.get("cleared").?.bool,
-        );
+        if (flavor.calculatesGeometry()) {
+            // #677 step 5: core does nothing to Canonical's table, so it has
+            // no ESP edit and no retired XBOOTLDR to describe. It names the
+            // transform and binds the geometry report that explains the disk
+            // it wrote instead.
+            try std.testing.expectEqualStrings(
+                disk_geometry.provenance_transform,
+                disk_layout.get("transform").?.string,
+            );
+            try std.testing.expectEqualStrings(
+                disk_geometry.provenance_source,
+                disk_layout.get("source").?.string,
+            );
+            try std.testing.expect(
+                !disk_layout.get("inherits_source_geometry").?.bool,
+            );
+            try std.testing.expect(disk_layout.get("esp") == null);
+            try std.testing.expect(disk_layout.get("retired_xbootldr") == null);
+            const binding = parsed.value.object.get("disk_geometry").?.object;
+            try std.testing.expectEqualStrings(
+                test_disk_geometry_binding.filename,
+                binding.get("filename").?.string,
+            );
+            try std.testing.expectEqual(
+                @as(i64, @intCast(test_core_planned_root_free_bytes)),
+                parsed.value.object.get("minimum_root_free_bytes").?.integer,
+            );
+            // The retired inherited geometry is not what this document
+            // describes, and saying so here is what keeps a future edit from
+            // quietly restoring it.
+            try std.testing.expect(
+                parsed.value.object.get("virtual_size").?.integer !=
+                    @as(i64, @intCast(core_substrate_virtual_size)),
+            );
+        } else {
+            try std.testing.expectEqualStrings(
+                "arm64-esp-rebuild-v1",
+                disk_layout.get("transform").?.string,
+            );
+            try std.testing.expectEqual(
+                @as(i64, 1_050_623),
+                disk_layout.get("esp").?.object.get("last_lba").?.integer,
+            );
+            try std.testing.expect(
+                disk_layout.get("retired_xbootldr").?.object.get("cleared").?.bool,
+            );
+            try std.testing.expect(parsed.value.object.get("disk_geometry") == null);
+        }
     }
 }
 
@@ -9288,8 +10108,10 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
         evidence[0..initialized],
         null,
         baremetal_virtual_size,
-        core_minimum_root_free_bytes + 4096,
+        null,
+        test_core_planned_root_free_bytes + 4096,
         test_inventory_binding,
+        null,
         null,
     ));
     // Right count, wrong package: the last transaction names something core
@@ -9306,10 +10128,12 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
         &core_plan,
         evidence[0..initialized],
         null,
-        core_virtual_size,
-        core_minimum_root_free_bytes + 4096,
+        test_core_virtual_size,
+        test_core_planned_root_free_bytes,
+        test_core_planned_root_free_bytes + 4096,
         test_inventory_binding,
         test_runtime_contract_binding,
+        test_disk_geometry_binding,
     ));
     evidence[initialized - 1].package = restore;
 
@@ -9345,10 +10169,12 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
         &core_plan,
         evidence[0..initialized],
         &stage,
-        core_virtual_size,
-        core_minimum_root_free_bytes + 4096,
+        test_core_virtual_size,
+        test_core_planned_root_free_bytes,
+        test_core_planned_root_free_bytes + 4096,
         test_inventory_binding,
         test_runtime_contract_binding,
+        test_disk_geometry_binding,
     ));
 
     // The runtime contract belongs to core alone (issue #677 step 2). A core
@@ -9366,10 +10192,12 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
             &core_plan,
             evidence[0..initialized],
             null,
-            core_virtual_size,
-            core_minimum_root_free_bytes + 4096,
+            test_core_virtual_size,
+            test_core_planned_root_free_bytes,
+            test_core_planned_root_free_bytes + 4096,
             test_inventory_binding,
             null,
+            test_disk_geometry_binding,
         ),
     );
     // The binding is checked before the evidence is, so a non-core flavor
@@ -9388,9 +10216,11 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
             evidence[0..initialized],
             null,
             baremetal_virtual_size,
-            core_minimum_root_free_bytes + 4096,
+            null,
+            test_core_planned_root_free_bytes + 4096,
             test_inventory_binding,
             test_runtime_contract_binding,
+            null,
         ),
     );
 }

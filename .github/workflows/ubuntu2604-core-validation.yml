@@ -156,7 +156,6 @@ jobs:
       ARCHITECTURE: ${{ matrix.architecture }}
       FLAVOR: core
       ASSET_NAME: ${{ matrix.asset_name }}
-      VIRTUAL_SIZE: 3758096384
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       WORK_DIR: .scratch/ubuntu2604-core-validation-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.key }}
       BUNDLE_DIR: artifact-staging/core-candidates/${{ matrix.key }}
@@ -282,7 +281,6 @@ jobs:
             --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
             --provenance-dir "$GITHUB_WORKSPACE/$BUNDLE_DIR/internal-provenance" \
             --output "$GITHUB_WORKSPACE/$BUNDLE_DIR/$ASSET_NAME" \
-            --size "$VIRTUAL_SIZE" \
             --uki-signing-certificate "$UKI_SIGNING_CERTIFICATE" \
             --uki-signing-certificate-sha256 "$UKI_SIGNING_CERTIFICATE_SHA256" \
             --uki-sign-command "$UKI_SIGN_COMMAND" \
@@ -291,7 +289,27 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" "$WORK_DIR" "$BUNDLE_DIR"
           cp "$build_log" "$BUNDLE_DIR/internal-provenance/build.log"
 
-      - name: Validate standalone zstd QCOW2 and exact 3584 MiB size
+      - name: Bind the calculated core disk geometry
+        run: |
+          set -euo pipefail
+          # Issue #677 step 5: nothing in this workflow names a size any more.
+          # The builder plans core's disk from the signed UKI it produced, the
+          # ext4 minimum it measured, and the appliance's measured first-boot
+          # growth, and publishes the plan. This re-derives every offset and
+          # length from that document's own inputs and exports the planned
+          # size, which is then the only size the artifact is checked against.
+          geometry="$BUNDLE_DIR/internal-provenance/ubuntu2604-disk-geometry-$FLAVOR-$ARCHITECTURE.json"
+          test -f "$geometry"
+          test -x "$RELEASE_TOOL"
+          planned=$("$RELEASE_TOOL" disk-geometry-verify \
+            --geometry "$geometry" \
+            --architecture "$ARCHITECTURE" \
+            --flavor "$FLAVOR" \
+            --github-env "$GITHUB_ENV")
+          printf 'Disk geometry `%s`: `%s`\n' "$CANDIDATE_KEY" "$planned" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Validate standalone zstd QCOW2 and the calculated size
         run: |
           set -euo pipefail
           asset="$BUNDLE_DIR/$ASSET_NAME"
@@ -304,7 +322,15 @@ jobs:
           "$RELEASE_TOOL" verify-image-info \
             --info "$BUNDLE_DIR/internal-provenance/image-info.json" \
             --virtual-size "$VIRTUAL_SIZE" \
-            --virtual-size-label "3584 MiB"
+            --virtual-size-label "$VIRTUAL_SIZE_LABEL"
+          # The plan and the published disk are bound in both directions: the
+          # plan produced the size checked above, and the geometry document is
+          # re-checked against it here.
+          "$RELEASE_TOOL" disk-geometry-verify \
+            --geometry "$BUNDLE_DIR/internal-provenance/ubuntu2604-disk-geometry-$FLAVOR-$ARCHITECTURE.json" \
+            --architecture "$ARCHITECTURE" \
+            --flavor "$FLAVOR" \
+            --virtual-size "$VIRTUAL_SIZE"
           digest=$(sha256sum "$asset" | awk '{print $1}')
           [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
           printf '%s\n' "$digest" > "$BUNDLE_DIR/internal-provenance/build-validated-digest"

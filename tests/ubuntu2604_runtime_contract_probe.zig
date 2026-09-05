@@ -329,7 +329,12 @@ fn evaluateLockdown(path: []const u8) Status {
 
 fn evaluate(requirement: contract.Requirement) Status {
     return switch (requirement.kind) {
-        .package => .ok,
+        // Neither is observable from inside the guest: a package is a dpkg
+        // fact the shipped exact lock carries, and a selector names a
+        // metapackage the build resolved and deliberately never installed.
+        // `Kind.probeable` filters both out before this is reached, so the
+        // arms exist to keep the switch exhaustive rather than to report.
+        .package, .package_selector => .ok,
         .command => evaluateCommand(requirement.target),
         .file => evaluatePath(requirement.target, .regular),
         .directory, .mutable_path => evaluatePath(requirement.target, .directory),
