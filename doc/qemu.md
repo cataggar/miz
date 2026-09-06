@@ -37,6 +37,9 @@ miz qemu AzureLinux --model core
 miz qemu AzureLinux-4.0-x86_64
 miz qemu Ubuntu
 miz qemu Ubuntu --arch aarch64
+miz qemu UbuntuCore
+miz qemu UbuntuCore --arch aarch64
+miz qemu Ubuntu-26.04-x86_64.core
 miz qemu FreeBSD
 miz qemu FreeBSD --arch x86_64
 ```
@@ -51,15 +54,16 @@ The `FreeBSD` alias similarly selects the host-native FreeBSD 15.1 image from
 release `FreeBSD-15.1-20260724`; on an AArch64 host it downloads
 `FreeBSD-15.1-aarch64.qcow2`.
 The `Ubuntu` alias selects the host-native full Ubuntu 26.04 image from release
-`Ubuntu-26.04-20260822`; use `--arch` to override it. Ubuntu core catalog
-selection remains fail-closed until the four-asset release completes and a
-follow-up change pins its final core URLs, image digests, and signing identity.
+`Ubuntu-26.04-20260822`; use `--arch` to override it. `UbuntuCore` selects the
+host-native minimized image from release `Ubuntu-26.04-20260905`. The full
+images use systemd, cloud-init, and WALinuxAgent. The core images use mizinit,
+azagent, and directly supervised OpenSSH.
 Existing images are never refreshed or overwritten. QEMU and its matching
 EDK2 firmware are resolved from the `cataggar/qemu` ghr installation first,
 then from a system QEMU/UEFI installation. Directory-prefixed aliases such as
 `miz qemu images/AzureLinux` or
-`miz qemu images/Ubuntu-26.04-aarch64` place the downloaded disk and firmware
-under that directory.
+`miz qemu images/UbuntuCore` place the downloaded disk and firmware under that
+directory.
 
 `FreeBSD` selects the pinned FreeBSD 15.1 release asset for the requested
 architecture. It defaults to the host architecture; for example, an ARM64 host
@@ -222,26 +226,32 @@ This command is intentionally a focused launcher for cataloged Azure Linux,
 Ubuntu, and FreeBSD Gen2 images plus compatible explicit disks, not a general
 VM configuration manager.
 
-The Ubuntu aliases are immutable bindings to release
-`Ubuntu-26.04-20260822`:
+The Ubuntu full aliases remain immutable bindings to release
+`Ubuntu-26.04-20260822`, while the core aliases bind release
+`Ubuntu-26.04-20260905`:
 
 ```text
 miz qemu Ubuntu
 miz qemu Ubuntu-26.04-x86_64
 miz qemu Ubuntu-26.04-aarch64
+miz qemu UbuntuCore
+miz qemu Ubuntu-26.04-x86_64.core
+miz qemu Ubuntu-26.04-aarch64.core
 ```
 
-Their image SHA-256 values are
-`23116f2a4fb508d1beb60fae673c95636c3540ad3ab8f42f6966367ef86e0511`
-and
-`f78fb8f8fc54af4bc26ac97f7cb1fd9750abdf4f24e62f7cffffeb2daef4b175`,
-respectively. Secure Boot pins the canonical-DER certificate SHA-256
+| Model | Architecture | Image SHA-256 |
+| --- | --- | --- |
+| full | x86_64 | `23116f2a4fb508d1beb60fae673c95636c3540ad3ab8f42f6966367ef86e0511` |
+| full | AArch64 | `f78fb8f8fc54af4bc26ac97f7cb1fd9750abdf4f24e62f7cffffeb2daef4b175` |
+| core | x86_64 | `5603b786bd39ea2b5f172a2a292e883a043655ce729d32320213cab8d69f4ee3` |
+| core | AArch64 | `7928969e7863142753404e3cabb1f0e9feb017e82885149a6d4b86c02a97c957` |
+
+Secure Boot pins the canonical-DER certificate SHA-256
 `08796d5bf0e16eb1731408be816bbbc014e9a81d91c7afbf34bf8c9e4617ae19`.
 The resolver enables model selection for a catalog family only when complete
 x86_64 and AArch64 pins exist for both full and core under one release tag and
-signing identity. Therefore `--model core` remains rejected for Ubuntu until
-the finalized four-asset release values are added; a partial rotation cannot
-become selectable.
+signing identity. The Ubuntu full pins intentionally remain on their original
+immutable release, so use `UbuntuCore` rather than `Ubuntu --model core`.
 
 ## Shared firmware resolution
 

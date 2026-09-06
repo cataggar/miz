@@ -142,6 +142,26 @@ const known_images = [_]KnownImage{
         .image_sha256 = "f78fb8f8fc54af4bc26ac97f7cb1fd9750abdf4f24e62f7cffffeb2daef4b175",
         .certificate_sha256 = ubuntu_release_certificate_sha256,
     },
+    .{
+        .family = .ubuntu,
+        .alias = "Ubuntu-26.04-x86_64.core",
+        .disk_name = "Ubuntu-26.04-x86_64.core.qcow2",
+        .release_spec = "cataggar/miz/Ubuntu-26.04-x86_64.core.qcow2@Ubuntu-26.04-20260905",
+        .architecture = .x86_64,
+        .image_sha256 = "5603b786bd39ea2b5f172a2a292e883a043655ce729d32320213cab8d69f4ee3",
+        .certificate_sha256 = "08796d5bf0e16eb1731408be816bbbc014e9a81d91c7afbf34bf8c9e4617ae19",
+        .model = .core,
+    },
+    .{
+        .family = .ubuntu,
+        .alias = "Ubuntu-26.04-aarch64.core",
+        .disk_name = "Ubuntu-26.04-aarch64.core.qcow2",
+        .release_spec = "cataggar/miz/Ubuntu-26.04-aarch64.core.qcow2@Ubuntu-26.04-20260905",
+        .architecture = .aarch64,
+        .image_sha256 = "7928969e7863142753404e3cabb1f0e9feb017e82885149a6d4b86c02a97c957",
+        .certificate_sha256 = ubuntu_release_certificate_sha256,
+        .model = .core,
+    },
 };
 
 fn familyHasCompleteModel(family: ImageFamily, model: ImageModel) bool {
@@ -216,8 +236,11 @@ const help_text =
     \\  AzureLinux-4.0-x86_64
     \\  AzureLinux-4.0-aarch64
     \\  Ubuntu
+    \\  UbuntuCore
     \\  Ubuntu-26.04-x86_64
     \\  Ubuntu-26.04-aarch64
+    \\  Ubuntu-26.04-x86_64.core
+    \\  Ubuntu-26.04-aarch64.core
     \\  FreeBSD
     \\  FreeBSD-15.1-x86_64
     \\  FreeBSD-15.1-aarch64
@@ -229,7 +252,7 @@ const help_text =
     \\Options:
     \\  --snapshot          Discard guest disk and UEFI variable changes on exit.
     \\  --model <m>         Catalog alias model: full (default) or core.
-    \\                      Ubuntu core awaits finalized release digest pins.
+    \\                      UbuntuCore selects Ubuntu's separate core release.
     \\  --architecture <a>  Guest architecture: auto, x86_64, or aarch64.
     \\  --arch <a>          Alias for --architecture.
     \\  --admin-username <n> Provision this administrator account (requires a key).
@@ -1091,6 +1114,19 @@ fn resolveImageAlloc(
             true,
         );
     }
+    if (std.mem.eql(u8, basename, "UbuntuCore")) {
+        if (options.model_was_explicit) return error.ImageModelRequiresAlias;
+        return resolvedKnownImageAlloc(
+            allocator,
+            imageForFamilyAndArchitecture(
+                .ubuntu,
+                catalogArchitecture(options),
+                .core,
+            ),
+            std.fs.path.dirname(argument),
+            true,
+        );
+    }
     for (known_images) |known| {
         if (!std.mem.eql(u8, basename, known.alias)) continue;
         if (options.model_was_explicit and !known.family.supportsModel())
@@ -1148,7 +1184,7 @@ fn imageForFamilyAndArchitecture(
     for (known_images) |known| {
         if (known.family == family and
             known.architecture == architecture and
-            (!family.supportsModel() or known.model == model))
+            known.model == model)
         {
             return known;
         }
@@ -3179,12 +3215,15 @@ test "qemu parser recognizes help" {
     try std.testing.expect(parsed.options.help);
 }
 
-test "qemu help lists finalized Ubuntu aliases and digest-pinned core handoff" {
+test "qemu help lists finalized Ubuntu full and core aliases" {
     for ([_][]const u8{
         "Ubuntu\n",
+        "UbuntuCore",
         "Ubuntu-26.04-x86_64",
         "Ubuntu-26.04-aarch64",
-        "Ubuntu core awaits finalized release digest pins",
+        "Ubuntu-26.04-x86_64.core",
+        "Ubuntu-26.04-aarch64.core",
+        "UbuntuCore selects Ubuntu's separate core release",
     }) |text| {
         try std.testing.expect(std.mem.indexOf(u8, help_text, text) != null);
     }
@@ -3542,6 +3581,52 @@ test "qemu resolves Ubuntu aliases for both host architectures" {
     try std.testing.expectEqual(GuestArchitecture.aarch64, arm.architecture);
 }
 
+test "qemu resolves UbuntuCore for both host architectures" {
+    try std.testing.expectEqualStrings(
+        "Ubuntu-26.04-x86_64.core.qcow2",
+        knownImageForHostArchitecture(.ubuntu, .x86_64, .core).disk_name,
+    );
+    try std.testing.expectEqualStrings(
+        "Ubuntu-26.04-aarch64.core.qcow2",
+        knownImageForHostArchitecture(.ubuntu, .aarch64, .core).disk_name,
+    );
+
+    const allocator = std.testing.allocator;
+    var host_alias = try resolveImageAlloc(allocator, .{
+        .image_path = "UbuntuCore",
+        .image_was_explicit = true,
+    });
+    defer host_alias.deinit(allocator);
+    const expected_host = knownImageForHostArchitecture(
+        .ubuntu,
+        builtin.cpu.arch,
+        .core,
+    );
+    try std.testing.expectEqualStrings(expected_host.disk_name, host_alias.disk_path);
+    try std.testing.expectEqual(expected_host.architecture, host_alias.architecture);
+    try std.testing.expect(host_alias.download_allowed);
+
+    var x86 = try resolveImageAlloc(allocator, .{
+        .image_path = "images/UbuntuCore",
+        .image_was_explicit = true,
+        .architecture_request = .x86_64,
+        .architecture_was_explicit = true,
+    });
+    defer x86.deinit(allocator);
+    try std.testing.expectEqualStrings("images/Ubuntu-26.04-x86_64.core.qcow2", x86.disk_path);
+    try std.testing.expectEqual(GuestArchitecture.x86_64, x86.architecture);
+
+    var arm = try resolveImageAlloc(allocator, .{
+        .image_path = "images/UbuntuCore",
+        .image_was_explicit = true,
+        .architecture_request = .aarch64,
+        .architecture_was_explicit = true,
+    });
+    defer arm.deinit(allocator);
+    try std.testing.expectEqualStrings("images/Ubuntu-26.04-aarch64.core.qcow2", arm.disk_path);
+    try std.testing.expectEqual(GuestArchitecture.aarch64, arm.architecture);
+}
+
 test "qemu resolves exact and directory-prefixed Ubuntu aliases" {
     const allocator = std.testing.allocator;
     var x86 = try resolveImageAlloc(allocator, .{
@@ -3584,6 +3669,47 @@ test "qemu resolves exact and directory-prefixed Ubuntu aliases" {
     try std.testing.expect(exact_disk.expected_image_sha256 != null);
     try std.testing.expect(exact_disk.expected_certificate_sha256 != null);
     try std.testing.expect(!exact_disk.download_allowed);
+
+    var core_x86 = try resolveImageAlloc(allocator, .{
+        .image_path = "Ubuntu-26.04-x86_64.core",
+        .image_was_explicit = true,
+    });
+    defer core_x86.deinit(allocator);
+    try std.testing.expectEqualStrings("Ubuntu-26.04-x86_64.core.qcow2", core_x86.disk_path);
+    try std.testing.expectEqual(GuestArchitecture.x86_64, core_x86.architecture);
+    try std.testing.expect(core_x86.expected_certificate_sha256 != null);
+    try std.testing.expect(core_x86.download_allowed);
+
+    var core_arm = try resolveImageAlloc(allocator, .{
+        .image_path = "downloads/Ubuntu-26.04-aarch64.core",
+        .image_was_explicit = true,
+    });
+    defer core_arm.deinit(allocator);
+    try std.testing.expectEqualStrings(
+        "downloads/Ubuntu-26.04-aarch64.core.qcow2",
+        core_arm.disk_path,
+    );
+    try std.testing.expectEqualStrings(
+        "downloads/Ubuntu-26.04-aarch64.core.code.fd",
+        core_arm.code_path,
+    );
+    try std.testing.expectEqualStrings(
+        "downloads/Ubuntu-26.04-aarch64.core.vars.fd",
+        core_arm.vars_path,
+    );
+    try std.testing.expectEqual(GuestArchitecture.aarch64, core_arm.architecture);
+    try std.testing.expect(core_arm.expected_certificate_sha256 != null);
+    try std.testing.expect(core_arm.download_allowed);
+
+    var core_disk = try resolveImageAlloc(allocator, .{
+        .image_path = "./Ubuntu-26.04-aarch64.core.qcow2",
+        .image_was_explicit = true,
+    });
+    defer core_disk.deinit(allocator);
+    try std.testing.expectEqual(GuestArchitecture.aarch64, core_disk.architecture);
+    try std.testing.expect(core_disk.expected_image_sha256 != null);
+    try std.testing.expect(core_disk.expected_certificate_sha256 != null);
+    try std.testing.expect(!core_disk.download_allowed);
 }
 
 test "qemu rejects model selection for FreeBSD aliases" {
@@ -3606,16 +3732,19 @@ test "qemu rejects model selection for FreeBSD aliases" {
     ));
 }
 
-test "qemu rejects model selection for Ubuntu until core is cataloged" {
+test "qemu keeps split-release Ubuntu aliases outside model selection" {
     try std.testing.expect(ImageFamily.azure_linux.supportsModel());
     try std.testing.expect(familyHasCompleteModel(.ubuntu, .full));
-    try std.testing.expect(!familyHasCompleteModel(.ubuntu, .core));
+    try std.testing.expect(familyHasCompleteModel(.ubuntu, .core));
     try std.testing.expect(!familyHasCompleteModelSet(.ubuntu));
     try std.testing.expect(!ImageFamily.ubuntu.supportsModel());
     for ([_][]const u8{
         "Ubuntu",
+        "UbuntuCore",
         "Ubuntu-26.04-x86_64",
         "Ubuntu-26.04-aarch64.qcow2",
+        "Ubuntu-26.04-x86_64.core",
+        "Ubuntu-26.04-aarch64.core.qcow2",
     }) |image_path| {
         try std.testing.expectError(error.ImageModelRequiresAlias, resolveImageAlloc(
             std.testing.allocator,
@@ -4819,13 +4948,41 @@ test "qemu release download specs remain pinned to validated releases" {
         "f78fb8f8fc54af4bc26ac97f7cb1fd9750abdf4f24e62f7cffffeb2daef4b175",
         known_images[7].image_sha256,
     );
+    const expected_ubuntu_core = [_]KnownImage{
+        .{
+            .family = .ubuntu,
+            .alias = "Ubuntu-26.04-x86_64.core",
+            .disk_name = "Ubuntu-26.04-x86_64.core.qcow2",
+            .release_spec = "cataggar/miz/Ubuntu-26.04-x86_64.core.qcow2@Ubuntu-26.04-20260905",
+            .architecture = .x86_64,
+            .image_sha256 = "5603b786bd39ea2b5f172a2a292e883a043655ce729d32320213cab8d69f4ee3",
+            .certificate_sha256 = ubuntu_release_certificate_sha256,
+            .model = .core,
+        },
+        .{
+            .family = .ubuntu,
+            .alias = "Ubuntu-26.04-aarch64.core",
+            .disk_name = "Ubuntu-26.04-aarch64.core.qcow2",
+            .release_spec = "cataggar/miz/Ubuntu-26.04-aarch64.core.qcow2@Ubuntu-26.04-20260905",
+            .architecture = .aarch64,
+            .image_sha256 = "7928969e7863142753404e3cabb1f0e9feb017e82885149a6d4b86c02a97c957",
+            .certificate_sha256 = "08796d5bf0e16eb1731408be816bbbc014e9a81d91c7afbf34bf8c9e4617ae19",
+            .model = .core,
+        },
+    };
+    try std.testing.expectEqualDeep(expected_ubuntu_core[0], known_images[8]);
+    try std.testing.expectEqualDeep(expected_ubuntu_core[1], known_images[9]);
+    try std.testing.expectEqualStrings(
+        "08796d5bf0e16eb1731408be816bbbc014e9a81d91c7afbf34bf8c9e4617ae19",
+        ubuntu_release_certificate_sha256,
+    );
     for (known_images[0..4]) |known| {
         try std.testing.expectEqualStrings(
             release_certificate_sha256,
             known.certificate_sha256.?,
         );
     }
-    for (known_images[6..8]) |known| {
+    for (known_images[6..10]) |known| {
         try std.testing.expectEqualStrings(
             ubuntu_release_certificate_sha256,
             known.certificate_sha256.?,
@@ -4915,6 +5072,28 @@ test "qemu Ubuntu image download argv is exact" {
         "f78fb8f8fc54af4bc26ac97f7cb1fd9750abdf4f24e62f7cffffeb2daef4b175",
         "--output",
         "images/Ubuntu-26.04-aarch64.qcow2",
+    }, &argv);
+}
+
+test "qemu Ubuntu core image download argv is exact" {
+    const allocator = std.testing.allocator;
+    var image = try resolveImageAlloc(allocator, .{
+        .image_path = "images/UbuntuCore",
+        .image_was_explicit = true,
+        .architecture_request = .aarch64,
+        .architecture_was_explicit = true,
+    });
+    defer image.deinit(allocator);
+    const digest_hex = std.fmt.bytesToHex(image.expected_image_sha256.?, .lower);
+    const argv = ghrDownloadArgv(image, &digest_hex);
+    try expectArgv(&.{
+        "ghr",
+        "download",
+        "cataggar/miz/Ubuntu-26.04-aarch64.core.qcow2@Ubuntu-26.04-20260905",
+        "--sha256",
+        "7928969e7863142753404e3cabb1f0e9feb017e82885149a6d4b86c02a97c957",
+        "--output",
+        "images/Ubuntu-26.04-aarch64.core.qcow2",
     }, &argv);
 }
 

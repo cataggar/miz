@@ -27,39 +27,48 @@ redownload verification.
 
 ## QEMU catalog aliases
 
-Release [`Ubuntu-26.04-20260822`](https://github.com/cataggar/miz/releases/tag/Ubuntu-26.04-20260822)
-publishes the immutable full-image catalog entries:
+The catalog keeps the original full-image aliases on immutable release
+[`Ubuntu-26.04-20260822`](https://github.com/cataggar/miz/releases/tag/Ubuntu-26.04-20260822)
+and binds the minimized core aliases to immutable release
+[`Ubuntu-26.04-20260905`](https://github.com/cataggar/miz/releases/tag/Ubuntu-26.04-20260905):
 
-| Alias | Release asset SHA-256 |
-| --- | --- |
-| `Ubuntu-26.04-x86_64` | `23116f2a4fb508d1beb60fae673c95636c3540ad3ab8f42f6966367ef86e0511` |
-| `Ubuntu-26.04-aarch64` | `f78fb8f8fc54af4bc26ac97f7cb1fd9750abdf4f24e62f7cffffeb2daef4b175` |
+| Model | Alias | Release asset SHA-256 |
+| --- | --- | --- |
+| full | `Ubuntu-26.04-x86_64` | `23116f2a4fb508d1beb60fae673c95636c3540ad3ab8f42f6966367ef86e0511` |
+| full | `Ubuntu-26.04-aarch64` | `f78fb8f8fc54af4bc26ac97f7cb1fd9750abdf4f24e62f7cffffeb2daef4b175` |
+| core | `Ubuntu-26.04-x86_64.core` | `5603b786bd39ea2b5f172a2a292e883a043655ce729d32320213cab8d69f4ee3` |
+| core | `Ubuntu-26.04-aarch64.core` | `7928969e7863142753404e3cabb1f0e9feb017e82885149a6d4b86c02a97c957` |
 
 `miz qemu Ubuntu` selects the x86_64 asset on x86_64 hosts and the AArch64
-asset on AArch64 hosts. Override that host-native choice with
-`--arch x86_64` or `--arch aarch64`. The architecture-specific aliases are
-exact, and a directory prefix controls where the catalog download and firmware
-bundle are placed:
+full asset on AArch64 hosts. `miz qemu UbuntuCore` performs the same
+host-architecture selection for the minimized core assets. Override either
+choice with `--arch x86_64` or `--arch aarch64`. The architecture-specific
+aliases are exact, and a directory prefix controls where the catalog download
+and firmware bundle are placed:
 
 ```text
 miz qemu Ubuntu
 miz qemu Ubuntu --arch aarch64
 miz qemu Ubuntu-26.04-x86_64
 miz qemu images/Ubuntu-26.04-aarch64
+miz qemu UbuntuCore
+miz qemu UbuntuCore --arch aarch64
+miz qemu Ubuntu-26.04-x86_64.core
+miz qemu images/Ubuntu-26.04-aarch64.core
 ```
 
-The catalog pins both immutable release asset URLs and the digests above.
+The full images provide systemd, cloud-init, and WALinuxAgent. The smaller core
+images provide mizinit, azagent, and directly supervised OpenSSH. The catalog
+pins each immutable release asset URL and digest above.
 Secure Boot additionally pins the validated release leaf certificate's
 canonical-DER SHA-256,
 `08796d5bf0e16eb1731408be816bbbc014e9a81d91c7afbf34bf8c9e4617ae19`.
 An existing image is reused and is never refreshed or overwritten.
 
-Only the immutable `20260822` full model is currently cataloged.
-`miz qemu Ubuntu --model core` remains rejected until the new release has
-actually completed and a follow-up catalog change pins its final core asset
-URLs, SHA-256 digests, and signer. The resolver requires a complete x86_64 and
-AArch64 pair for both models under one release tag and signing identity, so
-partial catalog data cannot enable selection.
+The resolver permits `--model` only when a family has complete full and core
+pairs under one release tag and signing identity. The Ubuntu full aliases
+intentionally retain their original release pins, so use `UbuntuCore` rather
+than `Ubuntu --model core`.
 
 ## Immutable source and package provenance
 
@@ -1641,12 +1650,8 @@ VHDs, credentials, and only ownership-tagged Azure resources.
 ## Catalog aliases
 
 The full aliases from immutable release `Ubuntu-26.04-20260822` remain pinned
-exactly as documented above and are not mutated in place. After the
-`Ubuntu-26.04-20260905` workflow completes successfully, a separate catalog
-handoff must rotate the full entries and add both core entries using the real
-final asset URLs, SHA-256 digests, and signing-certificate fingerprint.
-
-Do not substitute build-time guesses, acceptance-time intermediate values, or
-digests copied from the older release. Until those final pins land,
-`miz qemu Ubuntu --model core` stays fail-closed; explicit image paths require
-independent Secure Boot trust material as described in [QEMU](qemu.md).
+exactly as documented above and are not mutated in place. `UbuntuCore` and the
+two architecture-specific `.core` aliases pin the finalized
+`Ubuntu-26.04-20260905` assets, digests, and shared signing-certificate
+fingerprint. Explicit non-catalog image paths require independent Secure Boot
+trust material as described in [QEMU](qemu.md).
