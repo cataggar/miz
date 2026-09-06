@@ -980,9 +980,30 @@ pub fn build(b: *std.Build) void {
     const run_release_support_tests = b.addRunArtifact(release_support_tests);
     const release_support_test_step = b.step(
         "test-release-support",
-        "Run shared release-tooling foundation unit tests",
+        "Run shared release-tooling and Trusted Launch contract tests",
     );
     release_support_test_step.dependOn(&run_release_support_tests.step);
+    const azure_trusted_launch_contract_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/azure_trusted_launch_contract.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "release", .module = release_support_mod },
+            },
+        }),
+    });
+    const run_azure_trusted_launch_contract_tests = b.addRunArtifact(
+        azure_trusted_launch_contract_tests,
+    );
+    run_azure_trusted_launch_contract_tests.has_side_effects = true;
+    run_azure_trusted_launch_contract_tests.setEnvironmentVariable(
+        "MIZ_AZURE_TRUSTED_LAUNCH_ROOT",
+        b.build_root.path orelse ".",
+    );
+    release_support_test_step.dependOn(
+        &run_azure_trusted_launch_contract_tests.step,
+    );
 
     // ---- scripts/azure_vhd.zig: fixed-VHD footer, geometry, and qemu-img
     // agreement checks for Azure uploads, replacing scripts/azure_vhd.py.
@@ -2315,6 +2336,9 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_make_oci_fixture_tests.step);
         aggregate_test_step.dependOn(&run_freebsd_boot_tests.step);
         aggregate_test_step.dependOn(&run_release_support_tests.step);
+        aggregate_test_step.dependOn(
+            &run_azure_trusted_launch_contract_tests.step,
+        );
         aggregate_test_step.dependOn(&run_azure_vhd_tests.step);
         aggregate_test_step.dependOn(&run_azurelinux4_release_tests.step);
         aggregate_test_step.dependOn(&run_azurelinux4_contract_tests.step);

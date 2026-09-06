@@ -23,6 +23,7 @@ pub const Diagnostic = release.contract.Diagnostic;
 pub const digest = release.digest;
 pub const file_support = release.file;
 pub const json_document = release.json_document;
+pub const azure_trusted_launch = release.azure_trusted_launch;
 
 /// Every rejection in the Python is one `fail()` line; `error.Failed` is that
 /// line, and the diagnostic carries its text.

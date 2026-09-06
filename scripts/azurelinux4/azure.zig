@@ -31,6 +31,7 @@ const contract = release.contract;
 const digest_support = release.digest;
 const file_support = release.file;
 const json_document = release.json_document;
+const trusted_launch = release.azure_trusted_launch;
 
 pub const Diagnostic = contract.Diagnostic;
 
@@ -258,46 +259,12 @@ pub fn galleryRequest(
     disk_id: []const u8,
     certificate: []const u8,
 ) Allocator.Error!Value {
-    const encoded = try contracts.encodeBase64Alloc(allocator, certificate);
-    return contracts.object(allocator, &.{
-        .{ "location", contracts.str(location) },
-        .{ "properties", try contracts.object(allocator, &.{
-            .{ "publishingProfile", try contracts.object(allocator, &.{
-                .{ "replicationMode", contracts.str("Shallow") },
-                .{ "targetRegions", try contracts.array(allocator, &.{
-                    try contracts.object(allocator, &.{
-                        .{ "name", contracts.str(location) },
-                        .{ "regionalReplicaCount", contracts.int(1) },
-                        .{ "storageAccountType", contracts.str("Standard_LRS") },
-                    }),
-                }) },
-            }) },
-            .{ "storageProfile", try contracts.object(allocator, &.{
-                .{ "osDiskImage", try contracts.object(allocator, &.{
-                    .{ "source", try contracts.object(allocator, &.{
-                        .{ "id", contracts.str(disk_id) },
-                    }) },
-                }) },
-            }) },
-            .{ "securityProfile", try contracts.object(allocator, &.{
-                .{ "uefiSettings", try contracts.object(allocator, &.{
-                    .{ "signatureTemplateNames", try contracts.array(allocator, &.{
-                        contracts.str(contracts.gallery_signature_template),
-                    }) },
-                    .{ "additionalSignatures", try contracts.object(allocator, &.{
-                        .{ "db", try contracts.array(allocator, &.{
-                            try contracts.object(allocator, &.{
-                                .{ "type", contracts.str("x509") },
-                                .{ "value", try contracts.array(allocator, &.{
-                                    contracts.str(encoded),
-                                }) },
-                            }),
-                        }) },
-                    }) },
-                }) },
-            }) },
-        }) },
-    });
+    return trusted_launch.galleryVersionRequest(
+        allocator,
+        location,
+        disk_id,
+        certificate,
+    );
 }
 
 /// The create response must echo the exact custom UEFI settings that were
@@ -407,32 +374,7 @@ pub fn checkVmSecurity(
     label: []const u8,
     diagnostic: *Diagnostic,
 ) AzureError!void {
-    if (!contracts.isString(profile.get("securityType"), "TrustedLaunch")) {
-        return diagnostic.fail(
-            error.InvalidSecurityProfile,
-            "{s}: VM is not Trusted Launch",
-            .{label},
-        );
-    }
-    const settings = contracts.objectOrNull(profile.get("uefiSettings")) orelse
-        ObjectMap.empty;
-    if (!isTrue(settings.get("secureBootEnabled"))) return diagnostic.fail(
-        error.InvalidSecurityProfile,
-        "{s}: Secure Boot is not enabled",
-        .{label},
-    );
-    if (!isTrue(settings.get("vTpmEnabled"))) return diagnostic.fail(
-        error.InvalidSecurityProfile,
-        "{s}: vTPM is not enabled",
-        .{label},
-    );
-}
-
-/// `is not True` in the Python: only the boolean itself passes, never a
-/// truthy string or a 1.
-fn isTrue(value: ?Value) bool {
-    const present = value orelse return false;
-    return present == .bool and present.bool;
+    return trusted_launch.validateVmSecurityProfile(profile, label, diagnostic);
 }
 
 // ---------------------------------------------------------------------------

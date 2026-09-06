@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/azure_trusted_launch_lib.sh
+source "$script_dir/azure_trusted_launch_lib.sh"
+
 command_name=${1:-run}
 if [[ -z ${STATE_FILE:-} || -z ${GITHUB_RUN_ID:-} || -z ${GITHUB_RUN_ATTEMPT:-} || -z ${CANDIDATE_KEY:-} ]]; then
   echo "::error::Azure cleanup identity is incomplete"
@@ -252,6 +256,8 @@ vhd="$RESULT_DIR/${CANDIDATE_KEY}.vhd"
 private_key="$RESULT_DIR/id_ed25519"
 boot_log="$RESULT_DIR/boot.log"
 sku_json="$RESULT_DIR/sku.json"
+disk_json="$RESULT_DIR/managed-disk.json"
+image_definition_json="$RESULT_DIR/gallery-image-definition.json"
 certificate_der="$RESULT_DIR/signing-certificate.der"
 uefi_request="$RESULT_DIR/gallery-version-request.json"
 uefi_create_response="$RESULT_DIR/gallery-version-create-response.json"
@@ -365,31 +371,24 @@ test "$vhd_bytes" -eq "$((vhd_current_size + 512))"
 vhd_sha256=$(sha256sum "$vhd" | awk '{print $1}')
 [[ "$vhd_sha256" =~ ^[0-9a-f]{64}$ ]]
 
-az disk create \
-  --resource-group "$resource_group" \
-  --name "$disk_name" \
-  --location "$AZURE_LOCATION" \
-  --sku Standard_LRS \
-  --upload-type Upload \
-  --upload-size-bytes "$vhd_bytes" \
-  --os-type Linux \
-  --hyper-v-generation V2 \
-  --architecture "$azure_image_architecture" \
-  --output json >/dev/null
-disk_id=$(az disk show \
-  --resource-group "$resource_group" \
-  --name "$disk_name" \
-  --query id \
-  --output tsv)
+azure_trusted_launch_disk_create_args \
+  "$resource_group" "$disk_name" "$AZURE_LOCATION" "$vhd_bytes" \
+  "$azure_image_architecture"
+az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >/dev/null
+azure_trusted_launch_disk_show_args "$resource_group" "$disk_name"
+az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >"$disk_json"
+disk_id=$(
+  "$release_tool" check-managed-disk \
+    --disk "$disk_json" \
+    --architecture "$azure_image_architecture"
+)
 [[ "$disk_id" == /subscriptions/* ]]
 upload_sas=$(grant_disk_write_access "$disk_id" 7200)
 [[ "$upload_sas" == https://* ]]
 echo "::add-mask::$upload_sas"
 azcopy copy "$vhd" "$upload_sas" --blob-type PageBlob
-az disk revoke-access \
-  --resource-group "$resource_group" \
-  --name "$disk_name" \
-  --output json >/dev/null
+azure_trusted_launch_disk_revoke_access_args "$resource_group" "$disk_name"
+az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >/dev/null
 upload_sas=
 
 expanded_size_gib=$(((vhd_current_size + 1073741823) / 1073741824 + 2))
@@ -399,31 +398,21 @@ az disk update \
   --size-gb "$expanded_size_gib" \
   --output json >/dev/null
 
-az sig create \
-  --resource-group "$resource_group" \
-  --gallery-name "$gallery_name" \
-  --location "$AZURE_LOCATION" \
-  --output json >/dev/null
-az sig image-definition create \
-  --resource-group "$resource_group" \
-  --gallery-name "$gallery_name" \
-  --gallery-image-definition "$image_name" \
-  --publisher miz \
-  --offer azurelinux4 \
-  --sku "${short_arch}-${FLAVOR}" \
-  --os-type Linux \
-  --os-state Generalized \
-  --hyper-v-generation V2 \
-  --architecture "$azure_image_architecture" \
-  --features SecurityType=TrustedLaunchSupported \
-  --location "$AZURE_LOCATION" \
-  --output json >/dev/null
-image_definition_id=$(az sig image-definition show \
-  --resource-group "$resource_group" \
-  --gallery-name "$gallery_name" \
-  --gallery-image-definition "$image_name" \
-  --query id \
-  --output tsv)
+azure_trusted_launch_gallery_create_args \
+  "$resource_group" "$gallery_name" "$AZURE_LOCATION"
+az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >/dev/null
+azure_trusted_launch_image_definition_create_args \
+  "$resource_group" "$gallery_name" "$image_name" azurelinux4 \
+  "${short_arch}-${FLAVOR}" "$azure_image_architecture" "$AZURE_LOCATION"
+az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >/dev/null
+azure_trusted_launch_image_definition_show_args \
+  "$resource_group" "$gallery_name" "$image_name"
+az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >"$image_definition_json"
+image_definition_id=$(
+  "$release_tool" check-image-definition \
+    --definition "$image_definition_json" \
+    --architecture "$azure_image_architecture"
+)
 [[ "$image_definition_id" == /subscriptions/* ]]
 image_version_id="$image_definition_id/versions/1.0.0"
 "$release_tool" gallery-request \
@@ -431,11 +420,8 @@ image_version_id="$image_definition_id/versions/1.0.0"
   --location "$AZURE_LOCATION" \
   --disk-id "$disk_id" \
   --certificate "$certificate_der"
-az rest \
-  --method put \
-  --uri "https://management.azure.com${image_version_id}?api-version=2025-03-03" \
-  --body "@$uefi_request" \
-  --output json >"$uefi_response"
+azure_trusted_launch_gallery_version_put_args "$image_version_id" "$uefi_request"
+az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >"$uefi_response"
 cp "$uefi_response" "$uefi_create_response"
 "$release_tool" check-gallery-accepted \
   --request "$uefi_request" \
@@ -450,10 +436,8 @@ for _ in {1..120}; do
       ;;
   esac
   sleep 10
-  az rest \
-    --method get \
-    --uri "https://management.azure.com${image_version_id}?api-version=2025-03-03" \
-    --output json >"$uefi_response"
+  azure_trusted_launch_gallery_version_get_args "$image_version_id"
+  az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >"$uefi_response"
 done
 test "$provisioning_state" = Succeeded
 "$release_tool" check-gallery-final \
@@ -463,34 +447,14 @@ test "$provisioning_state" = Succeeded
 [[ "$image_version_id" == /subscriptions/* ]]
 
 ssh-keygen -q -t ed25519 -N '' -C miz-azure-acceptance -f "$private_key"
-az vm create \
-  --resource-group "$resource_group" \
-  --name "$vm_name" \
-  --location "$AZURE_LOCATION" \
-  --size "$AZURE_VM_SIZE" \
-  --image "$image_version_id" \
-  --admin-username "$admin_username" \
-  --authentication-type ssh \
-  --ssh-key-values "$private_key.pub" \
-  --enable-agent true \
-  --enable-auto-update false \
-  --security-type TrustedLaunch \
-  --enable-secure-boot true \
-  --enable-vtpm true \
-  --public-ip-sku Standard \
-  --nsg-rule SSH \
-  --boot-diagnostics-storage "" \
-  --output json >/dev/null
-az vm show \
-  --resource-group "$resource_group" \
-  --name "$vm_name" \
-  --query securityProfile \
-  --output json >"$vm_security_json"
-az vm get-instance-view \
-  --resource-group "$resource_group" \
-  --name "$vm_name" \
-  --query securityProfile \
-  --output json >"$instance_security_json"
+azure_trusted_launch_vm_create_args \
+  "$resource_group" "$vm_name" "$AZURE_LOCATION" "$AZURE_VM_SIZE" \
+  "$image_version_id" "$admin_username" "$private_key.pub" true true
+az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >/dev/null
+azure_trusted_launch_vm_resource_security_args "$resource_group" "$vm_name"
+az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >"$vm_security_json"
+azure_trusted_launch_vm_instance_security_args "$resource_group" "$vm_name"
+az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >"$instance_security_json"
 "$release_tool" check-vm-security \
   --profile "$vm_security_json" \
   --profile "$instance_security_json"

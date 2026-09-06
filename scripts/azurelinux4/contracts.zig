@@ -22,6 +22,7 @@ const release = @import("../release/root.zig");
 const Allocator = std.mem.Allocator;
 const contract = release.contract;
 const json_document = release.json_document;
+const trusted_launch = release.azure_trusted_launch;
 
 pub const Diagnostic = contract.Diagnostic;
 pub const Value = std.json.Value;
@@ -110,7 +111,7 @@ pub const private_key_pem_markers = [_][]const u8{
     "-----BEGIN OPENSSH PRIVATE KEY-----",
 };
 
-pub const gallery_signature_template = "MicrosoftUefiCertificateAuthorityTemplate";
+pub const gallery_signature_template = trusted_launch.signature_template;
 
 pub const ContractError = error{
     InvalidSchema,
@@ -522,82 +523,19 @@ pub fn validateAzureUefiSettings(
     certificate_sha256: []const u8,
     diagnostic: *Diagnostic,
 ) Error!Value {
-    const map = objectOrNull(settings) orelse return diagnostic.fail(
-        error.InvalidUefiSettings,
-        "Azure custom UEFI settings have an unexpected shape",
-        .{},
+    try trusted_launch.validateUefiSettings(
+        allocator,
+        settings,
+        certificate_sha256,
+        diagnostic,
     );
-    if (!hasExactKeys(map, &.{ "signatureTemplateNames", "additionalSignatures" })) {
-        return diagnostic.fail(
-            error.InvalidUefiSettings,
-            "Azure custom UEFI settings have an unexpected shape",
-            .{},
-        );
-    }
-    const templates = arrayOrNull(map.get("signatureTemplateNames"));
-    const retains_template = templates != null and
-        templates.?.len == 1 and
-        isString(templates.?[0], gallery_signature_template);
-    if (!retains_template) return diagnostic.fail(
-        error.InvalidUefiSettings,
-        "Azure custom UEFI settings do not retain the Microsoft template",
-        .{},
-    );
-    const additional = objectOrNull(map.get("additionalSignatures")) orelse
-        return diagnostic.fail(
-            error.InvalidUefiSettings,
-            "Azure custom UEFI additional signatures are invalid",
-            .{},
-        );
-    if (!hasExactKeys(additional, &.{"db"})) return diagnostic.fail(
-        error.InvalidUefiSettings,
-        "Azure custom UEFI additional signatures are invalid",
-        .{},
-    );
-    const encoded = dbCertificateBase64(additional.get("db")) orelse
-        return diagnostic.fail(
-            error.InvalidUefiSettings,
-            "Azure custom UEFI db signature is invalid",
-            .{},
-        );
-
-    const certificate = decodeBase64Alloc(allocator, encoded) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return diagnostic.fail(
-            error.InvalidUefiSettings,
-            "Azure custom UEFI certificate is not canonical base64",
-            .{},
-        ),
-    };
-    defer allocator.free(certificate);
-    if (!std.mem.eql(u8, &release.digest.hexBytes(certificate), certificate_sha256)) {
-        return diagnostic.fail(
-            error.InvalidUefiSettings,
-            "Azure custom UEFI certificate fingerprint mismatch",
-            .{},
-        );
-    }
     return settings.?;
-}
-
-fn dbCertificateBase64(db: ?Value) ?[]const u8 {
-    const entries = arrayOrNull(db) orelse return null;
-    if (entries.len != 1) return null;
-    const signature = objectOrNull(entries[0]) orelse return null;
-    if (!isString(signature.get("type"), "x509")) return null;
-    if (!hasExactKeys(signature, &.{ "type", "value" })) return null;
-    const values = arrayOrNull(signature.get("value")) orelse return null;
-    if (values.len != 1) return null;
-    return stringOrNull(values[0]);
 }
 
 /// `gallery_uefi_settings`: the settings a gallery document carries, or null
 /// when any level of the path is absent or not an object.
 pub fn galleryUefiSettings(document: *const ObjectMap) ?Value {
-    const properties = objectOrNull(document.get("properties")) orelse return null;
-    const security_profile = objectOrNull(properties.get("securityProfile")) orelse
-        return null;
-    return security_profile.get("uefiSettings");
+    return trusted_launch.galleryUefiSettings(document);
 }
 
 /// `validate_azure_gallery_uefi_settings`: the request must carry custom
@@ -611,28 +549,14 @@ pub fn validateAzureGalleryUefiSettings(
     certificate_sha256: []const u8,
     diagnostic: *Diagnostic,
 ) Error!Value {
-    const request_uefi = galleryUefiSettings(request);
-    const response_uefi = galleryUefiSettings(response);
-    const request_map = objectOrNull(request_uefi) orelse return diagnostic.fail(
-        error.InvalidUefiSettings,
-        "Azure gallery request omitted custom UEFI settings",
-        .{},
-    );
-    _ = request_map;
-    if (response_uefi) |actual| {
-        if (!jsonEql(actual, request_uefi.?)) return diagnostic.fail(
-            error.InvalidUefiSettings,
-            "Azure gallery version returned different custom UEFI settings",
-            .{},
-        );
-    }
-    _ = try validateAzureUefiSettings(
+    return trusted_launch.validateGalleryUefiSettings(
         allocator,
-        request_uefi,
+        request,
+        response,
         certificate_sha256,
+        false,
         diagnostic,
     );
-    return request_uefi.?;
 }
 
 /// `has_exact_contracts`: the acceptance result set must be exactly the

@@ -17,6 +17,10 @@ Azure Linux release images are available in full and core variants for both x86_
 
 Both flavors are Gen2 direct-UKI images with x86_64 and AArch64 variants. Release candidates use Azure Artifact Signing and are validated with Azure Trusted Launch, Secure Boot, and vTPM. Neither flavor contains baked credentials; supply a public SSH key during provisioning.
 
+See the canonical [Azure Trusted Launch image
+workflow](azure-trusted-launch.md) for managed-disk, gallery, custom UEFI, VM
+deployment, and validation requirements.
+
 `mizinit` supports an immutable default for other appliance uses, but the released Azure core images use `mizinit.mode=persistent` so the provisioned account, SSH keys, host keys, and agent state survive reboot.
 
 Core images format Azure's temporary resource disk as XFS. Its dynamic inode allocation is a better fit for build workspaces and package caches containing many small files than a fixed-inode ext4 filesystem. Managed data disks remain mount-only and are never reformatted by `azagent`.

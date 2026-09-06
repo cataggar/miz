@@ -22,6 +22,7 @@ const Builder = support.Builder;
 const Diagnostic = support.Diagnostic;
 const Error = support.Error;
 const fail = support.fail;
+const trusted_launch = support.azure_trusted_launch;
 
 pub const candidate_type = "ubuntu2604-candidate";
 pub const azure_result_type = "ubuntu2604-azure-acceptance";
@@ -636,92 +637,20 @@ pub fn validateAzureUefiSettings(
     certificate_sha256: []const u8,
     diagnostic: *Diagnostic,
 ) Error!void {
-    const expected_fields = [_][]const u8{
-        "additionalSignatures",
-        "signatureTemplateNames",
-    };
-    const object = support.objectOf(settings);
-    if (object == null or !support.hasExactFields(object.?, &expected_fields)) {
-        return fail(
-            diagnostic,
-            "Azure custom UEFI settings have an unexpected shape",
-            .{},
-        );
-    }
-    const templates = [_][]const u8{"MicrosoftUefiCertificateAuthorityTemplate"};
-    if (!support.isExactOrderedStrings(
-        object.?.get("signatureTemplateNames"),
-        &templates,
-    )) {
-        return fail(
-            diagnostic,
-            "Azure custom UEFI settings do not retain the Microsoft template",
-            .{},
-        );
-    }
-    const additional_fields = [_][]const u8{"db"};
-    const additional = support.objectOf(object.?.get("additionalSignatures"));
-    if (additional == null or
-        !support.hasExactFields(additional.?, &additional_fields))
-    {
-        return fail(
-            diagnostic,
-            "Azure custom UEFI additional signatures are invalid",
-            .{},
-        );
-    }
-    const db = support.arrayOf(additional.?.get("db"));
-    if (db == null or db.?.len != 1) return fail(
-        diagnostic,
-        "Azure custom UEFI db signature is invalid",
-        .{},
-    );
-    const entry_fields = [_][]const u8{ "type", "value" };
-    const entry = support.objectOf(db.?[0]);
-    if (entry == null or
-        !support.stringIs(entry.?.get("type"), "x509") or
-        !support.hasExactFields(entry.?, &entry_fields))
-    {
-        return fail(
-            diagnostic,
-            "Azure custom UEFI db signature is invalid",
-            .{},
-        );
-    }
-    const values = support.arrayOf(entry.?.get("value"));
-    if (values == null or values.?.len != 1 or values.?[0] != .string) return fail(
-        diagnostic,
-        "Azure custom UEFI db signature is invalid",
-        .{},
-    );
-    const certificate = provenance.decodeBase64(
+    trusted_launch.validateUefiSettings(
         allocator,
-        values.?[0].string,
-    ) catch return fail(
-        diagnostic,
-        "Azure custom UEFI certificate is not canonical base64",
-        .{},
-    );
-    defer allocator.free(certificate);
-    if (!std.mem.eql(
-        u8,
-        &support.digest.hexBytes(certificate),
+        settings,
         certificate_sha256,
-    )) {
-        return fail(
-            diagnostic,
-            "Azure custom UEFI certificate fingerprint mismatch",
-            .{},
-        );
-    }
+        diagnostic,
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidUefiSettings => error.Failed,
+    };
 }
 
 /// `gallery_uefi_settings`.
 pub fn galleryUefiSettings(document: *const std.json.ObjectMap) ?std.json.Value {
-    const properties = support.objectOf(document.get("properties")) orelse return null;
-    const security = support.objectOf(properties.get("securityProfile")) orelse
-        return null;
-    return security.get("uefiSettings");
+    return trusted_launch.galleryUefiSettings(document);
 }
 
 /// `validate_azure_gallery_uefi_settings`.
@@ -732,29 +661,17 @@ pub fn validateAzureGalleryUefiSettings(
     certificate_sha256: []const u8,
     diagnostic: *Diagnostic,
 ) Error!std.json.Value {
-    const request_uefi = galleryUefiSettings(request);
-    const response_uefi = galleryUefiSettings(response);
-    if (request_uefi == null or support.objectOf(request_uefi) == null) return fail(
-        diagnostic,
-        "Azure gallery request omitted custom UEFI settings",
-        .{},
-    );
-    if (response_uefi != null and
-        !support.jsonEqual(request_uefi.?, response_uefi.?))
-    {
-        return fail(
-            diagnostic,
-            "Azure gallery version returned different custom UEFI settings",
-            .{},
-        );
-    }
-    try validateAzureUefiSettings(
+    return trusted_launch.validateGalleryUefiSettings(
         allocator,
-        request_uefi,
+        request,
+        response,
         certificate_sha256,
+        false,
         diagnostic,
-    );
-    return request_uefi.?;
+    ) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidUefiSettings => error.Failed,
+    };
 }
 
 pub const conversion_fields = [_][]const u8{
