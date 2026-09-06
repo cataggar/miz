@@ -847,7 +847,7 @@ pub fn decompressXz(
     if (input_reader.seek != input_reader.end) return error.XzDecompressionFailed;
     try hashing_writer.writer.flush();
     try output_writer.interface.flush();
-    const readable_stage = try openProcFdReadOnly(io, stage.file);
+    const readable_stage = try reopenAtomicFile(io, &stage, .read_only);
     defer readable_stage.close(io);
     try validateXzIntegrity(io, compressed, readable_stage, hashing_writer.count);
 
@@ -1083,7 +1083,7 @@ pub fn finalizeQcow2(
         try validateStageBounded(io, stage.file, options.max_output_size);
     }
 
-    const stage_reader = try openProcFdReadOnly(io, stage.file);
+    const stage_reader = try reopenAtomicFile(io, &stage, .read_only);
     var finalized = image.Image.openFile(io, stage_reader) catch |err| {
         stage_reader.close(io);
         return err;
@@ -1130,7 +1130,10 @@ pub fn deriveFixedVhd(
     io: Io,
     options: DeriveFixedVhdOptions,
 ) !DerivedFixedVhd {
-    if (builtin.os.tag != .linux) return error.UnsupportedHost;
+    switch (builtin.os.tag) {
+        .linux, .macos => {},
+        else => return error.UnsupportedHost,
+    }
     if (options.max_input_size == 0) return error.InvalidInputSizeLimit;
     if (options.max_virtual_size == 0) return error.InvalidVirtualSizeLimit;
     if (options.max_output_size == 0) return error.InvalidOutputSizeLimit;
@@ -1222,7 +1225,7 @@ pub fn deriveFixedVhd(
     defer stage.deinit(io);
     try validateStageBounded(io, stage.file, options.max_output_size);
 
-    const stage_image_file = try openProcFdReadWrite(io, stage.file);
+    const stage_image_file = try reopenAtomicFile(io, &stage, .read_write);
     var finalized = try image.Image.createFile(
         io,
         stage_image_file,
@@ -1346,33 +1349,23 @@ fn runQemuImg(io: Io, options: QemuImgRunOptions) !void {
     }
 }
 
-fn openProcFdReadOnly(io: Io, file: File) !File {
-    var path_buffer: [64]u8 = undefined;
-    const fd_directory = if (builtin.os.tag == .linux) "/proc/self/fd" else "/dev/fd";
-    const path = try std.fmt.bufPrint(
-        &path_buffer,
-        "{s}/{d}",
-        .{ fd_directory, file.handle },
-    );
-    return Dir.cwd().openFile(io, path, .{
-        .mode = .read_only,
+fn reopenAtomicFile(
+    io: Io,
+    stage: *File.Atomic,
+    mode: Dir.OpenFileOptions.Mode,
+) !File {
+    const stage_basename = std.fmt.hex(stage.file_basename_hex);
+    const reopened = try stage.dir.openFile(io, &stage_basename, .{
+        .mode = mode,
         .allow_directory = false,
-        .follow_symlinks = true,
+        .follow_symlinks = false,
     });
-}
-
-fn openProcFdReadWrite(io: Io, file: File) !File {
-    var path_buffer: [64]u8 = undefined;
-    const path = try std.fmt.bufPrint(
-        &path_buffer,
-        "/proc/self/fd/{d}",
-        .{file.handle},
-    );
-    return Dir.cwd().openFile(io, path, .{
-        .mode = .read_write,
-        .allow_directory = false,
-        .follow_symlinks = true,
-    });
+    errdefer reopened.close(io);
+    if (!try sameFileIdentity(io, stage.file, reopened)) {
+        return error.OutputStageChanged;
+    }
+    try validateStage(io, reopened);
+    return reopened;
 }
 
 const OutputLocation = struct {
@@ -2675,11 +2668,13 @@ test "XZ decompression rejects hard-linked input and output" {
         .sub_path = input_path,
         .data = &test_xz,
     });
-    const input_file = try Dir.cwd().openFile(io, input_path, .{
-        .mode = .read_only,
-    });
-    defer input_file.close(io);
-    try input_file.hardLink(io, Dir.cwd(), output_path, .{});
+    try Dir.cwd().hardLink(
+        input_path,
+        Dir.cwd(),
+        output_path,
+        io,
+        .{},
+    );
 
     try std.testing.expectError(
         error.InputOutputAliased,
@@ -2909,11 +2904,13 @@ test "QCOW2 finalization rejects hard-linked input and output" {
     );
     source.close(io);
     const input = try hashFile(io, input_path);
-    const input_file = try Dir.cwd().openFile(io, input_path, .{
-        .mode = .read_only,
-    });
-    defer input_file.close(io);
-    try input_file.hardLink(io, Dir.cwd(), output_path, .{});
+    try Dir.cwd().hardLink(
+        input_path,
+        Dir.cwd(),
+        output_path,
+        io,
+        .{},
+    );
 
     try std.testing.expectError(
         error.InputOutputAliased,
@@ -2936,7 +2933,9 @@ test "QCOW2 finalization rejects hard-linked input and output" {
 }
 
 test "fixed VHD derivation relocates mirrored GPT transactionally" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
+        return error.SkipZigTest;
+    }
     const io = std.testing.io;
     const input_path = "test-derive-vhd-input.qcow2";
     const output_path = "test-derive-vhd-output.vhd";
@@ -3043,7 +3042,9 @@ test "fixed VHD derivation relocates mirrored GPT transactionally" {
 }
 
 test "fixed VHD derivation preserves output on digest failure and rejects aliases" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
+        return error.SkipZigTest;
+    }
     const io = std.testing.io;
     const input_path = "test-derive-vhd-safety.qcow2";
     const output_path = "test-derive-vhd-safety.vhd";
@@ -3091,11 +3092,13 @@ test "fixed VHD derivation preserves output on digest failure and rejects aliase
     try expectFileContent(io, output_path, "existing\n");
 
     try Dir.cwd().deleteFile(io, output_path);
-    const input_file = try Dir.cwd().openFile(io, input_path, .{
-        .mode = .read_only,
-    });
-    defer input_file.close(io);
-    try input_file.hardLink(io, Dir.cwd(), output_path, .{});
+    try Dir.cwd().hardLink(
+        input_path,
+        Dir.cwd(),
+        output_path,
+        io,
+        .{},
+    );
     options.expected_input_sha256 = metadata.sha256;
     try std.testing.expectError(
         error.InputOutputAliased,
@@ -3104,7 +3107,9 @@ test "fixed VHD derivation preserves output on digest failure and rejects aliase
 }
 
 test "fixed VHD derivation rejects backing paths before opening them" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
+        return error.SkipZigTest;
+    }
     const io = std.testing.io;
     const input_path = "test-derive-vhd-backed.qcow2";
     const output_path = "test-derive-vhd-backed.vhd";

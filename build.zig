@@ -378,6 +378,23 @@ pub fn build(b: *std.Build) void {
     // makes a targeted change to one of them expensive to verify.
     const miz_test_step = b.step("test-miz", "Run the miz package's tests");
     miz_test_step.dependOn(&run_miz_tests.step);
+    const artifact_pipeline_test_mod = b.createModule(.{
+        .root_source_file = b.path("packages/miz/src/artifact_pipeline.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    addZstdLibrary(artifact_pipeline_test_mod, host_zstd_dependency);
+    const artifact_pipeline_tests = b.addTest(.{
+        .root_module = artifact_pipeline_test_mod,
+    });
+    const run_artifact_pipeline_tests = b.addRunArtifact(
+        artifact_pipeline_tests,
+    );
+    const artifact_pipeline_test_step = b.step(
+        "test-artifact-pipeline",
+        "Run host-side artifact pipeline tests",
+    );
+    artifact_pipeline_test_step.dependOn(&run_artifact_pipeline_tests.step);
     // The native EDK2 variable-store parser/editor that replaced the
     // `virt-fw-vars` host dependency. It touches nothing in the disk-image
     // dependency graph, so it gets a step that builds in seconds.
