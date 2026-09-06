@@ -72,6 +72,8 @@ const usage_text =
     \\  azure-boot-artifact           download a bounded boot diagnostic
     \\  azure-failure-diagnostics     write the failure diagnostics document
     \\  azure-sku                     check the VM SKU and report temporary storage
+    \\  azure-managed-disk            check the uploaded Linux Gen2 disk
+    \\  azure-image-definition        check the TrustedLaunchSupported definition
     \\  azure-conversion-attestation  write the VHD conversion attestation
     \\  azure-gallery-request         write the gallery image-version request
     \\  azure-gallery-accepted        check the create response UEFI settings

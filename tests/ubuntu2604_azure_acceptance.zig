@@ -22,6 +22,8 @@ const source = @import("ubuntu2604_source.zig");
 const Source = source.Source;
 const script_path = "scripts/ubuntu2604_azure_acceptance.sh";
 const library_path = "scripts/ubuntu2604_azure_acceptance_lib.sh";
+const trusted_launch_library_path = "scripts/azure_trusted_launch_lib.sh";
+const trusted_launch_examples_path = "scripts/azure_trusted_launch_examples.sh";
 
 fn open() !Source {
     return Source.open(std.testing.allocator, script_path);
@@ -637,7 +639,12 @@ test "the harness runs no Python and the library is syntactically valid" {
     );
     try script.expectCount(source.interpreter, 2);
 
-    for ([_][]const u8{ script_path, library_path }) |path| {
+    for ([_][]const u8{
+        script_path,
+        library_path,
+        trusted_launch_library_path,
+        trusted_launch_examples_path,
+    }) |path| {
         const root = try source.rootAlloc(std.testing.allocator);
         defer std.testing.allocator.free(root);
         const full = try std.fs.path.join(std.testing.allocator, &.{ root, path });
@@ -670,8 +677,15 @@ test "core requests no VM agent and skips the vmAgent status check waagent alone
     try script.expectContains(
         "if [[ \"$FLAVOR\" == core ]]; then\n  enable_agent=false\nfi",
     );
-    try script.expectContains("--enable-agent \"$enable_agent\" \\");
+    try script.expectContains("azure_trusted_launch_vm_create_args \\");
+    try script.expectContains("\"$enable_agent\" false");
     try script.expectOmits("--enable-agent true \\");
+    var library = try Source.open(
+        std.testing.allocator,
+        trusted_launch_library_path,
+    );
+    defer library.deinit();
+    try library.expectContains("--enable-agent \"$enable_agent\"");
 
     try script.expectCount(
         "instanceView.vmAgent.statuses[?code=='ProvisioningState/succeeded']",

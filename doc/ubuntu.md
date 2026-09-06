@@ -25,6 +25,10 @@ until all four candidates pass digest-bound same-architecture QEMU acceptance
 (x86_64 KVM and AArch64 TCG), Azure Trusted Launch acceptance, and publication
 redownload verification.
 
+The full and core rows use the canonical [Azure Trusted Launch image
+workflow](azure-trusted-launch.md). The AArch64 bare-metal flavor is excluded
+from that support claim because it has no real-Azure acceptance row.
+
 ## QEMU catalog aliases
 
 The catalog keeps the original full-image aliases on immutable release

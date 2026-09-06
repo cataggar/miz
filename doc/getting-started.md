@@ -29,6 +29,7 @@ zig build run -- qemu
 ```
 
 See [Image building](image-building.md) for advanced image commands,
-[Azure Linux images](azure-linux.md) and
+[Azure Trusted Launch images](azure-trusted-launch.md),
+[Azure Linux images](azure-linux.md), and
 [Ubuntu 26.04 images](ubuntu.md) for hosted release recipes, and
 [FreeBSD images](freebsd.md) for the FreeBSD workflow.

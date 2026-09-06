@@ -34,6 +34,7 @@ const Writer = std.Io.Writer;
 const contract = release.contract;
 const file_support = release.file;
 const json_document = release.json_document;
+const trusted_launch = release.azure_trusted_launch;
 
 pub const Diagnostic = contract.Diagnostic;
 
@@ -60,6 +61,8 @@ const usage_text =
     \\  check-group-tags       require exact ownership tags before deleting a resource group
     \\  disk-access-sas        print the SAS URL of an accepted disk write-access grant
     \\  check-vm-sku           require an exact Gen2 Trusted Launch SKU; print resource-disk support
+    \\  check-managed-disk     require the uploaded Linux Gen2 disk and architecture
+    \\  check-image-definition require the Gen2 TrustedLaunchSupported gallery definition
     \\  gallery-request        write the gallery image-version request with the release signer
     \\  check-gallery-accepted require the create response to echo the requested UEFI settings
     \\  gallery-state          print the gallery image-version provisioning state
@@ -193,6 +196,8 @@ const command_table = [_]Command{
     .{ .name = "check-group-tags", .handler = runCheckGroupTags },
     .{ .name = "disk-access-sas", .handler = runDiskAccessSas },
     .{ .name = "check-vm-sku", .handler = runCheckVmSku },
+    .{ .name = "check-managed-disk", .handler = runCheckManagedDisk },
+    .{ .name = "check-image-definition", .handler = runCheckImageDefinition },
     .{ .name = "gallery-request", .handler = runGalleryRequest },
     .{ .name = "check-gallery-accepted", .handler = runCheckGalleryAccepted },
     .{ .name = "gallery-state", .handler = runGalleryState },
@@ -478,6 +483,40 @@ fn runCheckVmSku(context: Context, argv: []const []const u8) !void {
         context.diagnostic,
     );
     try context.out.print("{s}\n", .{if (result.has_resource_disk) "true" else "false"});
+}
+
+fn runCheckManagedDisk(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{ "disk", "architecture" });
+    var document = try azure.readObject(
+        context.allocator,
+        context.io,
+        try options.require("disk"),
+        context.diagnostic,
+    );
+    defer document.deinit();
+    const id = try trusted_launch.validateManagedDisk(
+        &document.parsed.value.object,
+        try options.require("architecture"),
+        context.diagnostic,
+    );
+    try context.out.print("{s}\n", .{id});
+}
+
+fn runCheckImageDefinition(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{ "definition", "architecture" });
+    var document = try azure.readObject(
+        context.allocator,
+        context.io,
+        try options.require("definition"),
+        context.diagnostic,
+    );
+    defer document.deinit();
+    const id = try trusted_launch.validateImageDefinition(
+        &document.parsed.value.object,
+        try options.require("architecture"),
+        context.diagnostic,
+    );
+    try context.out.print("{s}\n", .{id});
 }
 
 fn runGalleryRequest(context: Context, argv: []const []const u8) !void {
@@ -876,6 +915,8 @@ test "every command the shell and workflow call is dispatched" {
         "check-group-tags",
         "disk-access-sas",
         "check-vm-sku",
+        "check-managed-disk",
+        "check-image-definition",
         "gallery-request",
         "check-gallery-accepted",
         "gallery-state",

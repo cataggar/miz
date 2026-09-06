@@ -32,6 +32,7 @@ const publish_path = "scripts/azurelinux4_publish.sh";
 const runner_probe_path = "scripts/check_azurelinux4_release_runner.sh";
 const azure_module_path = "scripts/azurelinux4/azure.zig";
 const commands_module_path = "scripts/azurelinux4/commands.zig";
+const trusted_launch_library_path = "scripts/azure_trusted_launch_lib.sh";
 
 /// The tree to read. `build.zig` names the build root outright, so the checks
 /// do not depend on which directory the test binary was started in, matching
@@ -224,7 +225,8 @@ test "azure acceptance uses protected-environment OIDC and keeps no secret" {
         script,
         "\"$release_tool\" disk-access-sas --response \"$response_body\"",
     );
-    try std.testing.expect(count(script, "--output json >/dev/null") >= 9);
+    try expectContains(script, "source \"$script_dir/azure_trusted_launch_lib.sh\"");
+    try expectContains(script, "az \"${AZURE_TRUSTED_LAUNCH_ARGS[@]}\"");
     try expectContains(script, "gallery-version-create-response.json");
     try expectContains(script, "check-gallery-accepted");
     try expectContains(script, "check-gallery-final");
@@ -472,23 +474,34 @@ test "the release workflow requires built-in signing and Secure Boot" {
 
     const script = try readTracked(allocator, std.testing.io, acceptance_path);
     defer allocator.free(script);
-    try expectContains(script, "api-version=2025-03-03");
-    try expectContains(script, "--security-type TrustedLaunch");
-    try expectContains(script, "--enable-secure-boot true");
-    try expectContains(script, "--enable-vtpm true");
+    try expectContains(script, "azure_trusted_launch_gallery_version_put_args");
+    try expectContains(script, "azure_trusted_launch_vm_create_args");
+    const trusted_launch_library = try readTracked(
+        allocator,
+        std.testing.io,
+        trusted_launch_library_path,
+    );
+    defer allocator.free(trusted_launch_library);
+    try expectContains(trusted_launch_library, "api-version=2025-03-03");
+    try expectContains(trusted_launch_library, "--security-type TrustedLaunch");
+    try expectContains(trusted_launch_library, "--enable-secure-boot true");
+    try expectContains(trusted_launch_library, "--enable-vtpm true");
 
     // The gallery request body is built by the release tool, which is where
     // the Microsoft template it must retain is now spelled.
     const azure_module = try readTracked(allocator, std.testing.io, azure_module_path);
     defer allocator.free(azure_module);
-    try expectContains(azure_module, "gallery_signature_template");
+    try expectContains(azure_module, "trusted_launch.galleryVersionRequest");
     const contracts_module = try readTracked(
         allocator,
         std.testing.io,
         "scripts/azurelinux4/contracts.zig",
     );
     defer allocator.free(contracts_module);
-    try expectContains(contracts_module, "MicrosoftUefiCertificateAuthorityTemplate");
+    try expectContains(
+        contracts_module,
+        "trusted_launch.signature_template",
+    );
 }
 
 test "resource-group state precedes create and cleanup is guarded" {

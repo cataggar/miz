@@ -30,6 +30,7 @@ const runtime_contract_document = @import("runtime_contract_document.zig");
 const size_budget = @import("size_budget.zig");
 const size_inventory = @import("size_inventory.zig");
 const support = @import("support.zig");
+const trusted_launch = support.azure_trusted_launch;
 
 const Builder = support.Builder;
 const Diagnostic = support.Diagnostic;
@@ -503,6 +504,44 @@ pub fn dispatch(
             diagnostic,
         );
     }
+    if (std.mem.eql(u8, command, "azure-managed-disk")) {
+        var options = try parse(allocator, argv, &.{ "--disk", "--architecture" });
+        defer options.deinit();
+        var document = try support.readObject(
+            allocator,
+            io,
+            try options.require("--disk"),
+            diagnostic,
+        );
+        defer document.deinit();
+        const id = trusted_launch.validateManagedDisk(
+            document.object(),
+            try options.require("--architecture"),
+            diagnostic,
+        ) catch return error.Failed;
+        return out.print("{s}\n", .{id});
+    }
+    if (std.mem.eql(u8, command, "azure-image-definition")) {
+        var options = try parse(
+            allocator,
+            argv,
+            &.{ "--definition", "--architecture" },
+        );
+        defer options.deinit();
+        var document = try support.readObject(
+            allocator,
+            io,
+            try options.require("--definition"),
+            diagnostic,
+        );
+        defer document.deinit();
+        const id = trusted_launch.validateImageDefinition(
+            document.object(),
+            try options.require("--architecture"),
+            diagnostic,
+        ) catch return error.Failed;
+        return out.print("{s}\n", .{id});
+    }
     if (std.mem.eql(u8, command, "azure-conversion-attestation")) {
         var options = try parse(allocator, argv, &.{
             "--output",
@@ -624,26 +663,11 @@ pub fn dispatch(
         }) |path| {
             var document = try support.readObject(allocator, io, path, diagnostic);
             defer document.deinit();
-            const profile = document.object();
-            if (!support.stringIs(profile.get("securityType"), "TrustedLaunch")) {
-                return fail(diagnostic, "{s}: VM is not Trusted Launch", .{path});
-            }
-            const settings = support.objectOf(profile.get("uefiSettings"));
-            const secure_boot = if (settings) |object|
-                object.get("secureBootEnabled")
-            else
-                null;
-            if (!support.isTrue(secure_boot)) return fail(
+            trusted_launch.validateVmSecurityProfile(
+                document.object(),
+                path,
                 diagnostic,
-                "{s}: Secure Boot is not enabled",
-                .{path},
-            );
-            const vtpm = if (settings) |object| object.get("vTpmEnabled") else null;
-            if (!support.isTrue(vtpm)) return fail(
-                diagnostic,
-                "{s}: vTPM is not enabled",
-                .{path},
-            );
+            ) catch return error.Failed;
         }
         return;
     }
@@ -3426,64 +3450,18 @@ pub fn galleryRequest(
 
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
-    const builder = Builder.init(arena.allocator());
-    const encoder = std.base64.standard.Encoder;
-    const encoded = try arena.allocator().alloc(
-        u8,
-        encoder.calcSize(certificate.len),
+    const payload = try trusted_launch.galleryVersionRequest(
+        arena.allocator(),
+        location,
+        disk_id,
+        certificate,
     );
-    _ = encoder.encode(encoded, certificate);
-
-    var region = builder.object();
-    try builder.putString(&region, "name", location);
-    try builder.putInteger(&region, "regionalReplicaCount", 1);
-    try builder.putString(&region, "storageAccountType", "Standard_LRS");
-    var regions = builder.array();
-    try regions.append(.{ .object = region });
-
-    var publishing = builder.object();
-    try builder.putString(&publishing, "replicationMode", "Shallow");
-    try builder.put(&publishing, "targetRegions", .{ .array = regions });
-
-    var source = builder.object();
-    try builder.putString(&source, "id", disk_id);
-    var os_disk_image = builder.object();
-    try builder.put(&os_disk_image, "source", .{ .object = source });
-    var storage = builder.object();
-    try builder.put(&storage, "osDiskImage", .{ .object = os_disk_image });
-
-    var certificate_values = builder.array();
-    try certificate_values.append(.{ .string = encoded });
-    var signature = builder.object();
-    try builder.putString(&signature, "type", "x509");
-    try builder.put(&signature, "value", .{ .array = certificate_values });
-    var db = builder.array();
-    try db.append(.{ .object = signature });
-    var additional = builder.object();
-    try builder.put(&additional, "db", .{ .array = db });
-
-    var uefi = builder.object();
-    try builder.put(&uefi, "signatureTemplateNames", try builder.strings(
-        &.{"MicrosoftUefiCertificateAuthorityTemplate"},
-    ));
-    try builder.put(&uefi, "additionalSignatures", .{ .object = additional });
-    var security = builder.object();
-    try builder.put(&security, "uefiSettings", .{ .object = uefi });
-
-    var properties = builder.object();
-    try builder.put(&properties, "publishingProfile", .{ .object = publishing });
-    try builder.put(&properties, "storageProfile", .{ .object = storage });
-    try builder.put(&properties, "securityProfile", .{ .object = security });
-
-    var payload = builder.object();
-    try builder.putString(&payload, "location", location);
-    try builder.put(&payload, "properties", .{ .object = properties });
 
     return support.writeDocument(
         allocator,
         io,
         output,
-        .{ .object = payload },
+        payload,
         diagnostic,
     );
 }
