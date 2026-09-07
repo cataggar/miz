@@ -7,6 +7,7 @@ const Dir = std.Io.Dir;
 const script_path = "scripts/ubuntu2404_confidential_azure_acceptance.sh";
 const release_path = "scripts/ubuntu2404_confidential_release.zig";
 const library_path = "scripts/azure_confidential_vm_lib.sh";
+const guest_library_path = "scripts/ubuntu2404_confidential_guest_acceptance_lib.sh";
 const max_source_bytes = 4 * 1024 * 1024;
 const max_output_bytes = 1024 * 1024;
 
@@ -53,6 +54,8 @@ test "acceptance deploys and attests the exact Confidential VM contract" {
     defer allocator.free(release_tool);
     const library = try readTracked(allocator, library_path);
     defer allocator.free(library);
+    const guest_library = try readTracked(allocator, guest_library_path);
+    defer allocator.free(guest_library);
 
     for ([_][]const u8{
         "azure_confidential_vm_sku_list_args",
@@ -69,6 +72,25 @@ test "acceptance deploys and attests the exact Confidential VM contract" {
         "check-image-definition",
         "check-gallery",
         "check-vm",
+        "ubuntu2404_confidential_guest_final_acceptance",
+        "guest-imds.json",
+        "attestation.jwt",
+        "openid-configuration.json",
+        "jwks.json",
+        "attestation-client.stderr",
+        "azure-result.json",
+        "acceptance-result",
+    }) |needle| try expectContains(script, needle);
+    for ([_][]const u8{
+        "ubuntu2404_confidential_guest_configure_ssh",
+        "ubuntu2404_confidential_guest_wait_for_ssh",
+        "ubuntu2404_confidential_guest_check_readiness",
+        "ubuntu2404_confidential_guest_collect_identity",
+        "ubuntu2404_confidential_guest_pre_capture_check",
+        "ubuntu2404_confidential_guest_collect_attestation",
+        "ubuntu2404_confidential_guest_validate_persistent_data_disk",
+        "ubuntu2404_confidential_guest_cleanup_validation_files",
+        "ubuntu2404_confidential_guest_final_acceptance",
         "sudo -n mokutil --sb-state",
         "test -c /dev/tpmrm0",
         "cloud-init status --wait",
@@ -76,9 +98,9 @@ test "acceptance deploys and attests the exact Confidential VM contract" {
         "metadata/instance?api-version=2025-04-07",
         "az vm disk attach",
         "sudo -n reboot",
-        "beginGetAccess?api-version=2025-01-02",
-        "acceptance-result",
-    }) |needle| try expectContains(script, needle);
+        "sudo -n rm -f /tmp/azguestattestation1.deb /tmp/AttestationClient",
+    }) |needle| try expectContains(guest_library, needle);
+    try expectContains(script, "beginGetAccess?api-version=2025-01-02");
     for ([_][]const u8{
         "--features SecurityType=ConfidentialVMSupported",
         "--security-type ConfidentialVM",
@@ -104,31 +126,75 @@ test "acceptance deploys and attests the exact Confidential VM contract" {
         "MAA JWT signature is invalid",
     }) |needle| try expectContains(release_tool, needle);
 
+    try expectContains(guest_library, "09bc7bd670d52321760e640486ab5d556b6b5285");
+    try expectContains(guest_library, "azguestattestation1_1.0.5_amd64.deb");
     try expectContains(
-        script,
-        "09bc7bd670d52321760e640486ab5d556b6b5285",
-    );
-    try expectContains(script, "azguestattestation1_1.0.5_amd64.deb");
-    try expectContains(
-        script,
+        guest_library,
         "791dd441f84fca9ad3f9c46263a919ce50c987cfc4a80faf2f9d6bfc94d71815",
     );
     try expectContains(
-        script,
+        guest_library,
         "e046f80a571d73d59494a0c76b3c6277d5b04fc35cf6822901c20052d0487c2f",
     );
     try expectContains(
-        script,
+        guest_library,
         "a2aef93976948443ac981e18a260c2ae9f736368f8713b875916703ab37e9bc6",
     );
     try expectAbsent(script, "eval ");
+    try expectAbsent(guest_library, "eval ");
     try expectAbsent(script, "az disk grant-access");
     try expectAbsent(script, "TrustedLaunchSupported");
     try expectAbsent(script, "--certificate");
     try expectAbsent(script, "cat \"$attestation_token\"");
 }
 
-test "acceptance script is executable and valid shell" {
+test "pre-capture guest check is non-mutating and final acceptance is explicit" {
+    const allocator = std.testing.allocator;
+    const guest_library = try readTracked(allocator, guest_library_path);
+    defer allocator.free(guest_library);
+    const pre_capture_start = std.mem.indexOf(
+        u8,
+        guest_library,
+        "ubuntu2404_confidential_guest_pre_capture_check() {",
+    ) orelse return error.RequiredTextMissing;
+    const pre_capture_tail = guest_library[pre_capture_start..];
+    const pre_capture_end = std.mem.indexOf(
+        u8,
+        pre_capture_tail,
+        "\n}\n\nubuntu2404_confidential_guest_prepare_attestation_client()",
+    ) orelse return error.RequiredTextMissing;
+    const pre_capture = pre_capture_tail[0..pre_capture_end];
+    for ([_][]const u8{
+        "ubuntu2404_confidential_guest_wait_for_ssh",
+        "ubuntu2404_confidential_guest_check_readiness",
+        "ubuntu2404_confidential_guest_collect_identity",
+    }) |needle| try expectContains(pre_capture, needle);
+    for ([_][]const u8{
+        "dpkg",
+        "AttestationClient",
+        "az disk",
+        "mkfs",
+        "reboot",
+        "rm -f",
+    }) |needle| try expectAbsent(pre_capture, needle);
+
+    const final_start = std.mem.indexOf(
+        u8,
+        guest_library,
+        "ubuntu2404_confidential_guest_final_acceptance() {",
+    ) orelse return error.RequiredTextMissing;
+    const final_acceptance = guest_library[final_start..];
+    for ([_][]const u8{
+        "ubuntu2404_confidential_guest_wait_for_ssh",
+        "ubuntu2404_confidential_guest_check_readiness",
+        "ubuntu2404_confidential_guest_collect_attestation",
+        "ubuntu2404_confidential_guest_collect_identity",
+        "ubuntu2404_confidential_guest_validate_persistent_data_disk",
+        "ubuntu2404_confidential_guest_cleanup_validation_files",
+    }) |needle| try expectContains(final_acceptance, needle);
+}
+
+test "acceptance scripts are valid shell and runner is executable" {
     const allocator = std.testing.allocator;
     const root = try rootAlloc(allocator);
     defer allocator.free(root);
@@ -136,17 +202,24 @@ test "acceptance script is executable and valid shell" {
     defer allocator.free(path);
     const stat = try Dir.cwd().statFile(std.testing.io, path, .{});
     try std.testing.expect(stat.permissions.toMode() & 0o111 != 0);
-    const result = try std.process.run(allocator, std.testing.io, .{
-        .argv = &.{ "bash", "-n", path },
-        .stdout_limit = .limited(max_output_bytes),
-        .stderr_limit = .limited(max_output_bytes),
-    });
-    defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
-    try std.testing.expectEqual(@as(?u8, 0), switch (result.term) {
-        .exited => |code| code,
-        else => null,
-    });
+    const guest_library = try std.fs.path.join(
+        allocator,
+        &.{ root, guest_library_path },
+    );
+    defer allocator.free(guest_library);
+    for ([_][]const u8{ path, guest_library }) |shell_path| {
+        const result = try std.process.run(allocator, std.testing.io, .{
+            .argv = &.{ "bash", "-n", shell_path },
+            .stdout_limit = .limited(max_output_bytes),
+            .stderr_limit = .limited(max_output_bytes),
+        });
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        try std.testing.expectEqual(@as(?u8, 0), switch (result.term) {
+            .exited => |code| code,
+            else => null,
+        });
+    }
 }
 
 const Result = struct {
