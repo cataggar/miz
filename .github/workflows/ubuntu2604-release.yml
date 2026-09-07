@@ -27,12 +27,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: ubuntu2604-release-20260905
+  group: ubuntu2604-release-20260907
   cancel-in-progress: false
 
 env:
-  RELEASE_TAG: Ubuntu-26.04-20260905
-  RELEASE_TITLE: Ubuntu 26.04 full and core - 20260905
+  RELEASE_TAG: Ubuntu-26.04-20260907
+  RELEASE_TITLE: Ubuntu 26.04 full and core - 20260907
 
 jobs:
   prepare:
