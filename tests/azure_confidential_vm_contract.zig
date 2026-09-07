@@ -128,6 +128,8 @@ test "builders encode every independent Confidential VM resource contract" {
         "azure_confidential_vm_sku_list_args",
         "azure_confidential_vm_image_definition_create_args",
         "azure_confidential_vm_image_definition_show_args",
+        "azure_confidential_vm_managed_image_create_args",
+        "azure_confidential_vm_managed_image_show_args",
         "azure_confidential_vm_vm_create_args",
         "azure_confidential_vm_vm_resource_args",
         "azure_confidential_vm_vm_instance_security_args",
@@ -144,7 +146,7 @@ test "builders encode every independent Confidential VM resource contract" {
     }
     for ([_][]const u8{
         "--architecture " ++ confidential.architecture,
-        "--features SecurityType=" ++ confidential.image_security_type,
+        "--features SecurityType=" ++ confidential.image_security_feature,
         "--security-type " ++ confidential.vm_security_type,
         "--os-disk-security-encryption-type " ++
             confidential.os_disk_security_encryption_type,

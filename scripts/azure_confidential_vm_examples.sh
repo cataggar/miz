@@ -21,6 +21,12 @@ azure_trusted_launch_print_command
 azure_trusted_launch_disk_show_args RESOURCE_GROUP DISK_NAME
 azure_trusted_launch_print_command ' > managed-disk.json'
 
+azure_confidential_vm_managed_image_create_args \
+  RESOURCE_GROUP MANAGED_IMAGE REGION MANAGED_DISK_ID
+azure_confidential_vm_print_command
+azure_confidential_vm_managed_image_show_args RESOURCE_GROUP MANAGED_IMAGE
+azure_confidential_vm_print_command ' > managed-image.json'
+
 azure_confidential_vm_sku_list_args REGION VM_SIZE
 azure_confidential_vm_print_command ' > confidential-sku.json'
 
@@ -34,7 +40,7 @@ azure_confidential_vm_image_definition_show_args \
 azure_confidential_vm_print_command ' > image-definition.json'
 
 printf '%s\n' \
-  'ubuntu2404_confidential_release gallery-request --output gallery-version.json --location REGION --disk-id MANAGED_DISK_ID'
+  'ubuntu2404_confidential_release gallery-request --output gallery-version.json --location REGION --source-id MANAGED_IMAGE_ID'
 azure_trusted_launch_gallery_version_put_args \
   '/subscriptions/SUBSCRIPTION_ID/resourceGroups/RESOURCE_GROUP/providers/Microsoft.Compute/galleries/GALLERY/images/IMAGE_DEFINITION/versions/IMAGE_VERSION' \
   gallery-version.json

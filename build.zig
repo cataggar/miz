@@ -2084,7 +2084,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "miz", .module = host_miz_mod },
-                .{ .name = "release", .module = release_support_mod },
             },
         });
         const ubuntu2404_confidential_builder_exe = b.addExecutable(.{
@@ -2132,6 +2131,75 @@ pub fn build(b: *std.Build) void {
         ubuntu2404_confidential_step.dependOn(
             &run_ubuntu2404_confidential.step,
         );
+
+        const ubuntu2404_confidential_release_mod = b.createModule(.{
+            .root_source_file = b.path(
+                "scripts/ubuntu2404_confidential_release.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "miz", .module = host_miz_mod },
+                .{ .name = "release", .module = release_support_mod },
+            },
+        });
+        const ubuntu2404_confidential_release_exe = b.addExecutable(.{
+            .name = "ubuntu2404_confidential_release",
+            .root_module = ubuntu2404_confidential_release_mod,
+        });
+        const install_ubuntu2404_confidential_release = b.addInstallArtifact(
+            ubuntu2404_confidential_release_exe,
+            .{},
+        );
+        const ubuntu2404_confidential_release_install_step = b.step(
+            "install-ubuntu2404-confidential-release",
+            "Install the Ubuntu 24.04 Confidential VM acceptance tool",
+        );
+        ubuntu2404_confidential_release_install_step.dependOn(
+            &install_ubuntu2404_confidential_release.step,
+        );
+
+        const ubuntu2404_confidential_release_tests = b.addTest(.{
+            .root_module = ubuntu2404_confidential_release_mod,
+        });
+        const run_ubuntu2404_confidential_release_tests = b.addRunArtifact(
+            ubuntu2404_confidential_release_tests,
+        );
+        const ubuntu2404_confidential_release_test_step = b.step(
+            "test-ubuntu2404-confidential-release",
+            "Test Ubuntu 24.04 Confidential VM acceptance contracts",
+        );
+        ubuntu2404_confidential_release_test_step.dependOn(
+            &run_ubuntu2404_confidential_release_tests.step,
+        );
+        const ubuntu2404_confidential_acceptance_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(
+                    "tests/ubuntu2404_confidential_azure_acceptance.zig",
+                ),
+                .target = b.graph.host,
+                .optimize = optimize,
+            }),
+        });
+        const run_ubuntu2404_confidential_acceptance_tests = b.addRunArtifact(
+            ubuntu2404_confidential_acceptance_tests,
+        );
+        run_ubuntu2404_confidential_acceptance_tests.has_side_effects = true;
+        run_ubuntu2404_confidential_acceptance_tests.setEnvironmentVariable(
+            "MIZ_UBUNTU2404_CONFIDENTIAL_ROOT",
+            b.build_root.path orelse ".",
+        );
+        ubuntu2404_confidential_release_test_step.dependOn(
+            &run_ubuntu2404_confidential_acceptance_tests.step,
+        );
+        for (aggregate_test_steps) |aggregate_test_step| {
+            aggregate_test_step.dependOn(
+                &run_ubuntu2404_confidential_release_tests.step,
+            );
+            aggregate_test_step.dependOn(
+                &run_ubuntu2404_confidential_acceptance_tests.step,
+            );
+        }
 
         // ---- Ubuntu 26.04: immutable Canonical cloud-image input, Azure
         // package customization, host-side signed UKI, and standalone zstd
