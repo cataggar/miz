@@ -498,6 +498,7 @@ fn resolveEvidenceWithAttempts(
     fault: EvidenceFault,
     attempts: Attempts,
     max_attempt: i64,
+    selected_key: ?[]const u8,
 ) !void {
     const target_index: usize = 2;
     var arena: std.heap.ArenaAllocator = .init(allocator);
@@ -633,6 +634,7 @@ fn resolveEvidenceWithAttempts(
         .jobs = jobs_path,
         .artifacts = artifacts_path,
         .kind = kind,
+        .key = selected_key,
         .run_id = "100",
         .source_commit = fixture.source_commit,
         .max_attempt = max_attempt,
@@ -647,6 +649,7 @@ fn resolveEvidence(subject: *const Tree, fault: EvidenceFault) !void {
         fault,
         .{ "1", "1", "2", "1" },
         2,
+        null,
     );
 }
 
@@ -787,6 +790,7 @@ test "artifact selection resolves native and Azure result attempts" {
             .none,
             .{ "2", "1", "2", "1" },
             2,
+            null,
         );
         const output = try subject.path("resolved-{s}.json", .{@tagName(kind)});
         defer allocator.free(output);
@@ -807,6 +811,44 @@ test "artifact selection resolves native and Azure result attempts" {
                 .string,
         );
     }
+}
+
+test "artifact selection can recover one exact candidate from an incomplete run" {
+    var subject = try tree();
+    defer subject.deinit();
+    try resolveEvidenceWithAttempts(
+        &subject,
+        .candidate,
+        .missing,
+        .{ "1", "1", "2", "1" },
+        2,
+        "aarch64-core",
+    );
+    const output = try subject.path("resolved-candidate.json", .{});
+    defer allocator.free(output);
+    var selection = try fixture.read(allocator, io, output);
+    defer selection.deinit();
+    const artifacts = selection.value.object.get("artifacts").?.object;
+    try std.testing.expectEqual(@as(usize, 1), artifacts.count());
+    try std.testing.expect(
+        artifacts.get("aarch64-core") != null,
+    );
+}
+
+test "artifact selection rejects an unknown candidate restriction" {
+    var subject = try tree();
+    defer subject.deinit();
+    try std.testing.expectError(
+        error.Failed,
+        resolveEvidenceWithAttempts(
+            &subject,
+            .candidate,
+            .none,
+            @splat("1"),
+            1,
+            "riscv64-core",
+        ),
+    );
 }
 
 test "artifact selection rejects incomplete or untrusted evidence" {
@@ -839,6 +881,7 @@ test "artifact selection survives downstream-only reruns and prefers later full 
             .none,
             .{ "1", "1", "2", "1" },
             3,
+            null,
         );
         const output = try subject.path("resolved-candidate.json", .{});
         defer allocator.free(output);
@@ -863,6 +906,7 @@ test "artifact selection survives downstream-only reruns and prefers later full 
             .none,
             @splat("3"),
             3,
+            null,
         );
         const output = try subject.path("resolved-candidate.json", .{});
         defer allocator.free(output);
@@ -4691,6 +4735,7 @@ fn checkDownloaded(
         io,
         root,
         expected_path,
+        null,
         diagnostic,
     ) catch |err| switch (err) {
         error.Failed => return false,
@@ -4732,6 +4777,74 @@ fn downloadedSubject(subject: *const Tree) ![]u8 {
         }
     }
     return expected;
+}
+
+test "downloaded reissue validates one exact image and metadata pair" {
+    var subject = try stagedSubject();
+    defer subject.deinit();
+    const key = "aarch64-core";
+    const names = [_][]const u8{
+        contracts.lookup(key).?.asset_name,
+        contracts.galleryMetadataName(key).?,
+    };
+    const root = try subject.path("downloaded", .{});
+    defer allocator.free(root);
+    try Dir.cwd().createDirPath(io, root);
+
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(allocator);
+    for (names) |name| {
+        const source_path = try subject.path("staged/{s}", .{name});
+        defer allocator.free(source_path);
+        const destination_path = try subject.path("downloaded/{s}", .{name});
+        defer allocator.free(destination_path);
+        try Dir.cwd().copyFile(
+            source_path,
+            Dir.cwd(),
+            destination_path,
+            io,
+            .{},
+        );
+        const digest = try support.hashArtifact(io, destination_path);
+        try expected.print(
+            allocator,
+            "{s}\t{s}\t{d}\n",
+            .{ name, &digest.hex, digest.size },
+        );
+    }
+    const expected_path = try subject.path("reissue-expected.tsv", .{});
+    defer allocator.free(expected_path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = expected_path,
+        .data = expected.items,
+    });
+
+    var accepted: support.Diagnostic = .{};
+    try release_workflow.releaseDownloaded(
+        allocator,
+        io,
+        root,
+        expected_path,
+        key,
+        &accepted,
+    );
+
+    var wrong_key: support.Diagnostic = .{};
+    try std.testing.expectError(
+        error.Failed,
+        release_workflow.releaseDownloaded(
+            allocator,
+            io,
+            root,
+            expected_path,
+            "x86_64-core",
+            &wrong_key,
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        "downloaded reissue allowlist is not one exact image/metadata pair",
+        wrong_key.message(),
+    );
 }
 
 fn refreshDownloadedExpected(

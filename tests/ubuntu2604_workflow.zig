@@ -1,11 +1,11 @@
-//! Guards for `.github/workflows/ubuntu2604-release.yml`.
+//! Guards for the Ubuntu 26.04 release and explicit reissue workflows.
 //!
-//! The release workflow is the only path that publishes Ubuntu images, and
-//! almost everything that makes it safe is structural: which matrices exist,
-//! which jobs the publication gate needs, which tools the image builder may
-//! install, and which order steps run in. None of that is visible to a unit
-//! test of the release tooling, so it is asserted here, against the workflow
-//! source itself. Replaces `tests/ubuntu2604_workflow_test.py`.
+//! The routine release workflow and the narrowly scoped historical reissue
+//! are the only paths that publish Ubuntu images. Almost everything that makes
+//! them safe is structural: which evidence is accepted, which tools are
+//! allowed, which gates precede publication, and which environment protects
+//! the write credential. These tests keep those source contracts reviewable
+//! without running a release. Replaces `tests/ubuntu2604_workflow_test.py`.
 
 const std = @import("std");
 
@@ -13,9 +13,107 @@ const source = @import("ubuntu2604_source.zig");
 
 const Source = source.Source;
 const workflow_path = ".github/workflows/ubuntu2604-release.yml";
+const reissue_workflow_path =
+    ".github/workflows/ubuntu2604-gallery-reissue.yml";
+const reissue_publisher_path = "scripts/ubuntu2604_gallery_reissue.sh";
 
 fn open() !Source {
     return Source.open(std.testing.allocator, workflow_path);
+}
+
+test "gallery reissue is explicit, evidence-bound, and independently verified" {
+    var workflow = try Source.open(
+        std.testing.allocator,
+        reissue_workflow_path,
+    );
+    defer workflow.deinit();
+    var publisher = try Source.open(
+        std.testing.allocator,
+        reissue_publisher_path,
+    );
+    defer publisher.deinit();
+
+    for ([_][]const u8{
+        "workflow_dispatch:",
+        "source_release_tag:",
+        "candidate_run_id:",
+        "environment: ubuntu2604-release",
+        "contents: write",
+        "CANDIDATE_KEY: aarch64-core",
+        "ASSET_NAME: Ubuntu-26.04-aarch64.core.qcow2",
+        "METADATA_NAME: Ubuntu-26.04-aarch64.core.gallery.json",
+        "(.assets | length == 1)",
+        "\"$SELECTION\" \"$CANDIDATE_KEY\"",
+        "artifact-ids: ${{ steps.resolve.outputs.artifact_id }}",
+        "gh release download \"$SOURCE_RELEASE_TAG\"",
+        "\"$RELEASE_TOOL\" verify-candidate",
+        "\"$RELEASE_TOOL\" gallery-metadata",
+        "\"$RELEASE_TOOL\" verify-gallery-metadata",
+        "scripts/ubuntu2604_gallery_reissue.sh",
+    }) |needle| try workflow.expectContains(needle);
+    try source.expectOrder(
+        workflow.text,
+        "gh release download \"$SOURCE_RELEASE_TAG\"",
+        "\"$RELEASE_TOOL\" verify-candidate",
+        reissue_workflow_path,
+    );
+    try source.expectOrder(
+        workflow.text,
+        "\"$RELEASE_TOOL\" verify-candidate",
+        "\"$RELEASE_TOOL\" gallery-metadata",
+        reissue_workflow_path,
+    );
+    try source.expectOrder(
+        workflow.text,
+        "\"$RELEASE_TOOL\" verify-gallery-metadata",
+        "scripts/ubuntu2604_gallery_reissue.sh",
+        reissue_workflow_path,
+    );
+
+    for ([_][]const u8{
+        "[[ \"$REISSUE_TAG\" == \"$SOURCE_RELEASE_TAG-gallery\" ]]",
+        "[[ \"$REISSUE_TAG\" != \"$SOURCE_RELEASE_TAG\" ]]",
+        "\"$RELEASE_TOOL\" verify-candidate",
+        "\"$RELEASE_TOOL\" verify-gallery-metadata",
+        "[[ \"$TOOLING_COMMIT\" =~ ^[0-9a-f]{40}$ ]]",
+        "test \"$(wc -l <\"$expected_file\")\" -eq 2",
+        "(.assets[0].digest == $digest)",
+        "Final reissue $REISSUE_TAG is immutable",
+        "-f \"sha=$TOOLING_COMMIT\"",
+        "gh release create \"$REISSUE_TAG\"",
+        "gh release upload \"$REISSUE_TAG\"",
+        "\"$RELEASE_TOOL\" github-release-assets",
+        "\"$RELEASE_TOOL\" github-release-downloaded",
+        "--key \"$CANDIDATE_KEY\"",
+        "gh release edit \"$REISSUE_TAG\"",
+        "--draft=false",
+    }) |needle| try publisher.expectContains(needle);
+    try publisher.expectCount(
+        "gh release view \"$SOURCE_RELEASE_TAG\"",
+        2,
+    );
+    try source.expectOrder(
+        publisher.text,
+        "--stage draft",
+        "gh release download \"$REISSUE_TAG\"",
+        reissue_publisher_path,
+    );
+    try source.expectOrder(
+        publisher.text,
+        "\"$RELEASE_TOOL\" github-release-downloaded",
+        "--draft=false",
+        reissue_publisher_path,
+    );
+    try source.expectOrder(
+        publisher.text,
+        "--draft=false",
+        "--stage final",
+        reissue_publisher_path,
+    );
+    try publisher.expectOmits("gh release edit \"$SOURCE_RELEASE_TAG\"");
+    try publisher.expectOmits("gh release upload \"$SOURCE_RELEASE_TAG\"");
+    try workflow.expectOmits(source.interpreter);
+    try publisher.expectOmits(source.interpreter);
 }
 
 test "all release dependency prefetches use the bounded retry helper" {
@@ -168,8 +266,10 @@ test "candidate and acceptance artifacts are resolved independently by key" {
         "/actions/runs/$run_id/attempts/$attempt/jobs?filter=all&per_page=100",
     );
     try resolver.expectContains(
-        "\"$RELEASE_TOOL\" resolve-artifacts",
+        "arguments=(\n  resolve-artifacts",
     );
+    try resolver.expectContains("arguments+=(--key \"$key\")");
+    try resolver.expectContains("\"$RELEASE_TOOL\" \"${arguments[@]}\"");
     try resolver.expectContains("temporary_directory=\"${output}.inputs\"");
     try resolver.expectOmits("mktemp");
 }
