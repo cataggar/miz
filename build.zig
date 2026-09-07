@@ -2193,12 +2193,42 @@ pub fn build(b: *std.Build) void {
         ubuntu2404_confidential_release_test_step.dependOn(
             &run_ubuntu2404_confidential_acceptance_tests.step,
         );
+        const ubuntu2404_confidential_workflow_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(
+                    "tests/ubuntu2404_confidential_workflow.zig",
+                ),
+                .target = b.graph.host,
+                .optimize = optimize,
+            }),
+        });
+        const run_ubuntu2404_confidential_workflow_tests = b.addRunArtifact(
+            ubuntu2404_confidential_workflow_tests,
+        );
+        run_ubuntu2404_confidential_workflow_tests.has_side_effects = true;
+        run_ubuntu2404_confidential_workflow_tests.setEnvironmentVariable(
+            "MIZ_UBUNTU2404_CONFIDENTIAL_ROOT",
+            b.build_root.path orelse ".",
+        );
+        const ubuntu2404_confidential_workflow_test_step = b.step(
+            "test-ubuntu2404-confidential-workflow",
+            "Check the Ubuntu 24.04 Confidential VM release workflow",
+        );
+        ubuntu2404_confidential_workflow_test_step.dependOn(
+            &run_ubuntu2404_confidential_workflow_tests.step,
+        );
+        ubuntu2404_confidential_release_test_step.dependOn(
+            &run_ubuntu2404_confidential_workflow_tests.step,
+        );
         for (aggregate_test_steps) |aggregate_test_step| {
             aggregate_test_step.dependOn(
                 &run_ubuntu2404_confidential_release_tests.step,
             );
             aggregate_test_step.dependOn(
                 &run_ubuntu2404_confidential_acceptance_tests.step,
+            );
+            aggregate_test_step.dependOn(
+                &run_ubuntu2404_confidential_workflow_tests.step,
             );
         }
 

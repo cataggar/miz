@@ -1,0 +1,373 @@
+# Protected-environment setup required before dispatch:
+# - `ubuntu2404-confidential-release`: restrict deployments to `main`, define
+#   secrets AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, and define
+#   variables AZURE_LOCATION=westeurope and AZURE_VM_SIZE=Standard_DC2as_v5.
+#   The Entra federated credential subject is
+#   `repo:cataggar/miz:environment:ubuntu2404-confidential-release`.
+# Before dispatch, create or retarget RELEASE_TAG to the exact current `main`
+# commit. Publication preserves the accepted result and build provenance next
+# to the exact QCOW2 that passed nonce-bound SEV-SNP guest attestation.
+name: Publish Ubuntu 24.04 Confidential VM image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ubuntu2404-confidential-release-20260907
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: Ubuntu-24.04-confidential-20260907
+  RELEASE_TITLE: Ubuntu 24.04 Confidential VM - 20260907
+  ASSET_NAME: Ubuntu-24.04-x86_64.confidential.qcow2
+
+jobs:
+  prepare:
+    name: resolve immutable main source
+    if: github.repository == 'cataggar/miz' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source_commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: Check out merged main
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind release tag to the immutable source
+        id: source
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse HEAD)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse origin/main)" = "$commit"
+          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$commit"
+          direct_tag=$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')
+          peeled_tag=$(git ls-remote origin "refs/tags/$RELEASE_TAG^{}" | awk '{print $1}')
+          tag_commit=${peeled_tag:-$direct_tag}
+          test "$tag_commit" = "$commit"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "Accepted source commit: \`$commit\`" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: build authenticated x86_64 candidate
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    env:
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      WORK_DIR: .scratch/ubuntu2404-confidential
+      BUNDLE_DIR: artifact-staging/ubuntu2404-confidential-candidate
+      CANDIDATE: artifact-staging/ubuntu2404-confidential-candidate/Ubuntu-24.04-x86_64.confidential.qcow2
+      PROVENANCE: artifact-staging/ubuntu2404-confidential-candidate/Ubuntu-24.04-x86_64.confidential.qcow2.provenance.json
+      RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2404_confidential_release
+    steps:
+      - name: Check out accepted source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Install authenticated image-build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnupg jq qemu-utils tar
+          for tool in gpg gpgv qemu-img tar; do
+            command -v "$tool" >/dev/null
+          done
+
+      - name: Cache the pinned Canonical publication
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ${{ env.WORK_DIR }}/ubuntu-24.04-server-cloudimg-amd64-azure.vhd.tar.gz
+            ${{ env.WORK_DIR }}/ubuntu-24.04-server-cloudimg-amd64-azure.vhd.manifest
+            ${{ env.WORK_DIR }}/SHA256SUMS
+            ${{ env.WORK_DIR }}/SHA256SUMS.gpg
+          key: ubuntu2404-confidential-canonical-20260826-843d243792abb05b50e1a7f5e614e1184d8fc7195c119747cbb3038520258a22
+
+      - name: Build exact signed-source QCOW2 and provenance
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          bash scripts/zig_fetch_retry.sh \
+            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          rm -rf -- "$BUNDLE_DIR"
+          mkdir -p "$BUNDLE_DIR"
+          zig build -Doptimize=ReleaseSafe generalized-ubuntu2404-confidential -- \
+            --work-dir "$GITHUB_WORKSPACE/$WORK_DIR" \
+            --output "$GITHUB_WORKSPACE/$CANDIDATE" \
+            --provenance "$GITHUB_WORKSPACE/$PROVENANCE"
+          test -s "$CANDIDATE"
+          test -s "$PROVENANCE"
+
+      - name: Build accepted-source validation tooling
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          zig build -Doptimize=ReleaseSafe install-ubuntu2404-confidential-release
+          test -x "$RELEASE_TOOL"
+
+      - name: Revalidate the exact candidate against provenance
+        run: |
+          set -euo pipefail
+          readarray -t identity < <(
+            "$RELEASE_TOOL" verify-build \
+              --provenance "$PROVENANCE" \
+              --qcow "$CANDIDATE"
+          )
+          test "${#identity[@]}" -eq 3
+          [[ "${identity[0]}" =~ ^[0-9a-f]{64}$ ]]
+          test "${identity[1]}" = "$(stat --format='%s' "$CANDIDATE")"
+          qemu-img check "$CANDIDATE"
+          {
+            echo "### Ubuntu 24.04 Confidential VM candidate"
+            echo
+            echo "- Source commit: \`$SOURCE_COMMIT\`"
+            echo "- Candidate SHA-256: \`${identity[0]}\`"
+            echo "- Virtual size: \`${identity[2]}\` bytes"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload exact candidate and provenance
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ubuntu2404-confidential-candidate-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.CANDIDATE }}
+            ${{ env.PROVENANCE }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
+
+      - name: Remove local candidate state
+        if: always()
+        run: rm -rf -- "$BUNDLE_DIR" "$WORK_DIR/extracted" "$WORK_DIR/gnupg"
+
+  azure_acceptance:
+    name: protected Azure SEV-SNP acceptance
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    environment: ubuntu2404-confidential-release
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      CANDIDATE_DIR: .release/ubuntu2404-confidential/candidate
+      CANDIDATE: .release/ubuntu2404-confidential/candidate/Ubuntu-24.04-x86_64.confidential.qcow2
+      PROVENANCE: .release/ubuntu2404-confidential/candidate/Ubuntu-24.04-x86_64.confidential.qcow2.provenance.json
+      RESULT_DIR: artifact-staging/ubuntu2404-confidential-azure
+      STATE_FILE: .release/ubuntu2404-confidential/resource-group
+      RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2404_confidential_release
+      UBUNTU2404_CONFIDENTIAL_RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2404_confidential_release
+      MIZ: ${{ github.workspace }}/zig-out/bin/miz
+      AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+      AZURE_VM_SIZE: ${{ vars.AZURE_VM_SIZE }}
+    steps:
+      - name: Check out accepted source and acceptance harness
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Download exact build-validated candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ubuntu2404-confidential-candidate-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.CANDIDATE_DIR }}
+
+      - name: Fail closed on missing or unsupported protected configuration
+        env:
+          AZURE_CLIENT_ID_VALUE: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID_VALUE: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID_VALUE: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+          [[ "$AZURE_CLIENT_ID_VALUE" =~ $uuid ]]
+          [[ "$AZURE_TENANT_ID_VALUE" =~ $uuid ]]
+          [[ "$AZURE_SUBSCRIPTION_ID_VALUE" =~ $uuid ]]
+          test "$AZURE_LOCATION" = westeurope
+          test "$AZURE_VM_SIZE" = Standard_DC2as_v5
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Require Azure acceptance tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            curl jq openssh-client openssl qemu-utils unzip
+          for tool in az azcopy curl jq openssl qemu-img scp ssh ssh-keygen unzip; do
+            command -v "$tool" >/dev/null
+          done
+          az version --output json >/dev/null
+
+      - name: Build accepted-source miz and release tooling
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          bash scripts/zig_fetch_retry.sh \
+            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build -Doptimize=ReleaseSafe \
+            install-miz install-ubuntu2404-confidential-release
+          test -x "$MIZ"
+          test -x "$RELEASE_TOOL"
+
+      - name: Log in to Azure with protected-environment OIDC
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Run exact-digest Confidential VM acceptance
+        run: scripts/ubuntu2404_confidential_azure_acceptance.sh run
+
+      - name: Refresh Azure OIDC credential for unconditional cleanup
+        if: always()
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Delete only exact ownership-tagged Azure resources
+        if: always()
+        run: |
+          if [[ -x scripts/ubuntu2404_confidential_azure_acceptance.sh ]]; then
+            scripts/ubuntu2404_confidential_azure_acceptance.sh cleanup
+          elif [[ -s "$STATE_FILE" ]]; then
+            echo "::error::Cleanup script is absent while Azure state exists"
+            exit 1
+          fi
+
+      - name: Upload failed acceptance diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ubuntu2404-confidential-azure-failure-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.RESULT_DIR }}/*.json
+            ${{ env.RESULT_DIR }}/attestation-client.stderr
+          if-no-files-found: warn
+          retention-days: 2
+
+      - name: Upload exact Confidential VM acceptance result
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ubuntu2404-confidential-azure-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.RESULT_DIR }}/azure-result.json
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Remove candidate and local acceptance state
+        if: always()
+        run: rm -rf -- "$CANDIDATE_DIR" "$RESULT_DIR" .release/ubuntu2404-confidential
+
+  publish:
+    name: verify protected gate and publish
+    needs: [prepare, build, azure_acceptance]
+    if: >-
+      ${{
+        always() &&
+        needs.prepare.result == 'success' &&
+        needs.build.result == 'success' &&
+        needs.azure_acceptance.result == 'success'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: ubuntu2404-confidential-release
+    permissions:
+      actions: read
+      contents: write
+    env:
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      CANDIDATE_DIR: .release/ubuntu2404-confidential/publication/candidate
+      CANDIDATE: .release/ubuntu2404-confidential/publication/candidate/Ubuntu-24.04-x86_64.confidential.qcow2
+      PROVENANCE: .release/ubuntu2404-confidential/publication/candidate/Ubuntu-24.04-x86_64.confidential.qcow2.provenance.json
+      ACCEPTANCE_DIR: .release/ubuntu2404-confidential/publication/acceptance
+      ACCEPTANCE_RESULT: .release/ubuntu2404-confidential/publication/acceptance/azure-result.json
+      STAGING_ROOT: .release/ubuntu2404-confidential/publication/staging
+      RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2404_confidential_release
+      UBUNTU2404_CONFIDENTIAL_RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2404_confidential_release
+      AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
+      AZURE_VM_SIZE: ${{ vars.AZURE_VM_SIZE }}
+      REPOSITORY: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out accepted source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.prepare.outputs.source_commit }}
+          persist-credentials: false
+
+      - name: Download exact build candidate and provenance
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ubuntu2404-confidential-candidate-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.CANDIDATE_DIR }}
+
+      - name: Download exact protected acceptance result
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ubuntu2404-confidential-azure-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
+          path: ${{ env.ACCEPTANCE_DIR }}
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Build accepted-source publication tooling
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          bash scripts/zig_fetch_retry.sh \
+            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build -Doptimize=ReleaseSafe install-ubuntu2404-confidential-release
+          test -x "$RELEASE_TOOL"
+
+      - name: Revalidate the exact protected result and publish
+        run: scripts/ubuntu2404_confidential_publish.sh
+
+      - name: Remove publication staging
+        if: always()
+        run: rm -rf -- .release/ubuntu2404-confidential/publication

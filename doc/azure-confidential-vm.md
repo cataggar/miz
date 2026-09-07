@@ -13,6 +13,14 @@ SEV-SNP. Its gallery image definition uses
 and the resulting version can create either a standard Gen2 VM or a
 Confidential VM. Arm64 and Intel TDX are not part of this initial contract.
 
+The release-qualified Azure deployment profile is `westeurope` on
+`Standard_DC2as_v5`. That exact pair has passed the complete live acceptance
+path. Azure SKU availability and restrictions are subscription-specific, so
+the harness still queries `az vm list-skus` and rejects a configured SKU unless
+Azure reports AMD SEV-SNP Confidential Compute support with no blocking
+restriction. Other regions and SKUs are not part of the miz support boundary
+until the complete acceptance path has qualified them.
+
 The source and derived fixed VHD must be strictly smaller than 32 GiB. The
 acceptance path uploads that exact VHD to a managed disk, creates a generalized
 Gen2 managed image bound to the disk, and uses the managed image as the
@@ -134,3 +142,91 @@ Microsoft references:
 - [Create a Confidential VM from an Azure Compute Gallery image](https://learn.microsoft.com/azure/confidential-computing/create-confidential-vm-from-compute-gallery)
 - [Guest attestation for Confidential VMs](https://learn.microsoft.com/azure/confidential-computing/guest-attestation-confidential-vms)
 - [Secure Boot custom UEFI keys](https://learn.microsoft.com/azure/virtual-machines/trusted-launch-secure-boot-custom-uefi)
+
+## Protected release workflow
+
+`.github/workflows/ubuntu2404-confidential-release.yml` is the only publication
+path for this target. It can be dispatched manually only on `main`. The
+`prepare` job resolves the current remote `main` commit and requires the fixed
+release tag to resolve to that same commit, including through an annotated
+tag. Every checkout, candidate artifact name, acceptance artifact name, and
+published result is then bound to that immutable commit.
+
+Create a GitHub environment named `ubuntu2404-confidential-release`, restrict
+it to the `main` branch, and configure:
+
+| Kind | Name | Required value |
+|---|---|---|
+| Secret | `AZURE_CLIENT_ID` | Entra application client ID |
+| Secret | `AZURE_TENANT_ID` | Entra tenant ID |
+| Secret | `AZURE_SUBSCRIPTION_ID` | Acceptance subscription ID |
+| Variable | `AZURE_LOCATION` | `westeurope` |
+| Variable | `AZURE_VM_SIZE` | `Standard_DC2as_v5` |
+
+The Entra application needs a federated credential with subject
+`repo:cataggar/miz:environment:ubuntu2404-confidential-release`. Grant only
+the Azure permissions needed to create and delete the temporary resource group
+and its compute, disk, network, managed-image, and gallery resources. The
+workflow does not use a stored Azure client secret.
+
+Before dispatch, create `Ubuntu-24.04-confidential-20260907` at the exact
+current `main` commit. The workflow refuses a missing tag, a tag on another
+commit, a pull-request ref, or a dispatch against another repository. Dispatch
+from the Actions page or with:
+
+```console
+gh workflow run ubuntu2404-confidential-release.yml --ref main
+```
+
+The release graph is fail-closed:
+
+1. The build job authenticates Canonical's pinned publication, builds the
+   standalone QCOW2, emits its provenance JSON, re-hashes the result, and
+   uploads those exact two files without artifact recompression.
+2. The protected acceptance job downloads that named artifact, validates the
+   configured region and SKU, logs in with environment-scoped OIDC, derives
+   and uploads the fixed VHD, deploys the exact gallery version, and runs guest
+   and attestation checks. An `always()` path refreshes the OIDC credential and
+   deletes only the resource group whose name and ownership tags match the
+   workflow run and attempt.
+3. The publication job runs only after build and acceptance succeed. It
+   downloads the exact candidate, provenance, and acceptance artifacts,
+   revalidates their source commit, run identity, hashes, sizes, Azure profile,
+   and attested security contract, then publishes a draft and downloads every
+   asset for a final hash comparison before making the release public.
+
+The release contains exactly:
+
+- `Ubuntu-24.04-x86_64.confidential.qcow2`;
+- `Ubuntu-24.04-x86_64.confidential.qcow2.provenance.json`; and
+- `Ubuntu-24.04-x86_64.confidential.azure-acceptance.json`.
+
+The acceptance JSON records the QCOW2 and fixed-VHD hashes, Azure resource
+identities, MAA token and nonce hashes, VM identity, selected location and SKU,
+and the enforced SEV-SNP, Secure Boot, vTPM, compliance, and non-debug state.
+The temporary Azure resources are deleted; the result is the durable evidence
+that those exact candidate bytes passed the protected deployment.
+
+## Attestation and operational limitations
+
+The guest attestation client and `azguestattestation1` package are pinned by
+URL and SHA-256. The harness retrieves a fresh nonce-bound token from Microsoft
+Azure Attestation, retrieves the endpoint's OpenID metadata and JWKS over
+HTTPS, verifies the RS256 signature, and rejects identity, time, nonce,
+compliance, migration, VMPL, debugger, Secure Boot, or vTPM mismatches. A
+decoded token without successful JWKS verification is never accepted.
+
+The initial workflow has these intentional limitations:
+
+- Ubuntu 24.04 LTS x86_64 and AMD SEV-SNP only;
+- `ConfidentialVMSupported` source images only, not captured
+  `ConfidentialVM` images containing VM Guest State;
+- `VMGuestStateOnly`, not `DiskWithVMGuestState` or customer-managed
+  confidential OS-disk keys;
+- Canonical's stock Microsoft/Canonical Secure Boot trust, with no custom UEFI
+  `db` keys;
+- one qualified Azure profile:
+  `westeurope` / `Standard_DC2as_v5`; and
+- direct SSH connectivity from the GitHub-hosted acceptance runner to the
+  temporary VM, plus outbound HTTPS access to Canonical, Microsoft package,
+  Azure management, GitHub raw-content, and MAA endpoints.
