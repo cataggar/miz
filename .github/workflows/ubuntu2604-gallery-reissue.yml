@@ -1,0 +1,189 @@
+name: Reissue Ubuntu 26.04 ARM host image with gallery metadata
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_release_tag:
+        description: Final ARM host release whose exact QCOW2 should be reissued
+        required: true
+        default: Ubuntu-26.04-20260906-armhost
+        type: string
+      candidate_run_id:
+        description: Completed Ubuntu release run containing the exact aarch64-core candidate evidence
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ubuntu2604-gallery-reissue-${{ inputs.source_release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  reissue:
+    name: validate evidence and publish explicit metadata reissue
+    if: github.repository == 'cataggar/miz' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    environment: ubuntu2604-release
+    permissions:
+      actions: read
+      contents: write
+    env:
+      SOURCE_RELEASE_TAG: ${{ inputs.source_release_tag }}
+      CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+      CANDIDATE_KEY: aarch64-core
+      ASSET_NAME: Ubuntu-26.04-aarch64.core.qcow2
+      METADATA_NAME: Ubuntu-26.04-aarch64.core.gallery.json
+      CANDIDATE_DIR: .release/gallery-reissue/candidate
+      SOURCE_DIR: .release/gallery-reissue/source
+      ASSETS_DIR: .release/gallery-reissue/assets
+      STAGING_ROOT: .release/gallery-reissue/staging
+      SELECTION: .release/gallery-reissue/candidate-selection.json
+      RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
+      REPOSITORY: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out current reissue tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ github.token }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Build current metadata verifier
+        run: |
+          set -euo pipefail
+          unset ZIG_LOCAL_CACHE_DIR
+          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          bash scripts/zig_fetch_retry.sh \
+            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build -Doptimize=ReleaseSafe install-ubuntu2604-release
+          test -x "$RELEASE_TOOL"
+
+      - name: Resolve the exact surviving candidate evidence
+        id: resolve
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RELEASE_TAG" =~ ^Ubuntu-26\.04-[0-9]{8}-armhost$ ]]
+          [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          run=$(gh api "repos/$REPOSITORY/actions/runs/$CANDIDATE_RUN_ID")
+          test "$(jq -r .repository.full_name <<<"$run")" = "$REPOSITORY"
+          test "$(jq -r .path <<<"$run")" = ".github/workflows/ubuntu2604-release.yml"
+          test "$(jq -r .event <<<"$run")" = workflow_dispatch
+          test "$(jq -r .head_branch <<<"$run")" = main
+          test "$(jq -r .status <<<"$run")" = completed
+          source_commit=$(jq -r .head_sha <<<"$run")
+          [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
+          tooling_commit=$(git rev-parse HEAD)
+          test "$(git rev-parse origin/main)" = "$tooling_commit"
+
+          direct_tag=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG" | awk '{print $1}')
+          peeled_tag=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG^{}" | awk '{print $1}')
+          test "${peeled_tag:-$direct_tag}" = "$source_commit"
+
+          source_release=$(gh release view "$SOURCE_RELEASE_TAG" \
+            --repo "$REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,assets)
+          jq -e \
+            --arg tag "$SOURCE_RELEASE_TAG" \
+            --arg asset "$ASSET_NAME" \
+            '(.tagName == $tag) and
+             (.isDraft == false) and
+             (.isPrerelease == false) and
+             (.assets | length == 1) and
+             (.assets[0].name == $asset) and
+             (.assets[0].size > 0)' <<<"$source_release" >/dev/null
+
+          mkdir -p -- "$(dirname -- "$SELECTION")"
+          bash scripts/ubuntu2604_resolve_artifacts.sh \
+            candidate "$CANDIDATE_RUN_ID" "$source_commit" \
+            "$SELECTION" "$CANDIDATE_KEY"
+          artifact_id=$(jq -r --arg key "$CANDIDATE_KEY" \
+            '.artifacts[$key].artifact_id' "$SELECTION")
+          candidate_run_attempt=$(jq -r --arg key "$CANDIDATE_KEY" \
+            '.artifacts[$key].run_attempt' "$SELECTION")
+          [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$candidate_run_attempt" =~ ^[1-9][0-9]*$ ]]
+
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+          echo "tooling_commit=$tooling_commit" >> "$GITHUB_OUTPUT"
+          echo "artifact_id=$artifact_id" >> "$GITHUB_OUTPUT"
+          echo "candidate_run_attempt=$candidate_run_attempt" >> "$GITHUB_OUTPUT"
+          echo "reissue_tag=$SOURCE_RELEASE_TAG-gallery" >> "$GITHUB_OUTPUT"
+
+      - name: Download exact candidate and provenance
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ steps.resolve.outputs.artifact_id }}
+          path: ${{ env.CANDIDATE_DIR }}
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.candidate_run_id }}
+
+      - name: Download exact source-release QCOW2
+        run: |
+          set -euo pipefail
+          rm -rf -- "$SOURCE_DIR"
+          mkdir -p -- "$SOURCE_DIR"
+          gh release download "$SOURCE_RELEASE_TAG" \
+            --repo "$REPOSITORY" \
+            --pattern "$ASSET_NAME" \
+            --dir "$SOURCE_DIR"
+          test -f "$SOURCE_DIR/$ASSET_NAME"
+
+      - name: Revalidate source evidence and generate metadata
+        env:
+          SOURCE_COMMIT: ${{ steps.resolve.outputs.source_commit }}
+          TOOLING_COMMIT: ${{ steps.resolve.outputs.tooling_commit }}
+          CANDIDATE_RUN_ATTEMPT: ${{ steps.resolve.outputs.candidate_run_attempt }}
+        run: |
+          set -euo pipefail
+          rm -rf -- "$ASSETS_DIR"
+          mkdir -p -- "$ASSETS_DIR"
+          install -m 0644 "$SOURCE_DIR/$ASSET_NAME" "$ASSETS_DIR/$ASSET_NAME"
+          cmp "$SOURCE_DIR/$ASSET_NAME" "$ASSETS_DIR/$ASSET_NAME"
+
+          "$RELEASE_TOOL" verify-candidate \
+            --manifest "$CANDIDATE_DIR/candidate.json" \
+            --asset "$ASSETS_DIR/$ASSET_NAME" \
+            --key "$CANDIDATE_KEY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --run-id "$CANDIDATE_RUN_ID" \
+            --run-attempt "$CANDIDATE_RUN_ATTEMPT"
+          "$RELEASE_TOOL" gallery-metadata \
+            --manifest "$CANDIDATE_DIR/candidate.json" \
+            --asset "$ASSETS_DIR/$ASSET_NAME" \
+            --key "$CANDIDATE_KEY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --output "$ASSETS_DIR/$METADATA_NAME"
+          "$RELEASE_TOOL" verify-gallery-metadata \
+            --metadata "$ASSETS_DIR/$METADATA_NAME" \
+            --manifest "$CANDIDATE_DIR/candidate.json" \
+            --asset "$ASSETS_DIR/$ASSET_NAME" \
+            --key "$CANDIDATE_KEY" \
+            --source-commit "$SOURCE_COMMIT"
+
+      - name: Publish explicit metadata-capable reissue
+        env:
+          SOURCE_COMMIT: ${{ steps.resolve.outputs.source_commit }}
+          CANDIDATE_RUN_ATTEMPT: ${{ steps.resolve.outputs.candidate_run_attempt }}
+          REISSUE_TAG: ${{ steps.resolve.outputs.reissue_tag }}
+          RELEASE_TITLE: Ubuntu 26.04 AArch64 core gallery metadata reissue
+          UBUNTU2604_RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
+        run: scripts/ubuntu2604_gallery_reissue.sh
+
+      - name: Remove reissue staging and downloaded evidence
+        if: always()
+        run: rm -rf -- .release/gallery-reissue

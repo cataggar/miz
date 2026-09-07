@@ -302,6 +302,7 @@ pub fn dispatch(
             "--jobs",
             "--artifacts",
             "--kind",
+            "--key",
             "--run-id",
             "--source-commit",
             "--max-attempt",
@@ -313,6 +314,7 @@ pub fn dispatch(
             .artifacts = try options.require("--artifacts"),
             .kind = ArtifactKind.parse(try options.require("--kind")) orelse
                 return error.Usage,
+            .key = options.get("--key"),
             .run_id = try options.require("--run-id"),
             .source_commit = try options.require("--source-commit"),
             .max_attempt = try options.requireInteger("--max-attempt"),
@@ -849,13 +851,18 @@ pub fn dispatch(
         );
     }
     if (std.mem.eql(u8, command, "github-release-downloaded")) {
-        var options = try parse(allocator, argv, &.{ "--dir", "--expected" });
+        var options = try parse(
+            allocator,
+            argv,
+            &.{ "--dir", "--expected", "--key" },
+        );
         defer options.deinit();
         return releaseDownloaded(
             allocator,
             io,
             try options.require("--dir"),
             try options.require("--expected"),
+            options.get("--key"),
             diagnostic,
         );
     }
@@ -1730,6 +1737,8 @@ pub const ResolveArtifactsOptions = struct {
     jobs: []const u8,
     artifacts: []const u8,
     kind: ArtifactKind,
+    /// Restrict selection to one candidate for an explicit historical reissue.
+    key: ?[]const u8 = null,
     run_id: []const u8,
     source_commit: []const u8,
     max_attempt: i64,
@@ -1853,6 +1862,13 @@ pub fn resolveArtifacts(
         "artifact selection maximum attempt is invalid",
         .{},
     );
+    if (options.key) |key| {
+        if (contracts.lookup(key) == null) return fail(
+            diagnostic,
+            "artifact selection key is invalid: {s}",
+            .{key},
+        );
+    }
 
     var jobs_document = try readValue(allocator, io, options.jobs, diagnostic);
     defer jobs_document.deinit();
@@ -1887,6 +1903,9 @@ pub fn resolveArtifacts(
     var selected = builder.object();
 
     for (contracts.release_order) |key| {
+        if (options.key) |wanted| {
+            if (!std.mem.eql(u8, key, wanted)) continue;
+        }
         var selected_entry: ?std.json.Value = null;
         var attempt = options.max_attempt;
         while (attempt > 0) : (attempt -= 1) {
@@ -4211,10 +4230,29 @@ pub fn releaseDownloaded(
     io: Io,
     root: []const u8,
     expected_path: []const u8,
+    candidate_key: ?[]const u8,
     diagnostic: *Diagnostic,
 ) Error!void {
     var expected = try readExpected(allocator, io, expected_path, diagnostic);
     defer expected.deinit(allocator);
+
+    if (candidate_key) |wanted| {
+        const entry = contracts.lookup(wanted) orelse return fail(
+            diagnostic,
+            "downloaded release candidate key is invalid: {s}",
+            .{wanted},
+        );
+        if (expected.entries.items.len != 2 or
+            expected.find(entry.asset_name) == null or
+            expected.find(contracts.galleryMetadataName(wanted).?) == null)
+        {
+            return fail(
+                diagnostic,
+                "downloaded reissue allowlist is not one exact image/metadata pair",
+                .{},
+            );
+        }
+    }
 
     var directory = Dir.cwd().openDir(io, root, .{ .iterate = true }) catch
         return fail(
@@ -4264,6 +4302,9 @@ pub fn releaseDownloaded(
         );
     }
     for (contracts.release_order) |key| {
+        if (candidate_key) |wanted| {
+            if (!std.mem.eql(u8, key, wanted)) continue;
+        }
         const entry = contracts.lookup(key).?;
         const image_path = try support.joinPath(
             allocator,

@@ -3,8 +3,8 @@ set -euo pipefail
 
 # Fetch bounded workflow metadata only; the Zig resolver validates and selects
 # the exact artifact IDs without downloading the candidate payloads.
-if (( $# != 4 )); then
-  echo "usage: ubuntu2604_resolve_artifacts.sh KIND RUN_ID SOURCE_COMMIT OUTPUT" >&2
+if (( $# != 4 && $# != 5 )); then
+  echo "usage: ubuntu2604_resolve_artifacts.sh KIND RUN_ID SOURCE_COMMIT OUTPUT [KEY]" >&2
   exit 2
 fi
 
@@ -12,6 +12,7 @@ kind=$1
 run_id=$2
 source_commit=$3
 output=$4
+key=${5:-}
 
 case "$kind" in
   candidate|native|azure) ;;
@@ -60,11 +61,17 @@ gh api --paginate \
   "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" |
   jq -s '[.[].artifacts[]]' >"$temporary_directory/artifacts.json"
 
-"$RELEASE_TOOL" resolve-artifacts \
-  --jobs "$temporary_directory/jobs.json" \
-  --artifacts "$temporary_directory/artifacts.json" \
-  --kind "$kind" \
-  --run-id "$run_id" \
-  --source-commit "$source_commit" \
-  --max-attempt "$max_attempt" \
+arguments=(
+  resolve-artifacts
+  --jobs "$temporary_directory/jobs.json"
+  --artifacts "$temporary_directory/artifacts.json"
+  --kind "$kind"
+  --run-id "$run_id"
+  --source-commit "$source_commit"
+  --max-attempt "$max_attempt"
   --output "$output"
+)
+if [[ -n "$key" ]]; then
+  arguments+=(--key "$key")
+fi
+"$RELEASE_TOOL" "${arguments[@]}"
