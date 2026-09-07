@@ -14,6 +14,8 @@ pub const file = @import("file.zig");
 pub const digest = @import("digest.zig");
 pub const json_document = @import("json_document.zig");
 pub const azure_vhd_layout = @import("azure_vhd_layout.zig");
+pub const azure_compute = @import("azure_compute.zig");
+pub const azure_confidential_vm = @import("azure_confidential_vm.zig");
 pub const azure_trusted_launch = @import("azure_trusted_launch.zig");
 
 pub const Diagnostic = contract.Diagnostic;
@@ -24,5 +26,7 @@ test {
     _ = digest;
     _ = json_document;
     _ = azure_vhd_layout;
+    _ = azure_compute;
+    _ = azure_confidential_vm;
     _ = azure_trusted_launch;
 }

@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+
+# Each builder fills this array. Callers execute it as
+# `az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}"`; no command text is evaluated.
+AZURE_CONFIDENTIAL_VM_ARGS=()
+
+azure_confidential_vm_sku_list_args() {
+  local location=$1 vm_size=$2
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    vm list-skus
+    --location "$location"
+    --resource-type virtualMachines
+    --size "$vm_size"
+    --all
+    --output json
+  )
+}
+
+azure_confidential_vm_image_definition_create_args() {
+  local resource_group=$1 gallery=$2 image=$3 offer=$4 sku=$5 location=$6
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    sig image-definition create
+    --resource-group "$resource_group"
+    --gallery-name "$gallery"
+    --gallery-image-definition "$image"
+    --publisher miz
+    --offer "$offer"
+    --sku "$sku"
+    --os-type Linux
+    --os-state Generalized
+    --hyper-v-generation V2
+    --architecture x64
+    --features SecurityType=ConfidentialVMSupported
+    --location "$location"
+    --output json
+  )
+}
+
+azure_confidential_vm_image_definition_show_args() {
+  local resource_group=$1 gallery=$2 image=$3
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    sig image-definition show
+    --resource-group "$resource_group"
+    --gallery-name "$gallery"
+    --gallery-image-definition "$image"
+    --output json
+  )
+}
+
+azure_confidential_vm_vm_create_args() {
+  local resource_group=$1 vm_name=$2 location=$3 vm_size=$4 image_version_id=$5
+  local admin_username=$6 public_key=$7
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    vm create
+    --resource-group "$resource_group"
+    --name "$vm_name"
+    --location "$location"
+    --size "$vm_size"
+    --image "$image_version_id"
+    --admin-username "$admin_username"
+    --authentication-type ssh
+    --ssh-key-values "$public_key"
+    --enable-agent true
+    --enable-auto-update false
+    --security-type ConfidentialVM
+    --os-disk-security-encryption-type VMGuestStateOnly
+    --enable-secure-boot true
+    --enable-vtpm true
+    --public-ip-sku Standard
+    --nsg-rule SSH
+    --output json
+  )
+}
+
+azure_confidential_vm_vm_resource_args() {
+  local resource_group=$1 vm_name=$2
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    vm show
+    --resource-group "$resource_group"
+    --name "$vm_name"
+    --query '{securityProfile:securityProfile,osDiskSecurityProfile:storageProfile.osDisk.managedDisk.securityProfile,imageReference:storageProfile.imageReference}'
+    --output json
+  )
+}
+
+azure_confidential_vm_vm_instance_security_args() {
+  local resource_group=$1 vm_name=$2
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    vm get-instance-view
+    --resource-group "$resource_group"
+    --name "$vm_name"
+    --query securityProfile
+    --output json
+  )
+}
+
+azure_confidential_vm_print_command() {
+  local suffix=${1:-} argument
+  printf 'az'
+  for argument in "${AZURE_CONFIDENTIAL_VM_ARGS[@]}"; do
+    printf ' %q' "$argument"
+  done
+  printf '%s\n' "$suffix"
+}
