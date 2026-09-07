@@ -670,22 +670,41 @@ pub fn verify(
         diagnostic,
     );
     defer candidate.deinit();
-    var metadata = try support.readObject(
+    var metadata = try verifyCandidateFile(
         allocator,
         io,
         options.metadata,
+        options.asset,
+        &candidate,
         diagnostic,
     );
-    defer metadata.deinit();
+    metadata.deinit();
+}
+
+pub fn verifyCandidateFile(
+    allocator: Allocator,
+    io: Io,
+    metadata_path: []const u8,
+    asset_path: []const u8,
+    candidate: *const documents.Candidate,
+    diagnostic: *Diagnostic,
+) Error!support.json_document.Document {
+    var metadata = try support.readObject(
+        allocator,
+        io,
+        metadata_path,
+        diagnostic,
+    );
+    errdefer metadata.deinit();
     try validateDocument(allocator, metadata.object(), diagnostic);
-    try verifyAsset(io, metadata.object(), options.asset, diagnostic);
+    try verifyAsset(io, metadata.object(), asset_path, diagnostic);
 
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
     const expected = try build(
         allocator,
         Builder.init(arena.allocator()),
-        &candidate,
+        candidate,
         diagnostic,
     );
     if (!support.jsonEqual(metadata.parsed.value, expected)) return fail(
@@ -693,6 +712,7 @@ pub fn verify(
         "gallery metadata does not match the exact candidate",
         .{},
     );
+    return metadata;
 }
 
 pub fn validateFile(

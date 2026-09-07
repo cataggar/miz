@@ -250,7 +250,7 @@ test "publication fails closed across all three matrices" {
     );
     try source.expectContainsIn(
         publish,
-        "- name: Publish exactly four accepted Ubuntu assets",
+        "- name: Publish four accepted Ubuntu image and metadata pairs",
         workflow_path,
     );
 }
@@ -884,7 +884,7 @@ test "publication is gated on a reviewed size and content budget" {
     try source.expectOrder(
         publish_job,
         "--require-size-budget enforced",
-        "- name: Publish exactly four accepted Ubuntu assets",
+        "- name: Publish four accepted Ubuntu image and metadata pairs",
         workflow_path,
     );
 }
@@ -947,6 +947,25 @@ test "the build job validates the QCOW2 and publishes its metadata natively" {
     );
     try source.expectContainsIn(build_job, "disk-geometry-verify", workflow_path);
     try source.expectContainsIn(build_job, "FLAVOR: ${{ matrix.flavor }}", workflow_path);
+    try source.expectContainsIn(build_job, "gallery-metadata", workflow_path);
+    try source.expectContainsIn(build_job, "verify-gallery-metadata", workflow_path);
+    try source.expectContainsIn(
+        build_job,
+        "metadata=\"$BUNDLE_DIR/${ASSET_NAME%.qcow2}.gallery.json\"",
+        workflow_path,
+    );
+    try source.expectOrder(
+        build_job,
+        "\"$RELEASE_TOOL\" verify-candidate",
+        "\"$RELEASE_TOOL\" gallery-metadata",
+        workflow_path,
+    );
+    try source.expectOrder(
+        build_job,
+        "\"$RELEASE_TOOL\" verify-gallery-metadata",
+        "- name: Upload exact validated candidate",
+        workflow_path,
+    );
     try source.expectOmitsIn(build_job, source.interpreter, workflow_path);
 }
 
