@@ -517,7 +517,8 @@ test "core BinderFS, Binder devices, and DMA heap are probed" {
         "binder",
         "hwbinder",
         "vndbinder",
-        "for device in binder hwbinder vndbinder; do\n" ++
+        "[[ $EUID -ne 0 ]]\n" ++
+            "for device in binder hwbinder vndbinder; do\n" ++
             "  \"$probe\" version \"$binderfs_mount/$device\"\n" ++
             "done",
         "sudo -n \"$probe\" alloc \"$binderfs_mount/binder-control\"",

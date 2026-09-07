@@ -1140,6 +1140,7 @@ binderfs_mount=/dev/binderfs
 # A real, driver-backed BINDER_VERSION ioctl on each fixed device, and a
 # real BINDER_CTL_ADD dynamic allocation through binder-control.
 sudo -n /usr/bin/chmod 0755 "$probe"
+[[ $EUID -ne 0 ]]
 for device in binder hwbinder vndbinder; do
   "$probe" version "$binderfs_mount/$device"
 done
