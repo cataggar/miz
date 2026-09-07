@@ -46,6 +46,7 @@ const usage_text =
     \\  check-gallery          bind the gallery version to the managed disk
     \\  check-vm               require ConfidentialVM, VMGuestStateOnly, Secure Boot, and vTPM
     \\  acceptance-result      verify MAA attestation and write the bound result
+    \\  verify-acceptance      revalidate the exact protected acceptance result for publication
     \\
 ;
 
@@ -127,6 +128,7 @@ const command_table = [_]Command{
     .{ .name = "check-gallery", .handler = runCheckGallery },
     .{ .name = "check-vm", .handler = runCheckVm },
     .{ .name = "acceptance-result", .handler = runAcceptanceResult },
+    .{ .name = "verify-acceptance", .handler = runVerifyAcceptance },
 };
 
 fn run(context: Context, argv: []const []const u8) !void {
@@ -828,6 +830,15 @@ fn validEndpoint(endpoint: []const u8) bool {
     return true;
 }
 
+fn validPositiveDecimal(text: []const u8) bool {
+    if (text.len == 0 or text[0] == '0') return false;
+    for (text) |character| switch (character) {
+        '0'...'9' => {},
+        else => return false,
+    };
+    return true;
+}
+
 fn decodeUrlAlloc(
     allocator: Allocator,
     encoded: []const u8,
@@ -1406,6 +1417,278 @@ fn runAcceptanceResult(context: Context, argv: []const []const u8) !void {
     );
 }
 
+fn requireBoundAzureId(
+    allocator: Allocator,
+    id: []const u8,
+    resource_group: []const u8,
+    resource_type: []const u8,
+    label: []const u8,
+    diagnostic: *Diagnostic,
+) !void {
+    if (!std.mem.startsWith(u8, id, "/subscriptions/")) {
+        return invalid(diagnostic, "{s} is not an Azure resource ID", .{label});
+    }
+    const group_segment = try std.fmt.allocPrint(
+        allocator,
+        "/resourceGroups/{s}/providers/Microsoft.Compute/",
+        .{resource_group},
+    );
+    defer allocator.free(group_segment);
+    if (std.mem.indexOf(u8, id, group_segment) == null or
+        std.mem.indexOf(u8, id, resource_type) == null)
+    {
+        return invalid(
+            diagnostic,
+            "{s} is outside the accepted resource group or has the wrong type",
+            .{label},
+        );
+    }
+}
+
+fn verifyAcceptanceResult(
+    allocator: Allocator,
+    io: Io,
+    result_path: []const u8,
+    provenance_path: []const u8,
+    qcow_path: []const u8,
+    source_commit: []const u8,
+    location: []const u8,
+    vm_size: []const u8,
+    run_id: []const u8,
+    run_attempt: []const u8,
+    diagnostic: *Diagnostic,
+) !BuildEvidence {
+    if (!validCommit(source_commit) or
+        !validPositiveDecimal(run_id) or
+        !validPositiveDecimal(run_attempt))
+    {
+        return error.Usage;
+    }
+    const build = try verifyBuild(
+        allocator,
+        io,
+        provenance_path,
+        qcow_path,
+        diagnostic,
+    );
+    var document = try readObject(allocator, io, result_path, diagnostic);
+    defer document.deinit();
+    const root = document.object();
+    if (root.count() != 6 or
+        try requireInteger(root, "schema", "acceptance schema", diagnostic) != 1)
+    {
+        return invalid(diagnostic, "acceptance result shape is invalid", .{});
+    }
+    try requireEqual(
+        try requireString(root, "type", "acceptance type", diagnostic),
+        acceptance_type,
+        "acceptance type",
+        diagnostic,
+    );
+    try requireEqual(
+        try requireString(root, "source_commit", "acceptance source commit", diagnostic),
+        source_commit,
+        "acceptance source commit",
+        diagnostic,
+    );
+
+    const artifact = try requireObject(root, "artifact", "accepted artifact", diagnostic);
+    if (artifact.count() != 5) {
+        return invalid(diagnostic, "accepted artifact shape is invalid", .{});
+    }
+    const qcow_sha = try requireString(
+        &artifact,
+        "qcow_sha256",
+        "accepted QCOW2 SHA-256",
+        diagnostic,
+    );
+    _ = release.digest.parseHex(qcow_sha) catch
+        return invalid(diagnostic, "accepted QCOW2 SHA-256 is invalid", .{});
+    try requireEqual(
+        qcow_sha,
+        &build.qcow_sha256,
+        "accepted QCOW2 SHA-256",
+        diagnostic,
+    );
+    const qcow_size = try positiveU64(
+        try requireInteger(&artifact, "qcow_size", "accepted QCOW2 size", diagnostic),
+        "accepted QCOW2 size",
+        diagnostic,
+    );
+    if (qcow_size != build.qcow_size) {
+        return invalid(diagnostic, "accepted QCOW2 size mismatch", .{});
+    }
+    const virtual_size = try positiveU64(
+        try requireInteger(&artifact, "virtual_size", "accepted virtual size", diagnostic),
+        "accepted virtual size",
+        diagnostic,
+    );
+    const vhd_size = try positiveU64(
+        try requireInteger(&artifact, "vhd_size", "accepted VHD size", diagnostic),
+        "accepted VHD size",
+        diagnostic,
+    );
+    _ = release.digest.parseHex(try requireString(
+        &artifact,
+        "vhd_sha256",
+        "accepted VHD SHA-256",
+        diagnostic,
+    )) catch return invalid(diagnostic, "accepted VHD SHA-256 is invalid", .{});
+    try release.azure_confidential_vm.validateVhdSize(
+        build.virtual_size,
+        virtual_size,
+        vhd_size,
+        diagnostic,
+    );
+
+    const attestation = try requireObject(
+        root,
+        "attestation",
+        "accepted attestation",
+        diagnostic,
+    );
+    if (attestation.count() != 8) {
+        return invalid(diagnostic, "accepted attestation shape is invalid", .{});
+    }
+    try requireEqual(
+        try requireString(&attestation, "compliance", "attestation compliance", diagnostic),
+        "azure-compliant-cvm",
+        "attestation compliance",
+        diagnostic,
+    );
+    try requireFalse(&attestation, "debuggable", "attestation debuggable state", diagnostic);
+    const issuer = try requireString(
+        &attestation,
+        "issuer",
+        "attestation issuer",
+        diagnostic,
+    );
+    if (!validEndpoint(issuer)) {
+        return invalid(diagnostic, "attestation issuer is invalid", .{});
+    }
+    _ = release.digest.parseHex(try requireString(
+        &attestation,
+        "nonce_sha256",
+        "attestation nonce SHA-256",
+        diagnostic,
+    )) catch return invalid(diagnostic, "attestation nonce SHA-256 is invalid", .{});
+    try requireTrue(&attestation, "secure_boot", "attested Secure Boot state", diagnostic);
+    try requireEqual(
+        try requireString(&attestation, "tee", "attestation TEE", diagnostic),
+        "AMD SEV-SNP",
+        "attestation TEE",
+        diagnostic,
+    );
+    _ = release.digest.parseHex(try requireString(
+        &attestation,
+        "token_sha256",
+        "attestation token SHA-256",
+        diagnostic,
+    )) catch return invalid(diagnostic, "attestation token SHA-256 is invalid", .{});
+    try requireTrue(&attestation, "vtpm", "attested vTPM state", diagnostic);
+
+    const azure = try requireObject(root, "azure", "accepted Azure resources", diagnostic);
+    if (azure.count() != 8) {
+        return invalid(diagnostic, "accepted Azure resource shape is invalid", .{});
+    }
+    try requireEqual(
+        try requireString(&azure, "location", "accepted Azure location", diagnostic),
+        location,
+        "accepted Azure location",
+        diagnostic,
+    );
+    try requireEqual(
+        try requireString(&azure, "vm_size", "accepted Azure VM size", diagnostic),
+        vm_size,
+        "accepted Azure VM size",
+        diagnostic,
+    );
+    const expected_group = try std.fmt.allocPrint(
+        allocator,
+        "miz-u2404-cvm-{s}-{s}",
+        .{ run_id, run_attempt },
+    );
+    defer allocator.free(expected_group);
+    try requireEqual(
+        try requireString(&azure, "resource_group", "accepted resource group", diagnostic),
+        expected_group,
+        "accepted resource group",
+        diagnostic,
+    );
+    try requireBoundAzureId(
+        allocator,
+        try requireString(&azure, "managed_disk_id", "accepted managed disk", diagnostic),
+        expected_group,
+        "/disks/",
+        "accepted managed disk",
+        diagnostic,
+    );
+    try requireBoundAzureId(
+        allocator,
+        try requireString(&azure, "managed_image_id", "accepted managed image", diagnostic),
+        expected_group,
+        "/images/",
+        "accepted managed image",
+        diagnostic,
+    );
+    try requireBoundAzureId(
+        allocator,
+        try requireString(
+            &azure,
+            "gallery_image_version_id",
+            "accepted gallery image version",
+            diagnostic,
+        ),
+        expected_group,
+        "/galleries/",
+        "accepted gallery image version",
+        diagnostic,
+    );
+    try requireBoundAzureId(
+        allocator,
+        try requireString(&azure, "vm_resource_id", "accepted VM resource", diagnostic),
+        expected_group,
+        "/virtualMachines/",
+        "accepted VM resource",
+        diagnostic,
+    );
+    if (!validGuid(try requireString(&azure, "vm_id", "accepted VM ID", diagnostic))) {
+        return invalid(diagnostic, "accepted VM ID is invalid", .{});
+    }
+    return build;
+}
+
+fn runVerifyAcceptance(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "result",
+        "provenance",
+        "qcow",
+        "source-commit",
+        "location",
+        "vm-size",
+        "run-id",
+        "run-attempt",
+    });
+    const build = try verifyAcceptanceResult(
+        context.allocator,
+        context.io,
+        try options.require("result"),
+        try options.require("provenance"),
+        try options.require("qcow"),
+        try options.require("source-commit"),
+        try options.require("location"),
+        try options.require("vm-size"),
+        try options.require("run-id"),
+        try options.require("run-attempt"),
+        context.diagnostic,
+    );
+    try context.out.print("{s}\n{d}\n{d}\n", .{
+        &build.qcow_sha256,
+        build.qcow_size,
+        build.virtual_size,
+    });
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var arena: std.heap.ArenaAllocator = .init(init.gpa);
@@ -1467,6 +1750,7 @@ test "command surface is exact and rejects incomplete invocations" {
         "check-gallery",
         "check-vm",
         "acceptance-result",
+        "verify-acceptance",
     };
     try std.testing.expectEqual(names.len, command_table.len);
     var discard: Writer.Discarding = .init(&.{});
@@ -1498,6 +1782,126 @@ test "attestation endpoint commit and VM identities are strict" {
     try std.testing.expect(!validGuid("2DEDC52A-6832-46CE-9910"));
     try std.testing.expect(validCommit("0123456789abcdef0123456789abcdef01234567"));
     try std.testing.expect(!validCommit("0123456789ABCDEF0123456789ABCDEF01234567"));
+}
+
+test "publication revalidates the protected acceptance binding" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const candidate_path = try testFixturePath(allocator, &tmp.sub_path, "candidate.qcow2");
+    defer allocator.free(candidate_path);
+    const provenance_path = try testFixturePath(allocator, &tmp.sub_path, "provenance.json");
+    defer allocator.free(provenance_path);
+    const result_path = try testFixturePath(allocator, &tmp.sub_path, "acceptance.json");
+    defer allocator.free(result_path);
+    const candidate = "publication candidate fixture\n";
+    const qcow_sha = release.digest.hexBytes(candidate);
+    const commit = "0123456789abcdef0123456789abcdef01234567";
+    const virtual_size = 4 * 1024 * 1024;
+    const vhd_size = virtual_size + azure_vhd.footer_bytes;
+    const provenance = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schema\":1,\"type\":\"{s}\",\"release\":\"24.04\"," ++
+            "\"architecture\":\"x86_64\",\"tee\":\"AMD SEV-SNP\"," ++
+            "\"publication\":{{\"sha256sums_signature_verified\":true}}," ++
+            "\"guest_contract\":{{\"generalized\":true}}," ++
+            "\"candidate\":{{\"format\":\"standalone-qcow2\"," ++
+            "\"sha256\":\"{s}\",\"size\":{d},\"virtual_size\":{d}}}}}",
+        .{ expected_build_type, &qcow_sha, candidate.len, virtual_size },
+    );
+    defer allocator.free(provenance);
+    const result = try std.fmt.allocPrint(
+        allocator,
+        "{{\"artifact\":{{\"qcow_sha256\":\"{s}\",\"qcow_size\":{d}," ++
+            "\"vhd_sha256\":\"{s}\",\"vhd_size\":{d},\"virtual_size\":{d}}}," ++
+            "\"attestation\":{{\"compliance\":\"azure-compliant-cvm\"," ++
+            "\"debuggable\":false,\"issuer\":\"https://test.attest.azure.net\"," ++
+            "\"nonce_sha256\":\"{s}\",\"secure_boot\":true," ++
+            "\"tee\":\"AMD SEV-SNP\",\"token_sha256\":\"{s}\",\"vtpm\":true}}," ++
+            "\"azure\":{{\"gallery_image_version_id\":\"{s}/galleries/g/images/i/versions/1\"," ++
+            "\"location\":\"westeurope\",\"managed_disk_id\":\"{s}/disks/os\"," ++
+            "\"managed_image_id\":\"{s}/images/base\"," ++
+            "\"resource_group\":\"miz-u2404-cvm-123-4\"," ++
+            "\"vm_id\":\"2dedc52a-6832-46ce-9910-e8c9980bf5a7\"," ++
+            "\"vm_resource_id\":\"{s}/virtualMachines/vm\"," ++
+            "\"vm_size\":\"Standard_DC2as_v5\"}},\"schema\":1," ++
+            "\"source_commit\":\"{s}\",\"type\":\"{s}\"}}",
+        .{
+            &qcow_sha,
+            candidate.len,
+            "1" ** 64,
+            vhd_size,
+            virtual_size,
+            "2" ** 64,
+            "3" ** 64,
+            "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-123-4/providers/Microsoft.Compute",
+            "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-123-4/providers/Microsoft.Compute",
+            "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-123-4/providers/Microsoft.Compute",
+            "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-123-4/providers/Microsoft.Compute",
+            commit,
+            acceptance_type,
+        },
+    );
+    defer allocator.free(result);
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = candidate_path,
+        .data = candidate,
+    });
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = provenance_path,
+        .data = provenance,
+    });
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = result_path,
+        .data = result,
+    });
+
+    var diagnostic: Diagnostic = .{};
+    const accepted = try verifyAcceptanceResult(
+        allocator,
+        std.testing.io,
+        result_path,
+        provenance_path,
+        candidate_path,
+        commit,
+        "westeurope",
+        "Standard_DC2as_v5",
+        "123",
+        "4",
+        &diagnostic,
+    );
+    try std.testing.expectEqualStrings(&qcow_sha, &accepted.qcow_sha256);
+
+    const insecure = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        result,
+        "\"secure_boot\":true",
+        "\"secure_boot\":false",
+    );
+    defer allocator.free(insecure);
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = result_path,
+        .data = insecure,
+    });
+    diagnostic = .{};
+    try std.testing.expectError(error.InvalidDocument, verifyAcceptanceResult(
+        allocator,
+        std.testing.io,
+        result_path,
+        provenance_path,
+        candidate_path,
+        commit,
+        "westeurope",
+        "Standard_DC2as_v5",
+        "123",
+        "4",
+        &diagnostic,
+    ));
+    try std.testing.expectEqualStrings(
+        "attested Secure Boot state is not true",
+        diagnostic.message(),
+    );
 }
 
 const test_attestation_endpoint = "https://test.attest.azure.net";
