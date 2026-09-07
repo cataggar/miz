@@ -47,9 +47,33 @@ azure_confidential_vm_image_definition_show_args() {
   )
 }
 
+azure_confidential_vm_managed_image_create_args() {
+  local resource_group=$1 image=$2 location=$3 disk_id=$4
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    image create
+    --resource-group "$resource_group"
+    --name "$image"
+    --location "$location"
+    --source "$disk_id"
+    --os-type Linux
+    --hyper-v-generation V2
+    --output json
+  )
+}
+
+azure_confidential_vm_managed_image_show_args() {
+  local resource_group=$1 image=$2
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    image show
+    --resource-group "$resource_group"
+    --name "$image"
+    --output json
+  )
+}
+
 azure_confidential_vm_vm_create_args() {
   local resource_group=$1 vm_name=$2 location=$3 vm_size=$4 image_version_id=$5
-  local admin_username=$6 public_key=$7
+  local admin_username=$6 public_key=$7 managed_boot_diagnostics=${8:-false}
   AZURE_CONFIDENTIAL_VM_ARGS=(
     vm create
     --resource-group "$resource_group"
@@ -68,8 +92,11 @@ azure_confidential_vm_vm_create_args() {
     --enable-vtpm true
     --public-ip-sku Standard
     --nsg-rule SSH
-    --output json
   )
+  if [[ "$managed_boot_diagnostics" == true ]]; then
+    AZURE_CONFIDENTIAL_VM_ARGS+=(--boot-diagnostics-storage "")
+  fi
+  AZURE_CONFIDENTIAL_VM_ARGS+=(--output json)
 }
 
 azure_confidential_vm_vm_resource_args() {
@@ -78,7 +105,7 @@ azure_confidential_vm_vm_resource_args() {
     vm show
     --resource-group "$resource_group"
     --name "$vm_name"
-    --query '{securityProfile:securityProfile,osDiskSecurityProfile:storageProfile.osDisk.managedDisk.securityProfile,imageReference:storageProfile.imageReference}'
+    --query '{id:id,vmId:vmId,securityProfile:securityProfile,osDiskSecurityProfile:storageProfile.osDisk.managedDisk.securityProfile,imageReference:storageProfile.imageReference}'
     --output json
   )
 }

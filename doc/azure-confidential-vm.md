@@ -14,7 +14,12 @@ and the resulting version can create either a standard Gen2 VM or a
 Confidential VM. Arm64 and Intel TDX are not part of this initial contract.
 
 The source and derived fixed VHD must be strictly smaller than 32 GiB. The
-deployed VM must independently request:
+acceptance path uploads that exact VHD to a managed disk, creates a generalized
+Gen2 managed image bound to the disk, and uses the managed image as the
+`ConfidentialVmSupported` gallery-version source. Azure does not accept the
+intermediate managed disk directly for this image-definition security type.
+
+The deployed VM must independently request:
 
 - `securityType=ConfidentialVM`;
 - OS-disk `securityEncryptionType=VMGuestStateOnly`;
@@ -93,15 +98,17 @@ az disk create --resource-group RESOURCE_GROUP --name DISK_NAME --location REGIO
 azcopy copy image.vhd DISK_UPLOAD_SAS --blob-type PageBlob
 az disk revoke-access --resource-group RESOURCE_GROUP --name DISK_NAME --output json
 az disk show --resource-group RESOURCE_GROUP --name DISK_NAME --output json > managed-disk.json
+az image create --resource-group RESOURCE_GROUP --name MANAGED_IMAGE --location REGION --source MANAGED_DISK_ID --os-type Linux --hyper-v-generation V2 --output json
+az image show --resource-group RESOURCE_GROUP --name MANAGED_IMAGE --output json > managed-image.json
 az vm list-skus --location REGION --resource-type virtualMachines --size VM_SIZE --all --output json > confidential-sku.json
 az sig create --resource-group RESOURCE_GROUP --gallery-name GALLERY --location REGION --output json
 az sig image-definition create --resource-group RESOURCE_GROUP --gallery-name GALLERY --gallery-image-definition IMAGE_DEFINITION --publisher miz --offer ubuntu2404 --sku confidential-x64 --os-type Linux --os-state Generalized --hyper-v-generation V2 --architecture x64 --features SecurityType=ConfidentialVMSupported --location REGION --output json
 az sig image-definition show --resource-group RESOURCE_GROUP --gallery-name GALLERY --gallery-image-definition IMAGE_DEFINITION --output json > image-definition.json
-ubuntu2404_confidential_release gallery-request --output gallery-version.json --location REGION --disk-id MANAGED_DISK_ID
+ubuntu2404_confidential_release gallery-request --output gallery-version.json --location REGION --source-id MANAGED_IMAGE_ID
 az rest --method put --uri https://management.azure.com/subscriptions/SUBSCRIPTION_ID/resourceGroups/RESOURCE_GROUP/providers/Microsoft.Compute/galleries/GALLERY/images/IMAGE_DEFINITION/versions/IMAGE_VERSION\?api-version=2025-03-03 --body @gallery-version.json --output json > gallery-version-response.json
 az rest --method get --uri https://management.azure.com/subscriptions/SUBSCRIPTION_ID/resourceGroups/RESOURCE_GROUP/providers/Microsoft.Compute/galleries/GALLERY/images/IMAGE_DEFINITION/versions/IMAGE_VERSION\?api-version=2025-03-03 --output json > gallery-version-final.json
 az vm create --resource-group RESOURCE_GROUP --name VM_NAME --location REGION --size VM_SIZE --image /subscriptions/SUBSCRIPTION_ID/resourceGroups/RESOURCE_GROUP/providers/Microsoft.Compute/galleries/GALLERY/images/IMAGE_DEFINITION/versions/IMAGE_VERSION --admin-username ADMIN_USER --authentication-type ssh --ssh-key-values PUBLIC_KEY_FILE --enable-agent true --enable-auto-update false --security-type ConfidentialVM --os-disk-security-encryption-type VMGuestStateOnly --enable-secure-boot true --enable-vtpm true --public-ip-sku Standard --nsg-rule SSH --output json
-az vm show --resource-group RESOURCE_GROUP --name VM_NAME --query \{securityProfile:securityProfile\,osDiskSecurityProfile:storageProfile.osDisk.managedDisk.securityProfile\,imageReference:storageProfile.imageReference\} --output json > vm-resource.json
+az vm show --resource-group RESOURCE_GROUP --name VM_NAME --query \{id:id\,vmId:vmId\,securityProfile:securityProfile\,osDiskSecurityProfile:storageProfile.osDisk.managedDisk.securityProfile\,imageReference:storageProfile.imageReference\} --output json > vm-resource.json
 az vm get-instance-view --resource-group RESOURCE_GROUP --name VM_NAME --query securityProfile --output json > instance-security.json
 ubuntu2404_confidential_release check-vm --resource vm-resource.json --instance instance-security.json
 ```

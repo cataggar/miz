@@ -16,7 +16,8 @@ const Diagnostic = contract.Diagnostic;
 const ObjectMap = std.json.ObjectMap;
 const Value = std.json.Value;
 
-pub const image_security_type = "ConfidentialVMSupported";
+pub const image_security_feature = "ConfidentialVMSupported";
+pub const image_security_type = "ConfidentialVmSupported";
 pub const vm_security_type = "ConfidentialVM";
 pub const os_disk_security_encryption_type = "VMGuestStateOnly";
 pub const architecture = "x64";
@@ -34,11 +35,13 @@ pub const maximum_vhd_current_size: u64 = 32 * 1024 * 1024 * 1024;
 pub const Error = azure_compute.Error || error{
     InvalidVhdSize,
     InvalidSku,
+    InvalidManagedImage,
     InvalidDiskSecurityProfile,
     InvalidGalleryVersion,
 };
 pub const VhdSizeError = error{InvalidVhdSize};
 pub const SkuError = error{InvalidSku};
+pub const ManagedImageError = error{InvalidManagedImage};
 pub const DiskSecurityProfileError = error{InvalidDiskSecurityProfile};
 pub const GalleryVersionError = error{InvalidGalleryVersion};
 
@@ -50,14 +53,30 @@ pub const Sku = struct {
 pub fn galleryVersionRequest(
     allocator: Allocator,
     location: []const u8,
-    disk_id: []const u8,
+    managed_image_id: []const u8,
 ) !Value {
-    return azure_compute.galleryVersionRequest(
-        allocator,
-        location,
-        disk_id,
-        null,
-    );
+    const publishing = try azure_compute.object(allocator, &.{
+        .{ "replicationMode", azure_compute.string("Shallow") },
+        .{ "targetRegions", try azure_compute.array(allocator, &.{
+            try azure_compute.object(allocator, &.{
+                .{ "name", azure_compute.string(location) },
+                .{ "regionalReplicaCount", azure_compute.integer(1) },
+                .{ "storageAccountType", azure_compute.string("Standard_LRS") },
+            }),
+        }) },
+    });
+    const storage = try azure_compute.object(allocator, &.{
+        .{ "source", try azure_compute.object(allocator, &.{
+            .{ "id", azure_compute.string(managed_image_id) },
+        }) },
+    });
+    return azure_compute.object(allocator, &.{
+        .{ "location", azure_compute.string(location) },
+        .{ "properties", try azure_compute.object(allocator, &.{
+            .{ "publishingProfile", publishing },
+            .{ "storageProfile", storage },
+        }) },
+    });
 }
 
 pub fn validateVhdSize(
@@ -114,6 +133,70 @@ pub fn validateManagedDisk(
     diagnostic: *Diagnostic,
 ) azure_compute.ManagedDiskError![]const u8 {
     return azure_compute.validateManagedDisk(disk, architecture, diagnostic);
+}
+
+pub fn validateManagedImage(
+    image: *const ObjectMap,
+    disk_id: []const u8,
+    diagnostic: *Diagnostic,
+) ManagedImageError![]const u8 {
+    const id = azure_compute.stringOf(image.get("id")) orelse
+        return diagnostic.fail(
+            error.InvalidManagedImage,
+            "Azure managed image ID is absent",
+            .{},
+        );
+    if (!azure_compute.stringIs(image.get("hyperVGeneration"), hyper_v_generation) or
+        !azure_compute.stringIs(image.get("provisioningState"), "Succeeded"))
+    {
+        return diagnostic.fail(
+            error.InvalidManagedImage,
+            "Azure managed image is not a provisioned Gen2 image",
+            .{},
+        );
+    }
+    const storage = azure_compute.objectOf(image.get("storageProfile")) orelse
+        return diagnostic.fail(
+            error.InvalidManagedImage,
+            "Azure managed image storage profile is absent",
+            .{},
+        );
+    const os_disk = azure_compute.objectOf(storage.get("osDisk")) orelse
+        return diagnostic.fail(
+            error.InvalidManagedImage,
+            "Azure managed image OS disk is absent",
+            .{},
+        );
+    const managed_disk = azure_compute.objectOf(os_disk.get("managedDisk")) orelse
+        return diagnostic.fail(
+            error.InvalidManagedImage,
+            "Azure managed image source disk is absent",
+            .{},
+        );
+    if (!azure_compute.stringIs(os_disk.get("osType"), os_type) or
+        !azure_compute.stringIs(os_disk.get("osState"), os_state) or
+        !azure_compute.stringIs(managed_disk.get("id"), disk_id))
+    {
+        return diagnostic.fail(
+            error.InvalidManagedImage,
+            "Azure managed image does not bind the generalized Linux source disk",
+            .{},
+        );
+    }
+    const disk_size_gib = azure_compute.integerOf(os_disk.get("diskSizeGB")) orelse
+        return diagnostic.fail(
+            error.InvalidManagedImage,
+            "Azure managed image OS disk size is absent",
+            .{},
+        );
+    if (disk_size_gib <= 0 or disk_size_gib >= 32) {
+        return diagnostic.fail(
+            error.InvalidManagedImage,
+            "Azure managed image OS disk is not smaller than 32 GiB",
+            .{},
+        );
+    }
+    return id;
 }
 
 pub fn validateImageDefinition(
@@ -276,9 +359,7 @@ fn gallerySourceId(document: *const ObjectMap) ?[]const u8 {
         return null;
     const storage = azure_compute.objectOf(properties.get("storageProfile")) orelse
         return null;
-    const os_disk = azure_compute.objectOf(storage.get("osDiskImage")) orelse
-        return null;
-    const source = azure_compute.objectOf(os_disk.get("source")) orelse
+    const source = azure_compute.objectOf(storage.get("source")) orelse
         return null;
     return azure_compute.stringOf(source.get("id"));
 }
@@ -291,26 +372,26 @@ fn hasCustomUefiSettings(document: *const ObjectMap) bool {
     return security.contains("uefiSettings");
 }
 
-/// Bind a gallery version to the exact uploaded disk while requiring the
+/// Bind a gallery version to the exact managed image while requiring the
 /// stock Microsoft/Canonical UEFI trust chain. Custom UEFI keys are documented
 /// only for different gallery security profiles and are rejected here.
 pub fn validateGalleryVersion(
     request: *const ObjectMap,
     response: *const ObjectMap,
     image_version_id: []const u8,
-    disk_id: []const u8,
+    managed_image_id: []const u8,
     require_succeeded: bool,
     diagnostic: *Diagnostic,
 ) GalleryVersionError!void {
     if (gallerySourceId(request)) |source| {
-        if (!std.mem.eql(u8, source, disk_id)) return diagnostic.fail(
+        if (!std.mem.eql(u8, source, managed_image_id)) return diagnostic.fail(
             error.InvalidGalleryVersion,
-            "Azure gallery request does not reference the accepted managed disk",
+            "Azure gallery request does not reference the accepted managed image",
             .{},
         );
     } else return diagnostic.fail(
         error.InvalidGalleryVersion,
-        "Azure gallery request does not reference the accepted managed disk",
+        "Azure gallery request does not reference the accepted managed image",
         .{},
     );
     if (hasCustomUefiSettings(request)) return diagnostic.fail(
@@ -327,14 +408,14 @@ pub fn validateGalleryVersion(
         );
     }
     if (gallerySourceId(response)) |source| {
-        if (!std.ascii.eqlIgnoreCase(source, disk_id)) return diagnostic.fail(
+        if (!std.ascii.eqlIgnoreCase(source, managed_image_id)) return diagnostic.fail(
             error.InvalidGalleryVersion,
-            "Azure gallery version does not reference the accepted managed disk",
+            "Azure gallery version does not reference the accepted managed image",
             .{},
         );
     } else return diagnostic.fail(
         error.InvalidGalleryVersion,
-        "Azure gallery version does not reference the accepted managed disk",
+        "Azure gallery version does not reference the accepted managed image",
         .{},
     );
     if (hasCustomUefiSettings(response)) return diagnostic.fail(
@@ -456,7 +537,7 @@ test "Confidential VM resource requires security and VMGS-only encryption" {
 
 test "Confidential image definition rejects every security-profile substitution" {
     const valid =
-        \\{"id":"/subscriptions/test/galleries/g/images/i","osType":"Linux","osState":"Generalized","hyperVGeneration":"V2","architecture":"x64","features":[{"name":"SecurityType","value":"ConfidentialVMSupported"}]}
+        \\{"id":"/subscriptions/test/galleries/g/images/i","osType":"Linux","osState":"Generalized","hyperVGeneration":"V2","architecture":"x64","features":[{"name":"SecurityType","value":"ConfidentialVmSupported"}]}
     ;
     var definition = try parse(std.testing.allocator, valid);
     defer definition.deinit();
@@ -487,27 +568,47 @@ test "Confidential image definition rejects every security-profile substitution"
     }
 }
 
-test "gallery version binds the managed disk and rejects custom UEFI state" {
+test "managed image and gallery version bind their exact source" {
+    var image = try parse(std.testing.allocator,
+        \\{"id":"/subscriptions/test/resourceGroups/test/providers/Microsoft.Compute/images/os","hyperVGeneration":"V2","provisioningState":"Succeeded","storageProfile":{"osDisk":{"diskSizeGB":31,"managedDisk":{"id":"/subscriptions/test/disks/os"},"osState":"Generalized","osType":"Linux"}}}
+    );
+    defer image.deinit();
+    var diagnostic: Diagnostic = .{};
+    _ = try validateManagedImage(
+        &image.value.object,
+        "/subscriptions/test/disks/os",
+        &diagnostic,
+    );
+    image.value.object.getPtr("hyperVGeneration").?.* = .{ .string = "V1" };
+    try std.testing.expectError(
+        error.InvalidManagedImage,
+        validateManagedImage(
+            &image.value.object,
+            "/subscriptions/test/disks/os",
+            &diagnostic,
+        ),
+    );
+
     var request = try parse(std.testing.allocator,
-        \\{"properties":{"storageProfile":{"osDiskImage":{"source":{"id":"/subscriptions/test/disks/os"}}}}}
+        \\{"properties":{"storageProfile":{"source":{"id":"/subscriptions/test/images/os"}}}}
     );
     defer request.deinit();
     var response = try parse(std.testing.allocator,
-        \\{"id":"/subscriptions/test/galleries/g/images/i/versions/1.0.0","properties":{"provisioningState":"Succeeded","storageProfile":{"osDiskImage":{"source":{"id":"/subscriptions/test/disks/os"}}}}}
+        \\{"id":"/subscriptions/test/galleries/g/images/i/versions/1.0.0","properties":{"provisioningState":"Succeeded","storageProfile":{"source":{"id":"/subscriptions/test/images/os"}}}}
     );
     defer response.deinit();
-    var diagnostic: Diagnostic = .{};
+    diagnostic = .{};
     try validateGalleryVersion(
         &request.value.object,
         &response.value.object,
         "/subscriptions/test/galleries/g/images/i/versions/1.0.0",
-        "/subscriptions/test/disks/os",
+        "/subscriptions/test/images/os",
         true,
         &diagnostic,
     );
 
     var custom = try parse(std.testing.allocator,
-        \\{"properties":{"storageProfile":{"osDiskImage":{"source":{"id":"/subscriptions/test/disks/os"}}},"securityProfile":{"uefiSettings":{"signatureTemplateNames":["MicrosoftUefiCertificateAuthorityTemplate"]}}}}
+        \\{"properties":{"storageProfile":{"source":{"id":"/subscriptions/test/images/os"}},"securityProfile":{"uefiSettings":{"signatureTemplateNames":["MicrosoftUefiCertificateAuthorityTemplate"]}}}}
     );
     defer custom.deinit();
     try std.testing.expectError(
@@ -516,7 +617,7 @@ test "gallery version binds the managed disk and rejects custom UEFI state" {
             &custom.value.object,
             &response.value.object,
             "/subscriptions/test/galleries/g/images/i/versions/1.0.0",
-            "/subscriptions/test/disks/os",
+            "/subscriptions/test/images/os",
             true,
             &diagnostic,
         ),
