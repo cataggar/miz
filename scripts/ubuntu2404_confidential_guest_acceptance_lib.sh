@@ -122,7 +122,7 @@ ubuntu2404_confidential_guest_collect_attestation() {
   local endpoint=$1 nonce=$2 result_dir=$3 token=$4 openid=$5 jwks=$6 stderr=$7
   local package="$result_dir/azguestattestation1.deb"
   local client="$result_dir/attestation-client/cvm_linux_attestation_client/AttestationClient"
-  local jwks_uri
+  local jwks_uri ssh_status
   [[ "$endpoint" =~ ^https://[a-z0-9.-]+\.attest\.azure\.net$ ]] || return 1
   [[ "$nonce" =~ ^[0-9a-f]{64}$ ]] || return 1
   ubuntu2404_confidential_guest_require_ssh || return
@@ -135,10 +135,11 @@ ubuntu2404_confidential_guest_collect_attestation() {
     "$client" \
     "$UBUNTU2404_CONFIDENTIAL_GUEST_SSH_TARGET:/tmp/" || return
 
+  ssh_status=0
   ssh "${UBUNTU2404_CONFIDENTIAL_GUEST_SSH_OPTIONS[@]}" \
     "$UBUNTU2404_CONFIDENTIAL_GUEST_SSH_TARGET" \
     "/usr/bin/bash -s -- '$endpoint/' '$nonce'" \
-    >"$token" 2>"$stderr" <<'GUEST'
+    >"$token" 2>"$stderr" <<'GUEST' || ssh_status=$?
 set -Eeuo pipefail
 endpoint=$1
 nonce=$2
@@ -146,6 +147,9 @@ sudo -n dpkg -i /tmp/azguestattestation1.deb >/dev/null
 sudo -n chmod 0755 /tmp/AttestationClient
 sudo -n /tmp/AttestationClient -a "$endpoint" -n "$nonce" -o TOKEN
 GUEST
+  if (( ssh_status != 0 )); then
+    return "$ssh_status"
+  fi
   test -s "$token" || return
 
   curl --fail --silent --show-error \
@@ -248,17 +252,30 @@ ubuntu2404_confidential_guest_final_acceptance() {
   local endpoint=$4 nonce=$5 result_dir=$6 token=$7 openid=$8 jwks=$9
   local stderr=${10} resource_group=${11} vm_name=${12}
   local data_disk_name=${13} location=${14}
+  local validation_status=0 cleanup_status=0
 
-  ubuntu2404_confidential_guest_wait_for_ssh || return
-  ubuntu2404_confidential_guest_check_readiness "$expected_virtual_size" ||
-    return
-  ubuntu2404_confidential_guest_collect_attestation \
-    "$endpoint" "$nonce" "$result_dir" "$token" "$openid" "$jwks" "$stderr" ||
-    return
-  ubuntu2404_confidential_guest_collect_identity "$guest_imds" "$expected_vm_id" ||
-    return
-  ubuntu2404_confidential_guest_validate_persistent_data_disk \
-    "$resource_group" "$vm_name" "$data_disk_name" "$location" "$nonce" ||
-    return
-  ubuntu2404_confidential_guest_cleanup_validation_files
+  ubuntu2404_confidential_guest_wait_for_ssh || validation_status=$?
+  if (( validation_status == 0 )); then
+    ubuntu2404_confidential_guest_check_readiness "$expected_virtual_size" ||
+      validation_status=$?
+  fi
+  if (( validation_status == 0 )); then
+    ubuntu2404_confidential_guest_collect_attestation \
+      "$endpoint" "$nonce" "$result_dir" "$token" "$openid" "$jwks" "$stderr" ||
+      validation_status=$?
+  fi
+  if (( validation_status == 0 )); then
+    ubuntu2404_confidential_guest_collect_identity \
+      "$guest_imds" "$expected_vm_id" || validation_status=$?
+  fi
+  if (( validation_status == 0 )); then
+    ubuntu2404_confidential_guest_validate_persistent_data_disk \
+      "$resource_group" "$vm_name" "$data_disk_name" "$location" "$nonce" ||
+      validation_status=$?
+  fi
+  ubuntu2404_confidential_guest_cleanup_validation_files || cleanup_status=$?
+  if (( validation_status != 0 )); then
+    return "$validation_status"
+  fi
+  return "$cleanup_status"
 }

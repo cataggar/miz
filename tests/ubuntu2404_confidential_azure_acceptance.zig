@@ -240,6 +240,179 @@ const Result = struct {
     }
 };
 
+fn runGuestHarness(
+    allocator: Allocator,
+    root: []const u8,
+    name: []const u8,
+    source: []const u8,
+) !Result {
+    const repository = try rootAlloc(allocator);
+    defer allocator.free(repository);
+    const library = try std.fs.path.join(
+        allocator,
+        &.{ repository, guest_library_path },
+    );
+    defer allocator.free(library);
+    try Dir.cwd().createDirPath(std.testing.io, root);
+    const harness = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}.sh",
+        .{ root, name },
+    );
+    defer allocator.free(harness);
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = harness,
+        .data = source,
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{ "bash", harness, library, root },
+        .cwd = .{ .path = repository },
+        .stdout_limit = .limited(max_output_bytes),
+        .stderr_limit = .limited(max_output_bytes),
+    });
+    return .{
+        .term = result.term,
+        .stdout = result.stdout,
+        .stderr = result.stderr,
+    };
+}
+
+fn expectHarnessSucceeded(result: Result) !void {
+    if (result.succeeded()) return;
+    std.debug.print(
+        "guest shell harness failed:\nstdout:\n{s}\nstderr:\n{s}\n",
+        .{ result.stdout, result.stderr },
+    );
+    return error.GuestHarnessFailed;
+}
+
+test "attestation collection propagates SSH failure with token output" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository = try rootAlloc(allocator);
+    defer allocator.free(repository);
+    const root = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}",
+        .{ repository, tmp.sub_path },
+    );
+    defer allocator.free(root);
+    const result = try runGuestHarness(allocator, root, "attestation-ssh-failure",
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\library=$1
+        \\root=$2
+        \\source "$library"
+        \\mkdir -p "$root/result"
+        \\ubuntu2404_confidential_guest_prepare_attestation_client() {
+        \\  return 0
+        \\}
+        \\scp() {
+        \\  return 0
+        \\}
+        \\ssh() {
+        \\  printf '%s\n' nonempty-token
+        \\  return 23
+        \\}
+        \\curl() {
+        \\  : >"$root/unexpected-curl"
+        \\  return 0
+        \\}
+        \\UBUNTU2404_CONFIDENTIAL_GUEST_SSH_OPTIONS=(-o mock)
+        \\UBUNTU2404_CONFIDENTIAL_GUEST_SSH_TARGET=mizaccept@192.0.2.1
+        \\status=0
+        \\ubuntu2404_confidential_guest_collect_attestation \
+        \\  https://example.attest.azure.net \
+        \\  0000000000000000000000000000000000000000000000000000000000000000 \
+        \\  "$root/result" "$root/token" "$root/openid" "$root/jwks" \
+        \\  "$root/stderr" || status=$?
+        \\test "$status" -eq 23
+        \\test -s "$root/token"
+        \\test ! -e "$root/unexpected-curl"
+        \\
+    );
+    defer result.deinit(allocator);
+    try expectHarnessSucceeded(result);
+}
+
+test "final acceptance always cleans copied validation files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository = try rootAlloc(allocator);
+    defer allocator.free(repository);
+    const root = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}",
+        .{ repository, tmp.sub_path },
+    );
+    defer allocator.free(root);
+    const result = try runGuestHarness(allocator, root, "final-cleanup-failures",
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\library=$1
+        \\root=$2
+        \\source "$library"
+        \\case_name=
+        \\mock_cleanup_status=0
+        \\marker=
+        \\ubuntu2404_confidential_guest_wait_for_ssh() {
+        \\  return 0
+        \\}
+        \\ubuntu2404_confidential_guest_check_readiness() {
+        \\  return 0
+        \\}
+        \\ubuntu2404_confidential_guest_collect_attestation() {
+        \\  UBUNTU2404_CONFIDENTIAL_GUEST_VALIDATION_FILES_COPIED=true
+        \\  return 0
+        \\}
+        \\ubuntu2404_confidential_guest_collect_identity() {
+        \\  if [[ "$case_name" == identity ]]; then return 37; fi
+        \\  UBUNTU2404_CONFIDENTIAL_GUEST_VM_ID=00000000-0000-0000-0000-000000000000
+        \\}
+        \\ubuntu2404_confidential_guest_validate_persistent_data_disk() {
+        \\  printf '%s\n' disk >>"$marker"
+        \\  if [[ "$case_name" == disk ]]; then return 38; fi
+        \\}
+        \\ssh() {
+        \\  printf '%s\n' cleanup >>"$marker"
+        \\  return "$mock_cleanup_status"
+        \\}
+        \\run_case() {
+        \\  case_name=$1
+        \\  mock_cleanup_status=$2
+        \\  local expected_status=$3
+        \\  marker="$root/$case_name.marker"
+        \\  rm -f "$marker"
+        \\  UBUNTU2404_CONFIDENTIAL_GUEST_VALIDATION_FILES_COPIED=false
+        \\  UBUNTU2404_CONFIDENTIAL_GUEST_SSH_OPTIONS=(-o mock)
+        \\  UBUNTU2404_CONFIDENTIAL_GUEST_SSH_TARGET=mizaccept@192.0.2.1
+        \\  local status=0
+        \\  ubuntu2404_confidential_guest_final_acceptance \
+        \\    1 00000000-0000-0000-0000-000000000000 "$root/imds" \
+        \\    https://example.attest.azure.net \
+        \\    0000000000000000000000000000000000000000000000000000000000000000 \
+        \\    "$root" "$root/token" "$root/openid" "$root/jwks" "$root/stderr" \
+        \\    group vm disk-name westeurope || status=$?
+        \\  test "$status" -eq "$expected_status"
+        \\  test "$(grep -c '^cleanup$' "$marker")" -eq 1
+        \\  if [[ "$case_name" == identity ]]; then
+        \\    test "$(grep -c '^disk$' "$marker" || true)" -eq 0
+        \\  else
+        \\    test "$(grep -c '^disk$' "$marker")" -eq 1
+        \\  fi
+        \\}
+        \\run_case identity 41 37
+        \\run_case disk 0 38
+        \\run_case cleanup 39 39
+        \\
+    );
+    defer result.deinit(allocator);
+    try expectHarnessSucceeded(result);
+}
+
 fn runCleanup(
     allocator: Allocator,
     root: []const u8,
