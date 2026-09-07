@@ -2073,6 +2073,66 @@ pub fn build(b: *std.Build) void {
             aggregate_test_step.dependOn(generalized_check_step);
         }
 
+        // ---- Ubuntu 24.04 Confidential VM: authenticate Canonical's
+        // immutable Azure VHD, enforce the Gen2/SNP/TPM/Secure Boot contract,
+        // and convert its exact virtual-disk bytes to standalone QCOW2. ----
+        const ubuntu2404_confidential_builder_mod = b.createModule(.{
+            .root_source_file = b.path(
+                "scripts/build_generalized_ubuntu2404_confidential.zig",
+            ),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "miz", .module = host_miz_mod },
+                .{ .name = "release", .module = release_support_mod },
+            },
+        });
+        const ubuntu2404_confidential_builder_exe = b.addExecutable(.{
+            .name = "build_generalized_ubuntu2404_confidential",
+            .root_module = ubuntu2404_confidential_builder_mod,
+        });
+        b.installArtifact(ubuntu2404_confidential_builder_exe);
+
+        const ubuntu2404_confidential_check = b.step(
+            "check-generalized-ubuntu2404-confidential",
+            "Compile the Ubuntu 24.04 Confidential VM builder",
+        );
+        ubuntu2404_confidential_check.dependOn(
+            &ubuntu2404_confidential_builder_exe.step,
+        );
+
+        const ubuntu2404_confidential_tests = b.addTest(.{
+            .root_module = ubuntu2404_confidential_builder_mod,
+        });
+        const run_ubuntu2404_confidential_tests = b.addRunArtifact(
+            ubuntu2404_confidential_tests,
+        );
+        const ubuntu2404_confidential_test_step = b.step(
+            "test-generalized-ubuntu2404-confidential",
+            "Run focused Ubuntu 24.04 Confidential VM builder tests",
+        );
+        ubuntu2404_confidential_test_step.dependOn(
+            &run_ubuntu2404_confidential_tests.step,
+        );
+        for (aggregate_test_steps) |aggregate_test_step| {
+            aggregate_test_step.dependOn(
+                &run_ubuntu2404_confidential_tests.step,
+            );
+            aggregate_test_step.dependOn(ubuntu2404_confidential_check);
+        }
+
+        const run_ubuntu2404_confidential = b.addRunArtifact(
+            ubuntu2404_confidential_builder_exe,
+        );
+        if (b.args) |args| run_ubuntu2404_confidential.addArgs(args);
+        const ubuntu2404_confidential_step = b.step(
+            "generalized-ubuntu2404-confidential",
+            "Build generalized Ubuntu 24.04 for Azure Confidential VMs",
+        );
+        ubuntu2404_confidential_step.dependOn(
+            &run_ubuntu2404_confidential.step,
+        );
+
         // ---- Ubuntu 26.04: immutable Canonical cloud-image input, Azure
         // package customization, host-side signed UKI, and standalone zstd
         // QCOW2 finalization. The builder is host-native for both guest
