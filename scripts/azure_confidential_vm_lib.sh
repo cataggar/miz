@@ -99,6 +99,30 @@ azure_confidential_vm_vm_create_args() {
   AZURE_CONFIDENTIAL_VM_ARGS+=(--output json)
 }
 
+azure_confidential_vm_captured_vm_create_args() {
+  local resource_group=$1 vm_name=$2 location=$3 vm_size=$4 image_version_id=$5
+  local admin_username=$6 public_key=$7 managed_boot_diagnostics=${8:-false}
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    vm create
+    --resource-group "$resource_group"
+    --name "$vm_name"
+    --location "$location"
+    --size "$vm_size"
+    --image "$image_version_id"
+    --admin-username "$admin_username"
+    --authentication-type ssh
+    --ssh-key-values "$public_key"
+    --enable-agent true
+    --enable-auto-update false
+    --public-ip-sku Standard
+    --nsg-rule SSH
+  )
+  if [[ "$managed_boot_diagnostics" == true ]]; then
+    AZURE_CONFIDENTIAL_VM_ARGS+=(--boot-diagnostics-storage "")
+  fi
+  AZURE_CONFIDENTIAL_VM_ARGS+=(--output json)
+}
+
 azure_confidential_vm_vm_resource_args() {
   local resource_group=$1 vm_name=$2
   AZURE_CONFIDENTIAL_VM_ARGS=(
@@ -130,6 +154,10 @@ azure_confidential_vm_capture_vm_resource_args() {
     --query '{id:id,vmId:vmId,location:location,provisioningState:provisioningState,securityProfile:securityProfile,storageProfile:storageProfile}'
     --output json
   )
+}
+
+azure_confidential_vm_captured_vm_resource_args() {
+  azure_confidential_vm_capture_vm_resource_args "$@"
 }
 
 azure_confidential_vm_deallocate_args() {
@@ -231,7 +259,7 @@ azure_confidential_vm_capture_gallery_version_get_args() {
   AZURE_CONFIDENTIAL_VM_ARGS=(
     rest
     --method get
-    --uri "https://management.azure.com${image_version_id}?api-version=2025-03-03"
+    --uri "https://management.azure.com${image_version_id}?api-version=2025-03-03&%24expand=ReplicationStatus"
     --output json
   )
 }

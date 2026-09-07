@@ -146,6 +146,8 @@ test "builders encode every independent Confidential VM resource contract" {
     }
     const capture_builders = [_][]const u8{
         "azure_confidential_vm_capture_vm_resource_args",
+        "azure_confidential_vm_captured_vm_resource_args",
+        "azure_confidential_vm_captured_vm_create_args",
         "azure_confidential_vm_deallocate_args",
         "azure_confidential_vm_generalize_args",
         "azure_confidential_vm_capture_disk_show_args",
@@ -176,6 +178,7 @@ test "builders encode every independent Confidential VM resource contract" {
         "ConfidentialComputingType",
         "--features SecurityType=" ++ confidential.captured_image_security_type,
         "?api-version=" ++ confidential.gallery_version_api,
+        "%24expand=ReplicationStatus",
     }) |property| {
         if (std.mem.eql(u8, property, "ConfidentialComputingType")) {
             try expectContains(contract_source, property);
@@ -187,6 +190,16 @@ test "builders encode every independent Confidential VM resource contract" {
         examples,
         "source \"$script_dir/azure_trusted_launch_lib.sh\"",
     );
+    const inherited_create = try section(
+        library,
+        "azure_confidential_vm_captured_vm_create_args() {",
+        "azure_confidential_vm_vm_resource_args() {",
+    );
+    try expectContains(inherited_create, "--image \"$image_version_id\"");
+    try expectAbsent(inherited_create, "--security-type");
+    try expectAbsent(inherited_create, "--os-disk-security-encryption-type");
+    try expectAbsent(inherited_create, "--enable-secure-boot");
+    try expectAbsent(inherited_create, "--enable-vtpm");
     try expectAbsent(library, "eval ");
     try expectAbsent(examples, "eval ");
 }
