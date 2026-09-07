@@ -23,6 +23,7 @@ machines, including QEMU and cloud-ready workflows.
 ## Platform images
 
 - [Azure Trusted Launch image workflow](azure-trusted-launch.md)
+- [Azure Confidential VM image workflow](azure-confidential-vm.md)
 - [Azure Linux images](azure-linux.md)
 - [Ubuntu 26.04 full, core, and bare-metal images](ubuntu.md)
 - [FreeBSD images](freebsd.md)
