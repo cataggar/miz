@@ -105,6 +105,7 @@ fn expectStageRejected(subject: *const Tree) !void {
 fn makeAll(subject: *const Tree) !void {
     for (contracts.release_order) |key| {
         try fixture.makeBundle(subject, key, .{});
+        try generateGalleryMetadata(subject, key);
         try fixture.makeNativeResult(subject, key, .{});
     }
 }
@@ -1532,7 +1533,7 @@ test "the core gate records only current candidate and acceptance digests" {
     }
 }
 
-test "a successful stage publishes exactly four full and core assets" {
+test "a successful stage publishes four full and core image metadata pairs" {
     var subject = try tree();
     defer subject.deinit();
     try makeAll(&subject);
@@ -1544,7 +1545,7 @@ test "a successful stage publishes exactly four full and core assets" {
     defer manifest.deinit();
     const document = manifest.value.object;
 
-    try std.testing.expectEqual(@as(i64, 2), document.get("schema").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), document.get("schema").?.integer);
     try std.testing.expectEqualStrings(
         "miz-ubuntu2604-release",
         document.get("type").?.string,
@@ -1576,6 +1577,13 @@ test "a successful stage publishes exactly four full and core assets" {
             contracts.lookup(key).?.asset_name,
             asset.object.get("asset_name").?.string,
         );
+        try std.testing.expectEqualStrings(
+            contracts.galleryMetadataName(key).?,
+            asset.object.get("metadata_name").?.string,
+        );
+        try std.testing.expect(support.isSha256(
+            asset.object.get("metadata_sha256").?.string,
+        ));
         try std.testing.expect(documents.hasWorkflowIdentity(
             asset.object.get("candidate_workflow"),
         ));
@@ -1591,6 +1599,12 @@ test "a successful stage publishes exactly four full and core assets" {
         );
         defer allocator.free(staged);
         try std.testing.expect(support.isRegularFile(io, staged));
+        const staged_metadata = try subject.path(
+            "staged/{s}",
+            .{contracts.galleryMetadataName(key).?},
+        );
+        defer allocator.free(staged_metadata);
+        try std.testing.expect(support.isRegularFile(io, staged_metadata));
     }
 
     const notes_path = try subject.path("release-notes.md", .{});
@@ -1659,6 +1673,7 @@ test "staged publication records each candidate attempt exactly" {
                 attempts[index],
             );
         }
+        try generateGalleryMetadata(&subject, key);
     }
     try stage(&subject, publication_tag);
 
@@ -2797,6 +2812,51 @@ test "stage rejects an extra QCOW2 and a checksum sidecar" {
     defer allocator.free(sidecar);
     try Dir.cwd().writeFile(io, .{ .sub_path = sidecar, .data = "0" ** 64 });
     try expectStageRejected(&subject);
+}
+
+test "stage requires one exact gallery metadata companion per candidate" {
+    var missing = try tree();
+    defer missing.deinit();
+    try makeAll(&missing);
+    const missing_path = try missing.galleryMetadataPath("aarch64-core");
+    defer allocator.free(missing_path);
+    try Dir.cwd().deleteFile(io, missing_path);
+    try expectStageRejected(&missing);
+
+    var extra = try tree();
+    defer extra.deinit();
+    try makeAll(&extra);
+    const source_path = try extra.galleryMetadataPath("aarch64-core");
+    defer allocator.free(source_path);
+    const extra_path = try extra.path(
+        "candidates/duplicate.gallery.json",
+        .{},
+    );
+    defer allocator.free(extra_path);
+    try Dir.cwd().copyFile(
+        source_path,
+        Dir.cwd(),
+        extra_path,
+        io,
+        .{},
+    );
+    try expectStageRejected(&extra);
+
+    var substituted = try tree();
+    defer substituted.deinit();
+    try makeAll(&substituted);
+    const replacement = try substituted.galleryMetadataPath("x86_64-full");
+    defer allocator.free(replacement);
+    const target = try substituted.galleryMetadataPath("aarch64-core");
+    defer allocator.free(target);
+    try Dir.cwd().copyFile(
+        replacement,
+        Dir.cwd(),
+        target,
+        io,
+        .{},
+    );
+    try expectStageRejected(&substituted);
 }
 
 test "stage rejects source commit and identity changes" {
@@ -4101,7 +4161,7 @@ test "the publisher is draft-first, allowlisted, and fail-safe" {
     var script = try Source.open(allocator, "scripts/ubuntu2604_publish.sh");
     defer script.deinit();
 
-    try script.expectContains("test \"$(wc -l <\"$expected_file\")\" -eq 4");
+    try script.expectContains("test \"$(wc -l <\"$expected_file\")\" -eq 8");
     // The published allowlist is derived by the release tooling from the
     // staged manifest, and the shell only consumes the result.
     try script.expectContains("\"$RELEASE_TOOL\" publish-expected");
@@ -4236,6 +4296,57 @@ fn expectAssetsRejected(
 
 const draft_mismatch = "remote release asset allowlist/size mismatch: 4 assets";
 const final_mismatch = "published release did not retain the exact final allowlist";
+
+fn remoteReleaseForExpected(
+    expected: []const u8,
+    draft: bool,
+) ![]u8 {
+    var output: std.ArrayList(u8) = .empty;
+    errdefer output.deinit(allocator);
+    try output.print(
+        allocator,
+        "{{\"draft\": {s}, \"assets\": [",
+        .{if (draft) "true" else "false"},
+    );
+    var first = true;
+    var lines = std.mem.splitScalar(u8, expected, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const name = fields.next().?;
+        _ = fields.next().?;
+        const size = fields.next().?;
+        try output.print(
+            allocator,
+            "{s}{{\"name\":\"{s}\",\"size\":{s}}}",
+            .{ if (first) "" else ",", name, size },
+        );
+        first = false;
+    }
+    try output.appendSlice(allocator, "]}");
+    return output.toOwnedSlice(allocator);
+}
+
+test "github-release-assets accepts the exact eight staged files" {
+    var subject = try stagedSubject();
+    defer subject.deinit();
+    const expected = try expectStagedAccepted(&subject);
+    defer allocator.free(expected);
+    try std.testing.expectEqual(
+        contracts.release_order.len * 2,
+        std.mem.count(u8, expected, "\n"),
+    );
+    const remote = try remoteReleaseForExpected(expected, true);
+    defer allocator.free(remote);
+    var diagnostic: support.Diagnostic = .{};
+    try std.testing.expect(try checkReleaseAssets(
+        &subject,
+        remote,
+        expected,
+        "draft",
+        &diagnostic,
+    ));
+}
 
 test "github-release-assets binds each remote asset to one allowlist entry" {
     var subject = try tree();
@@ -4504,7 +4615,7 @@ test "publish-expected counts a symlinked staged asset as a staged file" {
     const allowlist = try expectStagedAccepted(&subject);
     defer allocator.free(allowlist);
     try std.testing.expectEqual(
-        contracts.release_order.len,
+        contracts.release_order.len * 2,
         std.mem.count(u8, allowlist, "\n"),
     );
 
@@ -4544,7 +4655,7 @@ test "publish-expected ignores staged entries that are not regular files" {
     const allowlist = try expectStagedAccepted(&subject);
     defer allocator.free(allowlist);
     try std.testing.expectEqual(
-        contracts.release_order.len,
+        contracts.release_order.len * 2,
         std.mem.count(u8, allowlist, "\n"),
     );
 }
@@ -4588,34 +4699,69 @@ fn checkDownloaded(
     return true;
 }
 
-const downloaded_payload = "downloaded release asset\n";
-
 /// A download directory holding exactly the allowlisted assets, plus the
 /// allowlist that describes them.
 fn downloadedSubject(subject: *const Tree) ![]u8 {
+    try makeAll(subject);
+    try stage(subject, publication_tag);
+    const expected = try expectStagedAccepted(subject);
+    errdefer allocator.free(expected);
+
     const root = try subject.path("downloaded", .{});
     defer allocator.free(root);
     try Dir.cwd().createDirPath(io, root);
-
-    var expected: std.ArrayList(u8) = .empty;
-    errdefer expected.deinit(allocator);
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(downloaded_payload, &digest, .{});
     for (contracts.release_order) |key| {
-        const name = contracts.lookup(key).?.asset_name;
-        const path = try subject.path("downloaded/{s}", .{name});
-        defer allocator.free(path);
-        try Dir.cwd().writeFile(io, .{
-            .sub_path = path,
-            .data = downloaded_payload,
-        });
-        try expected.print(allocator, "{s}\t{s}\t{d}\n", .{
-            name,
-            &std.fmt.bytesToHex(digest, .lower),
-            downloaded_payload.len,
-        });
+        for ([_][]const u8{
+            contracts.lookup(key).?.asset_name,
+            contracts.galleryMetadataName(key).?,
+        }) |name| {
+            const source_path = try subject.path("staged/{s}", .{name});
+            defer allocator.free(source_path);
+            const destination_path = try subject.path(
+                "downloaded/{s}",
+                .{name},
+            );
+            defer allocator.free(destination_path);
+            try Dir.cwd().copyFile(
+                source_path,
+                Dir.cwd(),
+                destination_path,
+                io,
+                .{},
+            );
+        }
     }
-    return expected.toOwnedSlice(allocator);
+    return expected;
+}
+
+fn refreshDownloadedExpected(
+    subject: *const Tree,
+    expected: []const u8,
+    changed_name: []const u8,
+) ![]u8 {
+    const changed_path = try subject.path(
+        "downloaded/{s}",
+        .{changed_name},
+    );
+    defer allocator.free(changed_path);
+    const changed = try support.hashArtifact(io, changed_path);
+    var refreshed: std.ArrayList(u8) = .empty;
+    errdefer refreshed.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, expected, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const separator = std.mem.indexOfScalar(u8, line, '\t').?;
+        if (std.mem.eql(u8, line[0..separator], changed_name)) {
+            try refreshed.print(
+                allocator,
+                "{s}\t{s}\t{d}\n",
+                .{ changed_name, &changed.hex, changed.size },
+            );
+        } else {
+            try refreshed.print(allocator, "{s}\n", .{line});
+        }
+    }
+    return refreshed.toOwnedSlice(allocator);
 }
 
 test "github-release-downloaded counts a symlinked download as a file" {
@@ -4680,7 +4826,7 @@ test "github-release-downloaded refuses a missing asset and a wrong one" {
     try std.testing.expect(!try checkDownloaded(&subject, expected, &missing));
     clobberStack();
     try std.testing.expectEqualStrings(
-        "downloaded release allowlist mismatch: 3 files",
+        "downloaded release allowlist mismatch: 7 files",
         missing.message(),
     );
 
@@ -4693,4 +4839,47 @@ test "github-release-downloaded refuses a missing asset and a wrong one" {
     const message = tampered.message();
     try std.testing.expect(std.mem.endsWith(u8, message, ": downloaded size mismatch"));
     try std.testing.expect(std.mem.startsWith(u8, message, first));
+}
+
+test "github-release-downloaded revalidates metadata after digest verification" {
+    var subject = try tree();
+    defer subject.deinit();
+    const expected = try downloadedSubject(&subject);
+    defer allocator.free(expected);
+    const metadata_name = contracts.galleryMetadataName("aarch64-core").?;
+    const metadata_path = try subject.path(
+        "downloaded/{s}",
+        .{metadata_name},
+    );
+    defer allocator.free(metadata_path);
+    try fixture.patchString(
+        allocator,
+        io,
+        metadata_path,
+        &.{
+            .{ .key = "image_definition" },
+            .{ .key = "features" },
+            .{ .index = 0 },
+            .{ .key = "value" },
+        },
+        "ConfidentialVMSupported",
+    );
+    const refreshed = try refreshDownloadedExpected(
+        &subject,
+        expected,
+        metadata_name,
+    );
+    defer allocator.free(refreshed);
+
+    var diagnostic: support.Diagnostic = .{};
+    try std.testing.expect(!try checkDownloaded(
+        &subject,
+        refreshed,
+        &diagnostic,
+    ));
+    clobberStack();
+    try std.testing.expectEqualStrings(
+        "gallery metadata image-definition contract is invalid",
+        diagnostic.message(),
+    );
 }

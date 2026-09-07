@@ -24,6 +24,7 @@ const contracts = @import("contracts.zig");
 const disk_geometry = @import("disk_geometry.zig");
 const documents = @import("documents.zig");
 const download = @import("download.zig");
+const gallery_metadata = @import("gallery_metadata.zig");
 const provenance = @import("provenance.zig");
 const runtime_contract = @import("ubuntu2604_runtime_contract");
 const runtime_contract_document = @import("runtime_contract_document.zig");
@@ -3804,7 +3805,7 @@ fn readExpected(
     return .{ .text = text, .entries = entries };
 }
 
-/// The publication allowlist: exactly the four published assets, and nothing
+/// The publication allowlist: exactly four image/metadata pairs, and nothing
 /// else staged next to them.
 pub fn publishExpected(
     allocator: Allocator,
@@ -3830,7 +3831,7 @@ pub fn publishExpected(
         "publication_workflow",
         "assets",
     }) or
-        support.integerOf(manifest.get("schema")) != 2 or
+        support.integerOf(manifest.get("schema")) != 3 or
         !support.stringIs(manifest.get("type"), "miz-ubuntu2604-release") or
         !documents.hasWorkflowIdentity(manifest.get("publication_workflow")))
     {
@@ -3866,6 +3867,9 @@ pub fn publishExpected(
             "asset_name",
             "sha256",
             "bytes",
+            "metadata_name",
+            "metadata_sha256",
+            "metadata_bytes",
             "virtual_size",
             "build_runner",
             "provenance_digest",
@@ -3911,7 +3915,12 @@ pub fn publishExpected(
         if (!support.stringIs(
             entry.get("asset_name"),
             contracts.lookup(key).?.asset_name,
-        )) {
+        ) or
+            !support.stringIs(
+                entry.get("metadata_name"),
+                contracts.galleryMetadataName(key).?,
+            ))
+        {
             return fail(diagnostic, "Ubuntu publication allowlist mismatch", .{});
         }
         seen[index.?] = true;
@@ -3924,22 +3933,148 @@ pub fn publishExpected(
         const name = support.stringOf(entry.get("asset_name"));
         const sha256 = support.stringOf(entry.get("sha256"));
         const size = support.integerOf(entry.get("bytes"));
+        const metadata_name = support.stringOf(entry.get("metadata_name"));
+        const metadata_sha256 = support.stringOf(entry.get("metadata_sha256"));
+        const metadata_size = support.integerOf(entry.get("metadata_bytes"));
+        const certificate_sha256 = support.stringOf(
+            entry.get("certificate_sha256"),
+        );
+        const signing_certificate_sha256 = support.stringOf(
+            entry.get("signing_certificate_sha256"),
+        );
+        const fallback_uki_sha256 = support.stringOf(
+            entry.get("fallback_uki_sha256"),
+        );
+        const provenance_digest = support.stringOf(
+            entry.get("provenance_digest"),
+        );
         if (name == null or
             !std.mem.eql(u8, std.fs.path.basename(name.?), name.?) or
             sha256 == null or !support.isSha256(sha256.?) or
-            size == null or size.? <= 0)
+            size == null or size.? <= 0 or
+            metadata_name == null or
+            !std.mem.eql(
+                u8,
+                std.fs.path.basename(metadata_name.?),
+                metadata_name.?,
+            ) or
+            metadata_sha256 == null or
+            !support.isSha256(metadata_sha256.?) or
+            metadata_size == null or metadata_size.? <= 0 or
+            certificate_sha256 == null or
+            !support.isSha256(certificate_sha256.?) or
+            signing_certificate_sha256 == null or
+            !support.isSha256(signing_certificate_sha256.?) or
+            fallback_uki_sha256 == null or
+            !support.isSha256(fallback_uki_sha256.?) or
+            provenance_digest == null or
+            !support.isSha256(provenance_digest.?))
         {
             return fail(diagnostic, "invalid Ubuntu publish manifest asset", .{});
         }
-        for (names.items) |seen_name| {
-            if (std.mem.eql(u8, seen_name, name.?)) return fail(
+        for ([_][]const u8{ name.?, metadata_name.? }) |candidate_name| {
+            for (names.items) |seen_name| {
+                if (std.mem.eql(u8, seen_name, candidate_name)) return fail(
+                    diagnostic,
+                    "invalid Ubuntu publish manifest asset",
+                    .{},
+                );
+            }
+            try names.append(allocator, candidate_name);
+        }
+
+        const image_path = try support.joinPath(
+            allocator,
+            &.{ assets_root, name.? },
+        );
+        defer allocator.free(image_path);
+        const metadata_path = try support.joinPath(
+            allocator,
+            &.{ assets_root, metadata_name.? },
+        );
+        defer allocator.free(metadata_path);
+        var metadata = try gallery_metadata.validateFile(
+            allocator,
+            io,
+            metadata_path,
+            image_path,
+            diagnostic,
+        );
+        defer metadata.deinit();
+        const metadata_digest = support.hashArtifact(io, metadata_path) catch
+            return fail(
                 diagnostic,
                 "invalid Ubuntu publish manifest asset",
                 .{},
             );
+        const metadata_image = support.objectOf(metadata.get("image")).?;
+        const metadata_signing = support.objectOf(metadata.get("signing")).?;
+        const metadata_uefi = support.objectOf(
+            metadata_signing.get("uefi_db"),
+        ).?;
+        const metadata_artifact = support.objectOf(
+            metadata_signing.get("artifact_signing"),
+        ).?;
+        const metadata_provider = support.objectOf(
+            metadata_artifact.get("provider"),
+        ).?;
+        const metadata_fallback = support.objectOf(
+            metadata_signing.get("fallback_uki"),
+        ).?;
+        const metadata_provenance = support.objectOf(
+            metadata.get("provenance"),
+        ).?;
+        if (!support.stringIs(metadata.get("key"), support.stringOf(entry.get("key")).?) or
+            !support.stringIs(metadata_image.get("sha256"), sha256.?) or
+            support.integerOf(metadata_image.get("bytes")) != size.? or
+            support.integerOf(metadata_image.get("virtual_size")) !=
+                support.integerOf(entry.get("virtual_size")) or
+            !support.stringIs(
+                metadata_image.get("source_commit"),
+                source_commit,
+            ) or
+            !support.stringIs(
+                metadata_uefi.get("certificate_sha256"),
+                certificate_sha256.?,
+            ) or
+            !support.stringIs(
+                metadata_artifact.get("certificate_sha256"),
+                signing_certificate_sha256.?,
+            ) or
+            !support.jsonEqual(
+                .{ .object = metadata_provider },
+                manifest.get("signing_provider").?,
+            ) or
+            !support.stringIs(
+                metadata_fallback.get("sha256"),
+                fallback_uki_sha256.?,
+            ) or
+            !support.stringIs(
+                metadata_provenance.get("digest"),
+                provenance_digest.?,
+            ) or
+            !support.jsonEqual(
+                metadata_provenance.get("workflow").?,
+                entry.get("candidate_workflow").?,
+            ) or
+            !std.mem.eql(
+                u8,
+                &metadata_digest.hex,
+                metadata_sha256.?,
+            ) or
+            metadata_digest.size != @as(u64, @intCast(metadata_size.?)))
+        {
+            return fail(
+                diagnostic,
+                "gallery metadata does not match the publish manifest",
+                .{},
+            );
         }
-        try names.append(allocator, name.?);
         try out.print("{s}\t{s}\t{d}\n", .{ name.?, sha256.?, size.? });
+        try out.print(
+            "{s}\t{s}\t{d}\n",
+            .{ metadata_name.?, metadata_sha256.?, metadata_size.? },
+        );
     }
 
     var directory = Dir.cwd().openDir(io, assets_root, .{ .iterate = true }) catch
@@ -4127,6 +4262,27 @@ pub fn releaseDownloaded(
             "{s}: downloaded digest mismatch",
             .{entry.name},
         );
+    }
+    for (contracts.release_order) |key| {
+        const entry = contracts.lookup(key).?;
+        const image_path = try support.joinPath(
+            allocator,
+            &.{ root, entry.asset_name },
+        );
+        defer allocator.free(image_path);
+        const metadata_path = try support.joinPath(
+            allocator,
+            &.{ root, contracts.galleryMetadataName(key).? },
+        );
+        defer allocator.free(metadata_path);
+        var metadata = try gallery_metadata.validateFile(
+            allocator,
+            io,
+            metadata_path,
+            image_path,
+            diagnostic,
+        );
+        metadata.deinit();
     }
 }
 

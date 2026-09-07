@@ -55,7 +55,7 @@ rm -rf -- "$assets_dir" "$verify_dir"
   --assets-dir "$assets_dir" \
   --release-tag "$RELEASE_TAG" \
   --source-commit "$SOURCE_COMMIT" >"$expected_file"
-test "$(wc -l <"$expected_file")" -eq 4
+test "$(wc -l <"$expected_file")" -eq 8
 
 release_mutated=false
 keep_draft_on_failure() {

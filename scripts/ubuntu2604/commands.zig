@@ -14,6 +14,7 @@ const Dir = std.Io.Dir;
 const Io = std.Io;
 const contracts = @import("contracts.zig");
 const documents = @import("documents.zig");
+const gallery_metadata = @import("gallery_metadata.zig");
 const provenance = @import("provenance.zig");
 const support = @import("support.zig");
 
@@ -387,6 +388,9 @@ const Staged = struct {
     asset_name: []const u8,
     sha256: []const u8,
     bytes: i64,
+    metadata_name: []const u8,
+    metadata_sha256: []const u8,
+    metadata_bytes: i64,
     virtual_size: i64,
     build_runner: []const u8,
     provenance_digest: []const u8,
@@ -505,6 +509,25 @@ fn stageInto(
         "expected exactly {d} candidate QCOW2 files, found {d}",
         .{ contracts.release_order.len, qcow_paths.len },
     );
+    const metadata_paths = support.listFilesWithSuffix(
+        allocator,
+        io,
+        candidates_root,
+        ".gallery.json",
+    ) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return fail(
+            diagnostic,
+            "expected exactly {d} gallery metadata files, found 0",
+            .{contracts.release_order.len},
+        ),
+    };
+    defer support.freePaths(allocator, metadata_paths);
+    if (metadata_paths.len != contracts.release_order.len) return fail(
+        diagnostic,
+        "expected exactly {d} gallery metadata files, found {d}",
+        .{ contracts.release_order.len, metadata_paths.len },
+    );
 
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -543,6 +566,21 @@ fn stageInto(
             diagnostic,
         );
         defer verified.deinit();
+        const metadata_name = contracts.galleryMetadataName(key).?;
+        const metadata_path = try support.joinPath(
+            allocator,
+            &.{ manifest_parent, metadata_name },
+        );
+        defer allocator.free(metadata_path);
+        var metadata = try gallery_metadata.verifyCandidateFile(
+            allocator,
+            io,
+            metadata_path,
+            asset_path,
+            &verified,
+            diagnostic,
+        );
+        defer metadata.deinit();
         if (!workflowMatchesRun(
             verified.object().get("workflow"),
             options.candidate_run_id,
@@ -759,6 +797,51 @@ fn stageInto(
             "{s}: staging changed candidate bytes",
             .{key},
         );
+        const metadata_destination = try support.joinPath(
+            allocator,
+            &.{ output, metadata_name },
+        );
+        defer allocator.free(metadata_destination);
+        const source_metadata_digest = support.hashArtifact(
+            io,
+            metadata_path,
+        ) catch return fail(
+            diagnostic,
+            "{s}: staging changed gallery metadata",
+            .{key},
+        );
+        Dir.cwd().copyFile(
+            metadata_path,
+            Dir.cwd(),
+            metadata_destination,
+            io,
+            .{},
+        ) catch return fail(
+            diagnostic,
+            "{s}: staging changed gallery metadata",
+            .{key},
+        );
+        const staged_metadata_digest = support.hashArtifact(
+            io,
+            metadata_destination,
+        ) catch return fail(
+            diagnostic,
+            "{s}: staging changed gallery metadata",
+            .{key},
+        );
+        if (staged_metadata_digest.size != source_metadata_digest.size or
+            !std.mem.eql(
+                u8,
+                &staged_metadata_digest.hex,
+                &source_metadata_digest.hex,
+            ))
+        {
+            return fail(
+                diagnostic,
+                "{s}: staging changed gallery metadata",
+                .{key},
+            );
+        }
 
         const build_validation = support.objectOf(
             verified.object().get("build_validation"),
@@ -774,6 +857,12 @@ fn stageInto(
             .asset_name = entry.asset_name,
             .sha256 = try arena.allocator().dupe(u8, verified.sha256),
             .bytes = @intCast(staged_digest.size),
+            .metadata_name = metadata_name,
+            .metadata_sha256 = try arena.allocator().dupe(
+                u8,
+                &staged_metadata_digest.hex,
+            ),
+            .metadata_bytes = @intCast(staged_metadata_digest.size),
             .virtual_size = verified.virtual_size,
             .build_runner = try arena.allocator().dupe(
                 u8,
@@ -836,6 +925,13 @@ fn stageInto(
         try builder.putString(&record, "asset_name", item.asset_name);
         try builder.putString(&record, "sha256", item.sha256);
         try builder.putInteger(&record, "bytes", item.bytes);
+        try builder.putString(&record, "metadata_name", item.metadata_name);
+        try builder.putString(
+            &record,
+            "metadata_sha256",
+            item.metadata_sha256,
+        );
+        try builder.putInteger(&record, "metadata_bytes", item.metadata_bytes);
         try builder.putInteger(&record, "virtual_size", item.virtual_size);
         try builder.putString(&record, "build_runner", item.build_runner);
         try builder.putString(&record, "provenance_digest", item.provenance_digest);
@@ -885,9 +981,8 @@ fn stageInto(
         options.run_attempt,
     );
 
-    // Schema 2 adds per-candidate and per-acceptance workflow attempts plus
-    // the publication attempt, so mixed-attempt releases remain auditable.
-    try builder.putInteger(&manifest, "schema", 2);
+    // Schema 3 binds one portable gallery metadata companion to every QCOW2.
+    try builder.putInteger(&manifest, "schema", 3);
     try builder.putString(&manifest, "type", "miz-ubuntu2604-release");
     try builder.putString(&manifest, "release_tag", options.release_tag);
     try builder.putString(&manifest, "source_commit", source_commit);
@@ -951,7 +1046,7 @@ fn writeNotes(
         \\
         \\## Highlights
         \\
-        \\- Exact four-asset matrix: full and core for x86_64 and AArch64.
+        \\- Exact four-image matrix: full and core for x86_64 and AArch64, each with digest-bound Azure Compute Gallery metadata.
         \\- Full remains 5 GiB with systemd, cloud-init, WALinuxAgent, and `sshd.service`.
         \\- Core's virtual disk is calculated per build from its signed UKI, its measured ext4 minimum, and a declared first-boot reserve, with mizinit, azagent, and supervised OpenSSH.
         \\- Every asset is digest-bound across build, accelerator-bound QEMU acceptance, Azure Trusted Launch, staging, upload, and redownload verification.
@@ -993,7 +1088,7 @@ fn writeNotes(
         \\
         \\All four candidates required signed UKIs and same-architecture QEMU with an exact accelerator identity: x86_64 used explicit KVM with `/dev/kvm`, the stable KVM API, `q35`, and `host`; AArch64 used explicit multi-threaded TCG with `virt` and `max`, with no accelerator probing or fallback. Azure Trusted Launch remained mandatory for both architectures with Secure Boot and vTPM, the exact signer in UEFI db, kernel lockdown, module trust, key-only SSH, provisioning, runtime Ubuntu identity, root growth, disk-policy enforcement, persistent and unique identity, and reboot/reconnect. Core additionally required mizinit PID-1 and SSH supervision, azagent provisioning, resource and managed-data-disk contracts, and signed in-tree Binder with BinderFS and DMA-heap probes in QEMU and Azure acceptance. Candidate and derived-VHD hashes were checked at every handoff; temporary VHDs and Azure resources were deleted.
         \\
-        \\Publication is an exact four-asset transaction: standalone zstd QCOW2 files with no backing images, verified remote names and sizes, and a redownloaded SHA-256 check before the draft becomes final. After the tag date, a finalized release is immutable.
+        \\Publication is an exact four-pair transaction: standalone zstd QCOW2 files with no backing images, each accompanied by gallery metadata, with verified remote names and sizes plus redownloaded semantic and SHA-256 checks before the draft becomes final. After the tag date, a finalized release is immutable.
         \\
         \\**No checksum sidecar assets are published**; SHA-256 digests are recorded only in these notes and the workflow job summary.
         \\

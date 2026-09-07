@@ -52,8 +52,8 @@ pub const candidate_expected = [_]Candidate{
     },
 };
 
-/// `RELEASE_ORDER` / `EXPECTED`: the exact four-asset publication order. It is
-/// fixed so staged metadata and release notes are reproducible.
+/// `RELEASE_ORDER` / `EXPECTED`: the exact four-candidate publication order.
+/// Each candidate contributes its image and metadata companion in this order.
 pub const release_order = [_][]const u8{
     "x86_64-full",
     "aarch64-full",

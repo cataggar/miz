@@ -456,6 +456,19 @@ jobs:
             --asset "$BUNDLE_DIR/$ASSET_NAME" \
             --key "$CANDIDATE_KEY" \
             --source-commit "$SOURCE_COMMIT"
+          metadata="$BUNDLE_DIR/${ASSET_NAME%.qcow2}.gallery.json"
+          "$RELEASE_TOOL" gallery-metadata \
+            --manifest "$BUNDLE_DIR/candidate.json" \
+            --asset "$BUNDLE_DIR/$ASSET_NAME" \
+            --key "$CANDIDATE_KEY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --output "$metadata"
+          "$RELEASE_TOOL" verify-gallery-metadata \
+            --metadata "$metadata" \
+            --manifest "$BUNDLE_DIR/candidate.json" \
+            --asset "$BUNDLE_DIR/$ASSET_NAME" \
+            --key "$CANDIDATE_KEY" \
+            --source-commit "$SOURCE_COMMIT"
 
       - name: Upload exact validated candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -1336,7 +1349,7 @@ jobs:
             --run-id "$RUN_ID_VALUE" \
             --require-size-budget enforced
 
-      - name: Publish exactly four accepted Ubuntu assets
+      - name: Publish four accepted Ubuntu image and metadata pairs
         run: scripts/ubuntu2604_publish.sh
 
       - name: Remove publication staging
