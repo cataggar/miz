@@ -18,8 +18,14 @@ const Value = std.json.Value;
 
 pub const image_security_feature = "ConfidentialVMSupported";
 pub const image_security_type = "ConfidentialVmSupported";
+pub const captured_image_security_type = "ConfidentialVM";
 pub const vm_security_type = "ConfidentialVM";
 pub const os_disk_security_encryption_type = "VMGuestStateOnly";
+pub const managed_disk_security_type =
+    "ConfidentialVM_VMGuestStateOnlyEncryptedWithPlatformKey";
+pub const gallery_os_disk_encryption_type =
+    "EncryptedVMGuestStateOnlyWithPmk";
+pub const platform_disk_encryption_type = "EncryptionAtRestWithPlatformKey";
 pub const architecture = "x64";
 pub const confidential_computing_type = "SNP";
 pub const hyper_v_generation = azure_compute.hyper_v_generation;
@@ -38,16 +44,44 @@ pub const Error = azure_compute.Error || error{
     InvalidManagedImage,
     InvalidDiskSecurityProfile,
     InvalidGalleryVersion,
+    InvalidCaptureVm,
+    InvalidCaptureDisk,
+    InvalidCaptureSnapshot,
+    InvalidCapturedImageDefinition,
+    InvalidCaptureGalleryVersion,
 };
 pub const VhdSizeError = error{InvalidVhdSize};
 pub const SkuError = error{InvalidSku};
 pub const ManagedImageError = error{InvalidManagedImage};
 pub const DiskSecurityProfileError = error{InvalidDiskSecurityProfile};
 pub const GalleryVersionError = error{InvalidGalleryVersion};
+pub const CaptureVmError = error{InvalidCaptureVm};
+pub const CaptureDiskError = error{InvalidCaptureDisk} ||
+    azure_compute.ManagedDiskError;
+pub const CaptureSnapshotError = error{InvalidCaptureSnapshot};
+pub const CapturedImageDefinitionError = error{InvalidCapturedImageDefinition} ||
+    azure_compute.ImageDefinitionError;
+pub const CaptureGalleryVersionError = error{InvalidCaptureGalleryVersion};
 
 pub const Sku = struct {
     name: []const u8,
     has_temporary_storage: bool,
+};
+
+pub const CaptureContract = struct {
+    subscription_id: []const u8,
+    location: []const u8,
+    source_image_version_id: []const u8,
+    vm_id: []const u8,
+    disk_id: []const u8,
+};
+
+pub const CaptureGalleryContract = struct {
+    subscription_id: []const u8,
+    location: []const u8,
+    source_id: []const u8,
+    image_definition_id: []const u8,
+    image_version_id: []const u8,
 };
 
 pub fn galleryVersionRequest(
@@ -439,6 +473,555 @@ pub fn validateGalleryVersion(
     }
 }
 
+fn validGuid(text: []const u8) bool {
+    if (text.len != 36) return false;
+    for (text, 0..) |character, index| {
+        if (index == 8 or index == 13 or index == 18 or index == 23) {
+            if (character != '-') return false;
+        } else switch (character) {
+            '0'...'9', 'a'...'f', 'A'...'F' => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+fn exactResource(
+    actual: ?Value,
+    expected_id: []const u8,
+    subscription_id: []const u8,
+) bool {
+    const id = azure_compute.stringOf(actual) orelse return false;
+    return azure_compute.resourceIdIs(id, expected_id) and
+        azure_compute.resourceIdHasSubscription(id, subscription_id);
+}
+
+fn exactLocation(document: *const ObjectMap, expected: []const u8) bool {
+    return azure_compute.stringIsIgnoreCase(document.get("location"), expected);
+}
+
+fn validVmDiskSecurityProfile(profile: *const ObjectMap) bool {
+    return azure_compute.stringIs(
+        profile.get("securityEncryptionType"),
+        os_disk_security_encryption_type,
+    ) and !profile.contains("diskEncryptionSet");
+}
+
+fn validResourceDiskSecurityProfile(profile: *const ObjectMap) bool {
+    return azure_compute.stringIs(
+        profile.get("securityType"),
+        managed_disk_security_type,
+    ) and !profile.contains("secureVMDiskEncryptionSetId");
+}
+
+fn validPlatformEncryption(document: *const ObjectMap) bool {
+    const encryption = azure_compute.objectOf(document.get("encryption")) orelse
+        return false;
+    return azure_compute.stringIs(
+        encryption.get("type"),
+        platform_disk_encryption_type,
+    );
+}
+
+/// Validate the exact VM that will be generalized and captured. The accepted
+/// VM must still bind the source image version and its managed OS disk.
+pub fn validateCaptureVm(
+    vm: *const ObjectMap,
+    expected: CaptureContract,
+    diagnostic: *Diagnostic,
+) CaptureVmError!void {
+    if (!exactResource(vm.get("id"), expected.vm_id, expected.subscription_id) or
+        !exactLocation(vm, expected.location) or
+        !azure_compute.stringIs(vm.get("provisioningState"), "Succeeded"))
+    {
+        return diagnostic.fail(
+            error.InvalidCaptureVm,
+            "Azure capture VM identity, subscription, location, or provisioning state is invalid",
+            .{},
+        );
+    }
+    const vm_id = azure_compute.stringOf(vm.get("vmId")) orelse "";
+    if (!validGuid(vm_id)) return diagnostic.fail(
+        error.InvalidCaptureVm,
+        "Azure capture VM unique identity is invalid",
+        .{},
+    );
+    const security = azure_compute.objectOf(vm.get("securityProfile")) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureVm,
+            "Azure capture VM security profile is absent",
+            .{},
+        );
+    azure_compute.validateVmSecurityProfile(
+        &security,
+        vm_security_type,
+        "VM is not Confidential",
+        "Azure capture VM",
+        diagnostic,
+    ) catch return error.InvalidCaptureVm;
+
+    const storage = azure_compute.objectOf(vm.get("storageProfile")) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureVm,
+            "Azure capture VM storage profile is absent",
+            .{},
+        );
+    const image = azure_compute.objectOf(storage.get("imageReference")) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureVm,
+            "Azure capture VM image reference is absent",
+            .{},
+        );
+    if (!exactResource(
+        image.get("id"),
+        expected.source_image_version_id,
+        expected.subscription_id,
+    )) return diagnostic.fail(
+        error.InvalidCaptureVm,
+        "Azure capture VM does not reference the accepted source image version",
+        .{},
+    );
+    const os_disk = azure_compute.objectOf(storage.get("osDisk")) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureVm,
+            "Azure capture VM OS disk is absent",
+            .{},
+        );
+    const managed_disk = azure_compute.objectOf(os_disk.get("managedDisk")) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureVm,
+            "Azure capture VM managed OS disk is absent",
+            .{},
+        );
+    if (!exactResource(
+        managed_disk.get("id"),
+        expected.disk_id,
+        expected.subscription_id,
+    )) return diagnostic.fail(
+        error.InvalidCaptureVm,
+        "Azure capture VM managed OS disk identity is invalid",
+        .{},
+    );
+    if (managed_disk.contains("diskEncryptionSet")) return diagnostic.fail(
+        error.InvalidCaptureVm,
+        "Azure capture VM unexpectedly uses a customer-managed disk encryption set",
+        .{},
+    );
+    const disk_security = azure_compute.objectOf(
+        managed_disk.get("securityProfile"),
+    ) orelse return diagnostic.fail(
+        error.InvalidCaptureVm,
+        "Azure capture VM managed OS disk security profile is absent",
+        .{},
+    );
+    if (!validVmDiskSecurityProfile(&disk_security)) return diagnostic.fail(
+        error.InvalidCaptureVm,
+        "Azure capture VM OS disk encryption is not VMGuestStateOnly without a CMK",
+        .{},
+    );
+}
+
+/// Validate the managed OS disk after deallocation/generalization and before it
+/// is used directly or copied to a snapshot.
+pub fn validateCaptureManagedDisk(
+    disk: *const ObjectMap,
+    expected: CaptureContract,
+    diagnostic: *Diagnostic,
+) CaptureDiskError![]const u8 {
+    const id = try azure_compute.validateManagedDisk(
+        disk,
+        architecture,
+        diagnostic,
+    );
+    if (!azure_compute.resourceIdIs(id, expected.disk_id) or
+        !azure_compute.resourceIdHasSubscription(id, expected.subscription_id) or
+        !exactLocation(disk, expected.location) or
+        !azure_compute.stringIs(disk.get("provisioningState"), "Succeeded") or
+        !exactResource(
+            disk.get("managedBy"),
+            expected.vm_id,
+            expected.subscription_id,
+        ))
+    {
+        return diagnostic.fail(
+            error.InvalidCaptureDisk,
+            "Azure capture OS disk identity, VM binding, location, or provisioning state is invalid",
+            .{},
+        );
+    }
+    const security = azure_compute.objectOf(disk.get("securityProfile")) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureDisk,
+            "Azure capture OS disk security profile is absent",
+            .{},
+        );
+    if (!validResourceDiskSecurityProfile(&security) or
+        !validPlatformEncryption(disk))
+    {
+        return diagnostic.fail(
+            error.InvalidCaptureDisk,
+            "Azure capture OS disk is not VMGuestStateOnly with platform-managed keys",
+            .{},
+        );
+    }
+    return id;
+}
+
+/// Validate a completed same-region snapshot copied from the accepted managed
+/// OS disk. Confidential security metadata must survive the copy unchanged.
+pub fn validateCaptureSnapshot(
+    snapshot: *const ObjectMap,
+    expected_snapshot_id: []const u8,
+    expected: CaptureContract,
+    diagnostic: *Diagnostic,
+) CaptureSnapshotError![]const u8 {
+    const id = azure_compute.stringOf(snapshot.get("id")) orelse "";
+    if (!azure_compute.resourceIdIs(id, expected_snapshot_id) or
+        !azure_compute.resourceIdHasSubscription(id, expected.subscription_id) or
+        !exactLocation(snapshot, expected.location) or
+        !azure_compute.stringIs(snapshot.get("provisioningState"), "Succeeded") or
+        !azure_compute.stringIs(snapshot.get("osType"), os_type) or
+        !azure_compute.stringIs(
+            snapshot.get("hyperVGeneration"),
+            hyper_v_generation,
+        ))
+    {
+        return diagnostic.fail(
+            error.InvalidCaptureSnapshot,
+            "Azure capture snapshot identity, location, OS, generation, or provisioning state is invalid",
+            .{},
+        );
+    }
+    const capabilities = azure_compute.objectOf(
+        snapshot.get("supportedCapabilities"),
+    ) orelse return diagnostic.fail(
+        error.InvalidCaptureSnapshot,
+        "Azure capture snapshot architecture is absent",
+        .{},
+    );
+    const creation = azure_compute.objectOf(snapshot.get("creationData")) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureSnapshot,
+            "Azure capture snapshot source is absent",
+            .{},
+        );
+    if (!azure_compute.stringIs(capabilities.get("architecture"), architecture) or
+        !azure_compute.stringIs(creation.get("createOption"), "Copy") or
+        !exactResource(
+            creation.get("sourceResourceId"),
+            expected.disk_id,
+            expected.subscription_id,
+        ))
+    {
+        return diagnostic.fail(
+            error.InvalidCaptureSnapshot,
+            "Azure capture snapshot does not bind the accepted x64 OS disk",
+            .{},
+        );
+    }
+    const security = azure_compute.objectOf(snapshot.get("securityProfile")) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureSnapshot,
+            "Azure capture snapshot security profile is absent",
+            .{},
+        );
+    if (!validResourceDiskSecurityProfile(&security) or
+        !validPlatformEncryption(snapshot))
+    {
+        return diagnostic.fail(
+            error.InvalidCaptureSnapshot,
+            "Azure capture snapshot is not VMGuestStateOnly with platform-managed keys",
+            .{},
+        );
+    }
+    return id;
+}
+
+pub fn validateCapturedImageDefinition(
+    definition: *const ObjectMap,
+    expected: CaptureGalleryContract,
+    diagnostic: *Diagnostic,
+) CapturedImageDefinitionError![]const u8 {
+    const id = try azure_compute.validateImageDefinition(
+        definition,
+        architecture,
+        captured_image_security_type,
+        "Azure gallery image definition is not ConfidentialVM",
+        diagnostic,
+    );
+    if (!azure_compute.resourceIdIs(id, expected.image_definition_id) or
+        !azure_compute.resourceIdHasSubscription(id, expected.subscription_id) or
+        !exactLocation(definition, expected.location) or
+        !azure_compute.stringIs(definition.get("provisioningState"), "Succeeded"))
+    {
+        return diagnostic.fail(
+            error.InvalidCapturedImageDefinition,
+            "Azure ConfidentialVM image-definition identity, subscription, location, or provisioning state is invalid",
+            .{},
+        );
+    }
+    return id;
+}
+
+pub fn captureGalleryVersionRequest(
+    allocator: Allocator,
+    location: []const u8,
+    source_id: []const u8,
+) !Value {
+    const encryption = try azure_compute.object(allocator, &.{
+        .{ "osDiskImage", try azure_compute.object(allocator, &.{
+            .{ "securityProfile", try azure_compute.object(allocator, &.{
+                .{
+                    "confidentialVMEncryptionType",
+                    azure_compute.string(gallery_os_disk_encryption_type),
+                },
+            }) },
+        }) },
+    });
+    return azure_compute.object(allocator, &.{
+        .{ "location", azure_compute.string(location) },
+        .{ "properties", try azure_compute.object(allocator, &.{
+            .{ "publishingProfile", try azure_compute.object(allocator, &.{
+                .{ "replicationMode", azure_compute.string("Full") },
+                .{ "targetRegions", try azure_compute.array(allocator, &.{
+                    try azure_compute.object(allocator, &.{
+                        .{ "name", azure_compute.string(location) },
+                        .{ "regionalReplicaCount", azure_compute.integer(1) },
+                        .{ "storageAccountType", azure_compute.string("Standard_LRS") },
+                        .{ "encryption", encryption },
+                    }),
+                }) },
+            }) },
+            .{ "storageProfile", try azure_compute.object(allocator, &.{
+                .{ "osDiskImage", try azure_compute.object(allocator, &.{
+                    .{ "source", try azure_compute.object(allocator, &.{
+                        .{ "id", azure_compute.string(source_id) },
+                    }) },
+                }) },
+            }) },
+        }) },
+    });
+}
+
+fn captureGallerySourceId(document: *const ObjectMap) ?[]const u8 {
+    const properties = azure_compute.objectOf(document.get("properties")) orelse
+        return null;
+    const storage = azure_compute.objectOf(properties.get("storageProfile")) orelse
+        return null;
+    const os_disk = azure_compute.objectOf(storage.get("osDiskImage")) orelse
+        return null;
+    const source = azure_compute.objectOf(os_disk.get("source")) orelse
+        return null;
+    return azure_compute.stringOf(source.get("id"));
+}
+
+fn validateCapturePublishingProfile(
+    document: *const ObjectMap,
+    location: []const u8,
+    strict_request: bool,
+    diagnostic: *Diagnostic,
+) CaptureGalleryVersionError!void {
+    const properties = azure_compute.objectOf(document.get("properties")) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure ConfidentialVM gallery properties are absent",
+            .{},
+        );
+    if (properties.contains("securityProfile")) return diagnostic.fail(
+        error.InvalidCaptureGalleryVersion,
+        "Azure ConfidentialVM gallery version must retain stock UEFI trust",
+        .{},
+    );
+    const publishing = azure_compute.objectOf(
+        properties.get("publishingProfile"),
+    ) orelse return diagnostic.fail(
+        error.InvalidCaptureGalleryVersion,
+        "Azure ConfidentialVM gallery publishing profile is absent",
+        .{},
+    );
+    if (strict_request and
+        (!azure_compute.hasExactFields(
+            properties,
+            &.{ "publishingProfile", "storageProfile" },
+        ) or
+            !azure_compute.hasExactFields(
+                publishing,
+                &.{ "replicationMode", "targetRegions" },
+            ) or
+            !azure_compute.stringIs(publishing.get("replicationMode"), "Full")))
+    {
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure ConfidentialVM gallery request contains unsupported properties",
+            .{},
+        );
+    }
+    const targets = azure_compute.arrayOf(publishing.get("targetRegions")) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure ConfidentialVM gallery target region is absent",
+            .{},
+        );
+    if (targets.len != 1) return diagnostic.fail(
+        error.InvalidCaptureGalleryVersion,
+        "Azure ConfidentialVM gallery request must have one regional replica and no cross-region targets",
+        .{},
+    );
+    const target = azure_compute.objectOf(targets[0]) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure ConfidentialVM gallery target region is invalid",
+            .{},
+        );
+    if (!azure_compute.stringIsIgnoreCase(target.get("name"), location) or
+        azure_compute.integerOf(target.get("regionalReplicaCount")) != 1 or
+        !azure_compute.stringIs(
+            target.get("storageAccountType"),
+            "Standard_LRS",
+        ))
+    {
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure ConfidentialVM gallery target must be the source region with one Standard_LRS replica",
+            .{},
+        );
+    }
+    if (strict_request and !azure_compute.hasExactFields(
+        target,
+        &.{
+            "encryption",
+            "name",
+            "regionalReplicaCount",
+            "storageAccountType",
+        },
+    )) return diagnostic.fail(
+        error.InvalidCaptureGalleryVersion,
+        "Azure ConfidentialVM gallery target contains unsupported settings",
+        .{},
+    );
+    const encryption = azure_compute.objectOf(target.get("encryption")) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure ConfidentialVM gallery OS-disk encryption profile is absent",
+            .{},
+        );
+    const os_disk = azure_compute.objectOf(encryption.get("osDiskImage")) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure ConfidentialVM gallery OS-disk encryption profile is absent",
+            .{},
+        );
+    const security = azure_compute.objectOf(os_disk.get("securityProfile")) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure ConfidentialVM gallery OS-disk security profile is absent",
+            .{},
+        );
+    if (!azure_compute.hasExactFields(encryption, &.{"osDiskImage"}) or
+        !azure_compute.hasExactFields(os_disk, &.{"securityProfile"}) or
+        !azure_compute.hasExactFields(
+            security,
+            &.{"confidentialVMEncryptionType"},
+        ) or
+        !azure_compute.stringIs(
+            security.get("confidentialVMEncryptionType"),
+            gallery_os_disk_encryption_type,
+        ))
+    {
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure ConfidentialVM gallery OS-disk encryption is not EncryptedVMGuestStateOnlyWithPmk",
+            .{},
+        );
+    }
+}
+
+pub fn validateCaptureGalleryRequest(
+    request: *const ObjectMap,
+    expected: CaptureGalleryContract,
+    diagnostic: *Diagnostic,
+) CaptureGalleryVersionError!void {
+    if (!exactLocation(request, expected.location)) return diagnostic.fail(
+        error.InvalidCaptureGalleryVersion,
+        "Azure ConfidentialVM gallery request location is invalid",
+        .{},
+    );
+    const source_id = captureGallerySourceId(request) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure ConfidentialVM gallery request source is absent",
+            .{},
+        );
+    if (!azure_compute.resourceIdIs(source_id, expected.source_id) or
+        !azure_compute.resourceIdHasSubscription(
+            source_id,
+            expected.subscription_id,
+        ))
+    {
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure ConfidentialVM gallery request does not reference the accepted disk or snapshot",
+            .{},
+        );
+    }
+    try validateCapturePublishingProfile(
+        request,
+        expected.location,
+        true,
+        diagnostic,
+    );
+}
+
+pub fn validateCapturedGalleryVersion(
+    response: *const ObjectMap,
+    expected: CaptureGalleryContract,
+    diagnostic: *Diagnostic,
+) CaptureGalleryVersionError!void {
+    if (!exactResource(
+        response.get("id"),
+        expected.image_version_id,
+        expected.subscription_id,
+    ) or !exactLocation(response, expected.location)) {
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure returned a different ConfidentialVM gallery image-version identity or location",
+            .{},
+        );
+    }
+    const source_id = captureGallerySourceId(response) orelse
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure ConfidentialVM gallery version source is absent",
+            .{},
+        );
+    if (!azure_compute.resourceIdIs(source_id, expected.source_id) or
+        !azure_compute.resourceIdHasSubscription(
+            source_id,
+            expected.subscription_id,
+        ))
+    {
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure ConfidentialVM gallery version does not reference the accepted disk or snapshot",
+            .{},
+        );
+    }
+    try validateCapturePublishingProfile(
+        response,
+        expected.location,
+        false,
+        diagnostic,
+    );
+    const properties = azure_compute.objectOf(response.get("properties")).?;
+    if (!azure_compute.stringIs(properties.get("provisioningState"), "Succeeded")) {
+        return diagnostic.fail(
+            error.InvalidCaptureGalleryVersion,
+            "Azure ConfidentialVM gallery image-version provisioning did not succeed",
+            .{},
+        );
+    }
+}
+
 fn parse(allocator: Allocator, text: []const u8) !std.json.Parsed(Value) {
     return std.json.parseFromSlice(Value, allocator, text, .{});
 }
@@ -626,4 +1209,246 @@ test "managed image and gallery version bind their exact source" {
         "ConfidentialVMSupported gallery request must retain stock UEFI trust",
         diagnostic.message(),
     );
+}
+
+const capture_contract: CaptureContract = .{
+    .subscription_id = "sub",
+    .location = "eastus2",
+    .source_image_version_id = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/" ++
+        "galleries/g/images/supported/versions/1.0.0",
+    .vm_id = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/" ++
+        "virtualMachines/capture",
+    .disk_id = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/" ++
+        "disks/capture-os",
+};
+
+const capture_gallery_contract: CaptureGalleryContract = .{
+    .subscription_id = "sub",
+    .location = "eastus2",
+    .source_id = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/" ++
+        "snapshots/capture-os",
+    .image_definition_id = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/" ++
+        "galleries/g/images/confidential",
+    .image_version_id = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/" ++
+        "galleries/g/images/confidential/versions/1.0.0",
+};
+
+test "capture VM binds identity image and VMGuestStateOnly OS disk" {
+    const valid =
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/capture","vmId":"01234567-89ab-cdef-0123-456789abcdef","location":"eastus2","provisioningState":"Succeeded","securityProfile":{"securityType":"ConfidentialVM","uefiSettings":{"secureBootEnabled":true,"vTpmEnabled":true}},"storageProfile":{"imageReference":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/supported/versions/1.0.0"},"osDisk":{"managedDisk":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/capture-os","securityProfile":{"securityEncryptionType":"VMGuestStateOnly"}}}}}
+    ;
+    var vm = try parse(std.testing.allocator, valid);
+    defer vm.deinit();
+    var diagnostic: Diagnostic = .{};
+    try validateCaptureVm(&vm.value.object, capture_contract, &diagnostic);
+
+    const invalid = [_][]const u8{
+        \\{"id":"/subscriptions/other/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/capture","vmId":"01234567-89ab-cdef-0123-456789abcdef","location":"eastus2","provisioningState":"Succeeded","securityProfile":{"securityType":"ConfidentialVM","uefiSettings":{"secureBootEnabled":true,"vTpmEnabled":true}},"storageProfile":{"imageReference":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/supported/versions/1.0.0"},"osDisk":{"managedDisk":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/capture-os","securityProfile":{"securityEncryptionType":"VMGuestStateOnly"}}}}}
+        ,
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/capture","vmId":"01234567-89ab-cdef-0123-456789abcdef","location":"westus2","provisioningState":"Succeeded","securityProfile":{"securityType":"ConfidentialVM","uefiSettings":{"secureBootEnabled":true,"vTpmEnabled":true}},"storageProfile":{"imageReference":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/supported/versions/1.0.0"},"osDisk":{"managedDisk":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/capture-os","securityProfile":{"securityEncryptionType":"VMGuestStateOnly"}}}}}
+        ,
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/capture","vmId":"01234567-89ab-cdef-0123-456789abcdef","location":"eastus2","provisioningState":"Succeeded","securityProfile":{"securityType":"TrustedLaunch","uefiSettings":{"secureBootEnabled":true,"vTpmEnabled":true}},"storageProfile":{"imageReference":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/supported/versions/1.0.0"},"osDisk":{"managedDisk":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/capture-os","securityProfile":{"securityEncryptionType":"VMGuestStateOnly"}}}}}
+        ,
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/capture","vmId":"01234567-89ab-cdef-0123-456789abcdef","location":"eastus2","provisioningState":"Succeeded","securityProfile":{"securityType":"ConfidentialVM","uefiSettings":{"secureBootEnabled":true,"vTpmEnabled":true}},"storageProfile":{"imageReference":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/other/versions/1.0.0"},"osDisk":{"managedDisk":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/capture-os","securityProfile":{"securityEncryptionType":"VMGuestStateOnly"}}}}}
+        ,
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/capture","vmId":"01234567-89ab-cdef-0123-456789abcdef","location":"eastus2","provisioningState":"Succeeded","securityProfile":{"securityType":"ConfidentialVM","uefiSettings":{"secureBootEnabled":true,"vTpmEnabled":true}},"storageProfile":{"imageReference":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/supported/versions/1.0.0"},"osDisk":{"managedDisk":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/capture-os","securityProfile":{"securityEncryptionType":"DiskWithVMGuestState"}}}}}
+        ,
+    };
+    for (invalid) |text| {
+        var candidate = try parse(std.testing.allocator, text);
+        defer candidate.deinit();
+        var candidate_diagnostic: Diagnostic = .{};
+        try std.testing.expectError(
+            error.InvalidCaptureVm,
+            validateCaptureVm(
+                &candidate.value.object,
+                capture_contract,
+                &candidate_diagnostic,
+            ),
+        );
+    }
+}
+
+test "capture disk and snapshot preserve source security in one region" {
+    var disk = try parse(std.testing.allocator,
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/capture-os","managedBy":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachines/capture","location":"eastus2","provisioningState":"Succeeded","osType":"Linux","hyperVGeneration":"V2","supportedCapabilities":{"architecture":"x64"},"securityProfile":{"securityType":"ConfidentialVM_VMGuestStateOnlyEncryptedWithPlatformKey"},"encryption":{"type":"EncryptionAtRestWithPlatformKey"}}
+    );
+    defer disk.deinit();
+    var diagnostic: Diagnostic = .{};
+    _ = try validateCaptureManagedDisk(
+        &disk.value.object,
+        capture_contract,
+        &diagnostic,
+    );
+    disk.value.object.getPtr("securityProfile").?.object
+        .getPtr("securityType").?.* = .{
+        .string = "ConfidentialVM_DiskEncryptedWithPlatformKey",
+    };
+    try std.testing.expectError(
+        error.InvalidCaptureDisk,
+        validateCaptureManagedDisk(
+            &disk.value.object,
+            capture_contract,
+            &diagnostic,
+        ),
+    );
+
+    const valid_snapshot =
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/capture-os","location":"eastus2","provisioningState":"Succeeded","osType":"Linux","hyperVGeneration":"V2","supportedCapabilities":{"architecture":"x64"},"creationData":{"createOption":"Copy","sourceResourceId":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/capture-os"},"securityProfile":{"securityType":"ConfidentialVM_VMGuestStateOnlyEncryptedWithPlatformKey"},"encryption":{"type":"EncryptionAtRestWithPlatformKey"}}
+    ;
+    var snapshot = try parse(std.testing.allocator, valid_snapshot);
+    defer snapshot.deinit();
+    _ = try validateCaptureSnapshot(
+        &snapshot.value.object,
+        capture_gallery_contract.source_id,
+        capture_contract,
+        &diagnostic,
+    );
+
+    const invalid = [_][]const u8{
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/capture-os","location":"westus2","provisioningState":"Succeeded","osType":"Linux","hyperVGeneration":"V2","supportedCapabilities":{"architecture":"x64"},"creationData":{"createOption":"Copy","sourceResourceId":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/capture-os"},"securityProfile":{"securityType":"ConfidentialVM_VMGuestStateOnlyEncryptedWithPlatformKey"},"encryption":{"type":"EncryptionAtRestWithPlatformKey"}}
+        ,
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/capture-os","location":"eastus2","provisioningState":"Failed","osType":"Linux","hyperVGeneration":"V2","supportedCapabilities":{"architecture":"x64"},"creationData":{"createOption":"Copy","sourceResourceId":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/capture-os"},"securityProfile":{"securityType":"ConfidentialVM_VMGuestStateOnlyEncryptedWithPlatformKey"},"encryption":{"type":"EncryptionAtRestWithPlatformKey"}}
+        ,
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/capture-os","location":"eastus2","provisioningState":"Succeeded","osType":"Linux","hyperVGeneration":"V2","supportedCapabilities":{"architecture":"x64"},"creationData":{"createOption":"Copy","sourceResourceId":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/other"},"securityProfile":{"securityType":"ConfidentialVM_VMGuestStateOnlyEncryptedWithPlatformKey"},"encryption":{"type":"EncryptionAtRestWithPlatformKey"}}
+        ,
+        \\{"id":"/subscriptions/other/resourceGroups/rg/providers/Microsoft.Compute/snapshots/capture-os","location":"eastus2","provisioningState":"Succeeded","osType":"Linux","hyperVGeneration":"V2","supportedCapabilities":{"architecture":"x64"},"creationData":{"createOption":"Copy","sourceResourceId":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/capture-os"},"securityProfile":{"securityType":"ConfidentialVM_VMGuestStateOnlyEncryptedWithPlatformKey"},"encryption":{"type":"EncryptionAtRestWithPlatformKey"}}
+        ,
+    };
+    for (invalid) |text| {
+        var candidate = try parse(std.testing.allocator, text);
+        defer candidate.deinit();
+        var candidate_diagnostic: Diagnostic = .{};
+        try std.testing.expectError(
+            error.InvalidCaptureSnapshot,
+            validateCaptureSnapshot(
+                &candidate.value.object,
+                capture_gallery_contract.source_id,
+                capture_contract,
+                &candidate_diagnostic,
+            ),
+        );
+    }
+}
+
+test "captured image definition is ConfidentialVM and provisioned" {
+    const valid =
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/confidential","location":"eastus2","provisioningState":"Succeeded","osType":"Linux","osState":"Generalized","hyperVGeneration":"V2","architecture":"x64","features":[{"name":"SecurityType","value":"ConfidentialVM"}]}
+    ;
+    var definition = try parse(std.testing.allocator, valid);
+    defer definition.deinit();
+    var diagnostic: Diagnostic = .{};
+    _ = try validateCapturedImageDefinition(
+        &definition.value.object,
+        capture_gallery_contract,
+        &diagnostic,
+    );
+
+    var wrong_security = try parse(std.testing.allocator,
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/confidential","location":"eastus2","provisioningState":"Succeeded","osType":"Linux","osState":"Generalized","hyperVGeneration":"V2","architecture":"x64","features":[{"name":"SecurityType","value":"ConfidentialVmSupported"}]}
+    );
+    defer wrong_security.deinit();
+    try std.testing.expectError(
+        error.InvalidImageDefinition,
+        validateCapturedImageDefinition(
+            &wrong_security.value.object,
+            capture_gallery_contract,
+            &diagnostic,
+        ),
+    );
+
+    const invalid_resource = [_][]const u8{
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/confidential","location":"westus2","provisioningState":"Succeeded","osType":"Linux","osState":"Generalized","hyperVGeneration":"V2","architecture":"x64","features":[{"name":"SecurityType","value":"ConfidentialVM"}]}
+        ,
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/confidential","location":"eastus2","provisioningState":"Failed","osType":"Linux","osState":"Generalized","hyperVGeneration":"V2","architecture":"x64","features":[{"name":"SecurityType","value":"ConfidentialVM"}]}
+        ,
+    };
+    for (invalid_resource) |text| {
+        var candidate = try parse(std.testing.allocator, text);
+        defer candidate.deinit();
+        var candidate_diagnostic: Diagnostic = .{};
+        try std.testing.expectError(
+            error.InvalidCapturedImageDefinition,
+            validateCapturedImageDefinition(
+                &candidate.value.object,
+                capture_gallery_contract,
+                &candidate_diagnostic,
+            ),
+        );
+    }
+}
+
+test "capture gallery request and response are exact and fail closed" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const request = try captureGalleryVersionRequest(
+        arena.allocator(),
+        capture_gallery_contract.location,
+        capture_gallery_contract.source_id,
+    );
+    var diagnostic: Diagnostic = .{};
+    try validateCaptureGalleryRequest(
+        &request.object,
+        capture_gallery_contract,
+        &diagnostic,
+    );
+
+    const response_text =
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/confidential/versions/1.0.0","location":"eastus2","properties":{"provisioningState":"Succeeded","publishingProfile":{"replicationMode":"Full","targetRegions":[{"name":"eastus2","regionalReplicaCount":1,"storageAccountType":"Standard_LRS","encryption":{"osDiskImage":{"securityProfile":{"confidentialVMEncryptionType":"EncryptedVMGuestStateOnlyWithPmk"}}}}]},"storageProfile":{"osDiskImage":{"source":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/capture-os"}}}}}
+    ;
+    var response = try parse(std.testing.allocator, response_text);
+    defer response.deinit();
+    try validateCapturedGalleryVersion(
+        &response.value.object,
+        capture_gallery_contract,
+        &diagnostic,
+    );
+
+    const invalid_requests = [_][]const u8{
+        \\{"location":"eastus2","properties":{"publishingProfile":{"replicationMode":"Full","targetRegions":[{"name":"eastus2","regionalReplicaCount":1,"storageAccountType":"Standard_LRS","encryption":{"osDiskImage":{"securityProfile":{"confidentialVMEncryptionType":"EncryptedWithPmk"}}}}]},"storageProfile":{"osDiskImage":{"source":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/capture-os"}}}}}
+        ,
+        \\{"location":"eastus2","properties":{"publishingProfile":{"replicationMode":"Full","targetRegions":[{"name":"eastus2","regionalReplicaCount":1,"storageAccountType":"Standard_LRS","encryption":{"osDiskImage":{"securityProfile":{"confidentialVMEncryptionType":"EncryptedVMGuestStateOnlyWithPmk"}}}}]},"storageProfile":{"osDiskImage":{"source":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/other"}}}}}
+        ,
+        \\{"location":"eastus2","properties":{"publishingProfile":{"replicationMode":"Full","targetRegions":[{"name":"eastus2","regionalReplicaCount":1,"storageAccountType":"Standard_LRS","encryption":{"osDiskImage":{"securityProfile":{"confidentialVMEncryptionType":"EncryptedVMGuestStateOnlyWithPmk"}}}},{"name":"westus2","regionalReplicaCount":1,"storageAccountType":"Standard_LRS","encryption":{"osDiskImage":{"securityProfile":{"confidentialVMEncryptionType":"EncryptedVMGuestStateOnlyWithPmk"}}}}]},"storageProfile":{"osDiskImage":{"source":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/capture-os"}}}}}
+        ,
+        \\{"location":"eastus2","properties":{"publishingProfile":{"replicationMode":"Full","targetRegions":[{"name":"eastus2","regionalReplicaCount":1,"storageAccountType":"Standard_LRS","encryption":{"osDiskImage":{"securityProfile":{"confidentialVMEncryptionType":"EncryptedVMGuestStateOnlyWithPmk"}}}}]},"storageProfile":{"osDiskImage":{"source":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/capture-os"}}},"securityProfile":{"uefiSettings":{"signatureTemplateNames":["Custom"]}}}}
+        ,
+    };
+    for (invalid_requests) |text| {
+        var candidate = try parse(std.testing.allocator, text);
+        defer candidate.deinit();
+        var candidate_diagnostic: Diagnostic = .{};
+        try std.testing.expectError(
+            error.InvalidCaptureGalleryVersion,
+            validateCaptureGalleryRequest(
+                &candidate.value.object,
+                capture_gallery_contract,
+                &candidate_diagnostic,
+            ),
+        );
+    }
+
+    const invalid_responses = [_][]const u8{
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/confidential/versions/2.0.0","location":"eastus2","properties":{"provisioningState":"Succeeded","publishingProfile":{"targetRegions":[{"name":"eastus2","regionalReplicaCount":1,"storageAccountType":"Standard_LRS","encryption":{"osDiskImage":{"securityProfile":{"confidentialVMEncryptionType":"EncryptedVMGuestStateOnlyWithPmk"}}}}]},"storageProfile":{"osDiskImage":{"source":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/capture-os"}}}}}
+        ,
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/confidential/versions/1.0.0","location":"eastus2","properties":{"provisioningState":"Succeeded","publishingProfile":{"targetRegions":[{"name":"eastus2","regionalReplicaCount":1,"storageAccountType":"Standard_LRS","encryption":{"osDiskImage":{"securityProfile":{"confidentialVMEncryptionType":"EncryptedVMGuestStateOnlyWithPmk"}}}}]},"storageProfile":{"osDiskImage":{"source":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/other"}}}}}
+        ,
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/confidential/versions/1.0.0","location":"eastus2","properties":{"provisioningState":"Succeeded","publishingProfile":{"targetRegions":[{"name":"eastus2","regionalReplicaCount":1,"storageAccountType":"Standard_LRS","encryption":{"osDiskImage":{"securityProfile":{"confidentialVMEncryptionType":"EncryptedWithPmk"}}}}]},"storageProfile":{"osDiskImage":{"source":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/capture-os"}}}}}
+        ,
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/confidential/versions/1.0.0","location":"eastus2","properties":{"provisioningState":"Failed","publishingProfile":{"targetRegions":[{"name":"eastus2","regionalReplicaCount":1,"storageAccountType":"Standard_LRS","encryption":{"osDiskImage":{"securityProfile":{"confidentialVMEncryptionType":"EncryptedVMGuestStateOnlyWithPmk"}}}}]},"storageProfile":{"osDiskImage":{"source":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/capture-os"}}}}}
+        ,
+    };
+    for (invalid_responses) |text| {
+        var candidate = try parse(std.testing.allocator, text);
+        defer candidate.deinit();
+        var candidate_diagnostic: Diagnostic = .{};
+        try std.testing.expectError(
+            error.InvalidCaptureGalleryVersion,
+            validateCapturedGalleryVersion(
+                &candidate.value.object,
+                capture_gallery_contract,
+                &candidate_diagnostic,
+            ),
+        );
+    }
 }

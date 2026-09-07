@@ -121,6 +121,121 @@ azure_confidential_vm_vm_instance_security_args() {
   )
 }
 
+azure_confidential_vm_capture_vm_resource_args() {
+  local resource_group=$1 vm_name=$2
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    vm show
+    --resource-group "$resource_group"
+    --name "$vm_name"
+    --query '{id:id,vmId:vmId,location:location,provisioningState:provisioningState,securityProfile:securityProfile,storageProfile:storageProfile}'
+    --output json
+  )
+}
+
+azure_confidential_vm_deallocate_args() {
+  local resource_group=$1 vm_name=$2
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    vm deallocate
+    --resource-group "$resource_group"
+    --name "$vm_name"
+    --output json
+  )
+}
+
+azure_confidential_vm_generalize_args() {
+  local resource_group=$1 vm_name=$2
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    vm generalize
+    --resource-group "$resource_group"
+    --name "$vm_name"
+    --output json
+  )
+}
+
+azure_confidential_vm_capture_disk_show_args() {
+  local disk_id=$1
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    disk show
+    --ids "$disk_id"
+    --output json
+  )
+}
+
+azure_confidential_vm_snapshot_create_args() {
+  local resource_group=$1 snapshot=$2 location=$3 disk_id=$4
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    snapshot create
+    --resource-group "$resource_group"
+    --name "$snapshot"
+    --location "$location"
+    --source "$disk_id"
+    --sku Standard_LRS
+    --output json
+  )
+}
+
+azure_confidential_vm_snapshot_show_args() {
+  local resource_group=$1 snapshot=$2
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    snapshot show
+    --resource-group "$resource_group"
+    --name "$snapshot"
+    --output json
+  )
+}
+
+azure_confidential_vm_capture_image_definition_create_args() {
+  local resource_group=$1 gallery=$2 image=$3 offer=$4 sku=$5 location=$6
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    sig image-definition create
+    --resource-group "$resource_group"
+    --gallery-name "$gallery"
+    --gallery-image-definition "$image"
+    --publisher miz
+    --offer "$offer"
+    --sku "$sku"
+    --os-type Linux
+    --os-state Generalized
+    --hyper-v-generation V2
+    --architecture x64
+    --features SecurityType=ConfidentialVM
+    --location "$location"
+    --output json
+  )
+}
+
+azure_confidential_vm_capture_image_definition_show_args() {
+  local resource_group=$1 gallery=$2 image=$3
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    sig image-definition show
+    --resource-group "$resource_group"
+    --gallery-name "$gallery"
+    --gallery-image-definition "$image"
+    --output json
+  )
+}
+
+azure_confidential_vm_capture_gallery_version_put_args() {
+  local image_version_id=$1 request=$2
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    rest
+    --method put
+    --uri "https://management.azure.com${image_version_id}?api-version=2025-03-03"
+    --body "@$request"
+    --output json
+  )
+}
+
+azure_confidential_vm_capture_gallery_version_get_args() {
+  local image_version_id=$1
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    rest
+    --method get
+    --uri "https://management.azure.com${image_version_id}?api-version=2025-03-03"
+    --output json
+  )
+}
+
 azure_confidential_vm_print_command() {
   local suffix=${1:-} argument
   printf 'az'
