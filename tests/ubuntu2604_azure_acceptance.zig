@@ -517,7 +517,9 @@ test "core BinderFS, Binder devices, and DMA heap are probed" {
         "binder",
         "hwbinder",
         "vndbinder",
-        "sudo -n \"$probe\" version",
+        "for device in binder hwbinder vndbinder; do\n" ++
+            "  \"$probe\" version \"$binderfs_mount/$device\"\n" ++
+            "done",
         "sudo -n \"$probe\" alloc \"$binderfs_mount/binder-control\"",
         "miz-acceptance-probe",
         // The runtime contract probe replaces the shell utilities the guest

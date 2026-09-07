@@ -808,7 +808,8 @@ fn loadBootModules(mode: BootMode) void {
 // Opt-in via `mizinit.binder=required` (default: disabled). A core image with
 // the matching signed kernel module sets this so an in-guest Binder workload
 // has a working IPC transport before any service starts: load binder_linux,
-// mount binderfs, and create the binder/hwbinder/vndbinder control devices.
+// mount binderfs, and create the binder/hwbinder/vndbinder control devices
+// with the world read-write mode Android services require.
 //
 // This is deliberately not built on loadModuleAt() above: that path only
 // ever handles a raw, uncompressed-after-decompress `.ko.xz` and a plain
@@ -822,6 +823,7 @@ fn loadBootModules(mode: BootMode) void {
 const binder_module_name = "binder_linux";
 const binderfs_mount_point = "/dev/binderfs";
 const binder_control_path = binderfs_mount_point ++ "/binder-control";
+const binder_device_mode = 0o666;
 
 /// finit_module(2) flag telling the kernel the supplied file descriptor is
 /// compressed and should be decompressed in-kernel before the normal
@@ -964,15 +966,21 @@ fn ensureBinderDevice(device: BinderDeviceName) linux.E {
     const name = device.asBytes();
     @memcpy(request.name[0..name.len], name);
 
-    return linux.errno(linux.ioctl(fd, binder_ctl_add, @intFromPtr(&request)));
+    const add_error = linux.errno(linux.ioctl(fd, binder_ctl_add, @intFromPtr(&request)));
+    if (add_error != .SUCCESS and add_error != .EXIST) return add_error;
+
+    var path_buf: [64:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ binderfs_mount_point, name }) catch return .NAMETOOLONG;
+    return linux.errno(linux.chmod(path, binder_device_mode));
 }
 
 /// Runs once, after /proc, /sys, and /dev are mounted (main() mounts those
 /// before this is reached) and the boot command line has been parsed. Every
 /// step tolerates "already done" (module already loaded, binderfs already
 /// mounted, a control device that already exists), so calling this more than
-/// once -- or racing a kernel that already brought Binder up -- is a no-op
-/// rather than a spurious failure.
+/// once -- or racing a kernel that already brought Binder up -- converges the
+/// devices to the mode Android requires rather than producing a spurious
+/// failure.
 fn configureBinder(policy: BinderPolicy) BinderSetupOutcome {
     if (policy != .required) return .not_requested;
 
@@ -996,7 +1004,7 @@ fn configureBinder(policy: BinderPolicy) BinderSetupOutcome {
             const e = ensureBinderDevice(device);
             if (binderStepResult(e, .EXIST) == .failed) {
                 devices = .failed;
-                writeErrno("[mizinit] binder required: BINDER_CTL_ADD failed", e);
+                writeErrno("[mizinit] binder required: preparing BinderFS device failed", e);
             }
         }
     } else {
@@ -2428,6 +2436,7 @@ test "binder devices are created in binder hwbinder vndbinder order" {
     try std.testing.expectEqualStrings("binder", binder_devices[0].asBytes());
     try std.testing.expectEqualStrings("hwbinder", binder_devices[1].asBytes());
     try std.testing.expectEqualStrings("vndbinder", binder_devices[2].asBytes());
+    try std.testing.expectEqual(@as(u32, 0o666), binder_device_mode);
 }
 
 test "BINDER_CTL_ADD matches the kernel's binderfs_device layout and _IOWR encoding" {

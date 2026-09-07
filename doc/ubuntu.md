@@ -934,12 +934,14 @@ against the packaged, possibly `.ko.zst`-compressed module file (asking the
 kernel to decompress and verify it, never decompressing or touching the
 signed bytes itself), mounts binderfs at `/dev/binderfs`, and creates
 `binder`, `hwbinder`, and `vndbinder` through binderfs's `BINDER_CTL_ADD`
-device-control ioctl. Every step tolerates already having been done (an
-already-loaded module, an already-mounted binderfs, an already-created
-device), so a restart or a race with a previous boot's partial setup is not a
-failure. A required-mode failure at any step is fatal to readiness: mizinit
-never prints its ready line and never starts `sshd` or `azagent`, rather than
-booting into a machine that looks up but has no working Binder workload.
+device-control ioctl. It sets the three fixed devices to mode `0666` so
+unprivileged Android services can open them. Every step tolerates already
+having been done (an already-loaded module, an already-mounted binderfs, an
+already-created device) and reapplies the required mode, so a restart or a
+race with a previous boot's partial setup is not a failure. A required-mode
+failure at any step is fatal to readiness: mizinit never prints its ready line
+and never starts `sshd` or `azagent`, rather than booting into a machine that
+looks up but has no working Binder workload.
 `mizinit.binder=disabled` (also the default when the option is absent) skips
 all of this.
 
@@ -1525,8 +1527,9 @@ Acceptance then asserts binderfs is mounted and that `binder-control`,
 `binder`, `hwbinder`, and `vndbinder` exist as dynamic character devices, and
 proves real device usability by transferring a small static probe binary
 (`tests/binder_probe.zig`, matched to the candidate's own architecture) over
-SSH, verifying its checksum, and using it to query the fixed devices and
-allocate and query a new dynamic Binder device through `binder-control`.
+SSH, verifying its checksum, and using the unprivileged deployment account to
+query the fixed devices. Root is used only to allocate and query a new dynamic
+Binder device through `binder-control`.
 
 ### Self-contained Binder and DMA-heap acceptance
 

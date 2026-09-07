@@ -1141,7 +1141,7 @@ binderfs_mount=/dev/binderfs
 # real BINDER_CTL_ADD dynamic allocation through binder-control.
 sudo -n /usr/bin/chmod 0755 "$probe"
 for device in binder hwbinder vndbinder; do
-  sudo -n "$probe" version "$binderfs_mount/$device"
+  "$probe" version "$binderfs_mount/$device"
 done
 sudo -n "$probe" alloc "$binderfs_mount/binder-control" miz-acceptance-probe
 sudo -n "$probe" version "$binderfs_mount/miz-acceptance-probe"

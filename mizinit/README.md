@@ -19,11 +19,13 @@ small reference for what a from-scratch container-image init needs to do.
   itself decompress and verify the signature rather than ever touching the
   signed bytes. It then mounts binderfs at `/dev/binderfs` and creates
   `binder`, `hwbinder`, and `vndbinder` through binderfs's `BINDER_CTL_ADD`
-  device-control ioctl. Every step tolerates already having been done, so
-  repeating setup across a restart is not a failure. When required, any step
-  failing is fatal to readiness: mizinit suppresses its ready line and does
-  not start `sshd` or `azagent`, rather than booting into a machine that
-  looks up but has no working Binder workload.
+  device-control ioctl, then sets the fixed devices to mode `0666` so
+  unprivileged Android services can open them. Every step tolerates already
+  having been done and reapplies the required mode, so repeating setup across
+  a restart is not a failure. When required, any step failing is fatal to
+  readiness: mizinit suppresses its ready line and does not start `sshd` or
+  `azagent`, rather than booting into a machine that looks up but has no
+  working Binder workload.
 - Mounts the ESP, sets the hostname, brings up loopback, then runs a small
   DHCP client on the first non-`lo` interface it finds and writes
   `/etc/resolv.conf`. DHCP replies are received on a raw `AF_PACKET` socket
@@ -138,7 +140,7 @@ options (alongside `linux-azure`'s signed `binder_linux` module, kernel
 config, and initramfs contents, all validated at build time -- see
 [`doc/ubuntu.md`](../doc/ubuntu.md)) to have mizinit load the module, mount
 binderfs, and create its devices before starting services, and to fail
-closed on any setup step required mode cannot complete.
+closed on any setup step or required device-mode change it cannot complete.
 
 The `/sbin/poweroff`, `/sbin/reboot`, and `/sbin/shutdown` helper links signal
 PID 1 so the same complete child-drain path is used rather than rebooting
