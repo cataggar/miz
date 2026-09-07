@@ -28,7 +28,17 @@ pub const Builder = support.Builder;
 pub const Diagnostic = support.Diagnostic;
 
 pub const source_commit = "a" ** 40;
-pub const certificate_der = "miz Ubuntu test certificate";
+pub const certificate_der_base64 =
+    "MIIC2jCCAcKgAwIBAgICBKEwDQYJKoZIhvcNAQELBQAwMDEgMB4GA1UEAwwXbWl6IG5hdGl2ZSBsb2NhbCBzaWduZXIxDDAKBgNV" ++
+    "BAoMA21pejAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEwMDAwMDBaMDAxIDAeBgNVBAMMF21peiBuYXRpdmUgbG9jYWwgc2lnbmVy" ++
+    "MQwwCgYDVQQKDANtaXowggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC5AIeQdj0ZtB377NTn4yk/TWP77/pOxAeKNRuX" ++
+    "WY/8ol47IkFl/d2nrdzRPFir/OR3WPC2C0PcCn6ldEh/DbkieFrYXDoY8eLGIcAASH1IHyUCaegagvaaosDV328d1qzm+xZtWTIm" ++
+    "nRVhHZNHOU6SCVgk5tbkPrgwdRNgdH7ba2HDaVelkuBumrzOGN6xykWUIhStF3YBNszfgC4O2m0GEutAF3mFqLUhbIMhuMWtu27e" ++
+    "K0VyIkUrRjaQGRs74x5Fb2+OV4/M0oVKsaRLTuYpdkNfI2Xp95f4v803eLUHRIhHifYQ8RBuh/ZCh5t3ZPm5u5ljqbsGIx2dFp6l" ++
+    "ResBAgMBAAEwDQYJKoZIhvcNAQELBQADggEBAKKAv4U/hkTowNj3SpMFm0CYrv47l0Xv+JTHH+PlWaCKxalLv3QnoGFFueoTg7Ap" ++
+    "+3bbchG+eakZn/w1LA6XsayOIsS9+VGSV4szcKhOsraPPuK2SkVtrzbvqsSr5phZb1P8BUE91YjZDsSlVWUYqUodRxn1gH0AbFrZ" ++
+    "w9ZQ9lenhbx4WZaeTUiS/kQNHx/xs11pvWOozhaCoyAV2VXsAqqB92laSzqVLz1nm6Z16PD14VrycusNZdO/sQZwqrjLvRjmg24T" ++
+    "YoUWAtRNPDc2F2mb/htcZFimdufWME5ZPEP54OeUJNFmQUvxScSGGEAHuU1kQxca1IqEU0FiJXPCy6o=";
 pub const signing_certificate_sha256 = "4" ** 64;
 pub const operation_id = "00000000-0000-4000-8000-000000000001";
 /// Two aligned MiB: large enough to exercise the VHD footer geometry, small
@@ -36,7 +46,20 @@ pub const operation_id = "00000000-0000-4000-8000-000000000001";
 pub const virtual_size: i64 = 2 * 1024 * 1024;
 
 pub fn certificateSha256() [64]u8 {
-    return support.digest.hexBytes(certificate_der);
+    var certificate: [1024]u8 = undefined;
+    const decoder = std.base64.standard.Decoder;
+    const size = decoder.calcSizeForSlice(certificate_der_base64) catch unreachable;
+    decoder.decode(certificate[0..size], certificate_der_base64) catch unreachable;
+    return support.digest.hexBytes(certificate[0..size]);
+}
+
+fn provenanceCertificate(allocator: Allocator) ![]u8 {
+    const decoder = std.base64.standard.Decoder;
+    const size = try decoder.calcSizeForSlice(certificate_der_base64);
+    const certificate = try allocator.alloc(u8, size);
+    errdefer allocator.free(certificate);
+    try decoder.decode(certificate, certificate_der_base64);
+    return certificate;
 }
 
 /// A private tree holding one test's candidates, Azure results, and staging
@@ -118,6 +141,13 @@ pub const Tree = struct {
         return self.path("native/{s}/native-result.json", .{key});
     }
 
+    pub fn galleryMetadataPath(self: *const Tree, key: []const u8) ![]u8 {
+        return self.path(
+            "candidates/{s}/{s}",
+            .{ key, contracts.galleryMetadataName(key).? },
+        );
+    }
+
     pub fn removeBundle(self: *const Tree, key: []const u8) !void {
         const candidate_dir = try self.candidateDir(key);
         defer self.allocator.free(candidate_dir);
@@ -131,7 +161,7 @@ pub const Tree = struct {
 pub const Options = struct {
     /// Overridden to prove the staging gate refuses two candidates that were
     /// signed by different certificates.
-    certificate: []const u8 = certificate_der,
+    certificate: ?[]const u8 = null,
     signing_certificate_sha256: []const u8 = signing_certificate_sha256,
     asset_bytes: ?[]const u8 = null,
 };
@@ -150,6 +180,11 @@ pub fn makeBundle(tree: *const Tree, key: []const u8, options: Options) !void {
     const io = tree.io;
     const entry = contracts.lookup(key).?;
     const flavor = contracts.parseFlavor(entry.flavor).?;
+    const certificate = if (options.certificate) |provided|
+        provided
+    else
+        try provenanceCertificate(allocator);
+    defer if (options.certificate == null) allocator.free(certificate);
 
     const candidate_dir = try tree.candidateDir(key);
     defer allocator.free(candidate_dir);
@@ -167,7 +202,7 @@ pub fn makeBundle(tree: *const Tree, key: []const u8, options: Options) !void {
     const provenance = try tree.provenanceDir(key);
     defer allocator.free(provenance);
     try Dir.cwd().createDirPath(io, provenance);
-    try writeProvenance(tree, key, provenance, options);
+    try writeProvenance(tree, key, provenance, certificate, options);
 
     var arena: std.heap.ArenaAllocator = .init(allocator);
     defer arena.deinit();
@@ -236,7 +271,7 @@ pub fn makeBundle(tree: *const Tree, key: []const u8, options: Options) !void {
     defer allocator.free(request);
     const response = try tree.path("azure/{s}/response.json", .{key});
     defer allocator.free(response);
-    const gallery = try galleryDocument(allocator, options.certificate);
+    const gallery = try galleryDocument(allocator, certificate);
     defer allocator.free(gallery);
     try Dir.cwd().writeFile(io, .{ .sub_path = request, .data = gallery });
     try Dir.cwd().writeFile(io, .{ .sub_path = response, .data = gallery });
@@ -580,6 +615,7 @@ fn writeProvenance(
     tree: *const Tree,
     key: []const u8,
     provenance: []const u8,
+    certificate: []const u8,
     options: Options,
 ) !void {
     const allocator = tree.allocator;
@@ -860,7 +896,7 @@ fn writeProvenance(
         &diagnostic,
     );
 
-    try writeSigning(tree, key, provenance, options);
+    try writeSigning(tree, key, provenance, certificate, options);
 }
 
 /// The measurements the fixture's calculated geometry stands on.
@@ -1248,6 +1284,7 @@ fn writeSigning(
     tree: *const Tree,
     key: []const u8,
     provenance: []const u8,
+    certificate: []const u8,
     options: Options,
 ) !void {
     const allocator = tree.allocator;
@@ -1255,11 +1292,11 @@ fn writeSigning(
     const encoder = std.base64.standard.Encoder;
     const encoded = try allocator.alloc(
         u8,
-        encoder.calcSize(options.certificate.len),
+        encoder.calcSize(certificate.len),
     );
     defer allocator.free(encoded);
-    _ = encoder.encode(encoded, options.certificate);
-    const fingerprint = support.digest.hexBytes(options.certificate);
+    _ = encoder.encode(encoded, certificate);
+    const fingerprint = support.digest.hexBytes(certificate);
     const fallback = if (std.mem.eql(u8, entry.architecture, "x86_64"))
         "EFI/BOOT/BOOTX64.EFI"
     else

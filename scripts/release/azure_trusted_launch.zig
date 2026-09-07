@@ -64,6 +64,97 @@ const stringIs = azure_compute.stringIs;
 const hasExactFields = azure_compute.hasExactFields;
 const jsonEqual = azure_compute.jsonEqual;
 
+pub fn imageDefinitionContract(
+    allocator: Allocator,
+    architecture: []const u8,
+) !Value {
+    return object(allocator, &.{
+        .{ "osType", string(os_type) },
+        .{ "osState", string(os_state) },
+        .{ "hyperVGeneration", string(hyper_v_generation) },
+        .{ "architecture", string(architecture) },
+        .{ "features", try array(allocator, &.{
+            try object(allocator, &.{
+                .{ "name", string("SecurityType") },
+                .{ "value", string(image_security_type) },
+            }),
+        }) },
+    });
+}
+
+pub fn validateImageDefinitionContract(
+    definition: *const ObjectMap,
+    architecture: []const u8,
+    diagnostic: *Diagnostic,
+) ImageDefinitionError!void {
+    if (!hasExactFields(definition.*, &.{
+        "architecture",
+        "features",
+        "hyperVGeneration",
+        "osState",
+        "osType",
+    }) or
+        !stringIs(definition.get("osType"), os_type) or
+        !stringIs(definition.get("osState"), os_state) or
+        !stringIs(definition.get("hyperVGeneration"), hyper_v_generation) or
+        !stringIs(definition.get("architecture"), architecture))
+    {
+        return diagnostic.fail(
+            error.InvalidImageDefinition,
+            "Azure gallery image-definition contract is invalid",
+            .{},
+        );
+    }
+    const features = arrayOf(definition.get("features")) orelse
+        return diagnostic.fail(
+            error.InvalidImageDefinition,
+            "Azure gallery image-definition contract is invalid",
+            .{},
+        );
+    if (features.len != 1) return diagnostic.fail(
+        error.InvalidImageDefinition,
+        "Azure gallery image-definition contract is invalid",
+        .{},
+    );
+    const feature = objectOf(features[0]) orelse return diagnostic.fail(
+        error.InvalidImageDefinition,
+        "Azure gallery image-definition contract is invalid",
+        .{},
+    );
+    if (!hasExactFields(feature, &.{ "name", "value" }) or
+        !stringIs(feature.get("name"), "SecurityType") or
+        !stringIs(feature.get("value"), image_security_type))
+    {
+        return diagnostic.fail(
+            error.InvalidImageDefinition,
+            "Azure gallery image-definition contract is invalid",
+            .{},
+        );
+    }
+}
+
+pub fn uefiSettings(
+    allocator: Allocator,
+    certificate: []const u8,
+) !Value {
+    const encoder = std.base64.standard.Encoder;
+    const encoded = try allocator.alloc(u8, encoder.calcSize(certificate.len));
+    _ = encoder.encode(encoded, certificate);
+    return object(allocator, &.{
+        .{ "signatureTemplateNames", try array(allocator, &.{
+            string(signature_template),
+        }) },
+        .{ "additionalSignatures", try object(allocator, &.{
+            .{ "db", try array(allocator, &.{
+                try object(allocator, &.{
+                    .{ "type", string("x509") },
+                    .{ "value", try array(allocator, &.{string(encoded)}) },
+                }),
+            }) },
+        }) },
+    });
+}
+
 /// Build the Compute Gallery image-version request used by both release
 /// families. The Microsoft template remains present while the exact release
 /// signer is appended to `db`.
@@ -73,29 +164,28 @@ pub fn galleryVersionRequest(
     disk_id: []const u8,
     certificate: []const u8,
 ) !Value {
-    const encoder = std.base64.standard.Encoder;
-    const encoded = try allocator.alloc(u8, encoder.calcSize(certificate.len));
-    _ = encoder.encode(encoded, certificate);
-
     const security_profile = try object(allocator, &.{
-        .{ "uefiSettings", try object(allocator, &.{
-            .{ "signatureTemplateNames", try array(allocator, &.{
-                string(signature_template),
-            }) },
-            .{ "additionalSignatures", try object(allocator, &.{
-                .{ "db", try array(allocator, &.{
-                    try object(allocator, &.{
-                        .{ "type", string("x509") },
-                        .{ "value", try array(allocator, &.{string(encoded)}) },
-                    }),
-                }) },
-            }) },
-        }) },
+        .{ "uefiSettings", try uefiSettings(allocator, certificate) },
     });
     return azure_compute.galleryVersionRequest(
         allocator,
         location,
         disk_id,
+        security_profile,
+    );
+}
+
+pub fn galleryVersionRequestWithOptions(
+    allocator: Allocator,
+    options: azure_compute.GalleryVersionOptions,
+    certificate: []const u8,
+) !Value {
+    const security_profile = try object(allocator, &.{
+        .{ "uefiSettings", try uefiSettings(allocator, certificate) },
+    });
+    return azure_compute.galleryVersionRequestWithOptions(
+        allocator,
+        options,
         security_profile,
     );
 }
