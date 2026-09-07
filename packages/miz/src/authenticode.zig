@@ -323,7 +323,14 @@ fn authenticodeCms(pe_bytes: []const u8) Error!AuthenticodeCms {
             return error.UnsupportedWinCertificate;
         }
         if (result != null) return error.MultipleAuthenticodeSignatures;
-        result = pe_bytes[offset + 8 .. entry_end];
+        const payload = pe_bytes[offset + 8 .. entry_end];
+        const content_info = try parseDerElement(payload, 0);
+        const internal_padding = payload[content_info.end..];
+        if (internal_padding.len >= 8) return error.InvalidWinCertificate;
+        for (internal_padding) |padding| {
+            if (padding != 0) return error.InvalidWinCertificate;
+        }
+        result = payload[0..content_info.end];
 
         const next = align8(entry_end) catch return error.InvalidWinCertificate;
         if (next > table.end) return error.InvalidWinCertificate;
@@ -2532,6 +2539,31 @@ test "native local-key signatures verify against the enrolled certificate" {
         "subject=CN=miz native local signer",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, details, "serial=04a1") != null);
+}
+
+test "WIN_CERTIFICATE accepts alignment padding included in dwLength" {
+    const allocator = std.testing.allocator;
+    const certificate = try decodeTestBase64Alloc(allocator, test_local_cert_b64);
+    defer allocator.free(certificate);
+    const key = try decodeTestBase64Alloc(allocator, test_local_key_pkcs8_b64);
+    defer allocator.free(key);
+    const image = try makeTestPe(allocator, 512);
+    defer allocator.free(image);
+    const signed = try signPeRsaSha256Alloc(allocator, image, key, certificate);
+    defer allocator.free(signed);
+
+    const pe = try parsePe(signed);
+    const entry_length = @as(usize, readU32Le(
+        signed[pe.certificate_offset..][0..4],
+    ));
+    try std.testing.expect(pe.certificate_size > entry_length);
+    writeU32Le(
+        signed[pe.certificate_offset..][0..4],
+        @intCast(pe.certificate_size),
+    );
+
+    const signer = try verifyRsaSha256(signed);
+    try std.testing.expectEqualSlices(u8, certificate, signer.certificate_der);
 }
 
 test "native verification fails closed on tampering and signer substitution" {

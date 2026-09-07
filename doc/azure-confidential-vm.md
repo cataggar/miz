@@ -25,6 +25,45 @@ deployed VM must independently request:
 OS-disk encryption. `DiskWithVMGuestState`, customer-managed confidential disk
 keys, and captured `ConfidentialVM` images are separate contracts.
 
+## Build the image
+
+The host-native builder pins Canonical's immutable Ubuntu 24.04 Azure
+publication, authenticates its detached `SHA256SUMS` signature with the
+embedded Canonical cloud-image key, and safely extracts its sole sparse VHD
+member:
+
+```console
+zig build generalized-ubuntu2404-confidential -- \
+  --work-dir /d/miz-ubuntu2404-confidential \
+  --output /d/miz-ubuntu2404-confidential/Ubuntu-24.04-x86_64.confidential.qcow2
+```
+
+The builder requires GNU tar, `gpg`, and `gpgv`. Downloads use the native Zig
+HTTPS client and are written atomically beneath `--work-dir`; pass
+`--proxy URL` only when egress requires an explicit proxy. After one successful
+download, `--offline` rejects a missing or changed cache entry instead of
+accessing the network.
+
+Before publishing the standalone QCOW2, the builder requires the signed
+manifest's Azure kernel and TPM package closure, a Linux 5.15-or-newer Azure
+kernel with Hyper-V, TPM, EFI, lockdown, and SEV guest configuration, empty
+machine and provisioning state, and valid x86_64 Authenticode signatures on
+the fallback shim, Ubuntu shim, and GRUB.
+
+Canonical's fixed VHD retains the internally consistent backup GPT at its
+original 3,584 MiB substrate boundary while advertising a larger Azure disk.
+The builder verifies that legacy GPT against the signed source, relocates only
+the backup GPT metadata and protective-MBR extent to the current disk end, and
+then requires a fully verified Gen2 GPT. Partition extents, filesystems, and
+guest bytes are unchanged. The candidate is read back through miz and must
+expose the same signer and boot-binary digests as the fixed source VHD.
+
+The companion `<output>.provenance.json` binds the signed publication inputs,
+extracted fixed VHD, validated kernel release, Secure Boot binaries and signer
+certificates, and final QCOW2 SHA-256. This proves the local build chain; live
+Azure acceptance remains responsible for proving SEV-SNP execution and guest
+attestation.
+
 ## Secure Boot trust
 
 The Ubuntu 24.04 target preserves Canonical's stock Azure boot chain:
