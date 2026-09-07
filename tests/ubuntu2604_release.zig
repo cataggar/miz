@@ -18,6 +18,7 @@ const Tree = fixture.Tree;
 const commands = release.commands;
 const contracts = release.contracts;
 const documents = release.documents;
+const gallery_metadata = release.gallery_metadata;
 const provenance = release.provenance;
 const support = release.support;
 
@@ -106,6 +107,275 @@ fn makeAll(subject: *const Tree) !void {
         try fixture.makeBundle(subject, key, .{});
         try fixture.makeNativeResult(subject, key, .{});
     }
+}
+
+fn generateGalleryMetadata(subject: *const Tree, key: []const u8) !void {
+    const manifest = try subject.manifestPath(key);
+    defer allocator.free(manifest);
+    const asset = try subject.assetPath(key);
+    defer allocator.free(asset);
+    const output = try subject.galleryMetadataPath(key);
+    defer allocator.free(output);
+    var diagnostic: support.Diagnostic = .{};
+    try gallery_metadata.generate(allocator, io, .{
+        .manifest = manifest,
+        .asset = asset,
+        .key = key,
+        .source_commit = fixture.source_commit,
+        .output = output,
+    }, &diagnostic);
+}
+
+fn verifyGalleryMetadata(subject: *const Tree, key: []const u8) !void {
+    const metadata = try subject.galleryMetadataPath(key);
+    defer allocator.free(metadata);
+    const manifest = try subject.manifestPath(key);
+    defer allocator.free(manifest);
+    const asset = try subject.assetPath(key);
+    defer allocator.free(asset);
+    var diagnostic: support.Diagnostic = .{};
+    try gallery_metadata.verify(allocator, io, .{
+        .metadata = metadata,
+        .manifest = manifest,
+        .asset = asset,
+        .key = key,
+        .source_commit = fixture.source_commit,
+    }, &diagnostic);
+}
+
+fn expectGalleryMetadataRejected(
+    subject: *const Tree,
+    key: []const u8,
+) !void {
+    try std.testing.expectError(
+        error.Failed,
+        verifyGalleryMetadata(subject, key),
+    );
+}
+
+test "gallery metadata binds all four Ubuntu release candidates" {
+    var subject = try tree();
+    defer subject.deinit();
+    for (contracts.release_order) |key| {
+        try fixture.makeBundle(&subject, key, .{});
+        try generateGalleryMetadata(&subject, key);
+        try verifyGalleryMetadata(&subject, key);
+
+        const path = try subject.galleryMetadataPath(key);
+        defer allocator.free(path);
+        var metadata = try fixture.read(allocator, io, path);
+        defer metadata.deinit();
+        const object = metadata.value.object;
+        const entry = contracts.lookup(key).?;
+        try std.testing.expectEqual(
+            gallery_metadata.schema,
+            object.get("schema").?.integer,
+        );
+        try std.testing.expectEqualStrings(
+            contracts.galleryMetadataName(key).?,
+            object.get("metadata_name").?.string,
+        );
+        try std.testing.expectEqualStrings(
+            contracts.azureArchitecture(entry.architecture).?,
+            object.get("image_definition").?.object.get("architecture").?.string,
+        );
+        try std.testing.expectEqualStrings(
+            "TrustedLaunchSupported",
+            object.get("image_definition").?.object
+                .get("features").?.array.items[0].object.get("value").?.string,
+        );
+        const uefi_db = object.get("signing").?.object.get("uefi_db").?.object;
+        try std.testing.expectEqualStrings(
+            "260101000000Z",
+            uefi_db.get("not_before").?.string,
+        );
+        try std.testing.expectEqualStrings(
+            "360101000000Z",
+            uefi_db.get("not_after").?.string,
+        );
+    }
+}
+
+test "gallery metadata rejects independent image and security substitutions" {
+    const key = "aarch64-core";
+    const cases = [_]struct {
+        path: []const Step,
+        value: []const u8,
+    }{
+        .{
+            .path = &.{.{ .key = "architecture" }},
+            .value = "x86_64",
+        },
+        .{
+            .path = &.{
+                .{ .key = "image" },
+                .{ .key = "source_commit" },
+            },
+            .value = "b" ** 40,
+        },
+        .{
+            .path = &.{
+                .{ .key = "image_definition" },
+                .{ .key = "architecture" },
+            },
+            .value = "x64",
+        },
+        .{
+            .path = &.{
+                .{ .key = "image_definition" },
+                .{ .key = "features" },
+                .{ .index = 0 },
+                .{ .key = "value" },
+            },
+            .value = "ConfidentialVMSupported",
+        },
+        .{
+            .path = &.{
+                .{ .key = "signing" },
+                .{ .key = "fallback_uki" },
+                .{ .key = "sha256" },
+            },
+            .value = "b" ** 64,
+        },
+        .{
+            .path = &.{
+                .{ .key = "signing" },
+                .{ .key = "artifact_signing" },
+                .{ .key = "certificate_sha256" },
+            },
+            .value = "b" ** 64,
+        },
+        .{
+            .path = &.{
+                .{ .key = "signing" },
+                .{ .key = "uefi_db" },
+                .{ .key = "certificate_sha256" },
+            },
+            .value = "b" ** 64,
+        },
+        .{
+            .path = &.{
+                .{ .key = "signing" },
+                .{ .key = "uefi_db" },
+                .{ .key = "certificate_der_base64" },
+            },
+            .value = "Y2hhbmdlZA==",
+        },
+        .{
+            .path = &.{
+                .{ .key = "signing" },
+                .{ .key = "uefi_db" },
+                .{ .key = "not_after" },
+            },
+            .value = "370101000000Z",
+        },
+        .{
+            .path = &.{
+                .{ .key = "provenance" },
+                .{ .key = "digest" },
+            },
+            .value = "b" ** 64,
+        },
+    };
+    for (cases) |case| {
+        var subject = try tree();
+        defer subject.deinit();
+        try fixture.makeBundle(&subject, key, .{});
+        try generateGalleryMetadata(&subject, key);
+        const path = try subject.galleryMetadataPath(key);
+        defer allocator.free(path);
+        try fixture.patchString(
+            allocator,
+            io,
+            path,
+            case.path,
+            case.value,
+        );
+        try expectGalleryMetadataRejected(&subject, key);
+    }
+}
+
+test "gallery metadata rejects changed image bytes and sizes" {
+    const key = "x86_64-full";
+    var changed_bytes = try tree();
+    defer changed_bytes.deinit();
+    try fixture.makeBundle(&changed_bytes, key, .{});
+    try generateGalleryMetadata(&changed_bytes, key);
+    const asset = try changed_bytes.assetPath(key);
+    defer allocator.free(asset);
+    try Dir.cwd().writeFile(io, .{ .sub_path = asset, .data = "changed\n" });
+    try expectGalleryMetadataRejected(&changed_bytes, key);
+
+    var changed_size = try tree();
+    defer changed_size.deinit();
+    try fixture.makeBundle(&changed_size, key, .{});
+    try generateGalleryMetadata(&changed_size, key);
+    const metadata = try changed_size.galleryMetadataPath(key);
+    defer allocator.free(metadata);
+    try fixture.patchInteger(
+        allocator,
+        io,
+        metadata,
+        &.{ .{ .key = "image" }, .{ .key = "bytes" } },
+        99,
+    );
+    try expectGalleryMetadataRejected(&changed_size, key);
+}
+
+test "gallery metadata renders parameterized Azure definition and version inputs" {
+    const key = "aarch64-core";
+    var subject = try tree();
+    defer subject.deinit();
+    try fixture.makeBundle(&subject, key, .{});
+    try generateGalleryMetadata(&subject, key);
+    const metadata = try subject.galleryMetadataPath(key);
+    defer allocator.free(metadata);
+    const asset = try subject.assetPath(key);
+    defer allocator.free(asset);
+    const definition_path = try subject.path("definition.json", .{});
+    defer allocator.free(definition_path);
+    var diagnostic: support.Diagnostic = .{};
+    try gallery_metadata.writeImageDefinition(
+        allocator,
+        io,
+        metadata,
+        asset,
+        definition_path,
+        &diagnostic,
+    );
+    var definition = try fixture.read(allocator, io, definition_path);
+    defer definition.deinit();
+    try std.testing.expectEqualStrings(
+        "Arm64",
+        definition.value.object.get("architecture").?.string,
+    );
+
+    const request_path = try subject.path("version-request.json", .{});
+    defer allocator.free(request_path);
+    try gallery_metadata.writeGalleryVersionRequest(allocator, io, .{
+        .metadata = metadata,
+        .asset = asset,
+        .location = "eastus2",
+        .disk_id = "/subscriptions/test/resourceGroups/rg/providers/Microsoft.Compute/disks/os",
+        .replication_mode = "Full",
+        .regional_replica_count = 3,
+        .storage_account_type = "Standard_ZRS",
+        .output = request_path,
+    }, &diagnostic);
+    var request = try fixture.read(allocator, io, request_path);
+    defer request.deinit();
+    const publishing = request.value.object.get("properties").?.object
+        .get("publishingProfile").?.object;
+    try std.testing.expectEqualStrings(
+        "Full",
+        publishing.get("replicationMode").?.string,
+    );
+    const region = publishing.get("targetRegions").?.array.items[0].object;
+    try std.testing.expectEqual(@as(i64, 3), region.get("regionalReplicaCount").?.integer);
+    try std.testing.expectEqualStrings(
+        "Standard_ZRS",
+        region.get("storageAccountType").?.string,
+    );
 }
 
 fn makeReleaseEvidence(subject: *const Tree) !void {

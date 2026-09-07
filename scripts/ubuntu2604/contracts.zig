@@ -68,6 +68,24 @@ pub fn lookup(key: []const u8) ?Candidate {
     return null;
 }
 
+pub fn galleryMetadataName(key: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, key, "x86_64-full"))
+        return "Ubuntu-26.04-x86_64.gallery.json";
+    if (std.mem.eql(u8, key, "aarch64-full"))
+        return "Ubuntu-26.04-aarch64.gallery.json";
+    if (std.mem.eql(u8, key, "x86_64-core"))
+        return "Ubuntu-26.04-x86_64.core.gallery.json";
+    if (std.mem.eql(u8, key, "aarch64-core"))
+        return "Ubuntu-26.04-aarch64.core.gallery.json";
+    return null;
+}
+
+pub fn azureArchitecture(architecture: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, architecture, "x86_64")) return "x64";
+    if (std.mem.eql(u8, architecture, "aarch64")) return "Arm64";
+    return null;
+}
+
 /// Whether `key` is one of the four published candidate keys.
 pub fn isReleaseKey(key: []const u8) bool {
     for (release_order) |entry| {

@@ -24,6 +24,7 @@ pub const commands = @import("ubuntu2604/commands.zig");
 pub const contracts = @import("ubuntu2604/contracts.zig");
 pub const documents = @import("ubuntu2604/documents.zig");
 pub const execution = @import("ubuntu2604/execution.zig");
+pub const gallery_metadata = @import("ubuntu2604/gallery_metadata.zig");
 pub const keys = @import("ubuntu2604/keys.zig");
 pub const provenance = @import("ubuntu2604/provenance.zig");
 pub const runtime_contract = @import("ubuntu2604_runtime_contract");
@@ -53,6 +54,10 @@ const usage_text =
     \\  azure-contracts               print the Azure contracts for a flavor
     \\  azure-result                  record an Azure acceptance result
     \\  verify-azure-result           re-verify an Azure acceptance result
+    \\  gallery-metadata              generate portable Compute Gallery metadata
+    \\  verify-gallery-metadata       verify metadata against the exact candidate
+    \\  gallery-image-definition      write the portable image-definition contract
+    \\  gallery-version-request       render a parameterized image-version request
     \\  stage                         stage the exact published asset set
     \\  verify-image-info             check a miz image-info document
     \\  size-inventory-verify         check a measured size-inventory document
@@ -373,6 +378,89 @@ fn dispatch(
         return;
     }
 
+    if (std.mem.eql(u8, command, "gallery-metadata")) {
+        var options = try cli.parse(allocator, argv, &.{
+            "--manifest",
+            "--asset",
+            "--key",
+            "--source-commit",
+            "--output",
+        });
+        defer options.deinit();
+        return gallery_metadata.generate(allocator, io, .{
+            .manifest = try options.require("--manifest"),
+            .asset = try options.require("--asset"),
+            .key = try options.require("--key"),
+            .source_commit = try options.require("--source-commit"),
+            .output = try options.require("--output"),
+        }, diagnostic);
+    }
+
+    if (std.mem.eql(u8, command, "verify-gallery-metadata")) {
+        var options = try cli.parse(allocator, argv, &.{
+            "--metadata",
+            "--manifest",
+            "--asset",
+            "--key",
+            "--source-commit",
+        });
+        defer options.deinit();
+        try gallery_metadata.verify(allocator, io, .{
+            .metadata = try options.require("--metadata"),
+            .manifest = try options.require("--manifest"),
+            .asset = try options.require("--asset"),
+            .key = try options.require("--key"),
+            .source_commit = try options.require("--source-commit"),
+        }, diagnostic);
+        try context.out.writeAll("valid\n");
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "gallery-image-definition")) {
+        var options = try cli.parse(
+            allocator,
+            argv,
+            &.{ "--metadata", "--asset", "--output" },
+        );
+        defer options.deinit();
+        return gallery_metadata.writeImageDefinition(
+            allocator,
+            io,
+            try options.require("--metadata"),
+            try options.require("--asset"),
+            try options.require("--output"),
+            diagnostic,
+        );
+    }
+
+    if (std.mem.eql(u8, command, "gallery-version-request")) {
+        var options = try cli.parse(allocator, argv, &.{
+            "--metadata",
+            "--asset",
+            "--location",
+            "--disk-id",
+            "--replication-mode",
+            "--regional-replica-count",
+            "--storage-account-type",
+            "--output",
+        });
+        defer options.deinit();
+        return gallery_metadata.writeGalleryVersionRequest(allocator, io, .{
+            .metadata = try options.require("--metadata"),
+            .asset = try options.require("--asset"),
+            .location = try options.require("--location"),
+            .disk_id = try options.require("--disk-id"),
+            .replication_mode = try options.require("--replication-mode"),
+            .regional_replica_count = try options.requireInteger(
+                "--regional-replica-count",
+            ),
+            .storage_account_type = try options.require(
+                "--storage-account-type",
+            ),
+            .output = try options.require("--output"),
+        }, diagnostic);
+    }
+
     if (std.mem.eql(u8, command, "stage")) {
         var options = try cli.parse(allocator, argv, &.{
             "--candidates",
@@ -423,6 +511,7 @@ test {
     _ = @import("ubuntu2604/disk_geometry.zig");
     _ = @import("ubuntu2604/documents.zig");
     _ = @import("ubuntu2604/download.zig");
+    _ = @import("ubuntu2604/gallery_metadata.zig");
     _ = @import("ubuntu2604/keys.zig");
     _ = @import("ubuntu2604/provenance.zig");
     _ = @import("ubuntu2604/size_budget.zig");

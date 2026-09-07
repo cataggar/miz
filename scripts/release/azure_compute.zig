@@ -138,29 +138,36 @@ pub fn jsonEqual(left: Value, right: Value) bool {
     };
 }
 
+pub const GalleryVersionOptions = struct {
+    location: []const u8,
+    disk_id: []const u8,
+    replication_mode: []const u8 = "Shallow",
+    regional_replica_count: i64 = 1,
+    storage_account_type: []const u8 = "Standard_LRS",
+};
+
 /// Build the image-version request shared by secure gallery profiles.
 /// `security_profile` is null for profiles that retain the source image's
 /// stock UEFI trust and a JSON object for profiles that customize it.
-pub fn galleryVersionRequest(
+pub fn galleryVersionRequestWithOptions(
     allocator: Allocator,
-    location: []const u8,
-    disk_id: []const u8,
+    options: GalleryVersionOptions,
     security_profile: ?Value,
 ) !Value {
     const publishing = try object(allocator, &.{
-        .{ "replicationMode", string("Shallow") },
+        .{ "replicationMode", string(options.replication_mode) },
         .{ "targetRegions", try array(allocator, &.{
             try object(allocator, &.{
-                .{ "name", string(location) },
-                .{ "regionalReplicaCount", integer(1) },
-                .{ "storageAccountType", string("Standard_LRS") },
+                .{ "name", string(options.location) },
+                .{ "regionalReplicaCount", integer(options.regional_replica_count) },
+                .{ "storageAccountType", string(options.storage_account_type) },
             }),
         }) },
     });
     const storage = try object(allocator, &.{
         .{ "osDiskImage", try object(allocator, &.{
             .{ "source", try object(allocator, &.{
-                .{ "id", string(disk_id) },
+                .{ "id", string(options.disk_id) },
             }) },
         }) },
     });
@@ -176,9 +183,22 @@ pub fn galleryVersionRequest(
             .{ "storageProfile", storage },
         });
     return object(allocator, &.{
-        .{ "location", string(location) },
+        .{ "location", string(options.location) },
         .{ "properties", properties },
     });
+}
+
+pub fn galleryVersionRequest(
+    allocator: Allocator,
+    location: []const u8,
+    disk_id: []const u8,
+    security_profile: ?Value,
+) !Value {
+    return galleryVersionRequestWithOptions(
+        allocator,
+        .{ .location = location, .disk_id = disk_id },
+        security_profile,
+    );
 }
 
 pub fn validateVmSecurityProfile(
