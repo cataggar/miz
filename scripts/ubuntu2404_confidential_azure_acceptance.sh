@@ -6,14 +6,11 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$script_dir/azure_trusted_launch_lib.sh"
 # shellcheck source=scripts/azure_confidential_vm_lib.sh
 source "$script_dir/azure_confidential_vm_lib.sh"
+# shellcheck source=scripts/ubuntu2404_confidential_guest_acceptance_lib.sh
+source "$script_dir/ubuntu2404_confidential_guest_acceptance_lib.sh"
 
 RELEASE_TOOL=${UBUNTU2404_CONFIDENTIAL_RELEASE_TOOL:-zig-out/bin/ubuntu2404_confidential_release}
 ATTESTATION_ENDPOINT=${ATTESTATION_ENDPOINT:-https://sharedeus2.eus2.attest.azure.net}
-attestation_package_url=https://packages.microsoft.com/repos/azurecore/pool/main/a/azguestattestation1/azguestattestation1_1.0.5_amd64.deb
-attestation_package_sha256=791dd441f84fca9ad3f9c46263a919ce50c987cfc4a80faf2f9d6bfc94d71815
-attestation_client_url=https://raw.githubusercontent.com/Azure/confidential-computing-cvm-guest-attestation/09bc7bd670d52321760e640486ab5d556b6b5285/cvm-platform-checker-exe/Linux/cvm_linux_attestation_client.zip
-attestation_client_archive_sha256=e046f80a571d73d59494a0c76b3c6277d5b04fc35cf6822901c20052d0487c2f
-attestation_client_sha256=a2aef93976948443ac981e18a260c2ae9f736368f8713b875916703ab37e9bc6
 
 command_name=${1:-run}
 if (( $# > 1 )); then
@@ -279,6 +276,7 @@ cleanup_on_exit() {
   local status=$?
   trap - EXIT INT TERM
   if [[ "$status" -ne 0 ]]; then collect_failure_diagnostics; fi
+  ubuntu2404_confidential_guest_cleanup_validation_files || status=1
   rm -f "$vhd" "$private_key" "$private_key.pub"
   cleanup_group || status=1
   exit "$status"
@@ -456,147 +454,16 @@ public_ip=$(az vm show \
   --query publicIps \
   --output tsv)
 [[ "$public_ip" =~ ^[0-9a-fA-F:.]+$ ]]
-ssh_options=(
-  -i "$private_key"
-  -o BatchMode=yes
-  -o ConnectTimeout=10
-  -o StrictHostKeyChecking=accept-new
-  -o UserKnownHostsFile="$RESULT_DIR/known_hosts"
-)
-ssh_target="$admin_username@$public_ip"
-
-wait_for_ssh() {
-  for _ in {1..180}; do
-    if ssh "${ssh_options[@]}" "$ssh_target" true >/dev/null 2>&1; then
-      return
-    fi
-    sleep 10
-  done
-  echo "::error::SSH did not become ready"
-  return 1
-}
-wait_for_ssh
-
-ssh "${ssh_options[@]}" "$ssh_target" \
-  "/usr/bin/bash -s -- '$virtual_size'" <<'GUEST'
-set -Eeuo pipefail
-expected_virtual_size=$1
-test "$(uname -m)" = x86_64
-grep -Fxq 'VERSION_ID="24.04"' /etc/os-release
-sudo -n cloud-init status --wait >/dev/null
-systemctl is-active --quiet walinuxagent.service
-test -s /etc/machine-id
-test -s /etc/ssh/ssh_host_ed25519_key
-test -d /sys/firmware/efi
-test -c /dev/tpmrm0
-sudo -n mokutil --sb-state | grep -Fqx 'SecureBoot enabled'
-root_source=$(findmnt -n -o SOURCE /)
-root_disk=$(lsblk -n -s -o NAME,TYPE "$root_source" | awk '$2 == "disk" {print "/dev/"$1; exit}')
-test -b "$root_disk"
-root_bytes=$(lsblk -b -dn -o SIZE "$root_disk")
-test "$root_bytes" -ge "$expected_virtual_size"
-GUEST
-
-curl --fail --silent --show-error --location \
-  --output "$RESULT_DIR/azguestattestation1.deb" \
-  "$attestation_package_url"
-echo "$attestation_package_sha256  $RESULT_DIR/azguestattestation1.deb" |
-  sha256sum --check --status
-curl --fail --silent --show-error --location \
-  --output "$RESULT_DIR/attestation-client.zip" \
-  "$attestation_client_url"
-echo "$attestation_client_archive_sha256  $RESULT_DIR/attestation-client.zip" |
-  sha256sum --check --status
-unzip -q "$RESULT_DIR/attestation-client.zip" -d "$RESULT_DIR/attestation-client"
-attestation_client="$RESULT_DIR/attestation-client/cvm_linux_attestation_client/AttestationClient"
-echo "$attestation_client_sha256  $attestation_client" | sha256sum --check --status
-chmod 0755 "$attestation_client"
-scp "${ssh_options[@]}" \
-  "$RESULT_DIR/azguestattestation1.deb" \
-  "$attestation_client" \
-  "$ssh_target:/tmp/"
-
+ubuntu2404_confidential_guest_configure_ssh \
+  "$private_key" "$RESULT_DIR/known_hosts" "$admin_username" "$public_ip"
 nonce=$(openssl rand -hex 32)
-ssh "${ssh_options[@]}" "$ssh_target" \
-  "/usr/bin/bash -s -- '$ATTESTATION_ENDPOINT/' '$nonce'" \
-  >"$attestation_token" 2>"$RESULT_DIR/attestation-client.stderr" <<'GUEST'
-set -Eeuo pipefail
-endpoint=$1
-nonce=$2
-sudo -n dpkg -i /tmp/azguestattestation1.deb >/dev/null
-sudo -n chmod 0755 /tmp/AttestationClient
-sudo -n /tmp/AttestationClient -a "$endpoint" -n "$nonce" -o TOKEN
-GUEST
-test -s "$attestation_token"
-
-curl --fail --silent --show-error \
-  --output "$openid_json" \
-  "$ATTESTATION_ENDPOINT/.well-known/openid-configuration"
-jwks_uri=$(jq -er '.jwks_uri | select(type == "string")' "$openid_json")
-test "$jwks_uri" = "$ATTESTATION_ENDPOINT/certs"
-curl --fail --silent --show-error --output "$jwks_json" "$jwks_uri"
-
-ssh "${ssh_options[@]}" "$ssh_target" \
-  'curl --fail --silent --show-error -H Metadata:true "http://169.254.169.254/metadata/instance?api-version=2025-04-07"' \
-  >"$guest_imds"
-guest_vm_id=$(jq -er '.compute.vmId | select(type == "string")' "$guest_imds")
-test "${guest_vm_id,,}" = "${azure_vm_id,,}"
-
-data_disk_size_gib=4
-az disk create \
-  --resource-group "$resource_group" \
-  --name "$data_disk_name" \
-  --location "$AZURE_LOCATION" \
-  --size-gb "$data_disk_size_gib" \
-  --sku Standard_LRS \
-  --output none
-az vm disk attach \
-  --resource-group "$resource_group" \
-  --vm-name "$vm_name" \
-  --name "$data_disk_name" \
-  --lun 0 \
-  --output none
-data_marker_sha256=$(
-  ssh "${ssh_options[@]}" "$ssh_target" \
-    "/usr/bin/bash -s -- '$nonce'" <<'GUEST'
-set -Eeuo pipefail
-nonce=$1
-for _ in {1..60}; do
-  test -b /dev/disk/azure/scsi1/lun0 && break
-  sleep 2
-done
-disk=$(readlink -f /dev/disk/azure/scsi1/lun0)
-test -b "$disk"
-sudo -n mkfs.ext4 -q "$disk"
-sudo -n mkdir -p /mnt/miz-acceptance
-uuid=$(sudo -n blkid -s UUID -o value "$disk")
-echo "UUID=$uuid /mnt/miz-acceptance ext4 defaults,nofail 0 2" |
-  sudo -n tee -a /etc/fstab >/dev/null
-sudo -n mount /mnt/miz-acceptance
-printf '%s' "$nonce" | sudo -n tee /mnt/miz-acceptance/nonce >/dev/null
-sudo -n sha256sum /mnt/miz-acceptance/nonce | awk '{print $1}'
-GUEST
-)
-[[ "$data_marker_sha256" =~ ^[0-9a-f]{64}$ ]]
-old_boot_id=$(ssh "${ssh_options[@]}" "$ssh_target" cat /proc/sys/kernel/random/boot_id)
-ssh "${ssh_options[@]}" "$ssh_target" 'sudo -n reboot' >/dev/null 2>&1 || true
-for _ in {1..180}; do
-  new_boot_id=$(
-    ssh "${ssh_options[@]}" "$ssh_target" \
-      cat /proc/sys/kernel/random/boot_id 2>/dev/null || true
-  )
-  if [[ -n "$new_boot_id" && "$new_boot_id" != "$old_boot_id" ]]; then break; fi
-  sleep 10
-done
-[[ -n ${new_boot_id:-} && "$new_boot_id" != "$old_boot_id" ]]
-test "$(
-  ssh "${ssh_options[@]}" "$ssh_target" \
-    'sudo -n sha256sum /mnt/miz-acceptance/nonce' |
-    awk '{print $1}'
-)" = "$data_marker_sha256"
-ssh "${ssh_options[@]}" "$ssh_target" \
-  'systemctl is-active --quiet walinuxagent.service && sudo -n mokutil --sb-state' |
-  grep -Fqx 'SecureBoot enabled'
+ubuntu2404_confidential_guest_final_acceptance \
+  "$virtual_size" "$azure_vm_id" "$guest_imds" \
+  "$ATTESTATION_ENDPOINT" "$nonce" "$RESULT_DIR" \
+  "$attestation_token" "$openid_json" "$jwks_json" \
+  "$RESULT_DIR/attestation-client.stderr" \
+  "$resource_group" "$vm_name" "$data_disk_name" "$AZURE_LOCATION"
+guest_vm_id=$UBUNTU2404_CONFIDENTIAL_GUEST_VM_ID
 
 now=$(date +%s)
 "$RELEASE_TOOL" acceptance-result \
