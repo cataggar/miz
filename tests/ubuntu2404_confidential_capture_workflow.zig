@@ -11,6 +11,8 @@ const github_policy_path =
     "scripts/ubuntu2404_confidential_github_policy.sh";
 const provenance_tag_path =
     "scripts/ubuntu2404_confidential_provenance_tag.sh";
+const publish_release_path =
+    "scripts/ubuntu2404_confidential_publish_release.sh";
 const guide_path = "doc/azure-confidential-vm.md";
 const max_source_bytes = 4 * 1024 * 1024;
 const max_output_bytes = 1024 * 1024;
@@ -230,7 +232,7 @@ test "approved dispatch checkout stays fixed and rejects moved main" {
     );
 }
 
-test "protected GitHub App tokens gate administration reads and retained workflow commits" {
+test "policy and publication GitHub App tokens stay separated" {
     const allocator = std.testing.allocator;
     const workflow = try readTracked(allocator, workflow_path);
     defer allocator.free(workflow);
@@ -249,19 +251,20 @@ test "protected GitHub App tokens gate administration reads and retained workflo
     try expectCount(
         workflow,
         "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349",
-        3,
+        4,
     );
-    try expectCount(workflow, "secrets.CAPTURE_GITHUB_APP_ID", 6);
-    try expectCount(workflow, "secrets.CAPTURE_GITHUB_APP_PRIVATE_KEY", 3);
-    try expectCount(workflow, "permission-administration: read", 3);
+    try expectCount(workflow, "secrets.CAPTURE_GITHUB_APP_ID", 7);
+    try expectCount(workflow, "secrets.CAPTURE_GITHUB_APP_PRIVATE_KEY", 4);
+    try expectAbsent(workflow, "permission-administration: read");
+    try expectCount(workflow, "permission-administration: write", 3);
     try expectCount(workflow, "permission-actions: read", 3);
-    try expectAbsent(workflow, "permission-contents: read");
-    try expectCount(workflow, "permission-contents: write", 3);
+    try expectCount(workflow, "permission-contents: read", 3);
+    try expectCount(workflow, "permission-contents: write", 1);
     try expectCount(workflow, "permission-workflows: write", 1);
     try expectAbsent(workflow, "\n      contents: write\n");
 
-    for ([_][]const u8{ prepare, capture, publication }) |job| {
-        const token = try indexOf(job, "actions/create-github-app-token@");
+    for ([_][]const u8{ prepare, capture }) |job| {
+        const token = try indexOf(job, "id: github_policy_token");
         const immutable = try indexOf(
             job,
             "repos/$GITHUB_REPOSITORY/immutable-releases",
@@ -269,24 +272,54 @@ test "protected GitHub App tokens gate administration reads and retained workflo
         try std.testing.expect(token < immutable);
         try expectContains(
             job,
-            "GH_TOKEN: ${{ steps.github_app_token.outputs.token }}",
+            "GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}",
         );
     }
     try expectContains(
         prepare,
         "environment: ubuntu2404-confidential-capture",
     );
+    const policy_token = try section(
+        publication,
+        "- name: Mint protected provenance policy token",
+        "- name: Mint isolated provenance publication token",
+    );
+    const publication_token = try section(
+        publication,
+        "- name: Mint isolated provenance publication token",
+        "- name: Check out exact approved publication verifier",
+    );
+    try expectContains(policy_token, "permission-administration: write");
+    try expectContains(policy_token, "permission-actions: read");
+    try expectContains(policy_token, "permission-contents: read");
+    try expectAbsent(policy_token, "permission-contents: write");
+    try expectAbsent(policy_token, "permission-workflows: write");
+    try expectContains(publication_token, "permission-contents: write");
+    try expectContains(publication_token, "permission-workflows: write");
+    try expectAbsent(publication_token, "permission-administration:");
+    try expectAbsent(publication_token, "permission-actions:");
     try expectContains(
         publication,
-        "permission-contents: write\n          permission-workflows: write",
+        "POLICY_GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}",
     );
+    try expectContains(
+        publication,
+        "PUBLICATION_GH_TOKEN: ${{ steps.github_publication_token.outputs.token }}",
+    );
+    try expectContains(
+        publication,
+        "github-token: ${{ steps.github_policy_token.outputs.token }}",
+    );
+    try expectCount(publication, "GH_TOKEN=\"$POLICY_GH_TOKEN\"", 12);
+    try expectCount(publication, "GH_TOKEN=\"$PUBLICATION_GH_TOKEN\"", 8);
     try expectAbsent(prepare, "gh api --method POST");
     try expectAbsent(prepare, "gh api --method PATCH");
     try expectAbsent(capture, "gh api --method POST");
     try expectAbsent(capture, "gh api --method PATCH");
+    try expectAbsent(publication, "GH_TOKEN=\"$POLICY_GH_TOKEN\" gh api --method");
 }
 
-test "ruleset verifier uses current REST shapes and exact App bypass" {
+test "repository writer boundary and ruleset policy fail closed" {
     const allocator = std.testing.allocator;
     const workflow = try readTracked(allocator, workflow_path);
     defer allocator.free(workflow);
@@ -296,9 +329,22 @@ test "ruleset verifier uses current REST shapes and exact App bypass" {
     try expectCount(
         workflow,
         "scripts/ubuntu2404_confidential_github_policy.sh",
-        4,
+        7,
     );
     for ([_][]const u8{
+        "repos/$GITHUB_REPOSITORY",
+        ".full_name == $repository",
+        ".login == $owner and .type == \"User\"",
+        "((.organization? // null) == null)",
+        "collaborators?affiliation=all&per_page=100",
+        ".permissions.push or .permissions.maintain or .permissions.admin",
+        "repos/$GITHUB_REPOSITORY/installations?per_page=100",
+        ".permissions.administration == \"write\"",
+        ".permissions.contents == \"write\"",
+        ".permissions.workflows == \"write\"",
+        "actions/permissions/workflow",
+        ".default_workflow_permissions == \"read\"",
+        ".can_approve_pull_request_reviews == false",
         "rulesets?includes_parents=true&targets=tag&per_page=100",
         "rulesets/$ruleset_id?includes_parents=true",
         ".target == \"tag\"",
@@ -330,6 +376,65 @@ test "ruleset verifier uses current REST shapes and exact App bypass" {
         \\  [[ "$argument" == repos/* ]] && endpoint=$argument
         \\done
         \\printf '%s\n' "$endpoint" >>"$GH_LOG"
+        \\if [[ "$endpoint" == repos/cataggar/miz ]]; then
+        \\  owner_type=User
+        \\  owner_login=cataggar
+        \\  organization=null
+        \\  [[ "${GH_MODE:-valid}" == org-repository ]] && {
+        \\    owner_type=Organization
+        \\    organization='{"login":"cataggar"}'
+        \\  }
+        \\  [[ "${GH_MODE:-valid}" == wrong-owner ]] && owner_login=other
+        \\  jq -n \
+        \\    --arg owner_type "$owner_type" \
+        \\    --arg owner_login "$owner_login" \
+        \\    --argjson organization "$organization" \
+        \\    '{full_name:"cataggar/miz",
+        \\      owner:{login:$owner_login,type:$owner_type},
+        \\      organization:$organization}'
+        \\  exit
+        \\fi
+        \\if [[ "$endpoint" == *'/collaborators?'* ]]; then
+        \\  owner='{"login":"cataggar","permissions":{"pull":true,"push":true,"maintain":true,"admin":true}}'
+        \\  case "${GH_MODE:-valid}" in
+        \\    extra-writer)
+        \\      printf '%s\n' "[[$owner,{\"login\":\"other\",\"permissions\":{\"pull\":true,\"push\":true,\"maintain\":false,\"admin\":false}}]]"
+        \\      ;;
+        \\    missing-collaborator-permissions)
+        \\      printf '%s\n' '[[{"login":"cataggar"}]]'
+        \\      ;;
+        \\    *)
+        \\      printf '%s\n' "[[$owner]]"
+        \\      ;;
+        \\  esac
+        \\  exit
+        \\fi
+        \\if [[ "$endpoint" == *'/installations?'* ]]; then
+        \\  publisher='{"app_id":1234,"permissions":{"administration":"write","actions":"read","contents":"write","workflows":"write"}}'
+        \\  case "${GH_MODE:-valid}" in
+        \\    extra-writer-app)
+        \\      printf '%s\n' "[[$publisher,{\"app_id\":5678,\"permissions\":{\"contents\":\"write\"}}]]"
+        \\      ;;
+        \\    missing-installation-permissions)
+        \\      printf '%s\n' '[[{"app_id":1234}]]'
+        \\      ;;
+        \\    wrong-publisher-permissions)
+        \\      printf '%s\n' '[[{"app_id":1234,"permissions":{"administration":"read","contents":"write","workflows":"write"}}]]'
+        \\      ;;
+        \\    *)
+        \\      printf '%s\n' "[[$publisher]]"
+        \\      ;;
+        \\  esac
+        \\  exit
+        \\fi
+        \\if [[ "$endpoint" == *'/actions/permissions/workflow' ]]; then
+        \\  if [[ "${GH_MODE:-valid}" == unsafe-workflow-default ]]; then
+        \\    printf '%s\n' '{"default_workflow_permissions":"write","can_approve_pull_request_reviews":true}'
+        \\  else
+        \\    printf '%s\n' '{"default_workflow_permissions":"read","can_approve_pull_request_reviews":false}'
+        \\  fi
+        \\  exit
+        \\fi
         \\if [[ "$endpoint" == *'/rulesets?'* ]]; then
         \\  case "${GH_MODE:-valid}" in
         \\    missing) printf '%s\n' '[[]]' ;;
@@ -341,44 +446,84 @@ test "ruleset verifier uses current REST shapes and exact App bypass" {
         \\source_type=Repository
         \\enforcement=active
         \\bypass='[{"actor_id":1234,"actor_type":"Integration","bypass_mode":"always"}]'
-        \\conditions='{"ref_name":{"include":["refs/tags/miz-provenance/ubuntu2404-confidential-cvm/**"],"exclude":[]}}'
+        \\conditions='{"ref_name":{"include":["refs/tags/miz-provenance/ubuntu2404-confidential-cvm/*/*/*"],"exclude":[]}}'
         \\rules='[{"type":"creation"},{"type":"update"},{"type":"deletion"}]'
         \\case "${GH_MODE:-valid}" in
         \\  parent) source_type=Organization ;;
         \\  inactive) enforcement=evaluate ;;
         \\  wrong-app) bypass='[{"actor_id":9876,"actor_type":"Integration","bypass_mode":"always"}]' ;;
         \\  extra-bypass) bypass='[{"actor_id":1234,"actor_type":"Integration","bypass_mode":"always"},{"actor_id":6,"actor_type":"User","bypass_mode":"always"}]' ;;
-        \\  extra-condition) conditions='{"ref_name":{"include":["refs/tags/miz-provenance/ubuntu2404-confidential-cvm/**"],"exclude":[]},"repository_name":{"include":["miz"],"exclude":[]}}' ;;
+        \\  missing-bypass) bypass=missing ;;
+        \\  extra-condition) conditions='{"ref_name":{"include":["refs/tags/miz-provenance/ubuntu2404-confidential-cvm/*/*/*"],"exclude":[]},"repository_name":{"include":["miz"],"exclude":[]}}' ;;
         \\  missing-rule) rules='[{"type":"creation"},{"type":"update"}]' ;;
         \\esac
-        \\jq -n \
-        \\  --arg source_type "$source_type" \
-        \\  --arg enforcement "$enforcement" \
-        \\  --argjson bypass "$bypass" \
-        \\  --argjson conditions "$conditions" \
-        \\  --argjson rules "$rules" \
-        \\  '{id:42,name:"ubuntu2404-confidential-provenance-tags",target:"tag",
-        \\    source_type:$source_type,source:"cataggar/miz",enforcement:$enforcement,
-        \\    bypass_actors:$bypass,conditions:$conditions,rules:$rules}'
+        \\if [[ "$bypass" == missing ]]; then
+        \\  jq -n \
+        \\    --arg source_type "$source_type" \
+        \\    --arg enforcement "$enforcement" \
+        \\    --argjson conditions "$conditions" \
+        \\    --argjson rules "$rules" \
+        \\    '{id:42,name:"ubuntu2404-confidential-provenance-tags",target:"tag",
+        \\      source_type:$source_type,source:"cataggar/miz",enforcement:$enforcement,
+        \\      conditions:$conditions,rules:$rules}'
+        \\else
+        \\  jq -n \
+        \\    --arg source_type "$source_type" \
+        \\    --arg enforcement "$enforcement" \
+        \\    --argjson bypass "$bypass" \
+        \\    --argjson conditions "$conditions" \
+        \\    --argjson rules "$rules" \
+        \\    '{id:42,name:"ubuntu2404-confidential-provenance-tags",target:"tag",
+        \\      source_type:$source_type,source:"cataggar/miz",enforcement:$enforcement,
+        \\      bypass_actors:$bypass,conditions:$conditions,rules:$rules}'
+        \\fi
         \\GH
         \\chmod +x bin/gh
         \\export PATH="$PWD/bin:$PATH"
         \\export GH_LOG="$PWD/gh.log"
         \\export GH_TOKEN=fixture
         \\export GITHUB_REPOSITORY=cataggar/miz
+        \\export GITHUB_REPOSITORY_OWNER=cataggar
         \\export GH_API_VERSION=2026-03-10
         \\export EXPECTED_PUBLISHER_APP_ID=1234
         \\export PROVENANCE_RULESET_NAME=ubuntu2404-confidential-provenance-tags
-        \\export PROVENANCE_TAG_PATTERN='refs/tags/miz-provenance/ubuntu2404-confidential-cvm/**'
+        \\export PROVENANCE_TAG_PATTERN='refs/tags/miz-provenance/ubuntu2404-confidential-cvm/*/*/*'
         \\policy="$MIZ_UBUNTU2404_CONFIDENTIAL_ROOT/scripts/ubuntu2404_confidential_github_policy.sh"
         \\GH_MODE=valid "$policy" valid
+        \\grep -F 'repos/cataggar/miz/collaborators?affiliation=all&per_page=100' gh.log >/dev/null
+        \\grep -F 'repos/cataggar/miz/installations?per_page=100' gh.log >/dev/null
+        \\grep -F 'repos/cataggar/miz/actions/permissions/workflow' gh.log >/dev/null
         \\grep -F 'repos/cataggar/miz/rulesets?includes_parents=true&targets=tag&per_page=100' gh.log >/dev/null
         \\grep -F 'repos/cataggar/miz/rulesets/42?includes_parents=true' gh.log >/dev/null
-        \\for mode in missing ambiguous parent inactive wrong-app extra-bypass extra-condition missing-rule; do
+        \\for mode in \
+        \\  org-repository wrong-owner extra-writer \
+        \\  missing-collaborator-permissions extra-writer-app \
+        \\  missing-installation-permissions wrong-publisher-permissions \
+        \\  unsafe-workflow-default missing ambiguous parent inactive \
+        \\  wrong-app extra-bypass missing-bypass extra-condition missing-rule
+        \\do
         \\  if GH_MODE=$mode "$policy" "$mode" >/dev/null 2>&1; then
         \\    exit 90
         \\  fi
         \\done
+        \\
+    );
+}
+
+test "ruleset path pattern matches generated tags with FNM_PATHNAME" {
+    try runShellFixture(std.testing.allocator, "ruleset-pattern-fixture.sh",
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\pattern='refs/tags/miz-provenance/ubuntu2404-confidential-cvm/*/*/*'
+        \\old_pattern='refs/tags/miz-provenance/ubuntu2404-confidential-cvm/**'
+        \\tag='refs/tags/miz-provenance/ubuntu2404-confidential-cvm/v1.2.3/origin-123-attempt-4/tool-0123456789abcdef0123456789abcdef01234567'
+        \\ruby_command=$(command -v ruby || command -v ruby-mri)
+        \\"$ruby_command" -e '
+        \\  pattern, old_pattern, tag = ARGV
+        \\  flags = File::FNM_PATHNAME
+        \\  abort "new pattern did not match" unless File.fnmatch?(pattern, tag, flags)
+        \\  abort "old pattern unexpectedly matched" if File.fnmatch?(old_pattern, tag, flags)
+        \\' "$pattern" "$old_pattern" "$tag"
         \\
     );
 }
@@ -672,13 +817,18 @@ test "publication boundary uploads one sanitized result and never deletes target
         "gh api --method POST \"${api_headers[@]}\"",
         "repos/$GITHUB_REPOSITORY/releases/$release_id",
         "uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets",
+        "github-policy-before-draft-discovery",
+        "github-policy-before-create",
+        "github-policy-before-upload",
         "github-policy-before-publish",
         "immutable-releases-before-publish.json",
         "tag-before-publish",
         "require-lightweight \"$PROVENANCE_RELEASE_TAG\" \"$TOOL_COMMIT\"",
         "origin-run-id: $ORIGIN_RUN_ID",
         "recovery-intent-sha256: $RECOVERY_INTENT_SHA256",
-        "-F draft=false",
+        "ubuntu2404_confidential_publish_release.sh",
+        "publish-release.json",
+        ".assets[0].digest == $digest",
     }) |needle| try expectContains(workflow, needle);
     try expectAbsent(publication, "gh release create");
     try expectAbsent(publication, "gh release upload");
@@ -826,19 +976,122 @@ test "draft release creation resume and ambiguity use numeric REST identity" {
         "ubuntu2404_confidential_github_policy.sh",
         "require-absent \"$PROVENANCE_RELEASE_TAG\" \"$TOOL_COMMIT\"",
         "require-lightweight \"$PROVENANCE_RELEASE_TAG\" \"$TOOL_COMMIT\"",
-        "-F draft=false",
+        "ubuntu2404_confidential_publish_release.sh",
+        "EXPECTED_RELEASE_NOTES=\"$expected_notes\"",
+        "\"$VALIDATION_DIR/publish-release.json\"",
     }) |needle| try expectContains(publication, needle);
     try expectCount(
         publication,
         "releases/tags/$PROVENANCE_RELEASE_TAG",
         1,
     );
-    const publish = try indexOf(publication, "-F draft=false");
+    const publish = try indexOf(
+        publication,
+        "scripts/ubuntu2404_confidential_publish_release.sh",
+    );
     const tag_read = try indexOf(
         publication,
         "releases/tags/$PROVENANCE_RELEASE_TAG",
     );
     try std.testing.expect(publish < tag_read);
+    const after_publish = publication[publish..];
+    const response_digest = try indexOf(
+        after_publish,
+        ".assets[0].digest == $digest",
+    );
+    const tag_verify = try indexOf(
+        after_publish,
+        "require-lightweight \"$PROVENANCE_RELEASE_TAG\" \"$TOOL_COMMIT\"",
+    );
+    try std.testing.expect(response_digest < tag_verify);
+}
+
+test "publish route resends exact identity and keeps Latest unchanged" {
+    const allocator = std.testing.allocator;
+    const publisher_source = try readTracked(allocator, publish_release_path);
+    defer allocator.free(publisher_source);
+    for ([_][]const u8{
+        "tag_name: $tag",
+        "target_commitish: $target",
+        "name: $title",
+        "body: $notes",
+        "draft: false",
+        "prerelease: false",
+        "make_latest: \"false\"",
+        "gh api --method PATCH",
+        "repos/$GITHUB_REPOSITORY/releases/$release_id",
+    }) |needle| try expectContains(publisher_source, needle);
+
+    const root = try rootAlloc(allocator);
+    defer allocator.free(root);
+    const publisher = try std.fs.path.join(
+        allocator,
+        &.{ root, publish_release_path },
+    );
+    defer allocator.free(publisher);
+    const stat = try Dir.cwd().statFile(std.testing.io, publisher, .{});
+    try std.testing.expect(stat.permissions.toMode() & 0o111 != 0);
+    const syntax = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{ "bash", "-n", publisher },
+        .stdout_limit = .limited(max_output_bytes),
+        .stderr_limit = .limited(max_output_bytes),
+    });
+    defer allocator.free(syntax.stdout);
+    defer allocator.free(syntax.stderr);
+    try std.testing.expectEqual(@as(?u8, 0), switch (syntax.term) {
+        .exited => |code| code,
+        else => null,
+    });
+
+    try runShellFixture(allocator, "publish-release-route-fixture.sh",
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\mkdir bin
+        \\cat >bin/gh <<'GH'
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\method=GET
+        \\input=
+        \\endpoint=
+        \\while (($#)); do
+        \\  case "$1" in
+        \\    --method) method=$2; shift 2 ;;
+        \\    --input) input=$2; shift 2 ;;
+        \\    repos/*) endpoint=$1; shift ;;
+        \\    *) shift ;;
+        \\  esac
+        \\done
+        \\test "$method" = PATCH
+        \\test "$endpoint" = repos/cataggar/miz/releases/7
+        \\jq -e '
+        \\  (keys | sort) ==
+        \\    ["body","draft","make_latest","name","prerelease","tag_name","target_commitish"] and
+        \\  .tag_name == "miz-provenance/ubuntu2404-confidential-cvm/v1.2.3/origin-123-attempt-4/tool-0123456789abcdef0123456789abcdef01234567" and
+        \\  .target_commitish == "0123456789abcdef0123456789abcdef01234567" and
+        \\  .name == "Ubuntu 24.04 Confidential VM gallery provenance 1.2.3" and
+        \\  .body == "exact origin and intent" and
+        \\  .draft == false and .prerelease == false and
+        \\  (.make_latest | type) == "string" and .make_latest == "false"
+        \\' "$input" >/dev/null
+        \\printf '%s %s\n' "$method" "$endpoint" >"$GH_LOG"
+        \\cat "$input"
+        \\GH
+        \\chmod +x bin/gh
+        \\export PATH="$PWD/bin:$PATH"
+        \\export GH_LOG="$PWD/gh.log"
+        \\export GH_TOKEN=fixture
+        \\export GH_API_VERSION=2026-03-10
+        \\export GITHUB_REPOSITORY=cataggar/miz
+        \\export PROVENANCE_RELEASE_TAG=miz-provenance/ubuntu2404-confidential-cvm/v1.2.3/origin-123-attempt-4/tool-0123456789abcdef0123456789abcdef01234567
+        \\export PROVENANCE_RELEASE_TITLE='Ubuntu 24.04 Confidential VM gallery provenance 1.2.3'
+        \\export TOOL_COMMIT=0123456789abcdef0123456789abcdef01234567
+        \\export EXPECTED_RELEASE_NOTES='exact origin and intent'
+        \\publisher="$MIZ_UBUNTU2404_CONFIDENTIAL_ROOT/scripts/ubuntu2404_confidential_publish_release.sh"
+        \\"$publisher" 7 request.json response.json
+        \\cmp request.json response.json
+        \\grep -Fx 'PATCH repos/cataggar/miz/releases/7' gh.log >/dev/null
+        \\
+    );
 }
 
 test "draft release fixtures accept fresh and exact resume but reject foreign and duplicate" {
@@ -951,17 +1204,31 @@ test "operator guide fixes prerequisites RBAC and quarantine boundary" {
         "`SCRATCH_RESERVATION_TAG`",
         "`CAPTURE_GITHUB_APP_ID`",
         "`CAPTURE_GITHUB_APP_PRIVATE_KEY`",
-        "**Administration: read**",
+        "**Administration: write**",
+        "**Actions: read**",
+        "**Contents: read**",
         "**Contents: write**",
         "**Workflows: write**",
         "omits `bypass_actors` from a ruleset response",
         "GitHub App/integration ID",
         "not the App installation ID",
+        "security boundary deliberately supports only the personal repository",
+        "collaborators?affiliation=all&per_page=100",
+        "permissions.push",
+        "permissions.maintain",
+        "permissions.admin",
+        "installations?per_page=100",
+        "permissions.contents=write",
+        "actions/permissions/workflow",
+        "default_workflow_permissions=read",
+        "can_approve_pull_request_reviews=false",
+        "repository owner remains the security root",
         "`ubuntu2404-confidential-provenance-tags`",
         "GET /repos/cataggar/miz/rulesets?includes_parents=true&targets=tag",
         "\"actor_type\": \"Integration\"",
         "\"bypass_mode\": \"always\"",
-        "\"refs/tags/miz-provenance/ubuntu2404-confidential-cvm/**\"",
+        "\"refs/tags/miz-provenance/ubuntu2404-confidential-cvm/*/*/*\"",
+        "`File.fnmatch` with `FNM_PATHNAME`",
         "{\"type\": \"creation\"}",
         "{\"type\": \"deletion\"}",
         "Do not pre-create\nthe tag",
@@ -984,6 +1251,8 @@ test "operator guide fixes prerequisites RBAC and quarantine boundary" {
         "never issues a second\nPUT",
         "exact owned draft may be resumed",
         "target_commitish=TOOL_COMMIT",
+        "make_latest=\"false\"",
+        "one protected\njob",
         "object.type=commit",
         "quarantined",
         "manual",

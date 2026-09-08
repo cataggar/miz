@@ -267,22 +267,62 @@ REST API version in a protected preflight before any Azure login or mutation
 and requires `enabled=true`; it never changes the repository setting.
 `GITHUB_TOKEN` cannot receive the required repository Administration access.
 Install a dedicated GitHub App on only `cataggar/miz` with repository
-permissions **Administration: read**, **Actions: read**, **Contents: write**,
+permissions **Administration: write**, **Actions: read**, **Contents: write**,
 and **Workflows: write**. The pinned official
 `actions/create-github-app-token` action mints a fresh installation token in
-each protected job. Every token requests **Administration: read** and
-**Contents: write** because GitHub omits `bypass_actors` from a ruleset response
-for a principal without repository write access; the workflow must inspect the
-complete bypass list before Azure mutation. Only the publication token requests
-**Workflows: write**, and only the publication job contains contents mutation
-API calls. Every token is revoked at job completion. Never expose or upload
-the App private key or installation token. `CAPTURE_GITHUB_APP_ID` is the
-GitHub App/integration ID used by a ruleset `Integration` bypass actor; it is
-not the App installation ID. The accepted source release itself must
+each protected job. The three policy tokens request **Administration: write**,
+**Actions: read**, and **Contents: read**. Ruleset write access is required
+because GitHub omits `bypass_actors` from a ruleset response for callers that
+cannot write the ruleset; an omitted bypass list is a hard failure. The
+publication job separately mints a token with only **Contents: write** and
+**Workflows: write**. The Administration-write policy token performs only
+reads and artifact download; the content token performs the draft
+create/read/upload/publish operations and never performs an Administration
+query. Every token is revoked at job completion. Never expose or upload the
+App private key or an installation token. `CAPTURE_GITHUB_APP_ID` is the
+GitHub App/integration ID used by a ruleset `Integration` bypass actor and the
+single permitted content-writing installation.
+It is not the App installation ID. The accepted source release itself must
 report `immutable=true`, be published, and be neither a draft nor a
-prerelease. Its exact tag must resolve to the recorded source commit. A
-repository or token for which the setting or release immutability cannot be
-queried is not eligible for capture.
+prerelease. Its exact tag must resolve
+to the recorded source commit. A repository or token for which the setting,
+writer inventory, or release immutability cannot be queried is not eligible
+for capture.
+
+The security boundary deliberately supports only the personal repository
+`cataggar/miz`. Before Azure access and at every GitHub release mutation
+boundary, the policy token requires all of the following without changing any
+setting:
+
+- `GET /repos/cataggar/miz` reports `owner.login=cataggar`,
+  `owner.type=User`, and no organization object. Organization teams, base
+  permissions, and custom repository roles are therefore outside this bounded
+  design.
+- Paginated
+  `GET /repos/cataggar/miz/collaborators?affiliation=all&per_page=100`
+  returns complete `permissions.push`, `permissions.maintain`, and
+  `permissions.admin` booleans, with no writer except the repository owner.
+  OAuth Apps and user tokens act through one of these user identities, so the
+  trusted owner is the only unavoidable user release writer.
+- Paginated `GET /repos/cataggar/miz/installations?per_page=100` returns a
+  complete Administration inventory containing each installation's numeric
+  `app_id` and `permissions` object. Exactly one installation may report
+  `permissions.contents=write`: `CAPTURE_GITHUB_APP_ID`, which must also
+  report `permissions.administration=write` and
+  `permissions.workflows=write`. A 404, redacted/omitted permissions object,
+  duplicate App ID, or additional Contents-write App fails closed. Do not
+  dispatch on a GitHub deployment that cannot expose this complete response to
+  the Administration-write installation token.
+- `GET /repos/cataggar/miz/actions/permissions/workflow` reports
+  `default_workflow_permissions=read` and
+  `can_approve_pull_request_reviews=false`. Only workflow code accepted by the
+  trusted owner on the default branch can explicitly elevate a job token.
+
+Deploy keys cannot call the releases API and receive no tag-ruleset bypass.
+Personal repositories have no team or organization custom-role grants. The
+repository owner remains the security root and can always change collaborators,
+Apps, settings, or default-branch code; all non-owner release writers are
+prohibited rather than treated as mutually trusted.
 
 Create exactly one repository tag ruleset named
 `ubuntu2404-confidential-provenance-tags`. No organization/enterprise parent
@@ -308,7 +348,7 @@ GitHub App ID:
   "conditions": {
     "ref_name": {
       "include": [
-        "refs/tags/miz-provenance/ubuntu2404-confidential-cvm/**"
+        "refs/tags/miz-provenance/ubuntu2404-confidential-cvm/*/*/*"
       ],
       "exclude": []
     }
@@ -327,8 +367,12 @@ actor or use `pull_request`/`exempt` bypass mode. The active creation, update,
 and deletion rules make the protected publishing App the only actor that can
 create, move, or delete a matching tag. The workflow verifies the exact
 conditions, rules, and sole `Integration`/`always` bypass through
-**Administration: read** before Azure mutation and again before release
-creation and publication. It never creates or modifies the ruleset.
+**Administration: write** before Azure mutation and again before draft
+discovery, creation, asset upload, and publication. The three explicit `*`
+components match exactly the generated `vVERSION/origin-.../tool-SHA` suffix
+under `File.fnmatch` with `FNM_PATHNAME`; the former terminal `**` did not
+cross those path separators. The workflow never creates or modifies the
+ruleset.
 
 Before dispatch, provision a unique empty scratch resource group named
 `miz-u2404-cvm-capture-<32-lowercase-hex>` in the configured subscription and
@@ -527,13 +571,22 @@ when tag, tool commit, title, origin identity, recovery intent digest, and any
 staged asset all match; a foreign or mismatched draft is refused, and a
 published release is never overwritten. The final provenance tag remains
 absent while the draft and its one asset are validated. Immediately before
-publication the workflow revalidates immutable releases, the exact active tag
-ruleset, current `main`, draft identity, and tag absence. The protected
-publishing App token then changes that exact draft to published, allowing the
-GitHub release API to create a lightweight tag atomically at the draft's exact
-`target_commitish=TOOL_COMMIT`. A pre-existing tag would cause the workflow to
-abort instead; `target_commitish` is never trusted for an existing tag. After
-publication the workflow reads
+draft discovery, draft creation, asset upload, and publication, the workflow
+revalidates the personal-repository single-writer inventory and exact active
+tag ruleset. It also revalidates immutable releases, current `main`, draft
+identity, asset digest, and tag absence immediately before publication. Draft
+create, resume, upload, validation, and publication remain in one protected
+job after its single environment approval, with no later approval or wait gap.
+The isolated content token then PATCHes the exact draft while resending
+`tag_name`, `target_commitish=TOOL_COMMIT`, title, body, `prerelease=false`,
+and the string-valued `make_latest="false"` together with `draft=false`. This
+keeps the provenance-only release from replacing the repository's Latest
+release and narrows accidental identity drift; writer exclusivity remains the
+race-prevention boundary. The PATCH response must still contain the one exact
+asset digest before tag validation continues. GitHub creates a lightweight tag
+atomically at the exact target commit. A pre-existing tag would cause the
+workflow to abort instead; `target_commitish` is never trusted for an existing
+tag. After publication the workflow reads
 `GET /repos/cataggar/miz/git/ref/tags/TAG`, requires a lightweight
 `object.type=commit` ref at exactly `TOOL_COMMIT`, and then applies the
 immutable release and one-asset/hash checks.
