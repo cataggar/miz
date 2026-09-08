@@ -83,6 +83,8 @@ pub const subdirectory_overhead_slots: u32 = 3;
 /// The root directory has no `.`/`..` pair, but reserves a volume-label entry
 /// plus the terminating slot. An unlabeled format uses one fewer slot.
 pub const root_directory_overhead_slots: u32 = 2;
+/// Largest FAT cluster the native reader/writer can process.
+pub const maximum_supported_cluster_size: usize = 32 * 1024;
 
 /// What a populated volume has to hold. Stated in bytes and slots rather
 /// than in clusters because cluster size is not an input: it is chosen from
@@ -963,6 +965,9 @@ pub fn open(image: *Image, io: Io, region: Region) OpenError!FileSystem {
     if (!isSupportedBytesPerSector(bytes_per_sector)) return error.UnsupportedBytesPerSector;
     const sectors_per_cluster = boot_sector[13];
     if (!isValidSectorsPerCluster(sectors_per_cluster)) return error.InvalidSectorsPerCluster;
+    if (@as(usize, bytes_per_sector) * sectors_per_cluster > maximum_supported_cluster_size) {
+        return error.InvalidSectorsPerCluster;
+    }
 
     const reserved_sector_count = std.mem.readInt(u16, boot_sector[14..16], .little);
     const fat_count = boot_sector[16];
@@ -1045,7 +1050,7 @@ pub fn open(image: *Image, io: Io, region: Region) OpenError!FileSystem {
 
 const default_bytes_per_sector: usize = 512;
 const max_bytes_per_sector: usize = 4096;
-const max_cluster_size: usize = 32 * 1024;
+const max_cluster_size = maximum_supported_cluster_size;
 const min_fat32_clusters: u32 = 65_525;
 const max_long_name_units: usize = 255;
 const directory_entry_size: usize = 32;
@@ -2325,6 +2330,26 @@ test "format writes FAT32 boot sector, FSInfo, backup boot sector, and root FAT 
     try std.testing.expectEqual(@as(u32, 0x0FFF_FFF8), std.mem.readInt(u32, fat0[0..4], .little) & fat_entry_mask);
     try std.testing.expectEqual(fat_entry_mask, std.mem.readInt(u32, fat0[4..8], .little) & fat_entry_mask);
     try std.testing.expectEqual(fat_entry_eoc, std.mem.readInt(u32, fat0[8..12], .little) & fat_entry_mask);
+}
+
+test "open rejects clusters larger than native scanner buffers" {
+    const io = std.testing.io;
+    const path = "test-fat32-oversized-cluster.img";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var image = try Image.create(io, path, .raw, default_bytes_per_sector, .{});
+    defer image.close(io);
+    var boot_sector: [default_bytes_per_sector]u8 = [_]u8{0} ** default_bytes_per_sector;
+    boot_sector[11..13].* = std.mem.toBytes(@as(u16, default_bytes_per_sector));
+    boot_sector[13] = 128;
+    boot_sector[510] = 0x55;
+    boot_sector[511] = 0xaa;
+    try image.pwrite(io, &boot_sector, 0);
+
+    try std.testing.expectError(error.InvalidSectorsPerCluster, open(&image, io, .{
+        .offset = 0,
+        .length = 8 * 1024 * 1024 * 1024,
+    }));
 }
 
 test "format writes a Linux-visible volume label directory entry" {

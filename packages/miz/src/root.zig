@@ -90,6 +90,7 @@ pub const block_device = @import("block_device.zig");
 pub const output = @import("output.zig");
 pub const disk_assembly = @import("disk_assembly.zig");
 pub const disk_fit = @import("disk_fit.zig");
+pub const efi_application_image = @import("efi_application_image.zig");
 const image_mod = @import("image.zig");
 const size_mod = @import("size.zig");
 
