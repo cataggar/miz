@@ -92,6 +92,35 @@ pub fn stringIs(value: ?Value, expected: []const u8) bool {
     return std.mem.eql(u8, actual, expected);
 }
 
+pub fn stringIsIgnoreCase(value: ?Value, expected: []const u8) bool {
+    const actual = stringOf(value) orelse return false;
+    return std.ascii.eqlIgnoreCase(actual, expected);
+}
+
+pub fn resourceIdIs(actual: []const u8, expected: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(actual, expected);
+}
+
+pub fn resourceIdSubscription(id: []const u8) ?[]const u8 {
+    var components = std.mem.splitScalar(u8, id, '/');
+    if (!std.mem.eql(u8, components.next() orelse return null, "")) return null;
+    if (!std.ascii.eqlIgnoreCase(
+        components.next() orelse return null,
+        "subscriptions",
+    )) return null;
+    const subscription = components.next() orelse return null;
+    if (subscription.len == 0) return null;
+    return subscription;
+}
+
+pub fn resourceIdHasSubscription(
+    id: []const u8,
+    expected_subscription: []const u8,
+) bool {
+    const subscription = resourceIdSubscription(id) orelse return false;
+    return std.ascii.eqlIgnoreCase(subscription, expected_subscription);
+}
+
 pub fn isTrue(value: ?Value) bool {
     const present = value orelse return false;
     return present == .bool and present.bool;
@@ -377,4 +406,21 @@ test "profile-independent validators reject the wrong security types" {
         "vm.json: VM is not Confidential",
         diagnostic.message(),
     );
+}
+
+test "Azure resource ID subscription parsing is fail closed" {
+    try std.testing.expectEqualStrings(
+        "00000000-0000-0000-0000-000000000000",
+        resourceIdSubscription(
+            "/subscriptions/00000000-0000-0000-0000-000000000000/" ++
+                "resourceGroups/test",
+        ).?,
+    );
+    try std.testing.expect(resourceIdHasSubscription(
+        "/SUBSCRIPTIONS/Test/resourceGroups/test",
+        "test",
+    ));
+    try std.testing.expect(resourceIdSubscription("subscriptions/test") == null);
+    try std.testing.expect(resourceIdSubscription("/tenants/test") == null);
+    try std.testing.expect(resourceIdSubscription("/subscriptions//disks/os") == null);
 }

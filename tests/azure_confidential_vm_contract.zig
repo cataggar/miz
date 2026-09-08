@@ -144,6 +144,29 @@ test "builders encode every independent Confidential VM resource contract" {
         try expectContains(library, declaration);
         try expectContains(examples, builder);
     }
+    const capture_builders = [_][]const u8{
+        "azure_confidential_vm_capture_vm_resource_args",
+        "azure_confidential_vm_captured_vm_resource_args",
+        "azure_confidential_vm_captured_vm_create_args",
+        "azure_confidential_vm_deallocate_args",
+        "azure_confidential_vm_generalize_args",
+        "azure_confidential_vm_capture_disk_show_args",
+        "azure_confidential_vm_snapshot_create_args",
+        "azure_confidential_vm_snapshot_show_args",
+        "azure_confidential_vm_capture_image_definition_create_args",
+        "azure_confidential_vm_capture_image_definition_show_args",
+        "azure_confidential_vm_capture_gallery_version_put_args",
+        "azure_confidential_vm_capture_gallery_version_get_args",
+    };
+    for (capture_builders) |builder| {
+        const declaration = try std.fmt.allocPrint(
+            allocator,
+            "{s}() {{",
+            .{builder},
+        );
+        defer allocator.free(declaration);
+        try expectContains(library, declaration);
+    }
     for ([_][]const u8{
         "--architecture " ++ confidential.architecture,
         "--features SecurityType=" ++ confidential.image_security_feature,
@@ -153,6 +176,9 @@ test "builders encode every independent Confidential VM resource contract" {
         "--enable-secure-boot true",
         "--enable-vtpm true",
         "ConfidentialComputingType",
+        "--features SecurityType=" ++ confidential.captured_image_security_type,
+        "?api-version=" ++ confidential.gallery_version_api,
+        "%24expand=ReplicationStatus",
     }) |property| {
         if (std.mem.eql(u8, property, "ConfidentialComputingType")) {
             try expectContains(contract_source, property);
@@ -164,8 +190,72 @@ test "builders encode every independent Confidential VM resource contract" {
         examples,
         "source \"$script_dir/azure_trusted_launch_lib.sh\"",
     );
+    const inherited_create = try section(
+        library,
+        "azure_confidential_vm_captured_vm_create_args() {",
+        "azure_confidential_vm_vm_resource_args() {",
+    );
+    try expectContains(inherited_create, "--image \"$image_version_id\"");
+    try expectAbsent(inherited_create, "--security-type");
+    try expectAbsent(inherited_create, "--os-disk-security-encryption-type");
+    try expectAbsent(inherited_create, "--enable-secure-boot");
+    try expectAbsent(inherited_create, "--enable-vtpm");
     try expectAbsent(library, "eval ");
     try expectAbsent(examples, "eval ");
+}
+
+test "capture shell builders preserve arguments as an array" {
+    const allocator = std.testing.allocator;
+    const root = try repositoryRootAlloc(allocator);
+    defer allocator.free(root);
+    const library = try std.fs.path.join(
+        allocator,
+        &.{ root, "scripts/azure_confidential_vm_lib.sh" },
+    );
+    defer allocator.free(library);
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{
+            "bash",
+            "-c",
+            \\source "$1"
+            \\shift
+            \\azure_confidential_vm_snapshot_create_args "$@"
+            \\printf '<%s>\n' "${AZURE_CONFIDENTIAL_VM_ARGS[@]}"
+            ,
+            "capture-builder-test",
+            library,
+            "resource group",
+            "snapshot;not-a-command",
+            "eastus2",
+            "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/disks/os disk",
+        },
+        .stdout_limit = .limited(max_output_bytes),
+        .stderr_limit = .limited(max_output_bytes),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqual(@as(?u8, 0), switch (result.term) {
+        .exited => |code| code,
+        else => null,
+    });
+    try std.testing.expectEqualStrings(
+        "<snapshot>\n" ++
+            "<create>\n" ++
+            "<--resource-group>\n" ++
+            "<resource group>\n" ++
+            "<--name>\n" ++
+            "<snapshot;not-a-command>\n" ++
+            "<--location>\n" ++
+            "<eastus2>\n" ++
+            "<--source>\n" ++
+            "</subscriptions/sub/resourceGroups/rg/providers/" ++
+            "Microsoft.Compute/disks/os disk>\n" ++
+            "<--sku>\n" ++
+            "<Standard_LRS>\n" ++
+            "<--output>\n" ++
+            "<json>\n",
+        result.stdout,
+    );
 }
 
 test "documentation states the qualified and excluded support boundary" {
