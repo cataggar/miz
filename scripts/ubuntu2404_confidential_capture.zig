@@ -1,5 +1,10 @@
 //! Target-specific provenance for promoting an accepted Ubuntu 24.04
 //! `ConfidentialVMSupported` image through Azure capture to `ConfidentialVM`.
+//!
+//! The protected workflow must freshly retrieve Azure ARM, OpenID, and JWKS
+//! evidence over HTTPS/OIDC immediately before invoking this offline validator.
+//! This module validates the complete contents and binds their raw SHA-256
+//! digests; it does not authenticate the transport origin of supplied files.
 
 const std = @import("std");
 const release = @import("release/root.zig");
@@ -24,17 +29,18 @@ pub const Artifact = struct {
 };
 
 pub const SourceExpected = struct {
+    repository: []const u8,
     commit: []const u8,
     location: []const u8,
     vm_size: []const u8,
     run_id: []const u8,
     run_attempt: []const u8,
-    acceptance_sha256: []const u8,
     artifact: Artifact,
 };
 
 pub const Expected = struct {
     source: SourceExpected,
+    repository: []const u8,
     subscription_id: []const u8,
     location: []const u8,
     run_id: []const u8,
@@ -46,6 +52,7 @@ pub const Expected = struct {
     image_version_id: []const u8,
     final_vm_id: []const u8,
     final_disk_id: []const u8,
+    attestation_endpoint: []const u8,
 };
 
 pub const Documents = struct {
@@ -64,8 +71,24 @@ pub const Documents = struct {
 pub const Attestation = struct {
     vm_id: []const u8,
     issuer: []const u8,
-    nonce_sha256: []const u8,
-    token_sha256: []const u8,
+};
+
+pub const Evidence = struct {
+    source_acceptance_sha256: release.digest.Hex,
+    source_provenance_sha256: release.digest.Hex,
+    capture_vm_sha256: release.digest.Hex,
+    capture_vm_instance_sha256: release.digest.Hex,
+    capture_disk_sha256: release.digest.Hex,
+    snapshot_sha256: release.digest.Hex,
+    image_definition_sha256: release.digest.Hex,
+    gallery_request_sha256: release.digest.Hex,
+    gallery_response_sha256: release.digest.Hex,
+    final_vm_sha256: release.digest.Hex,
+    final_vm_instance_sha256: release.digest.Hex,
+    token_sha256: release.digest.Hex,
+    openid_sha256: release.digest.Hex,
+    jwks_sha256: release.digest.Hex,
+    nonce_sha256: release.digest.Hex,
 };
 
 pub const Source = struct {
@@ -284,6 +307,20 @@ pub fn validateSourceVersionId(
     }
 }
 
+pub fn validateSnapshotId(
+    id: []const u8,
+    subscription_id: []const u8,
+    diagnostic: *Diagnostic,
+) !void {
+    if (!azureResourceId(id, subscription_id, .snapshot)) {
+        return invalid(
+            diagnostic,
+            "capture snapshot ID is malformed, mistyped, or cross-subscription",
+            .{},
+        );
+    }
+}
+
 fn resourceGroup(id: []const u8) ?[]const u8 {
     var split = std.mem.splitScalar(u8, id, '/');
     if (!std.mem.eql(u8, split.next() orelse return null, "") or
@@ -359,7 +396,9 @@ fn validateExpected(
     expected: Expected,
     diagnostic: *Diagnostic,
 ) !void {
-    if (!validCommit(expected.source.commit) or
+    if (!std.mem.eql(u8, expected.source.repository, repository) or
+        !std.mem.eql(u8, expected.repository, repository) or
+        !validCommit(expected.source.commit) or
         !validDecimal(expected.source.run_id) or
         !validDecimal(expected.source.run_attempt) or
         !validDecimal(expected.run_id) or
@@ -367,8 +406,6 @@ fn validateExpected(
     {
         return invalid(diagnostic, "capture workflow identity is invalid", .{});
     }
-    _ = release.digest.parseHex(expected.source.acceptance_sha256) catch
-        return invalid(diagnostic, "source acceptance SHA-256 is invalid", .{});
     _ = release.digest.parseHex(expected.source.artifact.qcow_sha256) catch
         return invalid(diagnostic, "source QCOW2 SHA-256 is invalid", .{});
     _ = release.digest.parseHex(expected.source.artifact.vhd_sha256) catch
@@ -376,7 +413,8 @@ fn validateExpected(
     if (expected.source.artifact.qcow_size == 0 or
         expected.source.artifact.vhd_size == 0 or
         expected.source.artifact.virtual_size == 0 or
-        !std.ascii.eqlIgnoreCase(expected.source.location, expected.location))
+        !std.ascii.eqlIgnoreCase(expected.source.location, expected.location) or
+        !validEndpoint(expected.attestation_endpoint))
     {
         return invalid(diagnostic, "capture source artifact or location is invalid", .{});
     }
@@ -599,11 +637,12 @@ fn cloneValue(allocator: Allocator, value: Value) !Value {
 
 fn workflowValue(
     allocator: Allocator,
+    workflow_repository: []const u8,
     run_id: []const u8,
     run_attempt: []const u8,
 ) !Value {
     return release.azure_compute.object(allocator, &.{
-        .{ "repository", release.azure_compute.string(repository) },
+        .{ "repository", release.azure_compute.string(workflow_repository) },
         .{ "run_id", release.azure_compute.string(run_id) },
         .{ "run_attempt", release.azure_compute.string(run_attempt) },
     });
@@ -614,12 +653,30 @@ fn attestationValue(allocator: Allocator, evidence: Attestation) !Value {
         .{ "compliance", release.azure_compute.string("azure-compliant-cvm") },
         .{ "debuggable", .{ .bool = false } },
         .{ "issuer", release.azure_compute.string(evidence.issuer) },
-        .{ "nonce_sha256", release.azure_compute.string(evidence.nonce_sha256) },
         .{ "secure_boot", .{ .bool = true } },
         .{ "tee", release.azure_compute.string("AMD SEV-SNP") },
-        .{ "token_sha256", release.azure_compute.string(evidence.token_sha256) },
         .{ "vm_id", release.azure_compute.string(evidence.vm_id) },
         .{ "vtpm", .{ .bool = true } },
+    });
+}
+
+fn evidenceValue(allocator: Allocator, evidence: Evidence) !Value {
+    return release.azure_compute.object(allocator, &.{
+        .{ "capture_disk_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.capture_disk_sha256)) },
+        .{ "capture_vm_instance_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.capture_vm_instance_sha256)) },
+        .{ "capture_vm_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.capture_vm_sha256)) },
+        .{ "final_vm_instance_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.final_vm_instance_sha256)) },
+        .{ "final_vm_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.final_vm_sha256)) },
+        .{ "gallery_request_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.gallery_request_sha256)) },
+        .{ "gallery_response_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.gallery_response_sha256)) },
+        .{ "image_definition_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.image_definition_sha256)) },
+        .{ "jwks_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.jwks_sha256)) },
+        .{ "nonce_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.nonce_sha256)) },
+        .{ "openid_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.openid_sha256)) },
+        .{ "snapshot_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.snapshot_sha256)) },
+        .{ "source_acceptance_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_acceptance_sha256)) },
+        .{ "source_provenance_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_provenance_sha256)) },
+        .{ "token_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.token_sha256)) },
     });
 }
 
@@ -628,6 +685,7 @@ pub fn result(
     documents: Documents,
     expected: Expected,
     attestation: Attestation,
+    evidence: Evidence,
     diagnostic: *Diagnostic,
 ) !Value {
     try validateExpected(allocator, expected, diagnostic);
@@ -694,7 +752,7 @@ pub fn result(
     );
     const capture_vm_id = try vmUniqueId(documents.capture_vm, diagnostic);
     if (!std.ascii.eqlIgnoreCase(attestation.vm_id, final_vm_id) or
-        !validEndpoint(attestation.issuer))
+        !std.mem.eql(u8, attestation.issuer, expected.attestation_endpoint))
     {
         return invalid(
             diagnostic,
@@ -702,11 +760,6 @@ pub fn result(
             .{},
         );
     }
-    _ = release.digest.parseHex(attestation.nonce_sha256) catch
-        return invalid(diagnostic, "final attestation nonce SHA-256 is invalid", .{});
-    _ = release.digest.parseHex(attestation.token_sha256) catch
-        return invalid(diagnostic, "final attestation token SHA-256 is invalid", .{});
-
     const source_artifact = try release.azure_compute.object(allocator, &.{
         .{ "qcow_sha256", release.azure_compute.string(expected.source.artifact.qcow_sha256) },
         .{ "qcow_size", release.azure_compute.integer(@intCast(expected.source.artifact.qcow_size)) },
@@ -716,10 +769,10 @@ pub fn result(
     });
     const source_acceptance = try release.azure_compute.object(allocator, &.{
         .{ "schema", release.azure_compute.integer(1) },
-        .{ "sha256", release.azure_compute.string(expected.source.acceptance_sha256) },
         .{ "type", release.azure_compute.string(source_acceptance_type) },
         .{ "workflow", try workflowValue(
             allocator,
+            expected.source.repository,
             expected.source.run_id,
             expected.source.run_attempt,
         ) },
@@ -798,6 +851,7 @@ pub fn result(
     return release.azure_compute.object(allocator, &.{
         .{ "architecture", release.azure_compute.string("x64") },
         .{ "capture", capture_value },
+        .{ "evidence", try evidenceValue(allocator, evidence) },
         .{ "final_acceptance", final_acceptance },
         .{ "gallery", gallery },
         .{ "location", release.azure_compute.string(expected.location) },
@@ -806,7 +860,12 @@ pub fn result(
         .{ "source", source_value },
         .{ "subscription_id", release.azure_compute.string(expected.subscription_id) },
         .{ "type", release.azure_compute.string(result_type) },
-        .{ "workflow", try workflowValue(allocator, expected.run_id, expected.run_attempt) },
+        .{ "workflow", try workflowValue(
+            allocator,
+            expected.repository,
+            expected.run_id,
+            expected.run_attempt,
+        ) },
     });
 }
 
@@ -845,6 +904,7 @@ pub fn validateResult(
     documents: Documents,
     expected: Expected,
     attestation: Attestation,
+    evidence: Evidence,
     diagnostic: *Diagnostic,
 ) !void {
     const independently_derived = try result(
@@ -852,6 +912,7 @@ pub fn validateResult(
         documents,
         expected,
         attestation,
+        evidence,
         diagnostic,
     );
     if (!jsonEqual(.{ .object = root.* }, independently_derived)) return invalid(
@@ -863,8 +924,28 @@ pub fn validateResult(
 
 test "Azure capture resource IDs are structural and exact" {
     const subscription = "00000000-0000-0000-0000-000000000000";
+    const snapshot =
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/capture/providers/Microsoft.Compute/snapshots/os";
     const definition =
         "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/gallery/providers/Microsoft.Compute/galleries/g/images/ubuntu";
+    var diagnostic: Diagnostic = .{};
+    try validateSnapshotId(snapshot, subscription, &diagnostic);
+    const invalid_snapshots = [_][]const u8{
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/capture/providers/Microsoft.Compute/disks/os",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/capture/providers/Microsoft.Network/virtualNetworks/os",
+        "subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/capture/providers/Microsoft.Compute/snapshots/os",
+        "prefix" ++ snapshot,
+        snapshot ++ "/extra",
+        "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/capture/providers/Microsoft.Compute/snapshots/os",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/capture/providers/Microsoft.Compute/snapshotsEvil/os",
+    };
+    for (invalid_snapshots) |invalid_snapshot| {
+        diagnostic = .{};
+        try std.testing.expectError(
+            error.InvalidDocument,
+            validateSnapshotId(invalid_snapshot, subscription, &diagnostic),
+        );
+    }
     try std.testing.expect(azureResourceId(definition, subscription, .image_definition));
     try std.testing.expect(azureResourceId(
         definition ++ "/versions/1.0.0",
@@ -885,7 +966,6 @@ test "Azure capture resource IDs are structural and exact" {
         .image_version,
     ));
 
-    var diagnostic: Diagnostic = .{};
     const invalid_pairs = [_][2][]const u8{
         .{
             definition,
@@ -936,12 +1016,12 @@ const test_final_vm_id = "22222222-2222-2222-2222-222222222222";
 fn testExpected() Expected {
     return .{
         .source = .{
+            .repository = repository,
             .commit = "0123456789abcdef0123456789abcdef01234567",
             .location = "eastus2",
             .vm_size = "Standard_DC2as_v5",
             .run_id = "123",
             .run_attempt = "1",
-            .acceptance_sha256 = "a" ** 64,
             .artifact = .{
                 .qcow_sha256 = "1" ** 64,
                 .qcow_size = 1024,
@@ -950,6 +1030,7 @@ fn testExpected() Expected {
                 .virtual_size = 3584,
             },
         },
+        .repository = repository,
         .subscription_id = test_subscription,
         .location = "eastus2",
         .run_id = "456",
@@ -961,6 +1042,27 @@ fn testExpected() Expected {
         .image_version_id = test_version,
         .final_vm_id = test_final_vm,
         .final_disk_id = test_final_disk,
+        .attestation_endpoint = "https://test.attest.azure.net",
+    };
+}
+
+fn testEvidence() Evidence {
+    return .{
+        .source_acceptance_sha256 = release.digest.hexBytes("source acceptance"),
+        .source_provenance_sha256 = release.digest.hexBytes("source provenance"),
+        .capture_vm_sha256 = release.digest.hexBytes("capture VM"),
+        .capture_vm_instance_sha256 = release.digest.hexBytes("capture VM instance"),
+        .capture_disk_sha256 = release.digest.hexBytes("capture disk"),
+        .snapshot_sha256 = release.digest.hexBytes("snapshot"),
+        .image_definition_sha256 = release.digest.hexBytes("image definition"),
+        .gallery_request_sha256 = release.digest.hexBytes("gallery request"),
+        .gallery_response_sha256 = release.digest.hexBytes("gallery response"),
+        .final_vm_sha256 = release.digest.hexBytes("final VM"),
+        .final_vm_instance_sha256 = release.digest.hexBytes("final VM instance"),
+        .token_sha256 = release.digest.hexBytes("MAA token"),
+        .openid_sha256 = release.digest.hexBytes("OpenID configuration"),
+        .jwks_sha256 = release.digest.hexBytes("JWKS"),
+        .nonce_sha256 = release.digest.hexBytes("nonce"),
     };
 }
 
@@ -1081,6 +1183,7 @@ fn expectTamper(
     replacement: []const u8,
     documents: Documents,
     attestation: Attestation,
+    evidence: Evidence,
 ) !void {
     const occurrences = std.mem.count(u8, valid, needle);
     if (occurrences != 1) {
@@ -1105,6 +1208,7 @@ fn expectTamper(
         documents,
         testExpected(),
         attestation,
+        evidence,
         &diagnostic,
     ));
 }
@@ -1187,15 +1291,15 @@ test "capture result independently rejects provenance substitutions" {
     const attestation: Attestation = .{
         .vm_id = test_final_vm_id,
         .issuer = "https://test.attest.azure.net",
-        .nonce_sha256 = "3" ** 64,
-        .token_sha256 = "4" ** 64,
     };
+    const evidence = testEvidence();
     var diagnostic: Diagnostic = .{};
     const valid_value = try result(
         allocator,
         documents,
         testExpected(),
         attestation,
+        evidence,
         &diagnostic,
     );
     try validateResult(
@@ -1204,6 +1308,7 @@ test "capture result independently rejects provenance substitutions" {
         documents,
         testExpected(),
         attestation,
+        evidence,
         &diagnostic,
     );
     const valid = try std.json.Stringify.valueAlloc(allocator, valid_value, .{});
@@ -1273,7 +1378,42 @@ test "capture result independently rejects provenance substitutions" {
         substitution[1],
         documents,
         attestation,
+        evidence,
     );
+
+    const digest_needle = try std.fmt.allocPrint(
+        allocator,
+        "\"capture_vm_sha256\":\"{s}\"",
+        .{&evidence.capture_vm_sha256},
+    );
+    const digest_replacement = try std.fmt.allocPrint(
+        allocator,
+        "\"capture_vm_sha256\":\"{s}\"",
+        .{&release.digest.hexBytes("substituted capture VM digest")},
+    );
+    try expectTamper(
+        allocator,
+        valid,
+        digest_needle,
+        digest_replacement,
+        documents,
+        attestation,
+        evidence,
+    );
+
+    var changed_file_evidence = evidence;
+    changed_file_evidence.capture_vm_sha256 =
+        release.digest.hexBytes("changed capture VM file");
+    diagnostic = .{};
+    try std.testing.expectError(error.InvalidDocument, validateResult(
+        allocator,
+        &valid_value.object,
+        documents,
+        testExpected(),
+        attestation,
+        changed_file_evidence,
+        &diagnostic,
+    ));
 
     const coordinated_final = try std.mem.replaceOwned(
         u8,
@@ -1299,6 +1439,7 @@ test "capture result independently rejects provenance substitutions" {
         documents,
         testExpected(),
         attestation,
+        evidence,
         &diagnostic,
     ));
 
@@ -1324,6 +1465,51 @@ test "capture result independently rejects provenance substitutions" {
         replaced_documents,
         testExpected(),
         attestation,
+        evidence,
+        &diagnostic,
+    ));
+
+    const substituted_final_resource =
+        test_prefix ++ "virtualMachines/substituted-final";
+    const substituted_result = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        valid,
+        test_final_vm,
+        substituted_final_resource,
+    );
+    var substituted_result_document = try std.json.parseFromSlice(
+        Value,
+        allocator,
+        substituted_result,
+        .{},
+    );
+    const substituted_final_vm_document = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        test_final_vm_document,
+        test_final_vm,
+        substituted_final_resource,
+    );
+    var substituted_final_vm = try std.json.parseFromSlice(
+        Value,
+        allocator,
+        substituted_final_vm_document,
+        .{},
+    );
+    var substituted_documents = documents;
+    substituted_documents.final_vm = &substituted_final_vm.value.object;
+    var substituted_evidence = evidence;
+    substituted_evidence.final_vm_sha256 =
+        release.digest.hexBytes(substituted_final_vm_document);
+    diagnostic = .{};
+    try std.testing.expectError(error.InvalidDocument, validateResult(
+        allocator,
+        &substituted_result_document.value.object,
+        substituted_documents,
+        testExpected(),
+        attestation,
+        substituted_evidence,
         &diagnostic,
     ));
 
@@ -1334,5 +1520,6 @@ test "capture result independently rejects provenance substitutions" {
         "44444444-4444-4444-4444-444444444444",
         documents,
         attestation,
+        evidence,
     );
 }

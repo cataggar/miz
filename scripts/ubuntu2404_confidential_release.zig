@@ -59,6 +59,12 @@ const usage_text =
     \\  capture-result         write durable source-to-capture provenance with signed MAA evidence
     \\  verify-capture         independently revalidate protected capture provenance
     \\
+    \\verify-capture requires independently supplied workflow identities and every
+    \\raw evidence file. Azure ARM, OpenID, and JWKS file authenticity must come
+    \\from fresh HTTPS/OIDC retrieval by the protected workflow immediately before
+    \\invocation; this CLI validates and tamper-evidently binds file contents but
+    \\does not authenticate their transport origin.
+    \\
 ;
 
 const ArgumentError = error{Usage};
@@ -1873,6 +1879,11 @@ fn captureGalleryContract(
         .image_definition_id = try options.require("definition-id"),
         .image_version_id = try options.require("version-id"),
     };
+    try capture.validateSnapshotId(
+        contract.source_id,
+        contract.subscription_id,
+        diagnostic,
+    );
     try capture.validateCaptureGalleryIds(
         contract.image_definition_id,
         contract.image_version_id,
@@ -2116,7 +2127,6 @@ fn captureExpected(
     options: *const Options,
     build: BuildEvidence,
     source_acceptance: *const ObjectMap,
-    acceptance_sha256: *const release.digest.Hex,
     diagnostic: *Diagnostic,
 ) !capture.Expected {
     try requireEqual(
@@ -2147,12 +2157,12 @@ fn captureExpected(
     }
     return .{
         .source = .{
+            .repository = try options.require("source-repository"),
             .commit = try options.require("source-commit"),
             .location = try options.require("source-location"),
             .vm_size = try options.require("source-vm-size"),
             .run_id = try options.require("source-run-id"),
             .run_attempt = try options.require("source-run-attempt"),
-            .acceptance_sha256 = acceptance_sha256,
             .artifact = .{
                 .qcow_sha256 = &build.qcow_sha256,
                 .qcow_size = qcow_size,
@@ -2179,6 +2189,7 @@ fn captureExpected(
                 ),
             },
         },
+        .repository = try options.require("repository"),
         .subscription_id = try options.require("subscription-id"),
         .location = try options.require("location"),
         .run_id = try options.require("run-id"),
@@ -2190,6 +2201,7 @@ fn captureExpected(
         .image_version_id = try options.require("version-id"),
         .final_vm_id = try options.require("final-vm-id"),
         .final_disk_id = try options.require("final-disk-id"),
+        .attestation_endpoint = try options.require("endpoint"),
     };
 }
 
@@ -2224,6 +2236,83 @@ fn verifiedCaptureInputs(
     };
 }
 
+fn captureEvidence(
+    context: Context,
+    options: *const Options,
+    source_acceptance_sha256: release.digest.Hex,
+    attestation: AttestationEvidence,
+) !capture.Evidence {
+    return .{
+        .source_acceptance_sha256 = source_acceptance_sha256,
+        .source_provenance_sha256 = (try release.digest.hashFile(
+            context.io,
+            try options.require("provenance"),
+            document_max_bytes,
+        )).hex,
+        .capture_vm_sha256 = (try release.digest.hashFile(
+            context.io,
+            try options.require("capture-vm"),
+            document_max_bytes,
+        )).hex,
+        .capture_vm_instance_sha256 = (try release.digest.hashFile(
+            context.io,
+            try options.require("capture-vm-instance"),
+            document_max_bytes,
+        )).hex,
+        .capture_disk_sha256 = (try release.digest.hashFile(
+            context.io,
+            try options.require("capture-disk"),
+            document_max_bytes,
+        )).hex,
+        .snapshot_sha256 = (try release.digest.hashFile(
+            context.io,
+            try options.require("snapshot"),
+            document_max_bytes,
+        )).hex,
+        .image_definition_sha256 = (try release.digest.hashFile(
+            context.io,
+            try options.require("definition"),
+            document_max_bytes,
+        )).hex,
+        .gallery_request_sha256 = (try release.digest.hashFile(
+            context.io,
+            try options.require("gallery-request"),
+            document_max_bytes,
+        )).hex,
+        .gallery_response_sha256 = (try release.digest.hashFile(
+            context.io,
+            try options.require("gallery-response"),
+            document_max_bytes,
+        )).hex,
+        .final_vm_sha256 = (try release.digest.hashFile(
+            context.io,
+            try options.require("final-vm"),
+            document_max_bytes,
+        )).hex,
+        .final_vm_instance_sha256 = (try release.digest.hashFile(
+            context.io,
+            try options.require("final-vm-instance"),
+            document_max_bytes,
+        )).hex,
+        .token_sha256 = (try release.digest.hashFile(
+            context.io,
+            try options.require("token"),
+            token_max_bytes,
+        )).hex,
+        .openid_sha256 = (try release.digest.hashFile(
+            context.io,
+            try options.require("openid"),
+            document_max_bytes,
+        )).hex,
+        .jwks_sha256 = (try release.digest.hashFile(
+            context.io,
+            try options.require("jwks"),
+            document_max_bytes,
+        )).hex,
+        .nonce_sha256 = attestation.nonce_sha256,
+    };
+}
+
 fn runCaptureResult(context: Context, argv: []const []const u8) !void {
     const options = try parseOptions(argv, &capture_result_options);
     const verified = try verifiedCaptureInputs(context, &options);
@@ -2238,7 +2327,6 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
         &options,
         verified.build,
         source_acceptance.object(),
-        &verified.acceptance_sha256,
         context.diagnostic,
     );
     var capture_vm = try readObject(context.allocator, context.io, try options.require("capture-vm"), context.diagnostic);
@@ -2272,6 +2360,12 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
         try options.requireInteger("now"),
         context.diagnostic,
     );
+    const evidence = try captureEvidence(
+        context,
+        &options,
+        verified.acceptance_sha256,
+        attestation,
+    );
     const result_document = try capture.result(
         context.allocator,
         .{
@@ -2290,9 +2384,8 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
         .{
             .vm_id = guest_vm_id,
             .issuer = attestation.issuer,
-            .nonce_sha256 = &attestation.nonce_sha256,
-            .token_sha256 = &attestation.token_sha256,
         },
+        evidence,
         context.diagnostic,
     );
     try release.json_document.writeDocument(
@@ -2317,7 +2410,6 @@ fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
         &options,
         verified.build,
         source_acceptance.object(),
-        &verified.acceptance_sha256,
         context.diagnostic,
     );
     var result_document = try readObject(
@@ -2363,6 +2455,12 @@ fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
         try options.requireInteger("now"),
         context.diagnostic,
     );
+    const evidence = try captureEvidence(
+        context,
+        &options,
+        verified.acceptance_sha256,
+        attestation,
+    );
     try capture.validateResult(
         context.allocator,
         result_document.object(),
@@ -2382,9 +2480,8 @@ fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
         .{
             .vm_id = final_guest_vm_id,
             .issuer = attestation.issuer,
-            .nonce_sha256 = &attestation.nonce_sha256,
-            .token_sha256 = &attestation.token_sha256,
         },
+        evidence,
         context.diagnostic,
     );
     try context.out.print("{s}\n{s}\n", .{
@@ -2480,6 +2577,73 @@ test "command surface is exact and rejects incomplete invocations" {
         try std.testing.expect(std.mem.indexOf(u8, usage_text, name) != null);
         try std.testing.expectError(error.Usage, run(context, &.{name}));
     }
+}
+
+test "capture evidence digests track raw file bytes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testFixturePath(allocator, &tmp.sub_path, "evidence.json");
+    defer allocator.free(path);
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = "{\"version\":1}\n",
+    });
+    const argv = [_][]const u8{
+        "--provenance",          path,
+        "--capture-vm",          path,
+        "--capture-vm-instance", path,
+        "--capture-disk",        path,
+        "--snapshot",            path,
+        "--definition",          path,
+        "--gallery-request",     path,
+        "--gallery-response",    path,
+        "--final-vm",            path,
+        "--final-vm-instance",   path,
+        "--token",               path,
+        "--openid",              path,
+        "--jwks",                path,
+    };
+    const options = try parseOptions(&argv, &capture_verify_options);
+    var discard: Writer.Discarding = .init(&.{});
+    var diagnostic: Diagnostic = .{};
+    const context: Context = .{
+        .allocator = allocator,
+        .io = std.testing.io,
+        .out = &discard.writer,
+        .diagnostic = &diagnostic,
+    };
+    const attestation: AttestationEvidence = .{
+        .token_sha256 = release.digest.hexBytes("token"),
+        .nonce_sha256 = release.digest.hexBytes("nonce"),
+        .issuer = "https://test.attest.azure.net",
+    };
+    const first = try captureEvidence(
+        context,
+        &options,
+        release.digest.hexBytes("source acceptance"),
+        attestation,
+    );
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = "{\"version\":2}\n",
+    });
+    const second = try captureEvidence(
+        context,
+        &options,
+        release.digest.hexBytes("source acceptance"),
+        attestation,
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &first.capture_vm_sha256,
+        &second.capture_vm_sha256,
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &first.openid_sha256,
+        &second.openid_sha256,
+    ));
 }
 
 test "attestation endpoint commit and VM identities are strict" {
