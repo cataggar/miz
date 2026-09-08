@@ -243,6 +243,30 @@ azure_confidential_vm_capture_image_definition_show_args() {
   )
 }
 
+azure_confidential_vm_resource_group_conditional_create_args() {
+  local resource_group_id=$1 request=$2
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    rest
+    --method put
+    --uri "https://management.azure.com${resource_group_id}?api-version=2022-09-01"
+    --headers 'If-None-Match=*'
+    --body "@$request"
+    --output json
+  )
+}
+
+azure_confidential_vm_capture_image_definition_conditional_create_args() {
+  local image_definition_id=$1 request=$2
+  AZURE_CONFIDENTIAL_VM_ARGS=(
+    rest
+    --method put
+    --uri "https://management.azure.com${image_definition_id}?api-version=2025-03-03"
+    --headers 'If-None-Match=*'
+    --body "@$request"
+    --output json
+  )
+}
+
 azure_confidential_vm_capture_gallery_version_put_args() {
   local image_version_id=$1 request=$2
   AZURE_CONFIDENTIAL_VM_ARGS=(

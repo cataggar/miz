@@ -253,6 +253,314 @@ test "persistent version is immutable fully replicated and final VM inherits sec
     try std.testing.expect(created < put);
 }
 
+test "conditional container creates prove ownership before cleanup state" {
+    const allocator = std.testing.allocator;
+    const script = try readTracked(allocator, script_path);
+    defer allocator.free(script);
+    const library = try readTracked(allocator, library_path);
+    defer allocator.free(library);
+
+    const group_builder = try section(
+        library,
+        "azure_confidential_vm_resource_group_conditional_create_args() {",
+        "\nazure_confidential_vm_capture_image_definition_conditional_create_args() {",
+    );
+    try expectContains(group_builder, "api-version=2022-09-01");
+    try expectContains(group_builder, "--headers 'If-None-Match=*'");
+    const definition_builder = try section(
+        library,
+        "azure_confidential_vm_capture_image_definition_conditional_create_args() {",
+        "\nazure_confidential_vm_capture_gallery_version_put_args() {",
+    );
+    try expectContains(definition_builder, "api-version=2025-03-03");
+    try expectContains(definition_builder, "--headers 'If-None-Match=*'");
+    const version_builder = try section(
+        library,
+        "azure_confidential_vm_capture_gallery_version_put_args() {",
+        "\nazure_confidential_vm_capture_gallery_version_get_args() {",
+    );
+    try expectContains(version_builder, "api-version=2025-03-03");
+    try expectContains(version_builder, "--headers 'If-None-Match=*'");
+    try expectAbsent(script, "az group create");
+    try expectAbsent(
+        script,
+        "azure_confidential_vm_capture_image_definition_create_args \\\n    \"$TARGET_RESOURCE_GROUP\"",
+    );
+
+    const group_create = try section(
+        script,
+        "group_exists=$(az group exists",
+        "\njq -n \\\n  --arg location \"$TARGET_LOCATION\"",
+    );
+    const group_put = try indexOf(
+        group_create,
+        "azure_confidential_vm_resource_group_conditional_create_args",
+    );
+    const group_response = try indexOf(
+        group_create,
+        "validate_temporary_group_document \"$temporary_group_response\"",
+    );
+    const group_get = try indexOf(
+        group_create,
+        "az group show --name \"$resource_group\"",
+    );
+    const group_fresh = try indexOf(
+        group_create,
+        "validate_temporary_group_document \"$temporary_group_json\"",
+    );
+    const group_owned = try indexOf(
+        group_create,
+        "state_replace '.temporary_group_created = true'",
+    );
+    try std.testing.expect(group_put < group_response);
+    try std.testing.expect(group_response < group_get);
+    try std.testing.expect(group_get < group_fresh);
+    try std.testing.expect(group_fresh < group_owned);
+
+    const definition_create = try section(
+        script,
+        "definition_was_created=false",
+        "\ntarget_request=\"$RESULT_DIR/target-gallery-request.json\"",
+    );
+    const definition_revalidate = try indexOf(
+        definition_create,
+        "validate_target_containers",
+    );
+    const definition_put = try indexOf(
+        definition_create,
+        "azure_confidential_vm_capture_image_definition_conditional_create_args",
+    );
+    const definition_response = try indexOf(
+        definition_create,
+        "validate_created_target_definition_response",
+    );
+    const definition_get = try indexOf(
+        definition_create,
+        "az sig image-definition show --ids \"$target_definition_id\"",
+    );
+    const definition_fresh = try indexOf(
+        definition_create,
+        "validate_target_definition_document \"$target_definition_json\" exact",
+    );
+    const definition_owned = try indexOf(
+        definition_create,
+        "state_replace '.target.definition_created = true'",
+    );
+    try std.testing.expect(definition_revalidate < definition_put);
+    try std.testing.expect(definition_put < definition_response);
+    try std.testing.expect(definition_response < definition_get);
+    try std.testing.expect(definition_get < definition_fresh);
+    try std.testing.expect(definition_fresh < definition_owned);
+
+    const version_mutation = try section(
+        script,
+        "target_request=\"$RESULT_DIR/target-gallery-request.json\"",
+        "\nwait_gallery_version",
+    );
+    const version_revalidate = try indexOf(
+        version_mutation,
+        "validate_target_containers",
+    );
+    const version_definition = try indexOf(
+        version_mutation,
+        "validate_target_definition_document \"$target_definition_json\"",
+    );
+    const version_put = try indexOf(
+        version_mutation,
+        "azure_confidential_vm_capture_gallery_version_put_args",
+    );
+    try std.testing.expect(version_revalidate < version_definition);
+    try std.testing.expect(version_definition < version_put);
+}
+
+test "conditional create collisions never claim cleanup ownership" {
+    const allocator = std.testing.allocator;
+    const script = try readTracked(allocator, script_path);
+    defer allocator.free(script);
+    const conditional_source = try section(
+        script,
+        "run_conditional_create() {",
+        "\nvalidate_temporary_group_document() {",
+    );
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository = try rootAlloc(allocator);
+    defer allocator.free(repository);
+    const root = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}",
+        .{ repository, tmp.sub_path },
+    );
+    defer allocator.free(root);
+    const fixture_source = try std.fmt.allocPrint(
+        allocator,
+        \\#!/usr/bin/env bash
+        \\set -Eeuo pipefail
+        \\MOCK_LOG='{s}/collision.log'
+        \\fail() {{ printf '%s\n' "$*" >&2; return 1; }}
+        \\az() {{ printf 'HTTP %s collision\n' "${{!#}}" >>"$MOCK_LOG"; return 42; }}
+        \\{s}
+        \\for kind in "temporary resource group" "target image definition"; do
+        \\  status=409
+        \\  [[ "$kind" == "target image definition" ]] && status=412
+        \\  if (
+        \\    set -Eeuo pipefail
+        \\    owned=false
+        \\    cleanup() {{
+        \\      if [[ "$owned" == true ]]; then
+        \\        printf 'DELETE %s\n' "$kind" >>"$MOCK_LOG"
+        \\      fi
+        \\    }}
+        \\    trap cleanup EXIT
+        \\    if run_conditional_create "{s}/response.json" "$kind" rest --method put "$status"; then
+        \\      owned=true
+        \\      printf 'CLAIM %s\n' "$kind" >>"$MOCK_LOG"
+        \\      exit 0
+        \\    fi
+        \\    exit 1
+        \\  ); then
+        \\    exit 91
+        \\  fi
+        \\done
+        \\
+    ,
+        .{ root, conditional_source, root },
+    );
+    defer allocator.free(fixture_source);
+    const result = try runShellSource(
+        allocator,
+        root,
+        "conditional-collision-fixture.sh",
+        fixture_source,
+    );
+    defer result.deinit(allocator);
+    try std.testing.expect(result.succeeded());
+    try expectContains(
+        result.stderr,
+        "Conditional temporary resource group create failed",
+    );
+    try expectContains(
+        result.stderr,
+        "Conditional target image definition create failed",
+    );
+    const log_path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/collision.log",
+        .{root},
+    );
+    defer allocator.free(log_path);
+    const log = try Dir.cwd().readFileAlloc(
+        std.testing.io,
+        log_path,
+        allocator,
+        .limited(max_output_bytes),
+    );
+    defer allocator.free(log);
+    try expectContains(log, "HTTP 409 collision");
+    try expectContains(log, "HTTP 412 collision");
+    try expectAbsent(log, "CLAIM");
+    try expectAbsent(log, "DELETE");
+}
+
+test "target resource group and gallery drift block target mutation" {
+    const allocator = std.testing.allocator;
+    const script = try readTracked(allocator, script_path);
+    defer allocator.free(script);
+    const validate_source = try section(
+        script,
+        "validate_target_containers() {",
+        "\nvalidate_created_target_definition_response() {",
+    );
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository = try rootAlloc(allocator);
+    defer allocator.free(repository);
+    const root = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}",
+        .{ repository, tmp.sub_path },
+    );
+    defer allocator.free(root);
+    const fixture_source = try std.fmt.allocPrint(
+        allocator,
+        \\#!/usr/bin/env bash
+        \\set -Eeuo pipefail
+        \\TARGET_RESOURCE_GROUP=target-rg
+        \\TARGET_GALLERY=release
+        \\TARGET_LOCATION=eastus2
+        \\TARGET_OWNER_TAG=durable-owner
+        \\AZURE_SUBSCRIPTION_ID=00000000-0000-0000-0000-000000000000
+        \\GITHUB_REPOSITORY=cataggar/miz
+        \\target_group_json='{s}/target-group.json'
+        \\target_gallery_json='{s}/target-gallery.json'
+        \\MOCK_LOG='{s}/drift.log'
+        \\fail() {{ printf '%s\n' "$*" >&2; return 1; }}
+        \\az() {{
+        \\  printf '%s\n' "$*" >>"$MOCK_LOG"
+        \\  case "$1 $2" in
+        \\    "group show")
+        \\      location=eastus2
+        \\      [[ "$DRIFT_KIND" == group ]] && location=westus
+        \\      printf '{{"id":"/subscriptions/%s/resourceGroups/target-rg","name":"target-rg","type":"Microsoft.Resources/resourceGroups","location":"%s","tags":{{"miz-owner":"durable-owner","miz-repository":"cataggar/miz"}}}}\n' "$AZURE_SUBSCRIPTION_ID" "$location"
+        \\      ;;
+        \\    "sig show")
+        \\      owner=durable-owner
+        \\      [[ "$DRIFT_KIND" == gallery ]] && owner=other-owner
+        \\      printf '{{"id":"/subscriptions/%s/resourceGroups/target-rg/providers/Microsoft.Compute/galleries/release","name":"release","type":"Microsoft.Compute/galleries","location":"eastus2","tags":{{"miz-owner":"%s","miz-repository":"cataggar/miz"}}}}\n' "$AZURE_SUBSCRIPTION_ID" "$owner"
+        \\      ;;
+        \\    "rest put") printf 'MUTATION\n' >>"$MOCK_LOG" ;;
+        \\    *) return 73 ;;
+        \\  esac
+        \\}}
+        \\{s}
+        \\for drift in group gallery; do
+        \\  if (
+        \\    set -Eeuo pipefail
+        \\    export DRIFT_KIND="$drift"
+        \\    if validate_target_containers; then
+        \\      az rest put
+        \\      exit 0
+        \\    fi
+        \\    exit 1
+        \\  ); then
+        \\    exit 92
+        \\  fi
+        \\done
+        \\
+    ,
+        .{ root, root, root, validate_source },
+    );
+    defer allocator.free(fixture_source);
+    const result = try runShellSource(
+        allocator,
+        root,
+        "target-drift-fixture.sh",
+        fixture_source,
+    );
+    defer result.deinit(allocator);
+    try std.testing.expect(result.succeeded());
+    try expectContains(
+        result.stderr,
+        "Target resource group subscription, location, or durable ownership is invalid",
+    );
+    try expectContains(
+        result.stderr,
+        "Target gallery subscription, location, or durable ownership is invalid",
+    );
+    const log_path = try std.fmt.allocPrint(allocator, "{s}/drift.log", .{root});
+    defer allocator.free(log_path);
+    const log = try Dir.cwd().readFileAlloc(
+        std.testing.io,
+        log_path,
+        allocator,
+        .limited(max_output_bytes),
+    );
+    defer allocator.free(log);
+    try expectContains(log, "group show");
+    try expectContains(log, "sig show");
+    try expectAbsent(log, "MUTATION");
+}
+
 test "cleanup is ordered exact and never targets durable containers broadly" {
     const allocator = std.testing.allocator;
     const script = try readTracked(allocator, script_path);
@@ -1195,17 +1503,24 @@ test "mocked run refuses a pre-existing target version before artifact work" {
         \\    echo "$count" >"$MOCK_EXISTS_COUNT"
         \\    if (( count == 1 )); then echo false; else echo true; fi
         \\    ;;
-        \\  "group create") exit 0 ;;
+        \\  "rest --method")
+        \\    printf '{"id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4","name":"miz-u2404-cvm-capture-123-4","type":"Microsoft.Resources/resourceGroups","location":"eastus2","tags":{"miz-owner":"ubuntu2404-confidential-capture","miz-repository":"cataggar/miz","miz-run-id":"123","miz-run-attempt":"4","miz-source-commit":"0123456789abcdef0123456789abcdef01234567"}}\n'
+        \\    ;;
         \\  "group show")
         \\    if [[ "$*" == *"--name target-rg"* ]]; then
-        \\      printf '{"id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/target-rg","location":"eastus2","tags":{"miz-owner":"durable-owner","miz-repository":"cataggar/miz"}}\n'
+        \\      printf '{"id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/target-rg","name":"target-rg","type":"Microsoft.Resources/resourceGroups","location":"eastus2","tags":{"miz-owner":"durable-owner","miz-repository":"cataggar/miz"}}\n'
         \\    else
-        \\      printf '{"tags":{"miz-owner":"ubuntu2404-confidential-capture","miz-repository":"cataggar/miz","miz-run-id":"123","miz-run-attempt":"4","miz-source-commit":"0123456789abcdef0123456789abcdef01234567"}}\n'
+        \\      printf '{"id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4","name":"miz-u2404-cvm-capture-123-4","type":"Microsoft.Resources/resourceGroups","location":"eastus2","tags":{"miz-owner":"ubuntu2404-confidential-capture","miz-repository":"cataggar/miz","miz-run-id":"123","miz-run-attempt":"4","miz-source-commit":"0123456789abcdef0123456789abcdef01234567"}}\n'
         \\    fi
         \\    ;;
         \\  "group delete") exit 0 ;;
         \\  "sig show")
-        \\    printf '{"id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/target-rg/providers/Microsoft.Compute/galleries/release","location":"eastus2","tags":{"miz-owner":"durable-owner","miz-repository":"cataggar/miz"}}\n'
+        \\    printf '{"id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/target-rg/providers/Microsoft.Compute/galleries/release","name":"release","type":"Microsoft.Compute/galleries","location":"eastus2","tags":{"miz-owner":"durable-owner","miz-repository":"cataggar/miz"}}\n'
+        \\    ;;
+        \\  "sig image-definition")
+        \\    test "$3" = show
+        \\    printf 'ResourceNotFound\n' >&2
+        \\    exit 3
         \\    ;;
         \\  "sig image-version")
         \\    test "$3" = show

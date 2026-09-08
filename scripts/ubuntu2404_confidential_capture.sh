@@ -125,6 +125,24 @@ owned_tags_match() {
     "$metadata" >/dev/null
 }
 
+exact_owned_tags_match() {
+  local metadata=$1 owner=$2 repository=$3 run_id=$4 run_attempt=$5 source_commit=$6
+  jq -e \
+    --arg owner "$owner" \
+    --arg repository "$repository" \
+    --arg run_id "$run_id" \
+    --arg run_attempt "$run_attempt" \
+    --arg source_commit "$source_commit" \
+    '.tags == {
+      "miz-owner": $owner,
+      "miz-repository": $repository,
+      "miz-run-id": $run_id,
+      "miz-run-attempt": $run_attempt,
+      "miz-source-commit": $source_commit
+    }' \
+    "$metadata" >/dev/null
+}
+
 validate_write_access_identity() {
   local disk_id=$1 disk_group=$2 disk_name=$3 temporary_group subscription expected_id
   temporary_group=$(jq -er '.temporary_resource_group' "$STATE_FILE") || return
@@ -450,10 +468,12 @@ final_vm_name="miz-cvm-final-${name_seed}"
 final_data_disk_name="miz-cvm-final-data-${name_seed}"
 admin_username=mizcapture
 
+temporary_group_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group"
 target_definition_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP/providers/Microsoft.Compute/galleries/$TARGET_GALLERY/images/$TARGET_IMAGE_DEFINITION"
 target_version_id="$target_definition_id/versions/$TARGET_IMAGE_VERSION"
 staging_definition_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/providers/Microsoft.Compute/galleries/$staging_gallery/images/$staging_definition"
 staging_version_id="$staging_definition_id/versions/$staging_version"
+snapshot_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/providers/Microsoft.Compute/snapshots/$snapshot_name"
 
 jq -n \
   --arg repository "$GITHUB_REPOSITORY" \
@@ -509,6 +529,14 @@ mkdir -p "$source_dir" "$capture_dir" "$final_dir"
 private_key="$RESULT_DIR/id_ed25519"
 known_hosts="$RESULT_DIR/known_hosts"
 capture_result="$RESULT_DIR/capture-result.json"
+temporary_group_request="$RESULT_DIR/temporary-resource-group-request.json"
+temporary_group_response="$RESULT_DIR/temporary-resource-group-response.json"
+temporary_group_json="$RESULT_DIR/temporary-resource-group.json"
+target_group_json="$RESULT_DIR/target-resource-group.json"
+target_gallery_json="$RESULT_DIR/target-gallery.json"
+target_definition_json="$RESULT_DIR/target-definition.json"
+target_definition_request="$RESULT_DIR/target-definition-request.json"
+target_definition_response="$RESULT_DIR/target-definition-response.json"
 
 exact_tags=(
   "miz-owner=$OWNER"
@@ -655,6 +683,141 @@ resource_absent() {
     return 1
   fi
   grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' "$stderr_file"
+}
+
+run_conditional_create() {
+  local response=$1 resource_kind=$2
+  shift 2
+  rm -f -- "$response"
+  if ! az "$@" >"$response"; then
+    rm -f -- "$response"
+    fail "Conditional $resource_kind create failed; refusing update or ownership claim"
+    return
+  fi
+}
+
+validate_temporary_group_document() {
+  local metadata=$1
+  jq -e \
+    --arg expected_id "$temporary_group_id" \
+    --arg name "$resource_group" \
+    --arg location "$AZURE_LOCATION" \
+    '(.id | ascii_downcase) == ($expected_id | ascii_downcase) and
+     (.name | ascii_downcase) == ($name | ascii_downcase) and
+     (.type | ascii_downcase) == "microsoft.resources/resourcegroups" and
+     (.location | ascii_downcase) == ($location | ascii_downcase)' \
+    "$metadata" >/dev/null &&
+    exact_owned_tags_match "$metadata" "$OWNER" "$GITHUB_REPOSITORY" \
+      "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"
+}
+
+validate_target_containers() {
+  az group show --name "$TARGET_RESOURCE_GROUP" --output json \
+    >"$target_group_json"
+  az sig show \
+    --resource-group "$TARGET_RESOURCE_GROUP" \
+    --gallery-name "$TARGET_GALLERY" \
+    --output json >"$target_gallery_json"
+  jq -e \
+    --arg expected_id "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP" \
+    --arg name "$TARGET_RESOURCE_GROUP" \
+    --arg location "$TARGET_LOCATION" \
+    --arg owner "$TARGET_OWNER_TAG" \
+    --arg repository "$GITHUB_REPOSITORY" \
+    '(.id | ascii_downcase) == ($expected_id | ascii_downcase) and
+     (.name | ascii_downcase) == ($name | ascii_downcase) and
+     (.type | ascii_downcase) == "microsoft.resources/resourcegroups" and
+     (.location | ascii_downcase) == ($location | ascii_downcase) and
+     .tags["miz-owner"] == $owner and
+     .tags["miz-repository"] == $repository' \
+    "$target_group_json" >/dev/null ||
+    {
+      fail "Target resource group subscription, location, or durable ownership is invalid"
+      return
+    }
+  jq -e \
+    --arg expected_id "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP/providers/Microsoft.Compute/galleries/$TARGET_GALLERY" \
+    --arg name "$TARGET_GALLERY" \
+    --arg location "$TARGET_LOCATION" \
+    --arg owner "$TARGET_OWNER_TAG" \
+    --arg repository "$GITHUB_REPOSITORY" \
+    '(.id | ascii_downcase) == ($expected_id | ascii_downcase) and
+     .name == $name and
+     (.type | ascii_downcase) == "microsoft.compute/galleries" and
+     (.location | ascii_downcase) == ($location | ascii_downcase) and
+     .tags["miz-owner"] == $owner and
+     .tags["miz-repository"] == $repository' \
+    "$target_gallery_json" >/dev/null ||
+    {
+      fail "Target gallery subscription, location, or durable ownership is invalid"
+      return
+    }
+}
+
+validate_created_target_definition_response() {
+  local metadata=$1
+  jq -e \
+    --arg expected_id "$target_definition_id" \
+    --arg location "$TARGET_LOCATION" \
+    --arg owner "$TARGET_OWNER_TAG" \
+    --arg repository "$GITHUB_REPOSITORY" \
+    --arg run_id "$GITHUB_RUN_ID" \
+    --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+    --arg source_commit "$SOURCE_COMMIT" \
+    '(.id | ascii_downcase) == ($expected_id | ascii_downcase) and
+     (.type | ascii_downcase) == "microsoft.compute/galleries/images" and
+     (.location | ascii_downcase) == ($location | ascii_downcase) and
+     .tags == {
+       "miz-owner": $owner,
+       "miz-repository": $repository,
+       "miz-run-id": $run_id,
+       "miz-run-attempt": $run_attempt,
+       "miz-source-commit": $source_commit
+     } and
+     .properties.identifier == {
+       publisher: "miz",
+       offer: "ubuntu2404",
+       sku: "confidential-x64"
+     } and
+     .properties.osType == "Linux" and
+     .properties.osState == "Generalized" and
+     .properties.hyperVGeneration == "V2" and
+     .properties.architecture == "x64" and
+     ([.properties.features[]? | select(.name == "SecurityType")] == [{
+       name: "SecurityType", value: "ConfidentialVM"
+     }])' \
+    "$metadata" >/dev/null
+}
+
+validate_target_definition_document() {
+  local metadata=$1 ownership=$2
+  if [[ "$ownership" == exact ]]; then
+    exact_owned_tags_match "$metadata" "$TARGET_OWNER_TAG" \
+      "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+      "$SOURCE_COMMIT" ||
+      {
+        fail "Created target definition lost its exact ownership tags"
+        return
+      }
+  else
+    jq -e \
+      --arg owner "$TARGET_OWNER_TAG" \
+      --arg repository "$GITHUB_REPOSITORY" \
+      '.tags["miz-owner"] == $owner and
+       .tags["miz-repository"] == $repository' \
+      "$metadata" >/dev/null ||
+      {
+        fail "Pre-existing target definition lacks durable ownership tags"
+        return
+      }
+  fi
+  "$RELEASE_TOOL" check-capture-definition \
+    --definition "$metadata" \
+    --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+    --location "$TARGET_LOCATION" \
+    --snapshot-id "$snapshot_id" \
+    --definition-id "$target_definition_id" \
+    --version-id "$target_version_id" >/dev/null
 }
 
 wait_gallery_version() {
@@ -806,44 +969,81 @@ case "$group_exists" in
   true) fail "Refusing to reuse temporary resource group $resource_group"; exit 1 ;;
   *) fail "Azure returned an invalid resource-group existence result"; exit 1 ;;
 esac
+jq -n \
+  --arg location "$AZURE_LOCATION" \
+  --arg owner "$OWNER" \
+  --arg repository "$GITHUB_REPOSITORY" \
+  --arg run_id "$GITHUB_RUN_ID" \
+  --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+  --arg source_commit "$SOURCE_COMMIT" \
+  '{
+    location: $location,
+    tags: {
+      "miz-owner": $owner,
+      "miz-repository": $repository,
+      "miz-run-id": $run_id,
+      "miz-run-attempt": $run_attempt,
+      "miz-source-commit": $source_commit
+    }
+  }' >"$temporary_group_request"
+azure_confidential_vm_resource_group_conditional_create_args \
+  "$temporary_group_id" "$temporary_group_request"
+run_conditional_create \
+  "$temporary_group_response" "temporary resource group" \
+  "${AZURE_CONFIDENTIAL_VM_ARGS[@]}"
+validate_temporary_group_document "$temporary_group_response" ||
+  fail "Conditional temporary resource-group response is invalid"
+az group show --name "$resource_group" --output json >"$temporary_group_json"
+validate_temporary_group_document "$temporary_group_json" ||
+  fail "Created temporary resource group failed fresh ownership validation"
 state_replace '.temporary_group_created = true'
-az group create \
-  --name "$resource_group" \
-  --location "$AZURE_LOCATION" \
-  --tags "${exact_tags[@]}" \
-  --output none
 
-target_group_json="$RESULT_DIR/target-resource-group.json"
-target_gallery_json="$RESULT_DIR/target-gallery.json"
-az group show --name "$TARGET_RESOURCE_GROUP" --output json >"$target_group_json"
-az sig show \
-  --resource-group "$TARGET_RESOURCE_GROUP" \
-  --gallery-name "$TARGET_GALLERY" \
-  --output json >"$target_gallery_json"
-jq -e \
-  --arg subscription "$AZURE_SUBSCRIPTION_ID" \
-  --arg expected_id "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP" \
+jq -n \
   --arg location "$TARGET_LOCATION" \
   --arg owner "$TARGET_OWNER_TAG" \
   --arg repository "$GITHUB_REPOSITORY" \
-  '(.id | ascii_downcase) == ($expected_id | ascii_downcase) and
-   (.location | ascii_downcase) == ($location | ascii_downcase) and
-   .tags["miz-owner"] == $owner and
-   .tags["miz-repository"] == $repository' \
-  "$target_group_json" >/dev/null ||
-  fail "Target resource group subscription, location, or durable ownership is invalid"
-jq -e \
-  --arg subscription "$AZURE_SUBSCRIPTION_ID" \
-  --arg expected_id "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP/providers/Microsoft.Compute/galleries/$TARGET_GALLERY" \
-  --arg location "$TARGET_LOCATION" \
-  --arg owner "$TARGET_OWNER_TAG" \
-  --arg repository "$GITHUB_REPOSITORY" \
-  '(.id | ascii_downcase) == ($expected_id | ascii_downcase) and
-   (.location | ascii_downcase) == ($location | ascii_downcase) and
-   .tags["miz-owner"] == $owner and
-   .tags["miz-repository"] == $repository' \
-  "$target_gallery_json" >/dev/null ||
-  fail "Target gallery subscription, location, or durable ownership is invalid"
+  --arg run_id "$GITHUB_RUN_ID" \
+  --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+  --arg source_commit "$SOURCE_COMMIT" \
+  '{
+    location: $location,
+    tags: {
+      "miz-owner": $owner,
+      "miz-repository": $repository,
+      "miz-run-id": $run_id,
+      "miz-run-attempt": $run_attempt,
+      "miz-source-commit": $source_commit
+    },
+    properties: {
+      identifier: {
+        publisher: "miz",
+        offer: "ubuntu2404",
+        sku: "confidential-x64"
+      },
+      osType: "Linux",
+      osState: "Generalized",
+      hyperVGeneration: "V2",
+      architecture: "x64",
+      features: [{
+        name: "SecurityType",
+        value: "ConfidentialVM"
+      }]
+    }
+  }' >"$target_definition_request"
+
+validate_target_containers
+
+definition_initial_stderr="$RESULT_DIR/target-definition-initial.stderr"
+definition_existed_initially=false
+if az sig image-definition show --ids "$target_definition_id" --output json \
+    >"$target_definition_json" 2>"$definition_initial_stderr"; then
+  definition_existed_initially=true
+  validate_target_definition_document "$target_definition_json" durable
+elif ! grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' \
+    "$definition_initial_stderr"; then
+  fail "Could not inspect the initial target image definition"
+fi
+rm -f -- "$definition_initial_stderr"
 
 version_absent_stderr="$RESULT_DIR/target-version-show.stderr"
 if ! resource_absent "$version_absent_stderr" \
@@ -1159,7 +1359,6 @@ az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$capture_disk_json"
   --disk-id "$capture_disk_id")" == "$capture_disk_id" ]]
 
 snapshot_json="$capture_dir/snapshot.json"
-snapshot_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/providers/Microsoft.Compute/snapshots/$snapshot_name"
 azure_confidential_vm_snapshot_create_args \
   "$resource_group" "$snapshot_name" "$AZURE_LOCATION" "$capture_disk_id"
 AZURE_CONFIDENTIAL_VM_ARGS+=(--tags "${exact_tags[@]}")
@@ -1178,51 +1377,27 @@ owned_tags_match "$snapshot_json" "$OWNER" "$GITHUB_REPOSITORY" \
   "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
   fail "Capture snapshot lost its exact run ownership tags"
 
-target_definition_json="$RESULT_DIR/target-definition.json"
-definition_absent_stderr="$RESULT_DIR/target-definition-show.stderr"
 definition_was_created=false
-if resource_absent "$definition_absent_stderr" \
-    az sig image-definition show --ids "$target_definition_id" --output json; then
-  state_replace '.target.definition_created = true'
-  azure_confidential_vm_capture_image_definition_create_args \
-    "$TARGET_RESOURCE_GROUP" "$TARGET_GALLERY" "$TARGET_IMAGE_DEFINITION" \
-    ubuntu2404 confidential-x64 "$TARGET_LOCATION"
-  AZURE_CONFIDENTIAL_VM_ARGS+=(
-    --tags
-    "miz-owner=$TARGET_OWNER_TAG"
-    "miz-repository=$GITHUB_REPOSITORY"
-    "miz-run-id=$GITHUB_RUN_ID"
-    "miz-run-attempt=$GITHUB_RUN_ATTEMPT"
-    "miz-source-commit=$SOURCE_COMMIT"
-  )
-  az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$target_definition_json"
-  definition_was_created=true
-else
+if [[ "$definition_existed_initially" == false ]]; then
+  validate_target_containers
+  azure_confidential_vm_capture_image_definition_conditional_create_args \
+    "$target_definition_id" "$target_definition_request"
+  run_conditional_create \
+    "$target_definition_response" "target image definition" \
+    "${AZURE_CONFIDENTIAL_VM_ARGS[@]}"
+  validate_created_target_definition_response "$target_definition_response" ||
+    fail "Conditional target image-definition response is invalid"
   az sig image-definition show --ids "$target_definition_id" --output json \
     >"$target_definition_json"
-  jq -e \
-    --arg owner "$TARGET_OWNER_TAG" \
-    --arg repository "$GITHUB_REPOSITORY" \
-    '.tags["miz-owner"] == $owner and .tags["miz-repository"] == $repository' \
-    "$target_definition_json" >/dev/null ||
-    fail "Pre-existing target definition lacks durable ownership tags"
+  validate_target_definition_document "$target_definition_json" exact
+  state_replace '.target.definition_created = true'
+  definition_was_created=true
+else
+  validate_target_containers
+  az sig image-definition show --ids "$target_definition_id" --output json \
+    >"$target_definition_json"
+  validate_target_definition_document "$target_definition_json" durable
 fi
-rm -f -- "$definition_absent_stderr"
-if [[ "$definition_was_created" == true ]]; then
-  owned_tags_match "$target_definition_json" "$TARGET_OWNER_TAG" \
-    "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
-    "$SOURCE_COMMIT" ||
-    fail "Created target definition lost its exact ownership tags"
-fi
-"$RELEASE_TOOL" check-capture-definition \
-  --definition "$target_definition_json" \
-  --subscription-id "$AZURE_SUBSCRIPTION_ID" \
-  --location "$TARGET_LOCATION" \
-  --snapshot-id "$snapshot_id" \
-  --definition-id "$target_definition_id" \
-  --version-id "$target_version_id" >/dev/null
-
-state_replace '.target.version_created = true'
 
 target_request="$RESULT_DIR/target-gallery-request.json"
 target_response="$RESULT_DIR/target-gallery-response.json"
@@ -1247,6 +1422,15 @@ jq \
     "miz-source-commit": $source_commit
   }' "$target_request" >"${target_request}.tagged"
 mv -f -- "${target_request}.tagged" "$target_request"
+validate_target_containers
+az sig image-definition show --ids "$target_definition_id" --output json \
+  >"$target_definition_json"
+if [[ "$definition_was_created" == true ]]; then
+  validate_target_definition_document "$target_definition_json" exact
+else
+  validate_target_definition_document "$target_definition_json" durable
+fi
+state_replace '.target.version_created = true'
 azure_confidential_vm_capture_gallery_version_put_args \
   "$target_version_id" "$target_request"
 az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$target_response"
