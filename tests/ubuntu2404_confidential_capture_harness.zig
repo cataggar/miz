@@ -331,7 +331,9 @@ test "harness encodes durable parent and serialized publication trust boundaries
         "PUBLICATION_PRINCIPAL_CLIENT_ID",
         "Capture and publication principals must be distinct",
         "usage: $0 prepare|adopt-recovery|inspect-recovery|export-recovery",
-        "\"$command_name\" != adopt-recovery",
+        "if [[ \"$command_name\" != adopt-recovery ]]; then\n" ++
+            "  require_capture_account\n" ++
+            "fi",
         "ORIGIN_RUN_ID",
         "ORIGIN_RUN_ATTEMPT",
         "RECOVERY_ARTIFACT_NAME",

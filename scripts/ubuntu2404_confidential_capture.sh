@@ -918,7 +918,9 @@ for tool in az azcopy curl jq openssl qemu-img scp sha256sum ssh ssh-keygen unzi
   }
 done
 
-require_capture_account
+if [[ "$command_name" != adopt-recovery ]]; then
+  require_capture_account
+fi
 
 report_error() {
   local status=$1 line=$2
