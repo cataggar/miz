@@ -25,13 +25,14 @@ command_name=${1:-run}
 if (( $# > 1 )) ||
     [[ "$command_name" != run && "$command_name" != prepare &&
       "$command_name" != publish && "$command_name" != recover &&
-      "$command_name" != inspect-recovery &&
+    "$command_name" != adopt-recovery &&
+    "$command_name" != inspect-recovery &&
       "$command_name" != export-recovery &&
       "$command_name" != mark-recovery-durable &&
       "$command_name" != export-dispatch &&
       "$command_name" != mark-dispatch-durable &&
       "$command_name" != finalize && "$command_name" != cleanup ]]; then
-  echo "usage: $0 prepare|inspect-recovery|export-recovery|mark-recovery-durable|export-dispatch|mark-dispatch-durable|publish|recover|finalize|cleanup|run" >&2
+  echo "usage: $0 prepare|adopt-recovery|inspect-recovery|export-recovery|mark-recovery-durable|export-dispatch|mark-dispatch-durable|publish|recover|finalize|cleanup|run" >&2
   exit 2
 fi
 
@@ -289,7 +290,7 @@ state_matches_identity() {
      (.temporary_resource_group | type == "string") and
      .temporary_resource_group == $scratch_resource_group and
      (.temporary_resource_group |
-       test("^miz-u2404-cvm-capture-[a-z0-9-]{8,48}$")) and
+       test("^miz-u2404-cvm-capture-[0-9a-f]{32}$")) and
      (
        .temporary_group_create == null or
        (
@@ -604,8 +605,8 @@ revoke_outstanding_disk_write_access() {
 }
 
 delete_temporary_group() {
-  local status publication_status result_status group resource_id metadata stderr_file
-  local inventory subscription_id
+  local status publication_status result_status dispatch_digest
+  local group resource_id metadata stderr_file inventory subscription_id
   status=$(jq -r '.temporary_group_create.status // "none"' "$STATE_FILE")
   case "$status" in
     none) return 0 ;;
@@ -619,12 +620,24 @@ delete_temporary_group() {
   esac
   publication_status=$(jq -er '.target.publication.status' "$STATE_FILE") ||
     return
+  result_status=$(jq -er '.result.status' "$STATE_FILE") || return
+  dispatch_digest=$(jq -r \
+    '.target.publication.dispatch_artifact_digest // ""' "$STATE_FILE") ||
+    return
+  if [[ -n ${DISPATCH_ARTIFACT_DIGEST:-} ]]; then
+    dispatch_digest=$DISPATCH_ARTIFACT_DIGEST
+  elif [[ -n ${ORIGIN_DISPATCH_ARTIFACT_DIGEST:-} ]]; then
+    dispatch_digest=$ORIGIN_DISPATCH_ARTIFACT_DIGEST
+  fi
+  if [[ -n "$dispatch_digest" && "$result_status" != durable ]]; then
+    fail "Capture result is not durably uploaded; retaining post-dispatch scratch resources for recovery"
+    return
+  fi
   if [[ "$publication_status" == put_dispatched ||
       "$publication_status" == quarantined ]]; then
     fail "Target publication is unresolved; retaining the temporary resource group for break-glass review"
     return
   fi
-  result_status=$(jq -er '.result.status' "$STATE_FILE") || return
   if [[ "$publication_status" == published &&
       "$result_status" != durable ]]; then
     fail "Capture result is not durably uploaded; retaining post-PUT scratch resources for recovery"
@@ -813,7 +826,7 @@ fi
     "$TARGET_GALLERY" =~ ^[A-Za-z0-9_]{1,80}$ &&
     "$TARGET_IMAGE_DEFINITION" =~ ^[A-Za-z0-9._()-]{1,80}$ &&
     "$TARGET_OWNER_TAG" =~ ^[A-Za-z0-9._:/-]{1,128}$ &&
-    "$SCRATCH_RESOURCE_GROUP" =~ ^miz-u2404-cvm-capture-[a-z0-9-]{8,48}$ &&
+    "$SCRATCH_RESOURCE_GROUP" =~ ^miz-u2404-cvm-capture-[0-9a-f]{32}$ &&
     "$SCRATCH_RESERVATION_TAG" =~ ^[A-Za-z0-9._:/-]{16,128}$ &&
     "$CAPTURE_PRINCIPAL_CLIENT_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ &&
     "$PUBLICATION_PRINCIPAL_CLIENT_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ &&
@@ -948,7 +961,8 @@ case "$command_name" in
     ;;
 esac
 
-if [[ "$command_name" == inspect-recovery ]]; then
+if [[ "$command_name" == adopt-recovery ||
+    "$command_name" == inspect-recovery ]]; then
   mkdir -p "$RESULT_DIR" "$(dirname -- "$STATE_FILE")"
   chmod 0700 "$RESULT_DIR" "$(dirname -- "$STATE_FILE")"
   recovery_state="$RECOVERY_DIR/capture-state.json"
@@ -959,8 +973,10 @@ if [[ "$command_name" == inspect-recovery ]]; then
       fail "Recovery artifact files are missing, linked, empty, or not owner-only"
       exit 1
     }
-  cp -- "$recovery_state" "$STATE_FILE"
-  chmod 0600 "$STATE_FILE"
+  if [[ "$command_name" == adopt-recovery || ! -e "$STATE_FILE" ]]; then
+    cp -- "$recovery_state" "$STATE_FILE"
+    chmod 0600 "$STATE_FILE"
+  fi
   state_file_is_safe && state_matches_identity ||
     {
       fail "Downloaded recovery state identity, schema, or permissions are invalid"
@@ -993,6 +1009,7 @@ staging_version_id="$staging_definition_id/versions/$staging_version"
 snapshot_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/providers/Microsoft.Compute/snapshots/$snapshot_name"
 
 if [[ "$uses_existing_state" != true &&
+    "$command_name" != adopt-recovery &&
     "$command_name" != inspect-recovery ]]; then
   jq -n \
     --arg repository "$GITHUB_REPOSITORY" \
@@ -1838,6 +1855,10 @@ require_prepared_state() {
       (
         ($command == "publish" or $command == "recover") and
         .target.publication.status == "put_authorized"
+      ) or
+      (
+        $command == "inspect-recovery" and
+        .target.publication.status == "quarantined"
       )
     )
   ' "$STATE_FILE" >/dev/null ||
@@ -2165,16 +2186,24 @@ validate_dispatch_marker() {
 }
 
 mark_dispatch_durable() {
+  local publication_status=${1:-put_authorized}
+  [[ "$publication_status" == put_authorized ||
+      "$publication_status" == quarantined ]] ||
+    {
+      fail "PUT dispatch durable state is invalid"
+      return
+    }
   [[ "${DISPATCH_ARTIFACT_DIGEST:-}" =~ ^sha256:[0-9a-f]{64}$ ]] ||
     {
       fail "PUT dispatch artifact digest is missing or invalid"
       return
     }
-  validate_dispatch_marker
+  validate_dispatch_marker || return
   state_replace \
     '.target.publication.dispatch_artifact_digest = $artifact_digest |
-     .target.publication.status = "put_authorized"' \
-    --arg artifact_digest "$DISPATCH_ARTIFACT_DIGEST"
+     .target.publication.status = $publication_status' \
+    --arg artifact_digest "$DISPATCH_ARTIFACT_DIGEST" \
+    --arg publication_status "$publication_status"
 }
 
 finalize_durable_result() {
@@ -2339,19 +2368,18 @@ inspect_recovery_target() {
       fail "Recovery action output path is invalid"
       return
     }
-  validate_recovery_intent
-  mark_recovery_durable
-  refresh_recovery_prepared_evidence
-  validate_target_parents
-  validate_publication_snapshot_access
-  local marker_present=false stderr_file="$RESULT_DIR/target-version-recovery.stderr"
-  if [[ -e "$dispatch_marker_file" ]]; then
-    marker_present=true
-    validate_dispatch_marker
-    mark_dispatch_durable
-  fi
-  if publication_az sig image-version show \
-      --ids "$target_version_id" --output json \
+  validate_recovery_intent || return
+  mark_recovery_durable || return
+    local marker_present=false stderr_file="$RESULT_DIR/target-version-recovery.stderr"
+    if [[ -e "$dispatch_marker_file" ]]; then
+      marker_present=true
+      mark_dispatch_durable quarantined || return
+    fi
+    refresh_recovery_prepared_evidence || return
+    validate_target_parents || return
+    validate_publication_snapshot_access || return
+  azure_confidential_vm_capture_gallery_version_get_args "$target_version_id"
+  if publication_az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" \
       >"$target_response" 2>"$stderr_file"; then
     rm -f -- "$stderr_file"
     [[ "$marker_present" == true ]] ||
@@ -2359,7 +2387,8 @@ inspect_recovery_target() {
         fail "Existing target version has no durable PUT dispatch marker"
         return
       }
-    validate_existing_target_version
+    validate_existing_target_version || return
+    state_replace '.target.publication.status = "put_authorized"'
     printf 'resume\n' >"$RECOVERY_ACTION_FILE"
   else
     grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' \
@@ -2380,6 +2409,14 @@ inspect_recovery_target() {
 }
 
 case "$command_name" in
+  adopt-recovery)
+    validate_recovery_intent
+    mark_recovery_durable
+    if [[ -e "$dispatch_marker_file" ]]; then
+      mark_dispatch_durable quarantined
+    fi
+    exit
+    ;;
   export-recovery)
     export_recovery_intent
     exit
@@ -2417,13 +2454,21 @@ cleanup_on_exit() {
   rm -f -- \
     "$source_dir/azguestattestation1.deb" "$source_dir/attestation-client.zip" \
     "$final_dir/azguestattestation1.deb" "$final_dir/attestation-client.zip"
-  local publication_status result_status
+  local publication_status result_status dispatch_digest
   publication_status=$(jq -r '.target.publication.status // "unknown"' \
     "$STATE_FILE" 2>/dev/null || printf unknown)
   result_status=$(jq -r '.result.status // "unknown"' \
     "$STATE_FILE" 2>/dev/null || printf unknown)
-  if [[ "$publication_status" == not_dispatched ||
-      "$publication_status" == put_authorized ]] ||
+  dispatch_digest=$(jq -r \
+    '.target.publication.dispatch_artifact_digest // ""' \
+    "$STATE_FILE" 2>/dev/null || printf unknown)
+  if [[ -n ${DISPATCH_ARTIFACT_DIGEST:-} ]]; then
+    dispatch_digest=$DISPATCH_ARTIFACT_DIGEST
+  elif [[ -n ${ORIGIN_DISPATCH_ARTIFACT_DIGEST:-} ]]; then
+    dispatch_digest=$ORIGIN_DISPATCH_ARTIFACT_DIGEST
+  fi
+  if [[ "$publication_status" == not_dispatched &&
+      -z "$dispatch_digest" ]] ||
       [[ "$publication_status" == published &&
         "$result_status" == durable ]]; then
     cleanup_resources || cleanup_status=1

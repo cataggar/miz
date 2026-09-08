@@ -9,6 +9,7 @@ const workflow_path =
 const harness_path = "scripts/ubuntu2404_confidential_capture.sh";
 const guide_path = "doc/azure-confidential-vm.md";
 const max_source_bytes = 4 * 1024 * 1024;
+const max_output_bytes = 1024 * 1024;
 
 fn rootAlloc(allocator: Allocator) ![]u8 {
     return std.testing.environ.getAlloc(
@@ -60,6 +61,53 @@ fn indexOf(text: []const u8, needle: []const u8) !usize {
         error.RequiredTextMissing;
 }
 
+fn runShellFixture(
+    allocator: Allocator,
+    name: []const u8,
+    source: []const u8,
+) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository = try rootAlloc(allocator);
+    defer allocator.free(repository);
+    const root = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}",
+        .{ repository, tmp.sub_path },
+    );
+    defer allocator.free(root);
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}",
+        .{ root, name },
+    );
+    defer allocator.free(path);
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = source,
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{ "bash", path },
+        .cwd = .{ .path = root },
+        .stdout_limit = .limited(max_output_bytes),
+        .stderr_limit = .limited(max_output_bytes),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| {
+            if (code == 0) return;
+            std.debug.print("fixture failed:\n{s}\n{s}\n", .{
+                result.stdout,
+                result.stderr,
+            });
+            return error.ShellFixtureFailed;
+        },
+        else => return error.ShellFixtureFailed,
+    }
+}
+
 fn section(text: []const u8, start: []const u8, end: ?[]const u8) ![]const u8 {
     const start_index = try indexOf(text, start);
     const tail = text[start_index + start.len ..];
@@ -97,7 +145,7 @@ test "capture workflow is dispatch-only guarded and fully pinned" {
     try expectCount(
         workflow,
         "environment: ubuntu2404-confidential-capture",
-        2,
+        3,
     );
     try expectCount(workflow, "id-token: write", 1);
     try expectAbsent(workflow, "uses: actions/checkout@v");
@@ -113,6 +161,58 @@ test "capture workflow is dispatch-only guarded and fully pinned" {
         const sha = suffix[0 .. std.mem.indexOfScalar(u8, suffix, ' ') orelse suffix.len];
         try std.testing.expect(isHexSha(sha));
     }
+}
+
+test "protected GitHub App tokens gate administration reads and retained workflow commits" {
+    const allocator = std.testing.allocator;
+    const workflow = try readTracked(allocator, workflow_path);
+    defer allocator.free(workflow);
+    const prepare = try section(workflow, "\n  prepare:\n", "\n  capture:\n");
+    const capture = try section(
+        workflow,
+        "\n  capture:\n",
+        "\n  publish_provenance:\n",
+    );
+    const publication = try section(
+        workflow,
+        "\n  publish_provenance:\n",
+        null,
+    );
+
+    try expectCount(
+        workflow,
+        "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349",
+        3,
+    );
+    try expectCount(workflow, "secrets.CAPTURE_GITHUB_APP_ID", 3);
+    try expectCount(workflow, "secrets.CAPTURE_GITHUB_APP_PRIVATE_KEY", 3);
+    try expectCount(workflow, "permission-administration: read", 3);
+    try expectCount(workflow, "permission-actions: read", 3);
+    try expectCount(workflow, "permission-contents: read", 2);
+    try expectCount(workflow, "permission-contents: write", 1);
+    try expectCount(workflow, "permission-workflows: write", 1);
+    try expectAbsent(workflow, "\n      contents: write\n");
+
+    for ([_][]const u8{ prepare, capture, publication }) |job| {
+        const token = try indexOf(job, "actions/create-github-app-token@");
+        const immutable = try indexOf(
+            job,
+            "repos/$GITHUB_REPOSITORY/immutable-releases",
+        );
+        try std.testing.expect(token < immutable);
+        try expectContains(
+            job,
+            "GH_TOKEN: ${{ steps.github_app_token.outputs.token }}",
+        );
+    }
+    try expectContains(
+        prepare,
+        "environment: ubuntu2404-confidential-capture",
+    );
+    try expectContains(
+        publication,
+        "permission-contents: write\n          permission-workflows: write",
+    );
 }
 
 test "immutable source release and provenance identities fail closed" {
@@ -136,6 +236,10 @@ test "immutable source release and provenance identities fail closed" {
         "recovery_mode=true",
         "origin_run_id=$GITHUB_RUN_ID",
         "origin_run_attempt=$GITHUB_RUN_ATTEMPT",
+        "actions/runs/$origin_run_id/attempts/$origin_run_attempt",
+        ".repository.full_name == env.GITHUB_REPOSITORY",
+        ".head_sha | test(\"^[0-9a-f]{40}$\")",
+        "test \"$origin_head_sha\" = \"$tool_commit\"",
         "actions/runs/$origin_run_id/artifacts?name=$recovery_artifact_name",
         "test \"sha256:$(sha256sum .capture/prepare/recovery.zip",
         ".schema == 5 and .stage == \"prepared\"",
@@ -145,9 +249,14 @@ test "immutable source release and provenance identities fail closed" {
         ".draft == false",
         ".prerelease == false",
         "(.assets | type == \"array\" and length == 3)",
+        "repos/$GITHUB_REPOSITORY/releases?per_page=100",
+        "[.[][] | select(.tag_name == $tag)] | length == 0",
         "Provenance release already exists; use explicit recovery inputs",
-        "grep -Eq 'HTTP 404|Not Found'",
     }) |needle| try expectContains(prepare, needle);
+    try expectAbsent(
+        prepare,
+        "actions/runs/$origin_run_id\"",
+    );
 }
 
 test "source acquisition is exact and validated before Azure" {
@@ -211,6 +320,7 @@ test "dual OIDC contexts and staged freshness ordering are fixed" {
         "secrets.AZURE_CAPTURE_CLIENT_ID",
         "secrets.AZURE_PUBLICATION_CLIENT_ID",
         "scripts/ubuntu2404_confidential_capture.sh prepare",
+        "scripts/ubuntu2404_confidential_capture.sh adopt-recovery",
         "scripts/ubuntu2404_confidential_capture.sh inspect-recovery",
         "scripts/ubuntu2404_confidential_capture.sh export-recovery",
         "scripts/ubuntu2404_confidential_capture.sh mark-recovery-durable",
@@ -220,7 +330,7 @@ test "dual OIDC contexts and staged freshness ordering are fixed" {
         "scripts/ubuntu2404_confidential_capture.sh recover",
         "scripts/ubuntu2404_confidential_capture.sh finalize",
         "- name: Refresh capture OIDC for unconditional exact cleanup",
-        "if: always() && needs.prepare.outputs.result_artifact_id == ''",
+        "if: always() && steps.result_discovery.outputs.result_artifact_id == ''",
         "steps.cleanup_login.outcome == 'success'",
         "Fresh cleanup login failed; retaining quarantined scratch state",
         "scripts/ubuntu2404_confidential_capture.sh cleanup",
@@ -243,6 +353,14 @@ test "dual OIDC contexts and staged freshness ordering are fixed" {
         capture_job,
         "Upload only sanitized recovery intent and state",
     );
+    const recovery_adoption = try indexOf(
+        capture_job,
+        "Adopt durable recovery dispatch into quarantined local state",
+    );
+    const result_discovery = try indexOf(
+        capture_job,
+        "Discover and validate one exact durable result across physical runs",
+    );
     const dispatch_upload = try indexOf(
         capture_job,
         "Upload durable PUT dispatch marker before mutation",
@@ -259,6 +377,8 @@ test "dual OIDC contexts and staged freshness ordering are fixed" {
     try std.testing.expect(prepare < publisher_login);
     try std.testing.expect(prepare < recovery_upload);
     try std.testing.expect(recovery_upload < publisher_login);
+    try std.testing.expect(recovery_adoption < result_discovery);
+    try std.testing.expect(recovery_adoption < publisher_login);
     try std.testing.expect(publisher_login < capture_refresh);
     try std.testing.expect(capture_refresh < dispatch_upload);
     try std.testing.expect(dispatch_upload < publish);
@@ -278,7 +398,7 @@ test "publication boundary uploads one sanitized result and never deletes target
         null,
     );
 
-    try expectCount(workflow, "gh release upload", 1);
+    try expectCount(workflow, "include-hidden-files: true", 3);
     for ([_][]const u8{
         "path: ${{ env.RESULT_DIR }}/capture-result.json",
         "retention-days: 90",
@@ -294,14 +414,19 @@ test "publication boundary uploads one sanitized result and never deletes target
         ".assets[0].digest == $digest",
         ".body == $notes",
         ".assets | length == 0 or length == 1",
-        "if [[ \"$release_exists\" == false ]]",
+        "release_count=$(jq -er 'length' \"$exact_releases_json\")",
+        "(( release_count <= 1 ))",
+        "gh api --method POST \"${api_headers[@]}\"",
+        "repos/$GITHUB_REPOSITORY/releases/$release_id",
+        "uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets",
         "if [[ \"$(jq -r '.draft' \"$release_json\")\" == true",
         "origin-run-id: $ORIGIN_RUN_ID",
         "recovery-intent-sha256: $RECOVERY_INTENT_SHA256",
-        "gh release edit \"$PROVENANCE_RELEASE_TAG\"",
-        "--draft=false",
-        "--target \"$TOOL_COMMIT\"",
+        "-F draft=false",
     }) |needle| try expectContains(workflow, needle);
+    try expectAbsent(publication, "gh release create");
+    try expectAbsent(publication, "gh release upload");
+    try expectAbsent(publication, "gh release edit");
     try expectAbsent(workflow, "attestation.jwt");
     try expectAbsent(workflow, "openid-configuration.json");
     try expectAbsent(workflow, "jwks.json");
@@ -315,7 +440,7 @@ test "publication boundary uploads one sanitized result and never deletes target
     try expectCount(
         harness,
         "publication_az \"${AZURE_CONFIDENTIAL_VM_ARGS[@]}\" \\\n      >\"$target_response\"",
-        1,
+        2,
     );
 }
 
@@ -334,7 +459,14 @@ test "durable recovery preserves origin and gates PUT cleanup and publication" {
         "result_artifact_name=\"ubuntu2404-confidential-capture-result-$origin_run_id-$origin_run_attempt-$TARGET_GALLERY_VERSION\"",
         "actions/runs/$origin_run_id/artifacts?name=$recovery_artifact_name",
         "actions/artifacts?name=$dispatch_artifact_name",
-        "artifacts?name=$result_artifact_name",
+        "ORIGIN_DISPATCH_ARTIFACT_DIGEST",
+        "actions/artifacts?name=$RESULT_ARTIFACT_NAME&per_page=100",
+        ".workflow_run.id",
+        "actions/runs/$physical_run_id",
+        "Multiple exact durable result artifacts exist across physical runs",
+        "selected_run_id=$physical_run_id",
+        "result_artifact_run_id=$DISCOVERED_RESULT_RUN_ID",
+        "result_artifact_run_id=$GITHUB_RUN_ID",
         "expired == false",
         "artifact-digest",
         "retention-days: 90",
@@ -345,7 +477,6 @@ test "durable recovery preserves origin and gates PUT cleanup and publication" {
         "Reuse only an exact already durable protected result",
         "RESULT_ARTIFACT_RUN_ID",
         "run-id: ${{ env.RESULT_ARTIFACT_RUN_ID }}",
-        "result_artifact_run_id=$ORIGIN_RUN_ID",
         "always() &&",
         "steps.finalize.outcome == 'success'",
         "steps.cleanup.outcome == 'success'",
@@ -355,9 +486,13 @@ test "durable recovery preserves origin and gates PUT cleanup and publication" {
         ".origin_run_id == $origin_run_id",
         ".origin_run_attempt == $origin_run_attempt",
         ".target.publication.status = \"put_dispatched\"",
+        ".target.publication.status = \"quarantined\"",
+        "mark_dispatch_durable quarantined",
         "Target is absent after a durable PUT dispatch marker; refusing an ambiguous second PUT",
+        "azure_confidential_vm_capture_gallery_version_get_args \"$target_version_id\"",
         "validate_existing_target_version",
         "MIZ_CAPTURE_TARGET=resumed-existing",
+        "retaining post-dispatch scratch resources for recovery",
         "Capture result is not durably uploaded; retaining post-PUT scratch resources for recovery",
         ".result.status = \"ready\"",
         ".result.status = \"durable\"",
@@ -371,6 +506,142 @@ test "durable recovery preserves origin and gates PUT cleanup and publication" {
     );
     try expectContains(recover_branch, "validate_existing_target_version");
     try expectAbsent(recover_branch, "publish_target_version_once");
+}
+
+test "hidden uploads and action versus REST digest formats are explicit" {
+    const allocator = std.testing.allocator;
+    const workflow = try readTracked(allocator, workflow_path);
+    defer allocator.free(workflow);
+    const capture = try section(
+        workflow,
+        "\n  capture:\n",
+        "\n  publish_provenance:\n",
+    );
+
+    try expectCount(workflow, "uses: actions/upload-artifact@", 3);
+    try expectCount(workflow, "include-hidden-files: true", 3);
+    for ([_][]const u8{
+        "${{ env.RECOVERY_DIR }}/capture-state.json",
+        "${{ env.RECOVERY_DIR }}/recovery-intent.json",
+        "${{ env.DISPATCH_DIR }}/put-dispatch.json",
+        "${{ env.RESULT_DIR }}/capture-result.json",
+        "[[ \"$NEW_RECOVERY_DIGEST\" =~ ^[0-9a-f]{64}$ ]]",
+        "recovery_digest=\"sha256:$NEW_RECOVERY_DIGEST\"",
+        "[[ \"$NEW_DISPATCH_DIGEST\" =~ ^[0-9a-f]{64}$ ]]",
+        "export DISPATCH_ARTIFACT_DIGEST=\"sha256:$NEW_DISPATCH_DIGEST\"",
+        "[[ \"$artifact_digest\" =~ ^sha256:[0-9a-f]{64}$ ]]",
+        "[[ \"$RECOVERY_ARTIFACT_DIGEST\" =~ ^sha256:[0-9a-f]{64}$ ]]",
+    }) |needle| try expectContains(workflow, needle);
+    try expectAbsent(capture, "path: ${{ env.RECOVERY_DIR }}\n");
+    try expectAbsent(capture, "path: ${{ env.DISPATCH_DIR }}\n");
+    try expectAbsent(capture, "path: ${{ env.RESULT_DIR }}\n");
+}
+
+test "draft release creation resume and ambiguity use numeric REST identity" {
+    const allocator = std.testing.allocator;
+    const workflow = try readTracked(allocator, workflow_path);
+    defer allocator.free(workflow);
+    const publication = try section(
+        workflow,
+        "\n  publish_provenance:\n",
+        null,
+    );
+
+    for ([_][]const u8{
+        "gh api --paginate --slurp",
+        "repos/$GITHUB_REPOSITORY/releases?per_page=100",
+        "[.[][] | select(.tag_name == $tag)]",
+        "(( release_count <= 1 ))",
+        "Multiple releases use the exact provenance tag",
+        "if (( release_count == 0 )); then",
+        "tag_name: $tag",
+        "target_commitish: $target",
+        "gh api --method POST",
+        "release_id=$(jq -er",
+        "validate_release_identity \"$release_json\"",
+        "repos/$GITHUB_REPOSITORY/releases/$release_id",
+        ".target_commitish == $tool_commit",
+        ".body == $notes",
+        "uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets",
+        "-F draft=false",
+    }) |needle| try expectContains(publication, needle);
+    try expectCount(
+        publication,
+        "releases/tags/$PROVENANCE_RELEASE_TAG",
+        1,
+    );
+    const publish = try indexOf(publication, "-F draft=false");
+    const tag_read = try indexOf(
+        publication,
+        "releases/tags/$PROVENANCE_RELEASE_TAG",
+    );
+    try std.testing.expect(publish < tag_read);
+}
+
+test "draft release fixtures accept fresh and exact resume but reject foreign and duplicate" {
+    try runShellFixture(std.testing.allocator, "release-selection-fixture.sh",
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\tag=Ubuntu-24.04-confidential-cvm-1.2.3
+        \\title='Ubuntu 24.04 Confidential VM gallery provenance 1.2.3'
+        \\asset=Ubuntu-24.04-x86_64.confidential-cvm-1.2.3.provenance.json
+        \\tool_commit=0123456789abcdef0123456789abcdef01234567
+        \\notes='exact origin and intent'
+        \\fresh='[[]]'
+        \\exact='[[{"id":7,"tag_name":"Ubuntu-24.04-confidential-cvm-1.2.3","name":"Ubuntu 24.04 Confidential VM gallery provenance 1.2.3","target_commitish":"0123456789abcdef0123456789abcdef01234567","body":"exact origin and intent","draft":true,"immutable":false,"prerelease":false,"assets":[]}]]'
+        \\foreign='[[{"id":8,"tag_name":"Ubuntu-24.04-confidential-cvm-1.2.3","name":"foreign","target_commitish":"0123456789abcdef0123456789abcdef01234567","body":"wrong origin","draft":true,"immutable":false,"prerelease":false,"assets":[]}]]'
+        \\duplicate='[[{"id":7,"tag_name":"Ubuntu-24.04-confidential-cvm-1.2.3"},{"id":9,"tag_name":"Ubuntu-24.04-confidential-cvm-1.2.3"}]]'
+        \\select_exact() {
+        \\  jq -c --arg tag "$tag" '[.[][] | select(.tag_name == $tag)]'
+        \\}
+        \\validate_identity() {
+        \\  jq -e \
+        \\    --arg tag "$tag" \
+        \\    --arg title "$title" \
+        \\    --arg name "$asset" \
+        \\    --arg notes "$notes" \
+        \\    --arg tool_commit "$tool_commit" \
+        \\    '.tag_name == $tag and .name == $title and
+        \\     .target_commitish == $tool_commit and
+        \\     .body == $notes and .prerelease == false and
+        \\     .draft == true and .immutable == false and
+        \\     (.assets | length == 0 or length == 1) and
+        \\     all(.assets[];
+        \\       .name == $name and .state == "uploaded" and
+        \\       (.id | type == "number" and . > 0))' >/dev/null
+        \\}
+        \\[[ "$(select_exact <<<"$fresh" | jq 'length')" == 0 ]]
+        \\exact_selected=$(select_exact <<<"$exact")
+        \\[[ "$(jq 'length' <<<"$exact_selected")" == 1 ]]
+        \\validate_identity <<<"$(jq '.[0]' <<<"$exact_selected")"
+        \\foreign_selected=$(select_exact <<<"$foreign")
+        \\if validate_identity <<<"$(jq '.[0]' <<<"$foreign_selected")"; then
+        \\  exit 90
+        \\fi
+        \\[[ "$(select_exact <<<"$duplicate" | jq 'length')" == 2 ]]
+        \\
+    );
+}
+
+test "result artifact fixtures preserve original and recovery physical run IDs" {
+    try runShellFixture(std.testing.allocator, "result-artifact-selection-fixture.sh",
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\name=ubuntu2404-confidential-capture-result-123-4-1.2.3
+        \\original='[{"artifacts":[{"id":1,"name":"ubuntu2404-confidential-capture-result-123-4-1.2.3","workflow_run":{"id":123}}]}]'
+        \\recovery='[{"artifacts":[{"id":2,"name":"ubuntu2404-confidential-capture-result-123-4-1.2.3","workflow_run":{"id":456}}]}]'
+        \\ambiguous='[{"artifacts":[{"id":1,"name":"ubuntu2404-confidential-capture-result-123-4-1.2.3","workflow_run":{"id":123}},{"id":2,"name":"ubuntu2404-confidential-capture-result-123-4-1.2.3","workflow_run":{"id":456}}]}]'
+        \\select_artifacts() {
+        \\  jq -c --arg name "$name" \
+        \\    '[.[] | .artifacts[]? | select(.name == $name)]'
+        \\}
+        \\original_selected=$(select_artifacts <<<"$original")
+        \\recovery_selected=$(select_artifacts <<<"$recovery")
+        \\[[ "$(jq -r '.[0].workflow_run.id' <<<"$original_selected")" == 123 ]]
+        \\[[ "$(jq -r '.[0].workflow_run.id' <<<"$recovery_selected")" == 456 ]]
+        \\[[ "$(select_artifacts <<<"$ambiguous" | jq 'length')" == 2 ]]
+        \\
+    );
 }
 
 test "publisher scopes are pre-provisionable and delete-free" {
@@ -415,7 +686,12 @@ test "operator guide fixes prerequisites RBAC and quarantine boundary" {
         "`PUBLICATION_VERSION_WRITE_SCOPE`",
         "`CAPTURE_TARGET_READ_SCOPE`",
         "`SCRATCH_RESERVATION_TAG`",
+        "`CAPTURE_GITHUB_APP_ID`",
+        "`CAPTURE_GITHUB_APP_PRIVATE_KEY`",
+        "**Administration: read**",
+        "**Workflows: write**",
         "`scratch_resource_group`",
+        "`miz-u2404-cvm-capture-<32-lowercase-hex>`",
         "require at least one designated release reviewer",
         "disable self-review",
         "GET /repos/cataggar/miz/immutable-releases",

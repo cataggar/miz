@@ -229,6 +229,8 @@ Configure:
 | Secret | `AZURE_PUBLICATION_CLIENT_ID` | distinct exclusive version publisher |
 | Secret | `AZURE_TENANT_ID` | common Entra tenant |
 | Secret | `AZURE_SUBSCRIPTION_ID` | common capture/target subscription |
+| Secret | `CAPTURE_GITHUB_APP_ID` | repository-installed protected capture GitHub App ID |
+| Secret | `CAPTURE_GITHUB_APP_PRIVATE_KEY` | PEM private key for that GitHub App |
 | Variable | `AZURE_LOCATION` | previously live-qualified region |
 | Variable | `AZURE_VM_SIZE` | previously live-qualified AMD SEV-SNP SKU |
 | Variable | `TARGET_RESOURCE_GROUP` | pre-provisioned durable resource group |
@@ -253,15 +255,28 @@ or raw attestation bundle is serialized into recovery state or uploaded.
 Enable **immutable releases** in the repository settings before creating the
 accepted source release or dispatching capture. The workflow queries
 `GET /repos/cataggar/miz/immutable-releases` with the pinned official GitHub
-REST API version before any Azure login or mutation and requires
-`enabled=true`; it never changes the repository setting. The accepted source
-release itself must report `immutable=true`, be published, and be neither a
-draft nor a prerelease. Its exact tag must resolve to the recorded source
-commit. A repository or token for which the setting or release immutability
-cannot be queried is not eligible for capture.
+REST API version in a protected preflight before any Azure login or mutation
+and requires `enabled=true`; it never changes the repository setting.
+`GITHUB_TOKEN` cannot receive the required repository Administration access.
+Install a dedicated GitHub App on only `cataggar/miz` with repository
+permissions **Administration: read**, **Actions: read**, **Contents: write**,
+and **Workflows: write**. The pinned official
+`actions/create-github-app-token` action mints a fresh installation token in
+each protected job, requests only read access in preflight/capture, requests
+Contents/Workflows write only for provenance publication to the retained tool
+commit, and revokes each token at job completion. Never expose or upload the
+App private key or installation token. The accepted source release itself must
+report `immutable=true`, be published, and be neither a draft nor a
+prerelease. Its exact tag must resolve to the recorded source commit. A
+repository or token for which the setting or release immutability cannot be
+queried is not eligible for capture.
 
 Before dispatch, provision a unique empty scratch resource group named
-`miz-u2404-cvm-capture-SUFFIX` in the configured subscription and region.
+`miz-u2404-cvm-capture-<32-lowercase-hex>` in the configured subscription and
+region. Generate the 128-bit suffix with a cryptographically secure random
+source; the name is deliberately independent of the future GitHub run ID so
+the resource group and its role assignments can be provisioned before
+dispatch.
 Give it exactly the tags
 `miz-owner=ubuntu2404-confidential-capture`,
 `miz-repository=cataggar/miz`, and
@@ -270,7 +285,8 @@ Give it exactly the tags
 therefore exist before dispatch. The harness refuses a missing, nonempty,
 mismatched, or already claimed group, atomically replaces the reservation tags
 with the immutable origin tags, and later deletes only that exact claimed
-group.
+group. The validated recovery state and exact ownership tags, not the generic
+resource-group name, bind it to the stable origin run and attempt.
 
 Use custom roles with no wildcard control-plane permissions. Assign the
 capture scratch-lifecycle role at that exact pre-provisioned scratch
@@ -378,8 +394,12 @@ validates their hashes and shape with the accepted-source tooling, and derives
 the source commit, source run/attempt, location, and VM size from the validated
 release evidence. It never adds an asset to that source release.
 
-The capture harness has explicit `prepare`, `inspect-recovery`, `publish`,
-`recover`, `finalize`, and `cleanup` stages. Normal dispatch fixes
+The capture harness has explicit `prepare`, `adopt-recovery`,
+`inspect-recovery`, `publish`, `recover`, `finalize`, and `cleanup` stages.
+Recovery first runs the non-Azure
+`adopt-recovery` transition so a downloaded durable dispatch marker is
+atomically persisted as quarantined before result discovery, Azure login, or
+fresh target inspection. Normal dispatch fixes
 `origin_run_id` and `origin_run_attempt` to the initial run. Manual recovery
 requires both original values or neither; current retry identity never replaces
 the origin used in resource names, tags, artifact names, or durable provenance.
@@ -409,12 +429,15 @@ dispatch marker may be uploaded and publication may proceed once. An absent
 version after a durable dispatch marker, or any mismatched/missing artifact,
 digest, state, tag, or resource, is ambiguous and fails closed.
 
-If the origin result artifact is already durable—for example, only scratch
-cleanup or provenance publication failed—the recovery dispatch downloads and
-strictly verifies that exact origin result and proceeds directly to provenance
-publication without another Azure login, target PUT, deployment, or
-attestation run. This preserves the original result digest and allows an exact
-owned draft release to resume.
+If an origin-bound result artifact is already durable—for example, only
+scratch cleanup or provenance publication failed—the recovery dispatch searches
+the repository-wide exact artifact name across original and physical recovery
+runs. It verifies each REST artifact digest, the producing workflow identity,
+and the full result identity, refuses zero-or-multiple ambiguity where a result
+is required, and persists the one physical upload run ID. It then proceeds
+directly to provenance publication without another Azure login, target PUT,
+deployment, or attestation run. This preserves the original result digest and
+allows an exact owned draft release to resume.
 
 Use explicit manual recovery rather than rerunning with a new origin:
 
@@ -422,7 +445,7 @@ Use explicit manual recovery rather than rerunning with a new origin:
 gh workflow run ubuntu2404-confidential-capture.yml --ref main \
   -f source_release_tag=Ubuntu-24.04-confidential-YYYYMMDD \
   -f target_gallery_version=MAJOR.MINOR.PATCH \
-  -f scratch_resource_group=miz-u2404-cvm-capture-SUFFIX \
+  -f scratch_resource_group=miz-u2404-cvm-capture-32_LOWERCASE_HEX \
   -f origin_run_id=ORIGINAL_RUN_ID \
   -f origin_run_attempt=ORIGINAL_RUN_ATTEMPT
 ```
@@ -435,7 +458,11 @@ JSON to a controlled draft GitHub release, downloads and revalidates that exact
 asset, then publishes the release. An exact owned draft may be resumed only
 when tag, tool commit, title, origin identity, recovery intent digest, and any
 staged asset all match; a foreign or mismatched draft is refused, and a
-published release is never overwritten. After publication the workflow
+published release is never overwritten. Draft discovery lists releases with
+pagination, refuses duplicate exact tags, captures the numeric release ID from
+the REST creation/list result, and uses `/releases/{id}` for every draft
+re-read, upload, and publish operation. The tag endpoint is used only after the
+release is published. After publication the workflow
 requires GitHub to report the release immutable with the exact tag, title, and
 commit and exactly one asset with the exact name and SHA-256. Full raw Azure
 and MAA verification has already succeeded inside the protected Azure job; the

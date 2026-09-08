@@ -12,7 +12,7 @@ const guest_library_path =
 const max_source_bytes = 4 * 1024 * 1024;
 const max_output_bytes = 1024 * 1024;
 const group_name =
-    "miz-u2404-cvm-capture-123-4-00112233445566778899aabbccddeeff";
+    "miz-u2404-cvm-capture-00112233445566778899aabbccddeeff";
 const subscription = "00000000-0000-0000-0000-000000000000";
 const commit = "0123456789abcdef0123456789abcdef01234567";
 const tool_commit = "fedcba9876543210fedcba9876543210fedcba98";
@@ -330,11 +330,13 @@ test "harness encodes durable parent and serialized publication trust boundaries
         "CAPTURE_PRINCIPAL_CLIENT_ID",
         "PUBLICATION_PRINCIPAL_CLIENT_ID",
         "Capture and publication principals must be distinct",
-        "usage: $0 prepare|inspect-recovery|export-recovery",
+        "usage: $0 prepare|adopt-recovery|inspect-recovery|export-recovery",
+        "\"$command_name\" != adopt-recovery",
         "ORIGIN_RUN_ID",
         "ORIGIN_RUN_ATTEMPT",
         "RECOVERY_ARTIFACT_NAME",
         "DISPATCH_ARTIFACT_NAME",
+        "ORIGIN_DISPATCH_ARTIFACT_DIGEST",
         "RESULT_ARTIFACT_NAME",
         "PUBLICATION_SNAPSHOT_READ_SCOPE",
         "PUBLICATION_VERSION_WRITE_SCOPE",
@@ -755,6 +757,174 @@ test "publication dispatch is one upsert and ambiguity is quarantined" {
     }
     try std.testing.expect(result.succeeded());
     try expectContains(result.stderr, "failed ambiguously");
+}
+
+test "durable dispatch recovery quarantines before expanded target inspection and cleanup" {
+    const allocator = std.testing.allocator;
+    const script = try readTracked(allocator, script_path);
+    defer allocator.free(script);
+    const library = try readTracked(allocator, library_path);
+    defer allocator.free(library);
+    const state_source = try section(
+        script,
+        "state_replace() {",
+        "\nowned_tags_match() {",
+    );
+    const dispatch_source = try section(
+        script,
+        "export_dispatch_marker() {",
+        "\nfinalize_durable_result() {",
+    );
+    const recovery_source = try section(
+        script,
+        "validate_existing_target_version() {",
+        "\ncase \"$command_name\" in",
+    );
+    const cleanup_source = try section(
+        script,
+        "delete_temporary_group() {",
+        "\ncleanup_resources() {",
+    );
+    const get_source = try section(
+        library,
+        "azure_confidential_vm_capture_gallery_version_get_args() {",
+        "\nazure_confidential_vm_print_command() {",
+    );
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try fixtureRoot(allocator, tmp);
+    defer allocator.free(root);
+    const state = try writeState(
+        allocator,
+        root,
+        "confirmed_created",
+        "not_dispatched",
+        false,
+        "[]",
+    );
+    defer allocator.free(state);
+    const preamble = try shellIdentityPreamble(allocator, state);
+    defer allocator.free(preamble);
+    const fixture_source = try std.fmt.allocPrint(
+        allocator,
+        \\#!/usr/bin/env bash
+        \\set -Eeuo pipefail
+        \\{s}
+        \\RESULT_DIR='{s}'
+        \\RECOVERY_ACTION_FILE='{s}/recovery-action'
+        \\dispatch_marker_file='{s}/put-dispatch.json'
+        \\target_response='{s}/target-response.json'
+        \\target_version_id=/subscriptions/{s}/resourceGroups/target-rg/providers/Microsoft.Compute/galleries/release/images/ubuntu-confidential/versions/1.2.3
+        \\target_request='{s}/target-request.json'
+        \\snapshot_id=/subscriptions/{s}/resourceGroups/{s}/providers/Microsoft.Compute/snapshots/capture
+        \\target_definition_id=/subscriptions/{s}/resourceGroups/target-rg/providers/Microsoft.Compute/galleries/release/images/ubuntu-confidential
+        \\RELEASE_TOOL='{s}/release'
+        \\RECOVERY_ARTIFACT_DIGEST=sha256:{s}
+        \\DISPATCH_ARTIFACT_DIGEST=sha256:{s}
+        \\AZURE_CONFIDENTIAL_VM_ARGS=()
+        \\printf '{{}}\n' >"$dispatch_marker_file"
+        \\chmod 0600 "$dispatch_marker_file"
+        \\{s}
+        \\{s}
+        \\{s}
+        \\{s}
+        \\{s}
+        \\validate_recovery_intent() {{ :; }}
+        \\mark_recovery_durable() {{ :; }}
+        \\refresh_recovery_prepared_evidence() {{ :; }}
+        \\validate_target_parents() {{ :; }}
+        \\validate_publication_snapshot_access() {{ :; }}
+        \\validate_dispatch_marker() {{ :; }}
+        \\validate_existing_target_version() {{ [[ "$MODE" != mismatch ]]; }}
+        \\publication_az() {{
+        \\  printf '%s\n' "$*" >>'{s}/publication.log'
+        \\  case "$MODE" in
+        \\    unavailable) printf 'AuthorizationFailed\n' >&2; return 52 ;;
+        \\    absent) printf 'ResourceNotFound\n' >&2; return 3 ;;
+        \\    mismatch|success) printf '{{}}\n' ;;
+        \\  esac
+        \\}}
+        \\az() {{ printf '%s\n' "$*" >>'{s}/az.log'; return 70; }}
+        \\reset_state() {{
+        \\  jq '.target.publication.status = "not_dispatched" |
+        \\      .target.publication.dispatch_artifact_digest = null' \
+        \\    "$STATE_FILE" >"$STATE_FILE.next"
+        \\  mv "$STATE_FILE.next" "$STATE_FILE"
+        \\  chmod 0600 "$STATE_FILE"
+        \\  rm -f -- "$RECOVERY_ACTION_FILE"
+        \\}}
+        \\reset_state
+        \\if delete_temporary_group; then exit 90; fi
+        \\jq -e '.target.publication.status == "not_dispatched" and
+        \\       .target.publication.dispatch_artifact_digest == null' \
+        \\  "$STATE_FILE" >/dev/null
+        \\for MODE in unavailable absent mismatch; do
+        \\  reset_state
+        \\  set +e
+        \\  ( set -e; inspect_recovery_target )
+        \\  inspect_status=$?
+        \\  set -e
+        \\  [[ "$inspect_status" != 0 ]]
+        \\  jq -e '.target.publication.status == "quarantined" and
+        \\         (.target.publication.dispatch_artifact_digest |
+        \\          test("^sha256:[0-9a-f]{{64}}$"))' "$STATE_FILE" >/dev/null
+        \\  if delete_temporary_group; then exit 91; fi
+        \\done
+        \\reset_state
+        \\MODE=success
+        \\inspect_recovery_target
+        \\jq -e '.target.publication.status == "put_authorized"' "$STATE_FILE" >/dev/null
+        \\[[ "$(cat "$RECOVERY_ACTION_FILE")" == resume ]]
+        \\if delete_temporary_group; then exit 92; fi
+        \\grep -Fq '%24expand=ReplicationStatus' '{s}/publication.log'
+        \\! grep -q 'group delete' '{s}/az.log'
+        \\
+    ,
+        .{
+            preamble,
+            root,
+            root,
+            root,
+            root,
+            subscription,
+            root,
+            subscription,
+            group_name,
+            subscription,
+            root,
+            "b" ** 64,
+            "c" ** 64,
+            state_source,
+            dispatch_source,
+            get_source,
+            recovery_source,
+            cleanup_source,
+            root,
+            root,
+            root,
+            root,
+        },
+    );
+    defer allocator.free(fixture_source);
+    const result = try runShellSource(
+        allocator,
+        root,
+        "durable-dispatch-recovery-fixture.sh",
+        fixture_source,
+    );
+    defer result.deinit(allocator);
+    if (!result.succeeded()) {
+        std.debug.print(
+            "durable dispatch fixture failed:\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ result.stdout, result.stderr },
+        );
+    }
+    try std.testing.expect(result.succeeded());
+    try expectContains(
+        result.stderr,
+        "retaining post-dispatch scratch resources for recovery",
+    );
 }
 
 test "parent missing and drift fail before any mutation" {

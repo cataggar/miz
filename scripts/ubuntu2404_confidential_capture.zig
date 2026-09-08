@@ -487,16 +487,9 @@ pub fn validateCaptureGalleryIds(
 
 fn validScratchResourceGroup(
     resource_group: []const u8,
-    run_id: []const u8,
-    run_attempt: []const u8,
 ) bool {
     if (!validResourceGroupName(resource_group)) return false;
-    var prefix_buffer: [96]u8 = undefined;
-    const prefix = std.fmt.bufPrint(
-        &prefix_buffer,
-        "miz-u2404-cvm-capture-{s}-{s}-",
-        .{ run_id, run_attempt },
-    ) catch return false;
+    const prefix = "miz-u2404-cvm-capture-";
     if (resource_group.len != prefix.len + 32 or
         !std.mem.startsWith(u8, resource_group, prefix))
     {
@@ -709,11 +702,7 @@ fn validateExpected(
         expected.source.artifact.virtual_size == 0 or
         !std.ascii.eqlIgnoreCase(expected.source.location, expected.location) or
         !validEndpoint(expected.attestation_endpoint) or
-        !validScratchResourceGroup(
-            expected.scratch_resource_group,
-            expected.run_id,
-            expected.run_attempt,
-        ) or
+        !validScratchResourceGroup(expected.scratch_resource_group) or
         !validResourceGroupName(expected.target_resource_group) or
         std.ascii.eqlIgnoreCase(
             expected.scratch_resource_group,
@@ -1822,7 +1811,7 @@ test "Azure capture resource IDs are structural and exact" {
 
 const test_subscription = "00000000-0000-0000-0000-000000000000";
 const test_group =
-    "miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff";
+    "miz-u2404-cvm-capture-00112233445566778899aabbccddeeff";
 const test_prefix = "/subscriptions/" ++ test_subscription ++
     "/resourceGroups/" ++ test_group ++ "/providers/Microsoft.Compute/";
 const test_source_version = "/subscriptions/" ++ test_subscription ++
@@ -1907,17 +1896,17 @@ fn testEvidence() Evidence {
     };
 }
 
-test "capture expectations enforce exact randomized scratch scope" {
+test "capture expectations enforce exact generic randomized scratch scope" {
     var diagnostic: Diagnostic = .{};
     try validateExpected(std.testing.allocator, testExpected(), &diagnostic);
 
     const invalid_groups = [_][]const u8{
-        "miz-u2404-cvm-capture-456-2",
-        "miz-u2404-cvm-capture-456-2-00112233445566778899AABBCCDDEEFF",
-        "miz-u2404-cvm-capture-456-2-0011223344556677",
-        "miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff-extra",
-        "miz-u2404-cvm-capture-4567-2-00112233445566778899aabbccddeeff",
-        "miz-u2404-cvm-capture-45-6-2-00112233445566778899aabbccddeeff",
+        "miz-u2404-cvm-capture-0011223344556677",
+        "miz-u2404-cvm-capture-00112233445566778899AABBCCDDEEFF",
+        "miz-u2404-cvm-capture-00112233445566778899aabbccddeefg",
+        "miz-u2404-cvm-capture-00112233445566778899aabbccddeeff-extra",
+        "miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff",
+        "other-u2404-cvm-capture-00112233445566778899aabbccddeeff",
     };
     for (invalid_groups) |group| {
         diagnostic = .{};
@@ -1932,7 +1921,7 @@ test "capture expectations enforce exact randomized scratch scope" {
     var expected = testExpected();
     expected.capture_disk_id =
         "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/" ++
-        "miz-u2404-cvm-capture-456-2-ffeeddccbbaa99887766554433221100" ++
+        "miz-u2404-cvm-capture-ffeeddccbbaa99887766554433221100" ++
         "/providers/Microsoft.Compute/disks/capture-os";
     diagnostic = .{};
     try std.testing.expectError(
@@ -1967,17 +1956,17 @@ test "capture expectations enforce exact randomized scratch scope" {
 test "scratch ARM scope parsing is case-insensitive and segment-safe" {
     var diagnostic: Diagnostic = .{};
     try validateScratchArmId(
-        "/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/MIZ-U2404-CVM-CAPTURE-456-2-00112233445566778899AABBCCDDEEFF/PROVIDERS/Microsoft.Network/networkInterfaces/source",
+        "/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/MIZ-U2404-CVM-CAPTURE-00112233445566778899AABBCCDDEEFF/PROVIDERS/Microsoft.Network/networkInterfaces/source",
         test_subscription,
         test_group,
         "network interface",
         &diagnostic,
     );
     const invalid_ids = [_][]const u8{
-        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-456-2-ffeeddccbbaa99887766554433221100/providers/Microsoft.Compute/disks/data",
-        "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff/providers/Microsoft.Compute/disks/data",
-        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff-extra/providers/Microsoft.Compute/disks/data",
-        "prefix/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff/providers/Microsoft.Compute/disks/data",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-ffeeddccbbaa99887766554433221100/providers/Microsoft.Compute/disks/data",
+        "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/miz-u2404-cvm-capture-00112233445566778899aabbccddeeff/providers/Microsoft.Compute/disks/data",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-00112233445566778899aabbccddeeff-extra/providers/Microsoft.Compute/disks/data",
+        "prefix/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-00112233445566778899aabbccddeeff/providers/Microsoft.Compute/disks/data",
     };
     for (invalid_ids) |id| {
         diagnostic = .{};
@@ -2307,7 +2296,7 @@ test "capture result independently rejects provenance substitutions" {
         },
         .{
             "\"scratch_resource_group\":\"" ++ test_group ++ "\"",
-            "\"scratch_resource_group\":\"miz-u2404-cvm-capture-456-2-ffeeddccbbaa99887766554433221100\"",
+            "\"scratch_resource_group\":\"miz-u2404-cvm-capture-ffeeddccbbaa99887766554433221100\"",
         },
         .{
             "\"architecture\":\"x64\",\"capture\"",
