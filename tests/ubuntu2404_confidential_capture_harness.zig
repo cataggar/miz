@@ -309,6 +309,10 @@ test "temporary resources use random group names explicit networking and allowli
         "final_os_disk_name=",
         "record_expected_resource",
         "temporary_resources",
+        "scratch-resource-inventory.json",
+        "--scratch-resource-group \"$resource_group\"",
+        "--scratch-inventory \"$scratch_inventory\"",
+        "--target-resource-group \"$TARGET_RESOURCE_GROUP\"",
         "Could not freshly inventory the temporary resource group",
         "unknown, mismatched, or untagged resource",
     }) |needle| try expectContains(script, needle);

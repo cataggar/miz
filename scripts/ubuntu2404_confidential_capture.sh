@@ -1430,6 +1430,7 @@ run_capture_vm_check() {
     --repository "$SOURCE_REPOSITORY" \
     --capture-run-id "$GITHUB_RUN_ID" \
     --capture-run-attempt "$GITHUB_RUN_ATTEMPT" \
+    --scratch-resource-group "$resource_group" \
     --subscription-id "$AZURE_SUBSCRIPTION_ID" \
     --location "$AZURE_LOCATION" \
     --source-version-id "$staging_version_id" \
@@ -2044,8 +2045,21 @@ owned_tags_match "$target_response" "$OWNER" "$GITHUB_REPOSITORY" \
   --vm-id "$final_vm_id" \
   --disk-id "$final_disk_id" >/dev/null
 
+scratch_inventory="$RESULT_DIR/scratch-resource-inventory.json"
+state_matches_identity "$STATE_FILE" ||
+  fail "Cannot create capture provenance from invalid scratch state"
+jq -c \
+  '{
+    schema: 1,
+    subscription_id: .subscription_id,
+    scratch_resource_group: .temporary_resource_group,
+    resources: (.temporary_resources | sort_by(.id | ascii_downcase))
+  }' "$STATE_FILE" >"$scratch_inventory"
+chmod 0600 "$scratch_inventory"
+
 capture_evidence_manifest="$RESULT_DIR/capture-evidence.sha256"
 sha256sum \
+  "$scratch_inventory" \
   "$upload_disk_json" \
   "$managed_image_json" \
   "$staging_definition_json" \
@@ -2092,6 +2106,9 @@ capture_common_args=(
   --repository "$GITHUB_REPOSITORY"
   --run-id "$GITHUB_RUN_ID"
   --run-attempt "$GITHUB_RUN_ATTEMPT"
+  --scratch-resource-group "$resource_group"
+  --scratch-inventory "$scratch_inventory"
+  --target-resource-group "$TARGET_RESOURCE_GROUP"
   --capture-vm-id "$capture_vm_id"
   --capture-disk-id "$capture_disk_id"
   --snapshot-id "$snapshot_id"

@@ -66,6 +66,8 @@ const usage_text =
     \\from fresh HTTPS/OIDC retrieval by the protected workflow immediately before
     \\invocation; this CLI validates and tamper-evidently binds file contents but
     \\does not authenticate their transport origin.
+    \\capture-result and verify-capture also require --scratch-resource-group,
+    \\--scratch-inventory, and the separately configured --target-resource-group.
     \\
 ;
 
@@ -1832,6 +1834,7 @@ fn runCheckCaptureVm(context: Context, argv: []const []const u8) !void {
         "repository",
         "capture-run-id",
         "capture-run-attempt",
+        "scratch-resource-group",
         "subscription-id",
         "location",
         "source-version-id",
@@ -1865,6 +1868,7 @@ fn runCheckCaptureVm(context: Context, argv: []const []const u8) !void {
         try options.require("capture-run-id"),
         try options.require("capture-run-attempt"),
         try options.require("repository"),
+        try options.require("scratch-resource-group"),
     );
     const source_version_id = try options.require("source-version-id");
     try capture.validateSourceVersionId(
@@ -1879,6 +1883,13 @@ fn runCheckCaptureVm(context: Context, argv: []const []const u8) !void {
         context.diagnostic,
     );
     defer document.deinit();
+    try capture.validateScratchArmDocument(
+        document.object(),
+        try options.require("subscription-id"),
+        try options.require("scratch-resource-group"),
+        "capture VM evidence",
+        context.diagnostic,
+    );
     try release.azure_confidential_vm.validateCaptureVm(
         document.object(),
         .{
@@ -2141,6 +2152,9 @@ const capture_result_options = [_][]const u8{
     "repository",
     "run-id",
     "run-attempt",
+    "scratch-resource-group",
+    "scratch-inventory",
+    "target-resource-group",
     "capture-vm-id",
     "capture-disk-id",
     "snapshot-id",
@@ -2188,6 +2202,9 @@ const capture_verify_options = [_][]const u8{
     "repository",
     "run-id",
     "run-attempt",
+    "scratch-resource-group",
+    "scratch-inventory",
+    "target-resource-group",
     "capture-vm-id",
     "capture-disk-id",
     "snapshot-id",
@@ -2285,6 +2302,8 @@ fn captureExpected(
         .location = try options.require("location"),
         .run_id = try options.require("run-id"),
         .run_attempt = try options.require("run-attempt"),
+        .scratch_resource_group = try options.require("scratch-resource-group"),
+        .target_resource_group = try options.require("target-resource-group"),
         .capture_vm_id = try options.require("capture-vm-id"),
         .capture_disk_id = try options.require("capture-disk-id"),
         .snapshot_id = try options.require("snapshot-id"),
@@ -2322,22 +2341,6 @@ const StagingEvidenceRevisions = struct {
     gallery_request: FileIdentity,
     gallery_response: FileIdentity,
 };
-
-fn resourceGroupFromId(id: []const u8) ?[]const u8 {
-    var segments = std.mem.splitScalar(u8, id, '/');
-    if (!std.mem.eql(u8, segments.next() orelse return null, "") or
-        !std.ascii.eqlIgnoreCase(segments.next() orelse return null, "subscriptions"))
-    {
-        return null;
-    }
-    _ = segments.next() orelse return null;
-    if (!std.ascii.eqlIgnoreCase(
-        segments.next() orelse return null,
-        "resourceGroups",
-    )) return null;
-    const group = segments.next() orelse return null;
-    return if (group.len == 0) null else group;
-}
 
 fn requireStagingOwnershipTags(
     document: *const ObjectMap,
@@ -2425,6 +2428,7 @@ fn validateStagingEvidence(
     run_id: []const u8,
     run_attempt: []const u8,
     repository: []const u8,
+    scratch_resource_group: []const u8,
 ) !StagingEvidenceRevisions {
     var source_acceptance = try readObject(
         context.allocator,
@@ -2470,6 +2474,13 @@ fn validateStagingEvidence(
         context.diagnostic,
     );
     defer disk.deinit();
+    try capture.validateScratchArmDocument(
+        disk.object(),
+        try options.require("subscription-id"),
+        scratch_resource_group,
+        "source staging disk evidence",
+        context.diagnostic,
+    );
     const disk_id = try release.azure_confidential_vm.validateManagedDisk(
         disk.object(),
         context.diagnostic,
@@ -2480,12 +2491,17 @@ fn validateStagingEvidence(
         try options.require("subscription-id"),
         context.diagnostic,
     );
-    const staging_group = resourceGroupFromId(source_version_id) orelse
-        return invalid(context.diagnostic, "staging gallery resource group is invalid", .{});
+    try capture.validateScratchArmId(
+        source_version_id,
+        try options.require("subscription-id"),
+        scratch_resource_group,
+        "source staging version",
+        context.diagnostic,
+    );
     try requireBoundAzureId(
         context.allocator,
         disk_id,
-        staging_group,
+        scratch_resource_group,
         "/disks/",
         "source staging disk",
         context.diagnostic,
@@ -2511,6 +2527,13 @@ fn validateStagingEvidence(
         context.diagnostic,
     );
     defer managed_image.deinit();
+    try capture.validateScratchArmDocument(
+        managed_image.object(),
+        try options.require("subscription-id"),
+        scratch_resource_group,
+        "source staging managed-image evidence",
+        context.diagnostic,
+    );
     const managed_image_id = try release.azure_confidential_vm.validateManagedImage(
         managed_image.object(),
         disk_id,
@@ -2519,7 +2542,7 @@ fn validateStagingEvidence(
     try requireBoundAzureId(
         context.allocator,
         managed_image_id,
-        staging_group,
+        scratch_resource_group,
         "/images/",
         "source staging managed image",
         context.diagnostic,
@@ -2550,6 +2573,13 @@ fn validateStagingEvidence(
         context.diagnostic,
     );
     defer definition.deinit();
+    try capture.validateScratchArmDocument(
+        definition.object(),
+        try options.require("subscription-id"),
+        scratch_resource_group,
+        "source staging definition evidence",
+        context.diagnostic,
+    );
     const definition_id = try release.azure_confidential_vm.validateImageDefinition(
         definition.object(),
         context.diagnostic,
@@ -2591,6 +2621,13 @@ fn validateStagingEvidence(
         context.diagnostic,
     );
     defer gallery_request.deinit();
+    try capture.validateScratchArmDocument(
+        gallery_request.object(),
+        try options.require("subscription-id"),
+        scratch_resource_group,
+        "source staging gallery request evidence",
+        context.diagnostic,
+    );
     var gallery_response = try readObject(
         context.allocator,
         context.io,
@@ -2598,6 +2635,13 @@ fn validateStagingEvidence(
         context.diagnostic,
     );
     defer gallery_response.deinit();
+    try capture.validateScratchArmDocument(
+        gallery_response.object(),
+        try options.require("subscription-id"),
+        scratch_resource_group,
+        "source staging gallery response evidence",
+        context.diagnostic,
+    );
     try release.azure_confidential_vm.validateGalleryVersion(
         gallery_request.object(),
         gallery_response.object(),
@@ -2640,6 +2684,7 @@ fn validateStagingEvidence(
 const EvidenceRevisions = struct {
     source_acceptance: FileIdentity,
     source_provenance: FileIdentity,
+    scratch_inventory: FileIdentity,
     source_staging_disk: FileIdentity,
     source_staging_managed_image: FileIdentity,
     source_staging_definition: FileIdentity,
@@ -2712,6 +2757,13 @@ fn captureEvidence(
             document_max_bytes,
             revisions.source_provenance,
             "source provenance evidence",
+        ),
+        .scratch_inventory_sha256 = try hashValidatedEvidence(
+            context,
+            try options.require("scratch-inventory"),
+            document_max_bytes,
+            revisions.scratch_inventory,
+            "scratch inventory evidence",
         ),
         .source_staging_disk_sha256 = try hashValidatedEvidence(
             context,
@@ -2840,6 +2892,7 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
         try options.require("run-id"),
         try options.require("run-attempt"),
         try options.require("repository"),
+        try options.require("scratch-resource-group"),
     );
     var source_acceptance = try readObject(
         context.allocator,
@@ -2860,6 +2913,13 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
         source_acceptance.object(),
         context.diagnostic,
     );
+    var scratch_inventory = try readObject(
+        context.allocator,
+        context.io,
+        try options.require("scratch-inventory"),
+        context.diagnostic,
+    );
+    defer scratch_inventory.deinit();
     var capture_vm = try readObject(context.allocator, context.io, try options.require("capture-vm"), context.diagnostic);
     defer capture_vm.deinit();
     var capture_vm_instance = try readObject(context.allocator, context.io, try options.require("capture-vm-instance"), context.diagnostic);
@@ -2897,6 +2957,7 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
         .{
             .source_acceptance = source_acceptance.identity,
             .source_provenance = verified.provenance_identity,
+            .scratch_inventory = scratch_inventory.identity,
             .source_staging_disk = staging.disk,
             .source_staging_managed_image = staging.managed_image,
             .source_staging_definition = staging.definition,
@@ -2921,6 +2982,7 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
         context.allocator,
         .{
             .source_acceptance = source_acceptance.object(),
+            .scratch_inventory = scratch_inventory.object(),
             .capture_vm = capture_vm.object(),
             .capture_vm_instance = capture_vm_instance.object(),
             .capture_disk = capture_disk.object(),
@@ -2957,6 +3019,7 @@ fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
         try options.require("run-id"),
         try options.require("run-attempt"),
         try options.require("repository"),
+        try options.require("scratch-resource-group"),
     );
     var source_acceptance = try readObject(
         context.allocator,
@@ -2977,6 +3040,13 @@ fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
         source_acceptance.object(),
         context.diagnostic,
     );
+    var scratch_inventory = try readObject(
+        context.allocator,
+        context.io,
+        try options.require("scratch-inventory"),
+        context.diagnostic,
+    );
+    defer scratch_inventory.deinit();
     var result_document = try readObject(
         context.allocator,
         context.io,
@@ -3026,6 +3096,7 @@ fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
         .{
             .source_acceptance = source_acceptance.identity,
             .source_provenance = verified.provenance_identity,
+            .scratch_inventory = scratch_inventory.identity,
             .source_staging_disk = staging.disk,
             .source_staging_managed_image = staging.managed_image,
             .source_staging_definition = staging.definition,
@@ -3051,6 +3122,7 @@ fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
         result_document.object(),
         .{
             .source_acceptance = source_acceptance.object(),
+            .scratch_inventory = scratch_inventory.object(),
             .capture_vm = capture_vm.object(),
             .capture_vm_instance = capture_vm_instance.object(),
             .capture_disk = capture_disk.object(),
@@ -3170,6 +3242,7 @@ test "command surface is exact and rejects incomplete invocations" {
 const EvidenceRevisionField = enum {
     source_acceptance,
     source_provenance,
+    scratch_inventory,
     source_staging_disk,
     source_staging_managed_image,
     source_staging_definition,
@@ -3214,6 +3287,7 @@ test "capture-result and verify-capture reject every evidence revision mismatch"
     const argv = [_][]const u8{
         "--source-acceptance",        path,
         "--provenance",               path,
+        "--scratch-inventory",        path,
         "--staging-disk",             path,
         "--staging-managed-image",    path,
         "--staging-definition",       path,
@@ -3249,6 +3323,7 @@ test "capture-result and verify-capture reject every evidence revision mismatch"
     const revisions: EvidenceRevisions = .{
         .source_acceptance = observed.identity,
         .source_provenance = observed.identity,
+        .scratch_inventory = observed.identity,
         .source_staging_disk = observed.identity,
         .source_staging_managed_image = observed.identity,
         .source_staging_definition = observed.identity,
