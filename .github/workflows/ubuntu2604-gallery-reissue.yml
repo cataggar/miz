@@ -183,7 +183,8 @@ jobs:
           private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
-          permission-administration: read
+          permission-administration: write
+          permission-contents: read
 
       - name: Publish explicit metadata-capable reissue
         env:

@@ -9,6 +9,8 @@ const Io = std.Io;
 const usage =
     \\usage:
     \\  miz_release verify-version --tag TAG --manifest PATH [--github-output PATH]
+    \\  miz_release check-release-policy --repository OWNER/REPO
+    \\      --immutable-response PATH --rulesets-response PATH
     \\  miz_release publish --repository OWNER/REPO --tag TAG --version VERSION
     \\      --commit SHA --assets-directory PATH --workspace PATH
     \\      [--github-step-summary PATH]
@@ -136,6 +138,21 @@ fn run(
             try output.writePositionalAll(io, text, stat.size);
         }
         return;
+    }
+    if (std.mem.eql(u8, argv[0], "check-release-policy")) {
+        try options.only(&.{
+            "--repository",
+            "--immutable-response",
+            "--rulesets-response",
+        });
+        return release.github_release.validateRepositoryReleasePolicyFiles(
+            allocator,
+            io,
+            try options.require("--immutable-response"),
+            try options.require("--rulesets-response"),
+            try options.require("--repository"),
+            diagnostic,
+        );
     }
     if (std.mem.eql(u8, argv[0], "publish")) {
         try options.only(&.{

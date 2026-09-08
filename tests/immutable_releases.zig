@@ -260,7 +260,10 @@ const Fixture = struct {
             path,
             self.allocator,
             .limited(max_output),
-        );
+        ) catch |err| switch (err) {
+            error.FileNotFound => self.allocator.dupe(u8, ""),
+            else => return err,
+        };
     }
 
     fn stage(self: *Fixture) ![]u8 {
@@ -364,13 +367,54 @@ test "fresh draft uploads verifies downloads and publishes once in order" {
     try expectOrder(
         log,
         "32:Accept: application/octet-stream",
-        "repos/cataggar/miz/immutable-releases",
-    );
-    try expectOrder(
-        log,
-        "repos/cataggar/miz/immutable-releases",
         "8:--method\x1f5:PATCH",
     );
+    const create_at = std.mem.indexOf(u8, log, create_endpoint) orelse
+        return error.MissingText;
+    const first_immutable = std.mem.indexOf(
+        u8,
+        log,
+        "repos/cataggar/miz/immutable-releases",
+    ) orelse return error.MissingText;
+    const first_ruleset = std.mem.indexOf(
+        u8,
+        log,
+        "rulesets?includes_parents=true&targets=tag&per_page=100",
+    ) orelse return error.MissingText;
+    try std.testing.expect(first_immutable < first_ruleset);
+    try std.testing.expect(first_ruleset < create_at);
+    const publish_at = std.mem.indexOf(
+        u8,
+        log,
+        "8:--method\x1f5:PATCH",
+    ) orelse return error.MissingText;
+    const before_publish = log[0..publish_at];
+    const final_tag = std.mem.lastIndexOf(
+        u8,
+        before_publish,
+        "repos/cataggar/miz/git/ref/tags/v1.2.3",
+    ) orelse return error.MissingText;
+    const final_immutable = std.mem.indexOfPos(
+        u8,
+        before_publish,
+        final_tag,
+        "repos/cataggar/miz/immutable-releases",
+    ) orelse return error.MissingText;
+    const final_ruleset = std.mem.indexOfPos(
+        u8,
+        before_publish,
+        final_immutable,
+        "rulesets?includes_parents=true&targets=tag&per_page=100",
+    ) orelse return error.MissingText;
+    try std.testing.expect(final_tag < final_immutable);
+    try std.testing.expect(final_immutable < final_ruleset);
+    const tag_after_publish = std.mem.indexOfPos(
+        u8,
+        log,
+        publish_at + 1,
+        "repos/cataggar/miz/git/ref/tags/v1.2.3",
+    ) orelse return error.MissingText;
+    try std.testing.expect(publish_at < tag_after_publish);
     try expectContains(log, "11:draft=false");
     try expectContains(log, "10:draft=true");
     try expectContains(log, "17:make_latest=false");
@@ -617,7 +661,7 @@ test "upload failure leaves a resumable draft and never publishes" {
     try expectAbsent(log, "8:--method\x1f5:PATCH");
 }
 
-test "immutable release policy failures leave the release as a draft" {
+test "repository release policy failures occur before draft mutation" {
     inline for ([_]struct {
         scenario: []const u8,
         policy_token: ?[]const u8,
@@ -643,6 +687,21 @@ test "immutable release policy failures leave the release as a draft" {
             .policy_token = null,
             .diagnostic = "policy token is missing",
         },
+        .{
+            .scenario = "ruleset-missing",
+            .policy_token = "policy-token",
+            .diagnostic = "tag ruleset is missing",
+        },
+        .{
+            .scenario = "ruleset-inactive",
+            .policy_token = "policy-token",
+            .diagnostic = "enforcement is not active",
+        },
+        .{
+            .scenario = "ruleset-bypass",
+            .policy_token = "policy-token",
+            .diagnostic = "has a bypass actor",
+        },
     }) |case| {
         var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
         defer fixture.deinit();
@@ -654,11 +713,10 @@ test "immutable release policy failures leave the release as a draft" {
         defer result.deinit(std.testing.allocator);
         try std.testing.expect(!result.succeeded());
         try expectContains(result.stderr, case.diagnostic);
-        const stage = try fixture.stage();
-        defer std.testing.allocator.free(stage);
-        try std.testing.expectEqualStrings("draft", stage);
         const log = try fixture.log();
         defer std.testing.allocator.free(log);
+        try expectAbsent(log, create_endpoint);
+        try expectAbsent(log, upload_endpoint);
         try expectAbsent(log, "8:--method\x1f5:PATCH");
     }
 }

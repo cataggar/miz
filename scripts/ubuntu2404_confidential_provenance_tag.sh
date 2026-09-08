@@ -22,6 +22,34 @@ api_headers=(
 full_ref="refs/tags/$tag_name"
 
 case "$command_name" in
+  classify)
+    matching_refs="$output_dir/provenance-matching-refs.json"
+    gh api "${api_headers[@]}" \
+      "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag_name" \
+      >"$matching_refs"
+    exact_count=$(jq -er \
+      --arg ref "$full_ref" \
+      '[.[] | select(.ref == $ref)] | length' \
+      "$matching_refs")
+    if (( exact_count == 0 )); then
+      printf '%s\n' absent
+    elif (( exact_count == 1 )); then
+      jq -e \
+        --arg ref "$full_ref" \
+        --arg commit "$expected_commit" \
+        '([.[] | select(.ref == $ref)] | length) == 1 and
+         ([.[] | select(.ref == $ref)][0] |
+           .object.type == "commit" and .object.sha == $commit)' \
+        "$matching_refs" >/dev/null || {
+        echo "::error::The protected provenance tag is not the exact lightweight commit ref"
+        exit 1
+      }
+      printf '%s\n' lightweight
+    else
+      echo "::error::The protected provenance tag is ambiguous"
+      exit 1
+    fi
+    ;;
   require-absent)
     matching_refs="$output_dir/provenance-matching-refs.json"
     gh api "${api_headers[@]}" \

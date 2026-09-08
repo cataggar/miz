@@ -92,6 +92,7 @@ const usage_text =
     \\  github-tag-target             print a tag object's target identity
     \\  github-release-metadata       require an exact resumable draft identity
     \\  github-immutable-releases     require the protected repository policy
+    \\  check-release-policy          require immutable releases and global tag immutability
     \\  github-draft-assets           plan/validate exact numeric draft mutations
     \\  github-stale-assets           print release assets outside the allowlist
     \\  github-release-assets         check remote release assets

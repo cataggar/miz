@@ -310,8 +310,8 @@ test "policy and publication GitHub App tokens stay separated" {
         publication,
         "github-token: ${{ steps.github_policy_token.outputs.token }}",
     );
-    try expectCount(publication, "GH_TOKEN=\"$POLICY_GH_TOKEN\"", 13);
-    try expectCount(publication, "GH_TOKEN=\"$PUBLICATION_GH_TOKEN\"", 11);
+    try expectCount(publication, "GH_TOKEN=\"$POLICY_GH_TOKEN\"", 15);
+    try expectCount(publication, "GH_TOKEN=\"$PUBLICATION_GH_TOKEN\"", 12);
     try expectAbsent(prepare, "gh api --method POST");
     try expectAbsent(prepare, "gh api --method PATCH");
     try expectAbsent(capture, "gh api --method POST");
@@ -440,8 +440,8 @@ test "repository writer boundary and ruleset policy fail closed" {
         \\if [[ "$endpoint" == *'/rulesets?'* ]]; then
         \\  case "${GH_MODE:-valid}" in
         \\    missing) printf '%s\n' '[[]]' ;;
-        \\    ambiguous) printf '%s\n' '[[{"id":42,"name":"ubuntu2404-confidential-provenance-tags"},{"id":43,"name":"other-tag-ruleset"}]]' ;;
-        \\    *) printf '%s\n' '[[{"id":42,"name":"ubuntu2404-confidential-provenance-tags"}]]' ;;
+        \\    ambiguous) printf '%s\n' '[[{"id":42,"name":"ubuntu2404-confidential-provenance-tags"},{"id":43,"name":"ubuntu2404-confidential-provenance-tags"}]]' ;;
+        \\    *) printf '%s\n' '[[{"id":42,"name":"ubuntu2404-confidential-provenance-tags"},{"id":665,"name":"miz-immutable-release-tags-v1"}]]' ;;
         \\  esac
         \\  exit
         \\fi
@@ -540,7 +540,7 @@ test "ruleset path pattern matches generated tags with FNM_PATHNAME" {
     );
 }
 
-test "provenance tag verifier enforces absence then exact lightweight ref" {
+test "provenance tag verifier classifies absence and exact lightweight refs" {
     const allocator = std.testing.allocator;
     const workflow = try readTracked(allocator, workflow_path);
     defer allocator.free(workflow);
@@ -550,12 +550,14 @@ test "provenance tag verifier enforces absence then exact lightweight ref" {
     for ([_][]const u8{
         "git/matching-refs/tags/$tag_name",
         "([.[] | select(.ref == $ref)] | length) == 0",
+        "printf '%s\\n' absent",
+        "printf '%s\\n' lightweight",
         "git/ref/tags/$tag_name",
         ".object.type == \"commit\"",
         ".object.sha == $commit",
     }) |needle| try expectContains(tag_policy, needle);
-    try expectCount(workflow, "require-absent \"$PROVENANCE_RELEASE_TAG\"", 3);
-    try expectCount(workflow, "require-lightweight \"$PROVENANCE_RELEASE_TAG\"", 1);
+    try expectCount(workflow, "classify \"$PROVENANCE_RELEASE_TAG\"", 1);
+    try expectCount(workflow, "require-lightweight \"$PROVENANCE_RELEASE_TAG\"", 4);
 
     try runShellFixture(allocator, "provenance-tag-fixture.sh",
         \\#!/usr/bin/env bash
@@ -596,6 +598,8 @@ test "provenance tag verifier enforces absence then exact lightweight ref" {
         \\tag='miz-provenance/ubuntu2404-confidential-cvm/v1.2.3/origin-123-attempt-4/tool-0123456789abcdef0123456789abcdef01234567'
         \\commit=0123456789abcdef0123456789abcdef01234567
         \\policy="$MIZ_UBUNTU2404_CONFIDENTIAL_ROOT/scripts/ubuntu2404_confidential_provenance_tag.sh"
+        \\test "$(GH_MODE=absent "$policy" classify "$tag" "$commit" classify-absent)" = absent
+        \\test "$(GH_MODE=exists "$policy" classify "$tag" "$commit" classify-exact)" = lightweight
         \\GH_MODE=absent "$policy" require-absent "$tag" "$commit" absent
         \\if GH_MODE=exists "$policy" require-absent "$tag" "$commit" exists >/dev/null 2>&1; then
         \\  exit 90
@@ -648,7 +652,9 @@ test "immutable source release and provenance identities fail closed" {
         "git fetch --no-tags --depth=1 origin \"$tool_commit\"",
         "provenance_release_tag=\"miz-provenance/ubuntu2404-confidential-cvm/v$TARGET_GALLERY_VERSION/origin-$origin_run_id-attempt-$origin_run_attempt/tool-$tool_commit\"",
         "ubuntu2404_confidential_provenance_tag.sh",
-        "require-absent \"$provenance_release_tag\" \"$tool_commit\"",
+        "classify \"$provenance_release_tag\" \"$tool_commit\"",
+        "provenance_tag_state\" == absent",
+        "provenance_tag_state\" == lightweight",
         ".draft == false",
         ".prerelease == false",
         "(.assets | type == \"array\" and length == 3)",
@@ -834,8 +840,10 @@ test "publication boundary uploads one sanitized result and never deletes target
         "github-policy-before-asset-repair",
         "github-policy-before-upload",
         "github-policy-before-publish",
-        "immutable-releases-before-publish.json",
-        "check-immutable-releases",
+        "release-policy-before-tag",
+        "release-policy-before-create",
+        "release-policy-before-publish",
+        "scripts/release/check_repository_release_policy.sh",
         "tag-before-publish",
         "require-lightweight \"$PROVENANCE_RELEASE_TAG\" \"$TOOL_COMMIT\"",
         "origin-run-id: $ORIGIN_RUN_ID",
@@ -871,6 +879,16 @@ test "publication boundary uploads one sanitized result and never deletes target
         2,
     );
     const repair = try indexOf(publication, "--mode repair");
+    const tag_policy_before_create = try indexOf(
+        publication,
+        "release-policy-before-tag",
+    );
+    const tag_create = try indexOf(
+        publication,
+        "repos/$GITHUB_REPOSITORY/git/refs",
+    );
+    const tag_after_create = try indexOf(publication, "tag-after-create");
+    const draft_create = try indexOf(publication, "draft: true");
     const deletion = try indexOf(publication, "gh api --method DELETE");
     const upload = try indexOf(publication, "https://uploads.github.com/");
     const final_assets = try indexOf(publication, "--mode final");
@@ -880,12 +898,23 @@ test "publication boundary uploads one sanitized result and never deletes target
     );
     const immutable_policy = try indexOf(
         publication,
-        "immutable-releases-before-publish.json",
+        "release-policy-before-publish",
+    );
+    const exact_tag = try indexOf(publication, "tag-before-publish");
+    const provenance_policy = try indexOf(
+        publication,
+        "github-policy-before-publish",
     );
     const published_assets = try indexOf(publication, "--mode published");
     try std.testing.expect(repair < deletion);
+    try std.testing.expect(tag_policy_before_create < tag_create);
+    try std.testing.expect(tag_create < tag_after_create);
+    try std.testing.expect(tag_after_create < draft_create);
     try std.testing.expect(deletion < upload);
     try std.testing.expect(upload < final_assets);
+    try std.testing.expect(final_assets < exact_tag);
+    try std.testing.expect(exact_tag < provenance_policy);
+    try std.testing.expect(provenance_policy < immutable_policy);
     try std.testing.expect(final_assets < immutable_policy);
     try std.testing.expect(immutable_policy < publish);
     try std.testing.expect(final_assets < publish);
@@ -1016,8 +1045,10 @@ test "draft release creation resume and ambiguity use numeric REST identity" {
         ".body == $notes",
         "uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets",
         "ubuntu2404_confidential_github_policy.sh",
-        "require-absent \"$PROVENANCE_RELEASE_TAG\" \"$TOOL_COMMIT\"",
+        "classify \"$PROVENANCE_RELEASE_TAG\" \"$TOOL_COMMIT\"",
         "require-lightweight \"$PROVENANCE_RELEASE_TAG\" \"$TOOL_COMMIT\"",
+        "repos/$GITHUB_REPOSITORY/git/refs",
+        "ref=refs/tags/$PROVENANCE_RELEASE_TAG",
         "ubuntu2404_confidential_publish_release.sh",
         "EXPECTED_RELEASE_NOTES=\"$expected_notes\"",
         "\"$VALIDATION_DIR/publish-release.json\"",

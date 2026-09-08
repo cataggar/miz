@@ -313,6 +313,13 @@ RELEASE_GITHUB_APP_ID
 RELEASE_GITHUB_APP_PRIVATE_KEY
 ```
 
+The shared release App must have repository **Administration: write**
+permission. Its protected policy token is explicitly downscoped to
+**Administration: write** and **Contents: read** and validates immutable
+releases plus the global `miz-immutable-release-tags-v1` no-bypass
+update/deletion tag ruleset before mutation and immediately before
+publication. Release tag corrections always use a new tag.
+
 and these variables:
 
 ```text

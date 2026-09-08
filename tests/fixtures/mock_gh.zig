@@ -93,6 +93,39 @@ fn apiCommand(
         }
         return;
     }
+    if (std.mem.indexOf(
+        u8,
+        endpoint,
+        "/rulesets?includes_parents=true&targets=tag&per_page=100",
+    ) != null) {
+        if (!std.mem.eql(u8, gh_token, "policy-token") or
+            std.mem.eql(u8, scenario, "policy-unauthorized"))
+        {
+            return error.MockPolicyUnauthorized;
+        }
+        if (std.mem.eql(u8, scenario, "ruleset-missing")) {
+            try out.writeAll("[[]]\n");
+            return;
+        }
+        const enforcement = if (std.mem.eql(u8, scenario, "ruleset-inactive"))
+            "disabled"
+        else
+            "active";
+        const bypass = if (std.mem.eql(u8, scenario, "ruleset-bypass"))
+            "[{\"actor_id\":123,\"actor_type\":\"Integration\",\"bypass_mode\":\"always\"}]"
+        else
+            "[]";
+        try out.print(
+            "[[{{\"id\":665,\"name\":\"miz-immutable-release-tags-v1\"," ++
+                "\"target\":\"tag\",\"source_type\":\"Repository\"," ++
+                "\"source\":\"cataggar/miz\",\"enforcement\":\"{s}\"," ++
+                "\"bypass_actors\":{s},\"conditions\":{{\"ref_name\":{{" ++
+                "\"include\":[\"~ALL\"],\"exclude\":[]}}}},\"rules\":[" ++
+                "{{\"type\":\"update\"}},{{\"type\":\"deletion\"}}]}}]]\n",
+            .{ enforcement, bypass },
+        );
+        return;
+    }
     if (std.mem.indexOf(u8, endpoint, "/git/ref/tags/") != null) {
         const sha = if (std.mem.eql(u8, scenario, "tag-mismatch"))
             "ffffffffffffffffffffffffffffffffffffffff"

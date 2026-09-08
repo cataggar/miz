@@ -170,10 +170,55 @@ fn hasYamlValue(
     return false;
 }
 
+fn leadingSpaces(line: []const u8) usize {
+    var count: usize = 0;
+    while (count < line.len and
+        (line[count] == ' ' or line[count] == '\t')) : (count += 1)
+    {}
+    return count;
+}
+
+fn appTokenStepCanWrite(normalized: []const u8) bool {
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    var iterator = std.mem.splitScalar(u8, normalized, '\n');
+    while (iterator.next()) |line| {
+        lines.append(std.testing.allocator, line) catch return true;
+    }
+
+    for (lines.items, 0..) |line, line_index| {
+        if (std.mem.indexOf(u8, line, "uses:") == null or
+            std.mem.indexOf(u8, line, "actions/create-github-app-token@") == null)
+        {
+            continue;
+        }
+        const uses_indent = leadingSpaces(line);
+        var explicit_read = false;
+        var index = line_index + 1;
+        while (index < lines.items.len) : (index += 1) {
+            const candidate = lines.items[index];
+            const trimmed = std.mem.trim(u8, candidate, " \t\r");
+            if (trimmed.len == 0 or trimmed[0] == '#') continue;
+            const indent = leadingSpaces(candidate);
+            if (indent < uses_indent or
+                (indent <= uses_indent and
+                    std.mem.startsWith(u8, trimmed, "- ")))
+            {
+                break;
+            }
+            if (hasYamlValue(candidate, "permission-contents", "read")) {
+                explicit_read = true;
+            }
+        }
+        if (!explicit_read) return true;
+    }
+    return false;
+}
+
 fn workflowCanWrite(normalized: []const u8) bool {
-    return hasYamlValue(normalized, "contents", "write") or
-        (std.mem.indexOf(u8, normalized, "create-github-app-token") != null and
-            hasYamlValue(normalized, "permission-contents", "write"));
+    return hasYamlValue(normalized, "permissions", "write-all") or
+        hasYamlValue(normalized, "contents", "write") or
+        appTokenStepCanWrite(normalized);
 }
 
 fn tokenHasReleaseEndpoint(token: []const u8) bool {
@@ -673,6 +718,43 @@ test "producer capability detection resists ordinary spelling variants" {
             .source = "permissions:\n  contents:    write\n",
         },
         .{
+            .path = ".github/workflows/other.yml",
+            .source =
+            \\permissions:   write-all
+            \\jobs:
+            \\  opaque:
+            \\    runs-on: ubuntu-latest
+            \\    steps:
+            \\      - uses: example/opaque-action@v1
+            ,
+        },
+        .{
+            .path = ".github/workflows/other.yml",
+            .source =
+            \\jobs:
+            \\  opaque:
+            \\    runs-on: ubuntu-latest
+            \\    steps:
+            \\      - id: token
+            \\        uses: actions/create-github-app-token@v2
+            \\        with:
+            \\          app-id: 123
+            \\          private-key: secret
+            \\      - uses: example/opaque-action@v1
+            ,
+        },
+        .{
+            .path = ".github/workflows/other.yml",
+            .source =
+            \\jobs:
+            \\  opaque:
+            \\    permissions: write-all
+            \\    runs-on: ubuntu-latest
+            \\    steps:
+            \\      - uses: example/opaque-action@v1
+            ,
+        },
+        .{
             .path = "tools/publish.sh",
             .source = "gh --repo acme/project release --verify-tag create v1",
         },
@@ -692,6 +774,41 @@ test "producer capability detection resists ordinary spelling variants" {
             ),
         );
     }
+}
+
+test "explicit App token Contents read is the only non-write request" {
+    const allocator = std.testing.allocator;
+    const safe =
+        \\jobs:
+        \\  query:
+        \\    runs-on: ubuntu-latest
+        \\    steps:
+        \\      - uses: actions/create-github-app-token@v2
+        \\        with:
+        \\          permission-contents:   read
+        \\      - uses: example/opaque-action@v1
+    ;
+    try std.testing.expect(!try looksLikeProducer(
+        allocator,
+        ".github/workflows/query.yml",
+        safe,
+    ));
+
+    const expression =
+        \\jobs:
+        \\  query:
+        \\    runs-on: ubuntu-latest
+        \\    steps:
+        \\      - uses: actions/create-github-app-token@v2
+        \\        with:
+        \\          permission-contents: ${{ inputs.contents_permission }}
+        \\      - uses: example/opaque-action@v1
+    ;
+    try std.testing.expect(try looksLikeProducer(
+        allocator,
+        ".github/workflows/query.yml",
+        expression,
+    ));
 }
 
 test "explicit GET keeps gh API body fields read-only" {
@@ -789,11 +906,11 @@ test "every publishing workflow mints the shared protected policy token" {
             source,
             "secrets.RELEASE_GITHUB_APP_PRIVATE_KEY",
         );
+        try expectContains(path, source, "permission-administration: write");
+        try expectContains(path, source, "permission-contents: read");
         if (std.mem.endsWith(u8, path, "ubuntu2404-confidential-capture.yml")) {
-            try expectContains(path, source, "permission-administration: write");
             try expectContains(path, source, "POLICY_GH_TOKEN");
         } else {
-            try expectContains(path, source, "permission-administration: read");
             try expectContains(
                 path,
                 source,
@@ -848,14 +965,45 @@ test "every shell asset publisher is draft-only until one-way publication" {
         try expectOrder(path, source, "--draft", "uploads.github.com/repos/");
         try expectOrder(path, source, "uploads.github.com/repos/", "gh release download");
         try expectOrder(path, source, "gh release download", "publish_attempted=true");
+        try expectContains(
+            path,
+            source,
+            "scripts/release/check_repository_release_policy.sh",
+        );
+        try expectContains(path, source, "check_repository_release_policy before-mutation");
+        try expectContains(path, source, "check_repository_release_policy before-publish");
         try expectOrder(
             path,
             source,
-            "repos/$REPOSITORY/immutable-releases",
-            "publish_attempted=true",
+            "check_repository_release_policy before-mutation",
+            "gh release create",
         );
+        if (std.mem.indexOf(
+            u8,
+            source,
+            "gh api --method POST \"repos/$REPOSITORY/git/refs\"",
+        ) != null) {
+            try expectOrder(
+                path,
+                source,
+                "check_repository_release_policy before-mutation",
+                "gh api --method POST \"repos/$REPOSITORY/git/refs\"",
+            );
+        }
+        try expectOrder(path, source, "check_repository_release_policy before-publish", "publish_attempted=true");
         try expectContains(path, source, "RELEASE_POLICY_GH_TOKEN");
-        try expectContains(path, source, "GH_TOKEN=\"$policy_token\" gh api");
+        try expectContains(path, source, "GH_TOKEN=\"$policy_token\"");
+        try expectContains(path, source, "git ls-remote origin \"refs/tags/$tag\"");
+        try expectContains(path, source, "git ls-remote origin \"refs/tags/$tag^{}\"");
+        try expectOrder(
+            path,
+            source,
+            if (std.mem.endsWith(u8, path, "ubuntu2604_gallery_reissue.sh"))
+                "verify_exact_remote_tag \"$REISSUE_TAG\""
+            else
+                "verify_exact_remote_tag \"$RELEASE_TAG\"",
+            "check_repository_release_policy before-publish",
+        );
         if (std.mem.indexOf(u8, source, "--method DELETE") != null) {
             try expectOrder(
                 path,
@@ -866,6 +1014,7 @@ test "every shell asset publisher is draft-only until one-way publication" {
         }
         try expectOrder(path, source, "publish_attempted=true", "draft=false");
         try expectOrder(path, source, "draft=false", "release_published=true");
+        try expectOrder(path, source, "release_published=true", "verify_exact_remote_tag");
         const published_at = std.mem.indexOf(
             u8,
             source,
@@ -876,6 +1025,26 @@ test "every shell asset publisher is draft-only until one-way publication" {
         try expectAbsent(path, published_path, "--method DELETE");
         try expectAbsent(path, published_path, "--draft");
     }
+}
+
+test "shared repository policy fetch is read-only paginated and Zig-validated" {
+    const allocator = std.testing.allocator;
+    const root = try rootAlloc(allocator);
+    defer allocator.free(root);
+    const path = "scripts/release/check_repository_release_policy.sh";
+    const source = try readSource(allocator, std.testing.io, root, path);
+    defer allocator.free(source);
+    for ([_][]const u8{
+        "repos/$repository/immutable-releases",
+        "--paginate --slurp",
+        "rulesets?includes_parents=true&targets=tag&per_page=100",
+        "\"$release_tool\" check-release-policy",
+        "--immutable-response",
+        "--rulesets-response",
+    }) |needle| try expectContains(path, source, needle);
+    try expectAbsent(path, source, "--method POST");
+    try expectAbsent(path, source, "--method PATCH");
+    try expectAbsent(path, source, "--method DELETE");
 }
 
 test "retained drafts are identity-checked by native release tools" {

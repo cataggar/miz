@@ -404,8 +404,12 @@ protected `azurelinux4-release` environment remains the credential boundary
 for Azure acceptance. The publication job separately requires the protected
 `azurelinux4-release` environment, restricted to `main`, with required
 reviewers, self-review disabled, and the shared `RELEASE_GITHUB_APP_ID` and
-`RELEASE_GITHUB_APP_PRIVATE_KEY` secrets. That App token performs only the
-fresh immutable-release policy read immediately before publication.
+`RELEASE_GITHUB_APP_PRIVATE_KEY` secrets. That App token requests
+Administration write and Contents read, but performs only policy reads. It
+requires both immutable releases and the global
+`miz-immutable-release-tags-v1` no-bypass update/deletion ruleset before tag or
+draft mutation and again immediately before publication. A tag created before
+a draft failure is retained and quarantined; corrections always use a new tag.
 
 The released QCOW2 files are not directly uploadable to Azure. Derive aligned
 fixed VHDs without changing their partitions:

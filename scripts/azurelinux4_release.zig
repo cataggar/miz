@@ -76,6 +76,7 @@ const usage_text =
     \\  tag-object             print the object a peeled annotated tag points at
     \\  check-release-metadata require an exact resumable draft identity
     \\  check-immutable-releases require the protected repository policy
+    \\  check-release-policy   require immutable releases and global tag immutability
     \\  check-draft-assets    plan/validate exact numeric draft asset mutations
     \\  release-stale-assets   print the asset IDs a release holds outside the allowlist
     \\  check-release-assets   require the exact remote allowlist in draft or published state
@@ -212,6 +213,7 @@ const command_table = [_]Command{
     .{ .name = "tag-object", .handler = runTagObject },
     .{ .name = "check-release-metadata", .handler = runCheckReleaseMetadata },
     .{ .name = "check-immutable-releases", .handler = runCheckImmutableReleases },
+    .{ .name = "check-release-policy", .handler = runCheckReleasePolicy },
     .{ .name = "check-draft-assets", .handler = runCheckDraftAssets },
     .{ .name = "release-stale-assets", .handler = runReleaseStaleAssets },
     .{ .name = "check-release-assets", .handler = runCheckReleaseAssets },
@@ -788,6 +790,22 @@ fn runCheckImmutableReleases(context: Context, argv: []const []const u8) !void {
     );
 }
 
+fn runCheckReleasePolicy(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "repository",
+        "immutable-response",
+        "rulesets-response",
+    });
+    return release.github_release.validateRepositoryReleasePolicyFiles(
+        context.allocator,
+        context.io,
+        try options.require("immutable-response"),
+        try options.require("rulesets-response"),
+        try options.require("repository"),
+        context.diagnostic,
+    );
+}
+
 fn runCheckDraftAssets(context: Context, argv: []const []const u8) !void {
     const options = try parseOptions(argv, &.{
         "release",
@@ -1013,6 +1031,7 @@ test "every command the shell and workflow call is dispatched" {
         "tag-object",
         "check-release-metadata",
         "check-immutable-releases",
+        "check-release-policy",
         "check-draft-assets",
         "release-stale-assets",
         "check-release-assets",

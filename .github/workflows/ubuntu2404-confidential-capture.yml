@@ -312,9 +312,17 @@ jobs:
           provenance_release_tag="miz-provenance/ubuntu2404-confidential-cvm/v$TARGET_GALLERY_VERSION/origin-$origin_run_id-attempt-$origin_run_attempt/tool-$tool_commit"
           provenance_release_title="Ubuntu 24.04 Confidential VM gallery provenance $TARGET_GALLERY_VERSION"
           provenance_asset_name="Ubuntu-24.04-x86_64.confidential-cvm-$TARGET_GALLERY_VERSION.provenance.json"
-          scripts/ubuntu2404_confidential_provenance_tag.sh \
-            require-absent "$provenance_release_tag" "$tool_commit" \
-            .capture/prepare/provenance-tag
+          provenance_tag_state=$(
+            scripts/ubuntu2404_confidential_provenance_tag.sh \
+              classify "$provenance_release_tag" "$tool_commit" \
+              .capture/prepare/provenance-tag
+          )
+          if [[ "$recovery_mode" == true ]]; then
+            [[ "$provenance_tag_state" == absent ||
+                "$provenance_tag_state" == lightweight ]]
+          else
+            test "$provenance_tag_state" = absent
+          fi
 
           source_release_json=.capture/prepare/source-release.json
           gh api "${api_headers[@]}" \
@@ -1329,19 +1337,28 @@ jobs:
           GH_TOKEN="$POLICY_GH_TOKEN" \
             scripts/ubuntu2404_confidential_github_policy.sh \
             "$VALIDATION_DIR/github-policy-before-release"
-          GH_TOKEN="$POLICY_GH_TOKEN" gh api --method GET "${api_headers[@]}" \
-            "repos/$GITHUB_REPOSITORY/immutable-releases" \
-            >"$VALIDATION_DIR/immutable-releases.json"
-          jq -e '.enabled == true' \
-            "$VALIDATION_DIR/immutable-releases.json" >/dev/null ||
-            {
-              echo "::error::Immutable releases are no longer guaranteed"
-              exit 1
-            }
+          GH_TOKEN="$POLICY_GH_TOKEN" \
+            scripts/release/check_repository_release_policy.sh \
+            "$VALIDATION_DIR/release-policy-before-tag" \
+            "$RELEASE_TOOL" "$GITHUB_REPOSITORY"
+          provenance_tag_state=$(
+            GH_TOKEN="$POLICY_GH_TOKEN" \
+              scripts/ubuntu2404_confidential_provenance_tag.sh \
+              classify "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
+              "$VALIDATION_DIR/tag-before-release"
+          )
+          if [[ "$provenance_tag_state" == absent ]]; then
+            GH_TOKEN="$PUBLICATION_GH_TOKEN" gh api --method POST \
+              "${api_headers[@]}" "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$PROVENANCE_RELEASE_TAG" \
+              -f "sha=$TOOL_COMMIT" >/dev/null
+          else
+            test "$provenance_tag_state" = lightweight
+          fi
           GH_TOKEN="$POLICY_GH_TOKEN" \
             scripts/ubuntu2404_confidential_provenance_tag.sh \
-            require-absent "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
-            "$VALIDATION_DIR/tag-before-release"
+            require-lightweight "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
+            "$VALIDATION_DIR/tag-after-create"
           direct_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
           peeled_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
           test "${peeled_source:-$direct_source}" = "$SOURCE_COMMIT"
@@ -1397,6 +1414,10 @@ jobs:
             GH_TOKEN="$POLICY_GH_TOKEN" \
               scripts/ubuntu2404_confidential_github_policy.sh \
               "$VALIDATION_DIR/github-policy-before-create"
+            GH_TOKEN="$POLICY_GH_TOKEN" \
+              scripts/release/check_repository_release_policy.sh \
+              "$VALIDATION_DIR/release-policy-before-create" \
+              "$RELEASE_TOOL" "$GITHUB_REPOSITORY"
             GH_TOKEN="$PUBLICATION_GH_TOKEN" \
               gh api --method POST "${api_headers[@]}" \
               "repos/$GITHUB_REPOSITORY/releases" \
@@ -1430,7 +1451,7 @@ jobs:
           validate_release_identity "$release_json"
           GH_TOKEN="$POLICY_GH_TOKEN" \
             scripts/ubuntu2404_confidential_provenance_tag.sh \
-            require-absent "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
+            require-lightweight "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
             "$VALIDATION_DIR/tag-after-draft"
           repair_plan="$VALIDATION_DIR/asset-repair-plan"
           "$RELEASE_TOOL" check-capture-release-assets \
@@ -1530,18 +1551,11 @@ jobs:
             --location "$TARGET_LOCATION" \
             --definition-id "$target_definition_id" \
             --version-id "$target_definition_id/versions/$TARGET_IMAGE_VERSION"
-          GH_TOKEN="$POLICY_GH_TOKEN" \
-            scripts/ubuntu2404_confidential_github_policy.sh \
-            "$VALIDATION_DIR/github-policy-before-publish"
           mapfile -t remote_main < <(
             git ls-remote origin refs/heads/main | awk '{print $1}'
           )
           test "${#remote_main[@]}" -eq 1
           test "${remote_main[0]}" = "$GITHUB_SHA"
-          GH_TOKEN="$POLICY_GH_TOKEN" \
-            scripts/ubuntu2404_confidential_provenance_tag.sh \
-            require-absent "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
-            "$VALIDATION_DIR/tag-before-publish"
           GH_TOKEN="$PUBLICATION_GH_TOKEN" gh api "${api_headers[@]}" \
             "repos/$GITHUB_REPOSITORY/releases/$release_id" \
             >"$release_json"
@@ -1556,11 +1570,20 @@ jobs:
             --asset-sha256 "$EXPECTED_RESULT_SHA256" \
             --asset-size "$expected_asset_size" \
             --mode final
-          GH_TOKEN="$POLICY_GH_TOKEN" gh api --method GET "${api_headers[@]}" \
-            "repos/$GITHUB_REPOSITORY/immutable-releases" \
-            >"$VALIDATION_DIR/immutable-releases-before-publish.json"
-          "$RELEASE_TOOL" check-immutable-releases \
-            --response "$VALIDATION_DIR/immutable-releases-before-publish.json"
+          direct_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
+          peeled_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
+          test "${peeled_source:-$direct_source}" = "$SOURCE_COMMIT"
+          GH_TOKEN="$POLICY_GH_TOKEN" \
+            scripts/ubuntu2404_confidential_provenance_tag.sh \
+            require-lightweight "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
+            "$VALIDATION_DIR/tag-before-publish"
+          GH_TOKEN="$POLICY_GH_TOKEN" \
+            scripts/ubuntu2404_confidential_github_policy.sh \
+            "$VALIDATION_DIR/github-policy-before-publish"
+          GH_TOKEN="$POLICY_GH_TOKEN" \
+            scripts/release/check_repository_release_policy.sh \
+            "$VALIDATION_DIR/release-policy-before-publish" \
+            "$RELEASE_TOOL" "$GITHUB_REPOSITORY"
           EXPECTED_RELEASE_NOTES="$expected_notes" \
             GH_TOKEN="$PUBLICATION_GH_TOKEN" \
             scripts/ubuntu2404_confidential_publish_release.sh \

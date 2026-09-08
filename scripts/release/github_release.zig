@@ -20,6 +20,7 @@ pub const Error = error{ Failed, OutOfMemory };
 
 pub const repository = "cataggar/miz";
 pub const github_api_version = "2026-03-10";
+pub const immutable_tag_ruleset_name = "miz-immutable-release-tags-v1";
 pub const platforms = [_][]const u8{
     "linux-musl-x64",
     "linux-musl-arm64",
@@ -1029,7 +1030,6 @@ const Publisher = struct {
     }
 
     fn publish(self: *Publisher) Error!void {
-        try self.verifyTag();
         var draft = try self.fetch(true, .require_uploaded);
         defer draft.deinit(self.allocator);
         try self.validateRemoteAssets(&draft);
@@ -1059,7 +1059,8 @@ const Publisher = struct {
         defer self.allocator.free(prerelease_field);
         const latest_field = try fieldAlloc(self, "make_latest", latest);
         defer self.allocator.free(latest_field);
-        try self.requireImmutableReleases();
+        try self.verifyTag();
+        try self.requireReleasePolicy();
         var result = try self.ghJson(&.{
             "api",
             "--method",
@@ -1133,22 +1134,22 @@ const Publisher = struct {
         }
     }
 
-    fn requireImmutableReleases(self: *Publisher) Error!void {
+    fn requireReleasePolicy(self: *Publisher) Error!void {
         const token = self.options.policy_token orelse return self.fail(
-            "immutable release policy token is missing",
+            "release policy token is missing",
             .{},
         );
         if (std.mem.trim(u8, token, " \t\r\n").len == 0) return self.fail(
-            "immutable release policy token is missing",
+            "release policy token is missing",
             .{},
         );
-        var endpoint_buffer: [512]u8 = undefined;
-        const endpoint = std.fmt.bufPrint(
-            &endpoint_buffer,
+        var immutable_endpoint_buffer: [512]u8 = undefined;
+        const immutable_endpoint = std.fmt.bufPrint(
+            &immutable_endpoint_buffer,
             "repos/{s}/immutable-releases",
             .{self.options.repository_name},
         ) catch return self.fail("immutable release endpoint is too long", .{});
-        var response = try self.ghJsonWithToken(&.{
+        var immutable_response = try self.ghJsonWithToken(&.{
             "api",
             "--method",
             "GET",
@@ -1156,11 +1157,36 @@ const Publisher = struct {
             "Accept: application/vnd.github+json",
             "-H",
             "X-GitHub-Api-Version: " ++ github_api_version,
-            endpoint,
+            immutable_endpoint,
         }, token);
-        defer response.deinit();
+        defer immutable_response.deinit();
         try validateImmutableReleasesValue(
-            response.value,
+            immutable_response.value,
+            self.diagnostic,
+        );
+
+        var rulesets_endpoint_buffer: [512]u8 = undefined;
+        const rulesets_endpoint = std.fmt.bufPrint(
+            &rulesets_endpoint_buffer,
+            "repos/{s}/rulesets?includes_parents=true&targets=tag&per_page=100",
+            .{self.options.repository_name},
+        ) catch return self.fail("rulesets endpoint is too long", .{});
+        var rulesets_response = try self.ghJsonWithToken(&.{
+            "api",
+            "--method",
+            "GET",
+            "--paginate",
+            "--slurp",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "X-GitHub-Api-Version: " ++ github_api_version,
+            rulesets_endpoint,
+        }, token);
+        defer rulesets_response.deinit();
+        try validateImmutableTagRulesetsValue(
+            rulesets_response.value,
+            self.options.repository_name,
             self.diagnostic,
         );
     }
@@ -1270,6 +1296,7 @@ pub fn publish(
         .assets = assets,
     };
     defer if (publisher.previous_main_tag) |tag| allocator.free(tag);
+    try publisher.requireReleasePolicy();
     try publisher.verifyTag();
     const discovered = try publisher.discover();
     var owned_body: ?[]u8 = null;
@@ -1510,6 +1537,217 @@ pub fn validateImmutableReleasesValue(
     );
 }
 
+pub fn validateImmutableTagRulesetsValue(
+    value: Value,
+    expected_repository: []const u8,
+    diagnostic: *Diagnostic,
+) Error!void {
+    if (value != .array) return diagnostic.fail(
+        error.Failed,
+        "paginated ruleset response is not an array",
+        .{},
+    );
+
+    var matching: ?std.json.ObjectMap = null;
+    for (value.array.items) |page| {
+        if (page != .array) return diagnostic.fail(
+            error.Failed,
+            "paginated ruleset page is not an array",
+            .{},
+        );
+        for (page.array.items) |entry| {
+            if (entry != .object) return diagnostic.fail(
+                error.Failed,
+                "ruleset listing entry is not an object",
+                .{},
+            );
+            const id = entry.object.get("id") orelse return diagnostic.fail(
+                error.Failed,
+                "ruleset listing id is missing",
+                .{},
+            );
+            if (id != .integer or id.integer <= 0) return diagnostic.fail(
+                error.Failed,
+                "ruleset listing id is invalid",
+                .{},
+            );
+            const name = entry.object.get("name") orelse return diagnostic.fail(
+                error.Failed,
+                "ruleset listing name is missing",
+                .{},
+            );
+            if (name != .string) return diagnostic.fail(
+                error.Failed,
+                "ruleset listing name is not a string",
+                .{},
+            );
+            if (!std.mem.eql(u8, name.string, immutable_tag_ruleset_name)) continue;
+            if (matching != null) return diagnostic.fail(
+                error.Failed,
+                "immutable release tag ruleset is ambiguous",
+                .{},
+            );
+            matching = entry.object;
+        }
+    }
+    const ruleset_value = matching orelse return diagnostic.fail(
+        error.Failed,
+        "immutable release tag ruleset is missing",
+        .{},
+    );
+    const ruleset = &ruleset_value;
+
+    const expected_fields = [_]struct {
+        key: []const u8,
+        expected: []const u8,
+        label: []const u8,
+    }{
+        .{ .key = "target", .expected = "tag", .label = "target" },
+        .{ .key = "source_type", .expected = "Repository", .label = "source type" },
+        .{ .key = "source", .expected = expected_repository, .label = "source" },
+        .{ .key = "enforcement", .expected = "active", .label = "enforcement" },
+    };
+    for (expected_fields) |field| {
+        const actual = ruleset.get(field.key) orelse return diagnostic.fail(
+            error.Failed,
+            "immutable release tag ruleset {s} is missing",
+            .{field.label},
+        );
+        if (actual != .string or !std.mem.eql(u8, actual.string, field.expected)) {
+            return diagnostic.fail(
+                error.Failed,
+                "immutable release tag ruleset {s} is not {s}",
+                .{ field.label, field.expected },
+            );
+        }
+    }
+
+    const bypass_actors = ruleset.get("bypass_actors") orelse
+        return diagnostic.fail(
+            error.Failed,
+            "immutable release tag ruleset bypass actors are not visible; Administration: write is required",
+            .{},
+        );
+    if (bypass_actors != .array) return diagnostic.fail(
+        error.Failed,
+        "immutable release tag ruleset bypass actors are not an array",
+        .{},
+    );
+    if (bypass_actors.array.items.len != 0) return diagnostic.fail(
+        error.Failed,
+        "immutable release tag ruleset has a bypass actor",
+        .{},
+    );
+
+    const conditions = ruleset.get("conditions") orelse return diagnostic.fail(
+        error.Failed,
+        "immutable release tag ruleset conditions are missing",
+        .{},
+    );
+    if (conditions != .object or conditions.object.count() != 1) {
+        return diagnostic.fail(
+            error.Failed,
+            "immutable release tag ruleset conditions are not exact",
+            .{},
+        );
+    }
+    const ref_name = conditions.object.get("ref_name") orelse
+        return diagnostic.fail(
+            error.Failed,
+            "immutable release tag ruleset ref-name condition is missing",
+            .{},
+        );
+    if (ref_name != .object or ref_name.object.count() != 2) {
+        return diagnostic.fail(
+            error.Failed,
+            "immutable release tag ruleset ref-name condition is not exact",
+            .{},
+        );
+    }
+    const include = ref_name.object.get("include") orelse return diagnostic.fail(
+        error.Failed,
+        "immutable release tag ruleset includes are missing",
+        .{},
+    );
+    if (include != .array) return diagnostic.fail(
+        error.Failed,
+        "immutable release tag ruleset includes are not an array",
+        .{},
+    );
+    var includes_all = false;
+    for (include.array.items) |pattern| {
+        if (pattern != .string) return diagnostic.fail(
+            error.Failed,
+            "immutable release tag ruleset include is not a string",
+            .{},
+        );
+        includes_all = includes_all or std.mem.eql(u8, pattern.string, "~ALL");
+    }
+    if (!includes_all) return diagnostic.fail(
+        error.Failed,
+        "immutable release tag ruleset does not include ~ALL",
+        .{},
+    );
+    const exclude = ref_name.object.get("exclude") orelse return diagnostic.fail(
+        error.Failed,
+        "immutable release tag ruleset exclusions are missing",
+        .{},
+    );
+    if (exclude != .array or exclude.array.items.len != 0) {
+        return diagnostic.fail(
+            error.Failed,
+            "immutable release tag ruleset has exclusions",
+            .{},
+        );
+    }
+
+    const rules = ruleset.get("rules") orelse return diagnostic.fail(
+        error.Failed,
+        "immutable release tag rules are missing",
+        .{},
+    );
+    if (rules != .array) return diagnostic.fail(
+        error.Failed,
+        "immutable release tag rules are not an array",
+        .{},
+    );
+    var update_count: usize = 0;
+    var deletion_count: usize = 0;
+    for (rules.array.items) |rule| {
+        if (rule != .object) return diagnostic.fail(
+            error.Failed,
+            "immutable release tag rule is not an object",
+            .{},
+        );
+        const rule_type = rule.object.get("type") orelse return diagnostic.fail(
+            error.Failed,
+            "immutable release tag rule type is missing",
+            .{},
+        );
+        if (rule_type != .string) return diagnostic.fail(
+            error.Failed,
+            "immutable release tag rule type is not a string",
+            .{},
+        );
+        if (std.mem.eql(u8, rule_type.string, "update")) {
+            update_count += 1;
+        } else if (std.mem.eql(u8, rule_type.string, "deletion")) {
+            deletion_count += 1;
+        } else {
+            return diagnostic.fail(
+                error.Failed,
+                "immutable release tag ruleset contains unsupported rule {s}",
+                .{rule_type.string},
+            );
+        }
+    }
+    if (update_count != 1 or deletion_count != 1) return diagnostic.fail(
+        error.Failed,
+        "immutable release tag ruleset must contain exactly one update and one deletion rule",
+        .{},
+    );
+}
+
 pub fn validateImmutableReleasesFile(
     allocator: Allocator,
     io: Io,
@@ -1539,6 +1777,65 @@ pub fn validateImmutableReleasesFile(
     );
     defer parsed.deinit();
     try validateImmutableReleasesValue(parsed.value, diagnostic);
+}
+
+pub fn validateImmutableTagRulesetsFile(
+    allocator: Allocator,
+    io: Io,
+    path: []const u8,
+    expected_repository: []const u8,
+    diagnostic: *Diagnostic,
+) Error!void {
+    const bytes = file_support.readBounded(
+        allocator,
+        io,
+        path,
+        4 * 1024 * 1024,
+    ) catch |err| return diagnostic.fail(
+        error.Failed,
+        "cannot read rulesets response: {t}",
+        .{err},
+    );
+    defer allocator.free(bytes);
+    var parsed = std.json.parseFromSlice(
+        Value,
+        allocator,
+        bytes,
+        .{},
+    ) catch |err| return diagnostic.fail(
+        error.Failed,
+        "cannot parse rulesets response: {t}",
+        .{err},
+    );
+    defer parsed.deinit();
+    try validateImmutableTagRulesetsValue(
+        parsed.value,
+        expected_repository,
+        diagnostic,
+    );
+}
+
+pub fn validateRepositoryReleasePolicyFiles(
+    allocator: Allocator,
+    io: Io,
+    immutable_releases_path: []const u8,
+    rulesets_path: []const u8,
+    expected_repository: []const u8,
+    diagnostic: *Diagnostic,
+) Error!void {
+    try validateImmutableReleasesFile(
+        allocator,
+        io,
+        immutable_releases_path,
+        diagnostic,
+    );
+    try validateImmutableTagRulesetsFile(
+        allocator,
+        io,
+        rulesets_path,
+        expected_repository,
+        diagnostic,
+    );
 }
 
 pub fn validateDraftMetadataFiles(
@@ -2514,6 +2811,150 @@ test "version and tag contract distinguishes prerelease SemVer" {
     try std.testing.expectError(
         error.Failed,
         validateVersionTag("01.2.3", "v01.2.3", &diagnostic),
+    );
+}
+
+fn expectImmutableTagPolicyFailure(
+    json: []const u8,
+    expected_diagnostic: []const u8,
+) !void {
+    var parsed = try std.json.parseFromSlice(
+        Value,
+        std.testing.allocator,
+        json,
+        .{},
+    );
+    defer parsed.deinit();
+    var diagnostic: Diagnostic = .{};
+    try std.testing.expectError(
+        error.Failed,
+        validateImmutableTagRulesetsValue(
+            parsed.value,
+            repository,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, diagnostic.message(), expected_diagnostic) != null,
+    );
+}
+
+test "global immutable tag ruleset policy fixtures fail closed" {
+    const prefix =
+        \\[[{"id":665,"name":"miz-immutable-release-tags-v1",
+        \\"target":"tag","source_type":"Repository","source":"cataggar/miz",
+    ;
+    const suffix =
+        \\,"bypass_actors":[],"conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},
+        \\"rules":[{"type":"update"},{"type":"deletion"}]}]]
+    ;
+    const valid = prefix ++ "\"enforcement\":\"active\"" ++ suffix;
+
+    var parsed = try std.json.parseFromSlice(
+        Value,
+        std.testing.allocator,
+        valid,
+        .{},
+    );
+    defer parsed.deinit();
+    var diagnostic: Diagnostic = .{};
+    try validateImmutableTagRulesetsValue(
+        parsed.value,
+        repository,
+        &diagnostic,
+    );
+
+    try expectImmutableTagPolicyFailure(
+        \\[[{"id":1,"name":"other"}]]
+    ,
+        "ruleset is missing",
+    );
+    try expectImmutableTagPolicyFailure(
+        \\[[{"id":665,"name":"miz-immutable-release-tags-v1",
+        \\"target":"tag","source_type":"Repository","source":"cataggar/miz",
+        \\"enforcement":"active","bypass_actors":[],
+        \\"conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},
+        \\"rules":[{"type":"update"},{"type":"deletion"}]},
+        \\{"id":666,"name":"miz-immutable-release-tags-v1"}]]
+    ,
+        "ruleset is ambiguous",
+    );
+    try expectImmutableTagPolicyFailure(
+        prefix ++ "\"enforcement\":\"disabled\"" ++ suffix,
+        "enforcement is not active",
+    );
+    try expectImmutableTagPolicyFailure(
+        \\[[{"id":665,"name":"miz-immutable-release-tags-v1",
+        \\"target":"branch","source_type":"Repository","source":"cataggar/miz",
+        \\"enforcement":"active","bypass_actors":[],
+        \\"conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},
+        \\"rules":[{"type":"update"},{"type":"deletion"}]}]]
+    ,
+        "target is not tag",
+    );
+    try expectImmutableTagPolicyFailure(
+        \\[[{"id":665,"name":"miz-immutable-release-tags-v1",
+        \\"target":"tag","source_type":"Organization","source":"cataggar",
+        \\"enforcement":"active","bypass_actors":[],
+        \\"conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},
+        \\"rules":[{"type":"update"},{"type":"deletion"}]}]]
+    ,
+        "source type is not Repository",
+    );
+    try expectImmutableTagPolicyFailure(
+        \\[[{"id":665,"name":"miz-immutable-release-tags-v1",
+        \\"target":"tag","source_type":"Repository","source":"cataggar/miz",
+        \\"enforcement":"active","bypass_actors":[],
+        \\"conditions":{"ref_name":{"include":["refs/tags/v*"],"exclude":[]}},
+        \\"rules":[{"type":"update"},{"type":"deletion"}]}]]
+    ,
+        "does not include ~ALL",
+    );
+    try expectImmutableTagPolicyFailure(
+        \\[[{"id":665,"name":"miz-immutable-release-tags-v1",
+        \\"target":"tag","source_type":"Repository","source":"cataggar/miz",
+        \\"enforcement":"active","bypass_actors":[],
+        \\"conditions":{"ref_name":{"include":["~ALL"],"exclude":["refs/tags/test"]}},
+        \\"rules":[{"type":"update"},{"type":"deletion"}]}]]
+    ,
+        "has exclusions",
+    );
+    try expectImmutableTagPolicyFailure(
+        \\[[{"id":665,"name":"miz-immutable-release-tags-v1",
+        \\"target":"tag","source_type":"Repository","source":"cataggar/miz",
+        \\"enforcement":"active","bypass_actors":[],
+        \\"conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},
+        \\"rules":[{"type":"deletion"}]}]]
+    ,
+        "exactly one update and one deletion",
+    );
+    try expectImmutableTagPolicyFailure(
+        \\[[{"id":665,"name":"miz-immutable-release-tags-v1",
+        \\"target":"tag","source_type":"Repository","source":"cataggar/miz",
+        \\"enforcement":"active","bypass_actors":[],
+        \\"conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},
+        \\"rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"}]}]]
+    ,
+        "unsupported rule creation",
+    );
+    try expectImmutableTagPolicyFailure(
+        \\[[{"id":665,"name":"miz-immutable-release-tags-v1",
+        \\"target":"tag","source_type":"Repository","source":"cataggar/miz",
+        \\"enforcement":"active","bypass_actors":[
+        \\{"actor_id":123,"actor_type":"Integration","bypass_mode":"always"}],
+        \\"conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},
+        \\"rules":[{"type":"update"},{"type":"deletion"}]}]]
+    ,
+        "has a bypass actor",
+    );
+    try expectImmutableTagPolicyFailure(
+        \\[[{"id":665,"name":"miz-immutable-release-tags-v1",
+        \\"target":"tag","source_type":"Repository","source":"cataggar/miz",
+        \\"enforcement":"active",
+        \\"conditions":{"ref_name":{"include":["~ALL"],"exclude":[]}},
+        \\"rules":[{"type":"update"},{"type":"deletion"}]}]]
+    ,
+        "Administration: write is required",
     );
 }
 

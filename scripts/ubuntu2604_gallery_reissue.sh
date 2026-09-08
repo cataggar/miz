@@ -13,7 +13,7 @@ for name in "${required[@]}"; do
     exit 1
   fi
 done
-for tool in awk gh jq sha256sum stat wc; do
+for tool in awk gh git jq sha256sum stat wc; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required reissue tool $tool is unavailable"
     exit 1
@@ -46,7 +46,6 @@ metadata="$ASSETS_DIR/$METADATA_NAME"
 expected_file="$STAGING_ROOT/expected.tsv"
 notes_file="$STAGING_ROOT/release-notes.md"
 release_file="$STAGING_ROOT/release.json"
-immutable_policy_file="$STAGING_ROOT/immutable-releases.json"
 source_release_file="$STAGING_ROOT/source-release.json"
 verify_dir="$STAGING_ROOT/remote"
 mkdir -p -- "$STAGING_ROOT"
@@ -220,14 +219,48 @@ preserve_draft_on_failure() {
     elif [[ "$release_mutated" == true ]]; then
       echo "::warning::Reissue failed; retaining resumable draft $REISSUE_TAG"
     elif [[ "$tag_created" == true ]]; then
-      gh api --method DELETE \
-        "repos/$REPOSITORY/git/refs/tags/$REISSUE_TAG" >/dev/null 2>&1 || true
+      echo "::warning::Reissue failed before draft creation; retaining and quarantining immutable tag $REISSUE_TAG"
     fi
   fi
   exit "$status"
 }
 trap preserve_draft_on_failure EXIT
 trap 'exit 130' INT TERM
+
+policy_token=${RELEASE_POLICY_GH_TOKEN:-}
+unset RELEASE_POLICY_GH_TOKEN
+if [[ -z "$policy_token" ]]; then
+  echo "::error::Protected repository release policy token is missing"
+  exit 1
+fi
+check_repository_release_policy() {
+  local label=$1
+  GH_TOKEN="$policy_token" \
+    scripts/release/check_repository_release_policy.sh \
+    "$STAGING_ROOT/release-policy-$label" "$RELEASE_TOOL" "$REPOSITORY"
+}
+verify_exact_remote_tag() {
+  local tag=$1
+  local expected=$2
+  local -a direct=()
+  local -a peeled=()
+  mapfile -t direct < <(
+    git ls-remote origin "refs/tags/$tag" | awk '{print $1}'
+  )
+  mapfile -t peeled < <(
+    git ls-remote origin "refs/tags/$tag^{}" | awk '{print $1}'
+  )
+  if ((${#direct[@]} != 1 || ${#peeled[@]} > 1)); then
+    echo "::error::Tag $tag did not resolve from one exact remote ref"
+    return 1
+  fi
+  if [[ "${peeled[0]:-${direct[0]}}" != "$expected" ]]; then
+    echo "::error::Tag $tag does not peel to accepted commit $expected"
+    return 1
+  fi
+}
+
+check_repository_release_policy before-mutation
 
 resolve_tag "$REISSUE_TAG" reissue
 if [[ "$tag_present" == true ]]; then
@@ -241,6 +274,7 @@ else
     -f "sha=$TOOLING_COMMIT" >/dev/null
   tag_created=true
 fi
+verify_exact_remote_tag "$REISSUE_TAG" "$TOOLING_COMMIT"
 
 if [[ "$release_exists" != true ]]; then
   release_mutated=true
@@ -363,23 +397,9 @@ jq -e \
    (.assets[0].digest == $digest)' "$source_release_file" >/dev/null
 
 check_draft_assets exact >/dev/null
-policy_token=${RELEASE_POLICY_GH_TOKEN:-}
-unset RELEASE_POLICY_GH_TOKEN
-if [[ -z "$policy_token" ]]; then
-  echo "::error::Protected immutable-release policy token is missing"
-  exit 1
-fi
-if ! GH_TOKEN="$policy_token" gh api --method GET \
-    -H 'Accept: application/vnd.github+json' \
-    -H 'X-GitHub-Api-Version: 2026-03-10' \
-    "repos/$REPOSITORY/immutable-releases" >"$immutable_policy_file"; then
-  unset policy_token
-  echo "::error::Cannot read the protected immutable-release policy"
-  exit 1
-fi
-unset policy_token
-"$RELEASE_TOOL" github-immutable-releases \
-  --response "$immutable_policy_file"
+verify_exact_remote_tag "$SOURCE_RELEASE_TAG" "$SOURCE_COMMIT"
+verify_exact_remote_tag "$REISSUE_TAG" "$TOOLING_COMMIT"
+check_repository_release_policy before-publish
 publish_attempted=true
 gh api --method PATCH "$release_api" \
   -f "tag_name=$REISSUE_TAG" \
@@ -391,6 +411,7 @@ gh api --method PATCH "$release_api" \
   -f "make_latest=false" >/dev/null
 release_published=true
 
+verify_exact_remote_tag "$REISSUE_TAG" "$TOOLING_COMMIT"
 gh api "$release_api" >"$release_file"
 "$RELEASE_TOOL" github-release-assets \
   --release "$release_file" \

@@ -854,6 +854,22 @@ pub fn dispatch(
             diagnostic,
         );
     }
+    if (std.mem.eql(u8, command, "check-release-policy")) {
+        var options = try parse(allocator, argv, &.{
+            "--repository",
+            "--immutable-response",
+            "--rulesets-response",
+        });
+        defer options.deinit();
+        return support.github_release.validateRepositoryReleasePolicyFiles(
+            allocator,
+            io,
+            try options.require("--immutable-response"),
+            try options.require("--rulesets-response"),
+            try options.require("--repository"),
+            diagnostic,
+        );
+    }
     if (std.mem.eql(u8, command, "github-release-assets")) {
         var options = try parse(allocator, argv, &.{
             "--release",
