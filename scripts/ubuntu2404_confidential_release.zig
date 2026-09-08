@@ -17,6 +17,7 @@ const Io = std.Io;
 const Dir = std.Io.Dir;
 const Writer = std.Io.Writer;
 const Diagnostic = release.contract.Diagnostic;
+const FileIdentity = release.file.Identity;
 const ObjectMap = std.json.ObjectMap;
 const Value = std.json.Value;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -277,6 +278,8 @@ const BuildEvidence = struct {
     qcow_sha256: release.digest.Hex,
     qcow_size: u64,
     virtual_size: u64,
+    provenance_identity: FileIdentity,
+    acceptance_identity: ?FileIdentity = null,
 };
 
 fn verifyBuild(
@@ -382,6 +385,7 @@ fn verifyBuild(
         .qcow_sha256 = observed.hex,
         .qcow_size = observed.size,
         .virtual_size = virtual_size,
+        .provenance_identity = document.identity,
     };
 }
 
@@ -900,6 +904,9 @@ const AttestationEvidence = struct {
     token_sha256: release.digest.Hex,
     nonce_sha256: release.digest.Hex,
     issuer: []const u8,
+    token_identity: FileIdentity,
+    openid_identity: FileIdentity,
+    jwks_identity: FileIdentity,
 };
 
 fn verifyJwtSignature(
@@ -1148,13 +1155,14 @@ fn verifyAttestation(
     if (!validGuid(vm_id) or now <= 0) {
         return invalid(diagnostic, "attestation identity or time is invalid", .{});
     }
-    const token_bytes = try release.file.readBounded(
+    var token_contents = try release.file.readBoundedIdentified(
         allocator,
         io,
         token_path,
         token_max_bytes,
     );
-    defer allocator.free(token_bytes);
+    defer token_contents.deinit(allocator);
+    const token_bytes = token_contents.bytes;
     const token = std.mem.trim(u8, token_bytes, " \t\r\n");
     if (token.len != token_bytes.len) {
         return invalid(diagnostic, "MAA token contains surrounding whitespace", .{});
@@ -1220,6 +1228,9 @@ fn verifyAttestation(
         .token_sha256 = release.digest.hexBytes(token),
         .nonce_sha256 = release.digest.hexBytes(nonce),
         .issuer = endpoint,
+        .token_identity = token_contents.identity,
+        .openid_identity = openid.identity,
+        .jwks_identity = jwks.identity,
     };
 }
 
@@ -1491,7 +1502,7 @@ fn verifyAcceptanceResult(
     {
         return error.Usage;
     }
-    const build = try verifyBuild(
+    var build = try verifyBuild(
         allocator,
         io,
         provenance_path,
@@ -1682,6 +1693,7 @@ fn verifyAcceptanceResult(
     if (!validGuid(try requireString(&azure, "vm_id", "accepted VM ID", diagnostic))) {
         return invalid(diagnostic, "accepted VM ID is invalid", .{});
     }
+    build.acceptance_identity = document.identity;
     return build;
 }
 
@@ -2208,11 +2220,8 @@ fn captureExpected(
 fn verifiedCaptureInputs(
     context: Context,
     options: *const Options,
-) !struct {
-    build: BuildEvidence,
-    acceptance_sha256: release.digest.Hex,
-} {
-    const build = try verifyAcceptanceResult(
+) !BuildEvidence {
+    return verifyAcceptanceResult(
         context.allocator,
         context.io,
         try options.require("source-acceptance"),
@@ -2225,90 +2234,157 @@ fn verifiedCaptureInputs(
         try options.require("source-run-attempt"),
         context.diagnostic,
     );
-    const acceptance_hash = try release.digest.hashFile(
-        context.io,
-        try options.require("source-acceptance"),
-        document_max_bytes,
-    );
-    return .{
-        .build = build,
-        .acceptance_sha256 = acceptance_hash.hex,
-    };
+}
+
+const EvidenceRevisions = struct {
+    source_acceptance: FileIdentity,
+    source_provenance: FileIdentity,
+    capture_vm: FileIdentity,
+    capture_vm_instance: FileIdentity,
+    capture_disk: FileIdentity,
+    snapshot: FileIdentity,
+    image_definition: FileIdentity,
+    gallery_request: FileIdentity,
+    gallery_response: FileIdentity,
+    final_vm: FileIdentity,
+    final_vm_instance: FileIdentity,
+    token: FileIdentity,
+    openid: FileIdentity,
+    jwks: FileIdentity,
+};
+
+fn requireSameRevision(
+    expected: FileIdentity,
+    actual: FileIdentity,
+    label: []const u8,
+    diagnostic: *Diagnostic,
+) !void {
+    if (!expected.eql(actual)) {
+        return invalid(diagnostic, "{s} changed after validation", .{label});
+    }
+}
+
+fn hashValidatedEvidence(
+    context: Context,
+    path: []const u8,
+    max_bytes: u64,
+    identity: FileIdentity,
+    label: []const u8,
+) !release.digest.Hex {
+    const observed = try release.digest.hashFile(context.io, path, max_bytes);
+    try requireSameRevision(identity, observed.identity, label, context.diagnostic);
+    return observed.hex;
 }
 
 fn captureEvidence(
     context: Context,
     options: *const Options,
-    source_acceptance_sha256: release.digest.Hex,
+    revisions: EvidenceRevisions,
     attestation: AttestationEvidence,
 ) !capture.Evidence {
+    const token_sha256 = try hashValidatedEvidence(
+        context,
+        try options.require("token"),
+        token_max_bytes,
+        revisions.token,
+        "MAA token evidence",
+    );
+    if (!std.mem.eql(u8, &token_sha256, &attestation.token_sha256)) {
+        return invalid(context.diagnostic, "MAA token evidence digest mismatch", .{});
+    }
     return .{
-        .source_acceptance_sha256 = source_acceptance_sha256,
-        .source_provenance_sha256 = (try release.digest.hashFile(
-            context.io,
+        .source_acceptance_sha256 = try hashValidatedEvidence(
+            context,
+            try options.require("source-acceptance"),
+            document_max_bytes,
+            revisions.source_acceptance,
+            "source acceptance evidence",
+        ),
+        .source_provenance_sha256 = try hashValidatedEvidence(
+            context,
             try options.require("provenance"),
             document_max_bytes,
-        )).hex,
-        .capture_vm_sha256 = (try release.digest.hashFile(
-            context.io,
+            revisions.source_provenance,
+            "source provenance evidence",
+        ),
+        .capture_vm_sha256 = try hashValidatedEvidence(
+            context,
             try options.require("capture-vm"),
             document_max_bytes,
-        )).hex,
-        .capture_vm_instance_sha256 = (try release.digest.hashFile(
-            context.io,
+            revisions.capture_vm,
+            "capture VM evidence",
+        ),
+        .capture_vm_instance_sha256 = try hashValidatedEvidence(
+            context,
             try options.require("capture-vm-instance"),
             document_max_bytes,
-        )).hex,
-        .capture_disk_sha256 = (try release.digest.hashFile(
-            context.io,
+            revisions.capture_vm_instance,
+            "capture VM instance evidence",
+        ),
+        .capture_disk_sha256 = try hashValidatedEvidence(
+            context,
             try options.require("capture-disk"),
             document_max_bytes,
-        )).hex,
-        .snapshot_sha256 = (try release.digest.hashFile(
-            context.io,
+            revisions.capture_disk,
+            "capture disk evidence",
+        ),
+        .snapshot_sha256 = try hashValidatedEvidence(
+            context,
             try options.require("snapshot"),
             document_max_bytes,
-        )).hex,
-        .image_definition_sha256 = (try release.digest.hashFile(
-            context.io,
+            revisions.snapshot,
+            "capture snapshot evidence",
+        ),
+        .image_definition_sha256 = try hashValidatedEvidence(
+            context,
             try options.require("definition"),
             document_max_bytes,
-        )).hex,
-        .gallery_request_sha256 = (try release.digest.hashFile(
-            context.io,
+            revisions.image_definition,
+            "image definition evidence",
+        ),
+        .gallery_request_sha256 = try hashValidatedEvidence(
+            context,
             try options.require("gallery-request"),
             document_max_bytes,
-        )).hex,
-        .gallery_response_sha256 = (try release.digest.hashFile(
-            context.io,
+            revisions.gallery_request,
+            "gallery request evidence",
+        ),
+        .gallery_response_sha256 = try hashValidatedEvidence(
+            context,
             try options.require("gallery-response"),
             document_max_bytes,
-        )).hex,
-        .final_vm_sha256 = (try release.digest.hashFile(
-            context.io,
+            revisions.gallery_response,
+            "gallery response evidence",
+        ),
+        .final_vm_sha256 = try hashValidatedEvidence(
+            context,
             try options.require("final-vm"),
             document_max_bytes,
-        )).hex,
-        .final_vm_instance_sha256 = (try release.digest.hashFile(
-            context.io,
+            revisions.final_vm,
+            "final VM evidence",
+        ),
+        .final_vm_instance_sha256 = try hashValidatedEvidence(
+            context,
             try options.require("final-vm-instance"),
             document_max_bytes,
-        )).hex,
-        .token_sha256 = (try release.digest.hashFile(
-            context.io,
-            try options.require("token"),
-            token_max_bytes,
-        )).hex,
-        .openid_sha256 = (try release.digest.hashFile(
-            context.io,
+            revisions.final_vm_instance,
+            "final VM instance evidence",
+        ),
+        .token_sha256 = token_sha256,
+        .openid_sha256 = try hashValidatedEvidence(
+            context,
             try options.require("openid"),
             document_max_bytes,
-        )).hex,
-        .jwks_sha256 = (try release.digest.hashFile(
-            context.io,
+            revisions.openid,
+            "OpenID evidence",
+        ),
+        .jwks_sha256 = try hashValidatedEvidence(
+            context,
             try options.require("jwks"),
             document_max_bytes,
-        )).hex,
+            revisions.jwks,
+            "JWKS evidence",
+        ),
         .nonce_sha256 = attestation.nonce_sha256,
     };
 }
@@ -2323,9 +2399,15 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
         context.diagnostic,
     );
     defer source_acceptance.deinit();
+    try requireSameRevision(
+        verified.acceptance_identity.?,
+        source_acceptance.identity,
+        "source acceptance evidence",
+        context.diagnostic,
+    );
     const expected = try captureExpected(
         &options,
-        verified.build,
+        verified,
         source_acceptance.object(),
         context.diagnostic,
     );
@@ -2363,7 +2445,22 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
     const evidence = try captureEvidence(
         context,
         &options,
-        verified.acceptance_sha256,
+        .{
+            .source_acceptance = source_acceptance.identity,
+            .source_provenance = verified.provenance_identity,
+            .capture_vm = capture_vm.identity,
+            .capture_vm_instance = capture_vm_instance.identity,
+            .capture_disk = capture_disk.identity,
+            .snapshot = snapshot.identity,
+            .image_definition = definition.identity,
+            .gallery_request = gallery_request.identity,
+            .gallery_response = gallery_response.identity,
+            .final_vm = final_vm.identity,
+            .final_vm_instance = final_vm_instance.identity,
+            .token = attestation.token_identity,
+            .openid = attestation.openid_identity,
+            .jwks = attestation.jwks_identity,
+        },
         attestation,
     );
     const result_document = try capture.result(
@@ -2406,9 +2503,15 @@ fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
         context.diagnostic,
     );
     defer source_acceptance.deinit();
+    try requireSameRevision(
+        verified.acceptance_identity.?,
+        source_acceptance.identity,
+        "source acceptance evidence",
+        context.diagnostic,
+    );
     const expected = try captureExpected(
         &options,
-        verified.build,
+        verified,
         source_acceptance.object(),
         context.diagnostic,
     );
@@ -2458,7 +2561,22 @@ fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
     const evidence = try captureEvidence(
         context,
         &options,
-        verified.acceptance_sha256,
+        .{
+            .source_acceptance = source_acceptance.identity,
+            .source_provenance = verified.provenance_identity,
+            .capture_vm = capture_vm.identity,
+            .capture_vm_instance = capture_vm_instance.identity,
+            .capture_disk = capture_disk.identity,
+            .snapshot = snapshot.identity,
+            .image_definition = definition.identity,
+            .gallery_request = gallery_request.identity,
+            .gallery_response = gallery_response.identity,
+            .final_vm = final_vm.identity,
+            .final_vm_instance = final_vm_instance.identity,
+            .token = attestation.token_identity,
+            .openid = attestation.openid_identity,
+            .jwks = attestation.jwks_identity,
+        },
         attestation,
     );
     try capture.validateResult(
@@ -2486,7 +2604,7 @@ fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
     );
     try context.out.print("{s}\n{s}\n", .{
         expected.image_version_id,
-        &verified.acceptance_sha256,
+        &evidence.source_acceptance_sha256,
     });
 }
 
@@ -2579,17 +2697,47 @@ test "command surface is exact and rejects incomplete invocations" {
     }
 }
 
-test "capture evidence digests track raw file bytes" {
+const EvidenceRevisionField = enum {
+    source_acceptance,
+    source_provenance,
+    capture_vm,
+    capture_vm_instance,
+    capture_disk,
+    snapshot,
+    image_definition,
+    gallery_request,
+    gallery_response,
+    final_vm,
+    final_vm_instance,
+    token,
+    openid,
+    jwks,
+};
+
+fn mismatchRevision(
+    revisions: EvidenceRevisions,
+    field: EvidenceRevisionField,
+) EvidenceRevisions {
+    var mismatched = revisions;
+    switch (field) {
+        inline else => |name| @field(mismatched, @tagName(name)).size += 1,
+    }
+    return mismatched;
+}
+
+test "capture-result and verify-capture reject every evidence revision mismatch" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try testFixturePath(allocator, &tmp.sub_path, "evidence.json");
+    const path = try testFixturePath(allocator, &tmp.sub_path, "evidence");
     defer allocator.free(path);
+    const bytes = "validated evidence";
     try Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = path,
-        .data = "{\"version\":1}\n",
+        .data = bytes,
     });
     const argv = [_][]const u8{
+        "--source-acceptance",   path,
         "--provenance",          path,
         "--capture-vm",          path,
         "--capture-vm-instance", path,
@@ -2613,37 +2761,58 @@ test "capture evidence digests track raw file bytes" {
         .out = &discard.writer,
         .diagnostic = &diagnostic,
     };
+    const observed = try release.digest.hashFile(
+        std.testing.io,
+        path,
+        document_max_bytes,
+    );
+    const revisions: EvidenceRevisions = .{
+        .source_acceptance = observed.identity,
+        .source_provenance = observed.identity,
+        .capture_vm = observed.identity,
+        .capture_vm_instance = observed.identity,
+        .capture_disk = observed.identity,
+        .snapshot = observed.identity,
+        .image_definition = observed.identity,
+        .gallery_request = observed.identity,
+        .gallery_response = observed.identity,
+        .final_vm = observed.identity,
+        .final_vm_instance = observed.identity,
+        .token = observed.identity,
+        .openid = observed.identity,
+        .jwks = observed.identity,
+    };
     const attestation: AttestationEvidence = .{
-        .token_sha256 = release.digest.hexBytes("token"),
+        .token_sha256 = release.digest.hexBytes(bytes),
         .nonce_sha256 = release.digest.hexBytes("nonce"),
         .issuer = "https://test.attest.azure.net",
+        .token_identity = observed.identity,
+        .openid_identity = observed.identity,
+        .jwks_identity = observed.identity,
     };
-    const first = try captureEvidence(
+    const evidence = try captureEvidence(
         context,
         &options,
-        release.digest.hexBytes("source acceptance"),
+        revisions,
         attestation,
     );
-    try Dir.cwd().writeFile(std.testing.io, .{
-        .sub_path = path,
-        .data = "{\"version\":2}\n",
-    });
-    const second = try captureEvidence(
-        context,
-        &options,
-        release.digest.hexBytes("source acceptance"),
-        attestation,
-    );
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        &first.capture_vm_sha256,
-        &second.capture_vm_sha256,
-    ));
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        &first.openid_sha256,
-        &second.openid_sha256,
-    ));
+    try std.testing.expectEqualStrings(&observed.hex, &evidence.capture_vm_sha256);
+    try std.testing.expectEqualStrings(&attestation.nonce_sha256, &evidence.nonce_sha256);
+
+    for (std.enums.values(EvidenceRevisionField)) |field| {
+        diagnostic = .{};
+        try std.testing.expectError(error.InvalidDocument, captureEvidence(
+            context,
+            &options,
+            mismatchRevision(revisions, field),
+            attestation,
+        ));
+        try std.testing.expect(std.mem.endsWith(
+            u8,
+            diagnostic.message(),
+            "changed after validation",
+        ));
+    }
 }
 
 test "attestation endpoint commit and VM identities are strict" {
