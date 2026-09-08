@@ -42,6 +42,7 @@ const write_workflows = [_][]const u8{
 const pattern_fixtures = [_][]const u8{
     "tests/azurelinux4_release_contract.zig",
     "tests/freebsd15_release.zig",
+    "tests/fixtures/mock_gh.zig",
     "tests/immutable_release_guard.zig",
     "tests/immutable_releases.zig",
     "tests/ubuntu2404_confidential_capture_workflow.zig",
@@ -191,6 +192,43 @@ fn tokenIsWriteMethod(token: []const u8) bool {
         std.mem.eql(u8, token, "--request=delete");
 }
 
+fn tokenContainsWriteMethod(token: []const u8) bool {
+    if (tokenIsWriteMethod(token)) return true;
+    for ([_][]const u8{ "post", "patch", "delete" }) |method| {
+        if (std.mem.eql(u8, token, method)) return true;
+        if (std.mem.endsWith(u8, token, method) and token.len > method.len) {
+            const separator = token[token.len - method.len - 1];
+            if (separator == '.' or separator == ':' or separator == '=') {
+                return true;
+            }
+        }
+        if (token.len == method.len + 1 and token[token.len - 1] == ':' and
+            std.mem.eql(u8, token[0..method.len], method))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn endpointWindowIsReleaseWrite(tokens: []const []const u8, index: usize) bool {
+    const token = tokens[index];
+    const release_endpoint = tokenHasReleaseEndpoint(token);
+    const upload_endpoint = std.mem.indexOf(
+        u8,
+        token,
+        "uploads.github.com",
+    ) != null and release_endpoint;
+    if (!release_endpoint) return false;
+    const start = index -| 24;
+    const end = @min(tokens.len, index + 25);
+    var write_method = false;
+    for (tokens[start..end]) |nearby| {
+        write_method = write_method or tokenContainsWriteMethod(nearby);
+    }
+    return upload_endpoint or write_method;
+}
+
 fn commandWindowIsReleaseWrite(tokens: []const []const u8, start: usize) bool {
     const end = @min(tokens.len, start + 48);
     var release_index: ?usize = null;
@@ -212,7 +250,7 @@ fn commandWindowIsReleaseWrite(tokens: []const []const u8, start: usize) bool {
             continue;
         }
         if (pending_method) {
-            write_method = write_method or tokenIsWriteMethod(token);
+            write_method = write_method or tokenContainsWriteMethod(token);
             pending_method = false;
         }
         write_method = write_method or tokenIsWriteMethod(token);
@@ -299,6 +337,7 @@ fn looksLikeProducer(
     var tokens = std.mem.tokenizeAny(u8, normalized, " \t\r\n");
     while (tokens.next()) |token| try tokens_list.append(allocator, token);
     for (tokens_list.items, 0..) |token, index| {
+        if (endpointWindowIsReleaseWrite(tokens_list.items, index)) return true;
         if (std.mem.eql(u8, token, "gh") and
             commandWindowIsReleaseWrite(tokens_list.items, index))
         {
@@ -347,11 +386,19 @@ fn isBinary(source: []const u8) bool {
     return std.mem.indexOfScalar(u8, source, 0) != null;
 }
 
-fn isExecutableContext(path: []const u8, mode: []const u8) bool {
-    if (std.mem.eql(u8, mode, "100755") or isWorkflow(path)) return true;
+fn isExecutableContext(path: []const u8, mode: []const u8, source: []const u8) bool {
+    if (std.mem.eql(u8, mode, "100755") or isWorkflow(path) or
+        std.mem.startsWith(u8, source, "#!"))
+    {
+        return true;
+    }
     for ([_][]const u8{
-        ".c",   ".cc", ".cpp", ".go", ".java", ".js",  ".jsx",
-        ".mjs", ".rs", ".sh",  ".ts", ".tsx",  ".zig",
+        ".bash", ".c",      ".cc",  ".clj",  ".cljs", ".cpp", ".cs",
+        ".csx",  ".dart",   ".ex",  ".exs",  ".fish", ".fs",  ".fsx",
+        ".go",   ".groovy", ".hs",  ".java", ".js",   ".jsx", ".kt",
+        ".kts",  ".lhs",    ".lua", ".m",    ".mjs",  ".mm",  ".php",
+        ".pl",   ".ps1",    ".py",  ".r",    ".rb",   ".rs",  ".scala",
+        ".sh",   ".swift",  ".ts",  ".tsx",  ".vb",   ".zig", ".zsh",
     }) |extension| {
         if (std.mem.endsWith(u8, path, extension)) return true;
     }
@@ -365,7 +412,7 @@ fn validateTrackedSource(
     source: []const u8,
     report_unreviewed: bool,
 ) !bool {
-    if (isBinary(source) or !isExecutableContext(path, mode)) return false;
+    if (isBinary(source) or !isExecutableContext(path, mode, source)) return false;
     const producer = try looksLikeProducer(allocator, path, source);
     if (!producer) return false;
     if (isListed(path, &pattern_fixtures) and
@@ -528,6 +575,30 @@ test "producer capability detection resists ordinary spelling variants" {
             .source = "graphql(`mutation { createRelease(input: $input) { id } }`)",
         },
         .{
+            .path = "src/fetch-client.js",
+            .source =
+            \\await fetch("https://api.github.com/repos/acme/project/releases", {
+            \\  method: "POST", body: payload
+            \\});
+            ,
+        },
+        .{
+            .path = "src/axios-client.ts",
+            .source = "await transport.post('https://api.github.com/repos/acme/project/releases', payload);",
+        },
+        .{
+            .path = "src/generic-client.rb",
+            .source = "http.request('PATCH', 'https://api.github.com/repos/acme/project/releases/7')",
+        },
+        .{
+            .path = "tools/non-executable." ++ "p" ++ "y",
+            .source = "#!/usr/bin/env " ++ "py" ++ "thon\nrequest(url='https://uploads.github.com/repos/acme/project/releases/7/assets?name=x', method='POST')",
+        },
+        .{
+            .path = "tools/release.kts",
+            .source = "client.request(\"https://api.github.com/repos/acme/project/releases/7\", method = \"DELETE\")",
+        },
+        .{
             .path = ".github/workflows/other.yml",
             .source = "steps:\n  - uses: ncipollo/release-action@v1\n",
         },
@@ -606,15 +677,22 @@ test "every shell asset publisher is draft-only until one-way publication" {
         try expectContains(path, source, "release_published=true");
         try expectContains(path, source, "publish_attempted=true");
         try expectContains(path, source, "--latest=false");
-        try expectContains(path, source, "--clobber");
+        try expectAbsent(path, source, "gh release upload");
+        try expectAbsent(path, source, "--clobber");
+        try expectContains(
+            path,
+            source,
+            "https://uploads.github.com/repos/$REPOSITORY/releases/$release_id/assets?name=",
+        );
+        try expectContains(path, source, "Content-Type: application/octet-stream");
         try expectContains(path, source, "quarantine and inspect immutable");
         try expectAbsent(
             path,
             source,
             "--draft >/dev/null 2>&1 || true",
         );
-        try expectOrder(path, source, "--draft", "gh release upload");
-        try expectOrder(path, source, "gh release upload", "gh release download");
+        try expectOrder(path, source, "--draft", "uploads.github.com/repos/");
+        try expectOrder(path, source, "uploads.github.com/repos/", "gh release download");
         try expectOrder(path, source, "gh release download", "publish_attempted=true");
         if (std.mem.indexOf(u8, source, "--method DELETE") != null) {
             try expectOrder(
@@ -624,15 +702,15 @@ test "every shell asset publisher is draft-only until one-way publication" {
                 "publish_attempted=true",
             );
         }
-        try expectOrder(path, source, "publish_attempted=true", "--draft=false");
-        try expectOrder(path, source, "--draft=false", "release_published=true");
+        try expectOrder(path, source, "publish_attempted=true", "draft=false");
+        try expectOrder(path, source, "draft=false", "release_published=true");
         const published_at = std.mem.indexOf(
             u8,
             source,
             "release_published=true",
         ).?;
         const published_path = source[published_at..];
-        try expectAbsent(path, published_path, "gh release upload");
+        try expectAbsent(path, published_path, "uploads.github.com/repos/");
         try expectAbsent(path, published_path, "--method DELETE");
         try expectAbsent(path, published_path, "--draft");
     }
@@ -670,7 +748,7 @@ test "retained drafts are identity-checked by native release tools" {
             requirement[0],
             source,
             requirement[1],
-            "gh release upload",
+            "uploads.github.com/repos/",
         );
     }
 }
@@ -756,7 +834,7 @@ test "shell-created drafts bind and refetch the exact target before upload" {
             requirement.path,
             transaction,
             requirement.validator,
-            "gh release upload",
+            "uploads.github.com/repos/",
         );
     }
 }

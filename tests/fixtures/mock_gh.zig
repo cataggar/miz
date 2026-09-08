@@ -59,7 +59,15 @@ fn apiCommand(
     out: *std.Io.Writer,
 ) !void {
     const endpoint = for (argv) |argument| {
-        if (std.mem.startsWith(u8, argument, "repos/")) break argument;
+        if (std.mem.startsWith(u8, argument, "repos/") or
+            std.mem.startsWith(
+                u8,
+                argument,
+                "https://uploads.github.com/repos/",
+            ))
+        {
+            break argument;
+        }
     } else return error.MissingApiEndpoint;
     const method = optionValue(argv, "--method") orelse "GET";
 
@@ -107,12 +115,69 @@ fn apiCommand(
         );
         return;
     }
+    if (std.mem.endsWith(u8, endpoint, "/releases/generate-notes") and
+        std.mem.eql(u8, method, "POST"))
+    {
+        if (!std.mem.eql(u8, fieldValue(argv, "tag_name") orelse "", tag) or
+            !std.mem.eql(
+                u8,
+                fieldValue(argv, "target_commitish") orelse "",
+                commit,
+            ))
+        {
+            return error.MockInvalidGeneratedNotesIdentity;
+        }
+        try out.writeAll("{\"body\":");
+        try writeJsonString(out, generatedNotes(scenario));
+        try out.writeAll("}\n");
+        return;
+    }
     if (std.mem.endsWith(u8, endpoint, "/releases") and
         std.mem.eql(u8, method, "POST"))
     {
+        if (!std.mem.eql(u8, fieldValue(argv, "draft") orelse "", "true") or
+            !std.mem.eql(
+                u8,
+                fieldValue(argv, "generate_release_notes") orelse "",
+                "false",
+            ))
+        {
+            return error.MockInvalidDraftCreation;
+        }
+        if (!std.mem.eql(
+            u8,
+            fieldValue(argv, "make_latest") orelse "",
+            "false",
+        )) {
+            return error.MockInvalidDraftLatest;
+        }
+        const expected_body = try expectedReleaseBody(allocator, tag, scenario);
+        defer allocator.free(expected_body);
+        if (!std.mem.eql(
+            u8,
+            fieldValue(argv, "body") orelse "",
+            expected_body,
+        )) {
+            return error.MockMissingGeneratedNotes;
+        }
         try writeStage(io, root, "draft");
         try ensureRemoteDirectory(allocator, io, root);
         try writeRelease(allocator, io, root, scenario, tag, version, commit, out);
+        return;
+    }
+    if (std.mem.startsWith(
+        u8,
+        endpoint,
+        "https://uploads.github.com/repos/cataggar/miz/releases/42/assets?name=",
+    ) and std.mem.eql(u8, method, "POST")) {
+        const name_marker = "?name=";
+        const name_at = std.mem.indexOf(u8, endpoint, name_marker) orelse
+            return error.MissingAssetName;
+        const name = endpoint[name_at + name_marker.len ..];
+        const source = optionValue(argv, "--input") orelse
+            return error.MissingUploadInput;
+        try uploadAsset(allocator, io, root, scenario, source, name);
+        try out.writeAll("{}\n");
         return;
     }
     if (std.mem.endsWith(u8, endpoint, "/releases/42") and
@@ -156,6 +221,7 @@ fn apiCommand(
         const id = try parseTrailingId(endpoint);
         const bytes = try readAssetById(allocator, io, root, id);
         defer allocator.free(bytes);
+        try writeMarker(io, root, "download-started", "true");
         try out.writeAll(bytes);
         if (std.mem.eql(u8, scenario, "corrupt-download")) {
             try out.writeAll("corrupt");
@@ -180,6 +246,20 @@ fn releaseCommand(
     }
     const source = argv[2];
     const name = std.fs.path.basename(source);
+    try uploadAsset(allocator, io, root, scenario, source, name);
+}
+
+fn uploadAsset(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    scenario: []const u8,
+    source: []const u8,
+    name: []const u8,
+) !void {
+    if (std.mem.eql(u8, scenario, "upload-failure")) {
+        return error.MockUploadFailure;
+    }
     if (std.mem.eql(u8, scenario, "starter-first-upload") and
         !try markerExists(allocator, io, root, "starter-created"))
     {
@@ -243,11 +323,7 @@ fn writeRelease(
     else
         try std.fmt.allocPrint(allocator, "miz {s}", .{version});
     defer if (!std.mem.eql(u8, title, "foreign title")) allocator.free(title);
-    const body = try std.fmt.allocPrint(
-        allocator,
-        "**Install:**\n\n```console\nghr install cataggar/miz@{s}\n```\n",
-        .{tag},
-    );
+    const body = try expectedReleaseBody(allocator, tag, "fresh");
     defer allocator.free(body);
     try out.print(
         "{{\"id\":{d},\"tag_name\":",
@@ -333,6 +409,12 @@ fn writeAssets(
         );
         wrote_asset = true;
     }
+    const corrupt_final_gate =
+        (std.mem.eql(u8, scenario, "final-null-digest") or
+            std.mem.eql(u8, scenario, "final-starter-state") or
+            std.mem.eql(u8, scenario, "final-wrong-digest")) and
+        try markerExists(allocator, io, root, "download-started");
+    var corrupted = false;
     for (names.items) |name| {
         if (wrote_asset) try out.writeByte(',');
         const path = try std.fs.path.join(allocator, &.{ remote, name });
@@ -349,10 +431,32 @@ fn writeAssets(
         const hex = std.fmt.bytesToHex(hash, .lower);
         try out.print("{{\"id\":{d},\"name\":", .{assetId(name)});
         try writeJsonString(out, name);
-        try out.print(
-            ",\"size\":{d},\"state\":\"uploaded\",\"digest\":\"sha256:{s}\"}}",
-            .{ bytes.len, &hex },
-        );
+        try out.print(",\"size\":{d},\"state\":", .{bytes.len});
+        if (corrupt_final_gate and !corrupted and
+            std.mem.eql(u8, scenario, "final-starter-state"))
+        {
+            try out.writeAll("\"starter\",\"digest\":\"sha256:");
+            try out.writeAll(&hex);
+            try out.writeAll("\"}");
+            corrupted = true;
+        } else if (corrupt_final_gate and !corrupted and
+            std.mem.eql(u8, scenario, "final-null-digest"))
+        {
+            try out.writeAll("\"uploaded\",\"digest\":null}");
+            corrupted = true;
+        } else if (corrupt_final_gate and !corrupted and
+            std.mem.eql(u8, scenario, "final-wrong-digest"))
+        {
+            try out.writeAll(
+                "\"uploaded\",\"digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"}",
+            );
+            corrupted = true;
+        } else {
+            try out.print(
+                "\"uploaded\",\"digest\":\"sha256:{s}\"}}",
+                .{&hex},
+            );
+        }
         wrote_asset = true;
     }
 }
@@ -375,7 +479,11 @@ fn appendLog(
     defer allocating.deinit();
     for (argv) |argument| {
         try allocating.writer.print("{d}:", .{argument.len});
-        try allocating.writer.writeAll(argument);
+        for (argument) |character| switch (character) {
+            '\n' => try allocating.writer.writeAll("\\n"),
+            '\r' => try allocating.writer.writeAll("\\r"),
+            else => try allocating.writer.writeByte(character),
+        };
         try allocating.writer.writeByte('\x1f');
     }
     try allocating.writer.writeByte('\n');
@@ -424,6 +532,37 @@ fn optionValue(argv: []const []const u8, name: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+fn fieldValue(argv: []const []const u8, name: []const u8) ?[]const u8 {
+    for (argv) |argument| {
+        if (!std.mem.startsWith(u8, argument, name) or
+            argument.len <= name.len or argument[name.len] != '=')
+        {
+            continue;
+        }
+        return argument[name.len + 1 ..];
+    }
+    return null;
+}
+
+fn generatedNotes(scenario: []const u8) []const u8 {
+    if (std.mem.eql(u8, scenario, "notes-mismatch")) {
+        return "## What's Changed\n\n* Regenerated fixture changelog changed\n";
+    }
+    return "## What's Changed\n\n* Generated fixture changelog\n";
+}
+
+fn expectedReleaseBody(
+    allocator: Allocator,
+    tag: []const u8,
+    scenario: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "**Install:**\n\n```console\nghr install cataggar/miz@{s}\n```\n{s}",
+        .{ tag, generatedNotes(scenario) },
+    );
 }
 
 fn parseTrailingId(endpoint: []const u8) !i64 {

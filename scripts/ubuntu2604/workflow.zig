@@ -4193,6 +4193,11 @@ pub fn releaseAssets(
         return mismatch(final, 0, diagnostic);
     const draft = support.isTrue(document.get("draft"));
     if (final and draft) return mismatch(true, assets.len, diagnostic);
+    if (!final and !draft) return fail(
+        diagnostic,
+        "release stopped being a draft before verification",
+        .{},
+    );
     if (assets.len != expected.entries.items.len) {
         return mismatch(final, assets.len, diagnostic);
     }
@@ -4221,16 +4226,22 @@ pub fn releaseAssets(
         {
             return mismatch(final, assets.len, diagnostic);
         }
+        if (!support.stringIs(entry.get("state"), "uploaded")) {
+            return mismatch(final, assets.len, diagnostic);
+        }
+        var digest_buffer: [71]u8 = undefined;
+        const expected_digest = std.fmt.bufPrint(
+            &digest_buffer,
+            "sha256:{s}",
+            .{expected.entries.items[index].sha256},
+        ) catch unreachable;
+        if (!support.stringIs(entry.get("digest"), expected_digest)) {
+            return mismatch(final, assets.len, diagnostic);
+        }
     }
     for (claimed) |taken| {
         if (!taken) return mismatch(final, assets.len, diagnostic);
     }
-
-    if (!final and !draft) return fail(
-        diagnostic,
-        "release stopped being a draft before verification",
-        .{},
-    );
 }
 
 /// The downloaded copy of the release must be byte-identical to the staged

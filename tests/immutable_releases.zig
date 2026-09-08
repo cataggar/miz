@@ -8,6 +8,9 @@ const Io = std.Io;
 
 const commit = "0123456789abcdef0123456789abcdef01234567";
 const max_output = 4 * 1024 * 1024;
+const create_endpoint = "repos/cataggar/miz/releases\x1f";
+const upload_endpoint =
+    "https://uploads.github.com/repos/cataggar/miz/releases/42/assets?name=";
 const platforms = [_][]const u8{
     "linux-musl-x64",
     "linux-musl-arm64",
@@ -167,6 +170,26 @@ const Fixture = struct {
         }
     }
 
+    fn addExactAssets(self: *Fixture, version: []const u8) !void {
+        for (platforms) |platform| {
+            inline for ([_][]const u8{ ".tar.gz", ".sbom.spdx.json" }) |suffix| {
+                const name = try std.fmt.allocPrint(
+                    self.allocator,
+                    "miz-{s}-{s}{s}",
+                    .{ version, platform, suffix },
+                );
+                defer self.allocator.free(name);
+                const contents = try std.fmt.allocPrint(
+                    self.allocator,
+                    "fixture:{s}\n",
+                    .{name},
+                );
+                defer self.allocator.free(contents);
+                try self.addRemote(name, contents);
+            }
+        }
+    }
+
     fn run(
         self: *Fixture,
         scenario: []const u8,
@@ -273,6 +296,39 @@ fn expectSucceeded(result: Run) !void {
     return error.PublisherFailed;
 }
 
+fn expectFreshNumericMutationChecks(log: []const u8) !void {
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(std.testing.allocator);
+    var iterator = std.mem.splitScalar(u8, log, '\n');
+    while (iterator.next()) |line| {
+        if (line.len != 0) try lines.append(std.testing.allocator, line);
+    }
+    var mutations: usize = 0;
+    for (lines.items, 0..) |line, index| {
+        const is_delete = std.mem.indexOf(
+            u8,
+            line,
+            "8:--method\x1f6:DELETE",
+        ) != null;
+        const is_upload = std.mem.indexOf(u8, line, upload_endpoint) != null;
+        if (!is_delete and !is_upload) continue;
+        mutations += 1;
+        try std.testing.expect(index != 0);
+        try expectContains(
+            lines.items[index - 1],
+            "repos/cataggar/miz/releases/42",
+        );
+        if (is_upload) {
+            try std.testing.expect(index + 1 < lines.items.len);
+            try expectContains(
+                lines.items[index + 1],
+                "repos/cataggar/miz/releases/42",
+            );
+        }
+    }
+    try std.testing.expect(mutations != 0);
+}
+
 test "fresh draft uploads verifies downloads and publishes once in order" {
     var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
     defer fixture.deinit();
@@ -281,10 +337,15 @@ test "fresh draft uploads verifies downloads and publishes once in order" {
     try expectSucceeded(result);
     const log = try fixture.log();
     defer std.testing.allocator.free(log);
-    try expectOrder(log, "8:--method\x1f4:POST", "7:release\x1f6:upload");
     try expectOrder(
         log,
-        "7:release\x1f6:upload",
+        "repos/cataggar/miz/releases/generate-notes",
+        create_endpoint,
+    );
+    try expectOrder(log, create_endpoint, upload_endpoint);
+    try expectOrder(
+        log,
+        upload_endpoint,
         "32:Accept: application/octet-stream",
     );
     try expectOrder(
@@ -293,13 +354,20 @@ test "fresh draft uploads verifies downloads and publishes once in order" {
         "8:--method\x1f5:PATCH",
     );
     try expectContains(log, "11:draft=false");
+    try expectContains(log, "10:draft=true");
+    try expectContains(log, "17:make_latest=false");
     try expectContains(log, "16:make_latest=true");
+    try expectContains(log, "Generated fixture changelog");
     try expectContains(
         log,
         "target_commitish=0123456789abcdef0123456789abcdef01234567",
     );
     try expectContains(log, "assets; argv remains literal");
+    try expectContains(log, "Content-Type: application/octet-stream");
+    try expectAbsent(log, "7:release\x1f6:upload");
+    try expectAbsent(log, "--clobber");
     try expectAbsent(log, "sh -c");
+    try expectFreshNumericMutationChecks(log);
     const stage = try fixture.stage();
     defer std.testing.allocator.free(stage);
     try std.testing.expectEqualStrings("published", stage);
@@ -315,7 +383,7 @@ test "a missing or legacy draft target is refused before upload" {
         try expectContains(result.stderr, "release target");
         const log = try fixture.log();
         defer std.testing.allocator.free(log);
-        try expectAbsent(log, "7:release\x1f6:upload");
+        try expectAbsent(log, upload_endpoint);
         try expectAbsent(log, "8:--method\x1f5:PATCH");
     }
 }
@@ -335,7 +403,7 @@ test "a starter asset left by a failed upload is repaired on the next run" {
     try expectSucceeded(second);
     const log = try fixture.log();
     defer std.testing.allocator.free(log);
-    try expectOrder(log, "8:--method\x1f6:DELETE", "7:release\x1f6:upload");
+    try expectOrder(log, "8:--method\x1f6:DELETE", upload_endpoint);
     const stage = try fixture.stage();
     defer std.testing.allocator.free(stage);
     try std.testing.expectEqualStrings("published", stage);
@@ -353,7 +421,7 @@ test "unknown draft asset states fail closed before repair" {
     const log = try fixture.log();
     defer std.testing.allocator.free(log);
     try expectAbsent(log, "8:--method\x1f6:DELETE");
-    try expectAbsent(log, "7:release\x1f6:upload");
+    try expectAbsent(log, upload_endpoint);
 }
 
 test "duplicate uploaded and incomplete entries are replaced safely" {
@@ -383,9 +451,10 @@ test "duplicate uploaded and incomplete entries are replaced safely" {
         u8,
         log,
         second_delete + 1,
-        "7:release\x1f6:upload",
+        upload_endpoint,
     ) orelse return error.MissingText;
     try std.testing.expect(second_delete < upload);
+    try expectFreshNumericMutationChecks(log);
 }
 
 test "an exact retained draft resumes without creating another release" {
@@ -397,8 +466,44 @@ test "an exact retained draft resumes without creating another release" {
     try expectSucceeded(result);
     const log = try fixture.log();
     defer std.testing.allocator.free(log);
-    try expectAbsent(log, "8:--method\x1f4:POST");
+    try expectAbsent(log, create_endpoint);
     try expectContains(log, "8:--method\x1f5:PATCH");
+}
+
+test "an exact retained draft asset set is not reuploaded" {
+    var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+    defer fixture.deinit();
+    try fixture.setStage("draft");
+    try fixture.addExactAssets("1.2.3");
+    const result = try fixture.run("resume", "1.2.3");
+    defer result.deinit(std.testing.allocator);
+    try expectSucceeded(result);
+    const log = try fixture.log();
+    defer std.testing.allocator.free(log);
+    try expectAbsent(log, upload_endpoint);
+    try expectAbsent(log, "8:--method\x1f6:DELETE");
+    try expectContains(log, "8:--method\x1f5:PATCH");
+}
+
+test "regenerated release notes must exactly match a resumable draft" {
+    var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+    defer fixture.deinit();
+    try fixture.setStage("draft");
+    const result = try fixture.run("notes-mismatch", "1.2.3");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(!result.succeeded());
+    try expectContains(result.stderr, "release body");
+    const log = try fixture.log();
+    defer std.testing.allocator.free(log);
+    try expectOrder(
+        log,
+        "repos/cataggar/miz/releases/generate-notes",
+        "releases?per_page=100",
+    );
+    try expectAbsent(log, create_endpoint);
+    try expectAbsent(log, upload_endpoint);
+    try expectAbsent(log, "8:--method\x1f6:DELETE");
+    try expectAbsent(log, "8:--method\x1f5:PATCH");
 }
 
 test "a published release is refused before every mutation" {
@@ -412,10 +517,10 @@ test "a published release is refused before every mutation" {
     const log = try fixture.log();
     defer std.testing.allocator.free(log);
     for ([_][]const u8{
-        "7:release\x1f6:upload",
+        upload_endpoint,
         "8:--method\x1f6:DELETE",
         "8:--method\x1f5:PATCH",
-        "8:--method\x1f4:POST",
+        create_endpoint,
     }) |needle| {
         try expectAbsent(log, needle);
     }
@@ -431,7 +536,7 @@ test "duplicate exact-tag releases are refused before mutation" {
     try expectContains(result.stderr, "more than one release has exact tag");
     const log = try fixture.log();
     defer std.testing.allocator.free(log);
-    try expectAbsent(log, "7:release\x1f6:upload");
+    try expectAbsent(log, upload_endpoint);
     try expectAbsent(log, "8:--method\x1f5:PATCH");
 }
 
@@ -492,6 +597,31 @@ test "missing and changed remote assets fail before publish" {
     }
 }
 
+test "the last numeric draft fetch requires exact uploaded API digests" {
+    inline for ([_]struct {
+        scenario: []const u8,
+        diagnostic: []const u8,
+    }{
+        .{ .scenario = "final-null-digest", .diagnostic = "has no digest" },
+        .{ .scenario = "final-starter-state", .diagnostic = "not fully uploaded" },
+        .{ .scenario = "final-wrong-digest", .diagnostic = "has digest" },
+    }) |case| {
+        var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+        defer fixture.deinit();
+        const result = try fixture.run(case.scenario, "1.2.3");
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(!result.succeeded());
+        try expectContains(result.stderr, case.diagnostic);
+        const stage = try fixture.stage();
+        defer std.testing.allocator.free(stage);
+        try std.testing.expectEqualStrings("draft", stage);
+        const log = try fixture.log();
+        defer std.testing.allocator.free(log);
+        try expectContains(log, "32:Accept: application/octet-stream");
+        try expectAbsent(log, "8:--method\x1f5:PATCH");
+    }
+}
+
 test "foreign metadata and wrong tag target fail before asset mutation" {
     inline for ([_][]const u8{ "metadata-mismatch", "tag-mismatch" }) |scenario| {
         var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
@@ -503,7 +633,7 @@ test "foreign metadata and wrong tag target fail before asset mutation" {
         const log = try fixture.log();
         defer std.testing.allocator.free(log);
         for ([_][]const u8{
-            "7:release\x1f6:upload",
+            upload_endpoint,
             "8:--method\x1f6:DELETE",
             "8:--method\x1f5:PATCH",
         }) |needle| {
@@ -539,7 +669,7 @@ test "post-publication verification failure performs no later mutation" {
     const publish_at = std.mem.indexOf(u8, log, publish_marker) orelse
         return error.MissingText;
     const after = log[publish_at + publish_marker.len ..];
-    try expectAbsent(after, "7:release\x1f6:upload");
+    try expectAbsent(after, upload_endpoint);
     try expectAbsent(after, "8:--method\x1f6:DELETE");
     try expectAbsent(after, "draft=true");
 }

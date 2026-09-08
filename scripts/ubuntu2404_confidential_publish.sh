@@ -11,7 +11,7 @@ if [[ -z ${CANDIDATE:-} || -z ${PROVENANCE:-} ||
   echo "::error::Required Ubuntu 24.04 Confidential VM publication configuration is incomplete"
   exit 1
 fi
-for tool in gh jq sha256sum stat; do
+for tool in gh sha256sum stat; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required publication tool $tool is unavailable"
     exit 1
@@ -147,15 +147,8 @@ if release_is_draft=$(
     --source-commit "$SOURCE_COMMIT"
 fi
 
-if [[ "$release_exists" == true ]]; then
-  gh release edit "$RELEASE_TAG" \
-    --repo "$REPOSITORY" \
-    --verify-tag \
-    --draft \
-    --latest=false \
-    --title "$RELEASE_TITLE" \
-    --notes-file "$notes_file" >/dev/null
-else
+if [[ "$release_exists" != true ]]; then
+  release_mutated=true
   gh release create "$RELEASE_TAG" \
     --repo "$REPOSITORY" \
     --verify-tag \
@@ -165,7 +158,6 @@ else
     --title "$RELEASE_TITLE" \
     --notes-file "$notes_file" >/dev/null
 fi
-release_mutated=true
 release_id=${existing_release_id:-$(gh release view "$RELEASE_TAG" \
   --repo "$REPOSITORY" \
   --json databaseId \
@@ -180,79 +172,79 @@ gh api "$release_api" >"$release_file"
   --release-title "$RELEASE_TITLE" \
   --source-commit "$SOURCE_COMMIT"
 
+check_release_assets() {
+  local mode=$1
+  local asset_name=${2:-}
+  local -a args=(
+    check-draft-assets
+    --release "$release_file"
+    --notes "$notes_file"
+    --expected "$expected_file"
+    --release-id "$release_id"
+    --release-tag "$RELEASE_TAG"
+    --release-title "$RELEASE_TITLE"
+    --source-commit "$SOURCE_COMMIT"
+    --mode "$mode"
+  )
+  if [[ -n "$asset_name" ]]; then
+    args+=(--asset-name "$asset_name")
+  fi
+  gh api "$release_api" >"$release_file"
+  "$RELEASE_TOOL" "${args[@]}"
+}
+
+repair_file="$STAGING_ROOT/repair-asset-ids"
+while true; do
+  check_release_assets repair >"$repair_file"
+  asset_id=
+  read -r asset_id <"$repair_file" || true
+  [[ -n "$asset_id" ]] || break
+  [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+  release_mutated=true
+  gh api --method DELETE "repos/$REPOSITORY/releases/assets/$asset_id"
+done
+check_release_assets subset >/dev/null
+
 while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
   test "$(sha256sum "$assets_dir/$asset_name" | awk '{print $1}')" = "$expected_sha"
   test "$(stat --format='%s' "$assets_dir/$asset_name")" = "$expected_bytes"
-  gh release upload "$RELEASE_TAG" "$assets_dir/$asset_name" \
-    --clobber \
-    --repo "$REPOSITORY"
+  [[ "$asset_name" =~ ^[A-Za-z0-9._-]+$ ]]
+  upload_status=$(check_release_assets asset "$asset_name")
+  if [[ "$upload_status" == keep ]]; then
+    continue
+  fi
+  [[ "$upload_status" == upload ]]
+  release_mutated=true
+  gh api --method POST \
+    -H 'Content-Type: application/octet-stream' \
+    --input "$assets_dir/$asset_name" \
+    "https://uploads.github.com/repos/$REPOSITORY/releases/$release_id/assets?name=$asset_name" \
+    >/dev/null
+  check_release_assets subset >/dev/null
 done <"$expected_file"
 
-gh api "$release_api" >"$release_file"
-"$RELEASE_TOOL" check-release-metadata \
-  --release "$release_file" \
-  --notes "$notes_file" \
-  --release-tag "$RELEASE_TAG" \
-  --release-title "$RELEASE_TITLE" \
-  --source-commit "$SOURCE_COMMIT"
-jq -r \
-  --arg candidate "$candidate_name" \
-  --arg provenance "$provenance_name" \
-  --arg acceptance "$acceptance_name" \
-  '.assets[]
-   | select(.name != $candidate and .name != $provenance and .name != $acceptance)
-   | .id' "$release_file" >"$STAGING_ROOT/stale-asset-ids"
-while read -r asset_id; do
-  [[ -z "$asset_id" ]] && continue
-  [[ "$asset_id" =~ ^[0-9]+$ ]]
-  gh api --method DELETE "repos/$REPOSITORY/releases/assets/$asset_id"
-done <"$STAGING_ROOT/stale-asset-ids"
-
-validate_release() {
-  local expected_draft=$1
-  local candidate_bytes provenance_bytes acceptance_bytes
-  candidate_bytes=$(stat --format='%s' "$assets_dir/$candidate_name")
-  provenance_bytes=$(stat --format='%s' "$assets_dir/$provenance_name")
-  acceptance_bytes=$(stat --format='%s' "$assets_dir/$acceptance_name")
-  gh api "$release_api" >"$release_file"
-  jq -e \
-    --argjson expected_draft "$expected_draft" \
-    --arg candidate "$candidate_name" \
-    --arg provenance "$provenance_name" \
-    --arg acceptance "$acceptance_name" \
-    --argjson candidate_bytes "$candidate_bytes" \
-    --argjson provenance_bytes "$provenance_bytes" \
-    --argjson acceptance_bytes "$acceptance_bytes" \
-    '.draft == $expected_draft and
-     ([.assets[] | {name, size}] | sort_by(.name)) ==
-       ([{name:$candidate,size:$candidate_bytes},
-         {name:$provenance,size:$provenance_bytes},
-         {name:$acceptance,size:$acceptance_bytes}] | sort_by(.name))' \
-    "$release_file" >/dev/null
-}
-
-validate_release true
+check_release_assets exact >/dev/null
 mkdir "$verify_dir"
 gh release download "$RELEASE_TAG" \
   --repo "$REPOSITORY" \
-  --dir "$verify_dir" \
-  --clobber
+  --dir "$verify_dir"
 while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
   test "$(sha256sum "$verify_dir/$asset_name" | awk '{print $1}')" = "$expected_sha"
   test "$(stat --format='%s' "$verify_dir/$asset_name")" = "$expected_bytes"
 done <"$expected_file"
 
-validate_release true
+check_release_assets exact >/dev/null
 publish_attempted=true
-gh release edit "$RELEASE_TAG" \
-  --repo "$REPOSITORY" \
-  --verify-tag \
-  --draft=false \
-  --latest=false \
-  --title "$RELEASE_TITLE" \
-  --notes-file "$notes_file" >/dev/null
+gh api --method PATCH "$release_api" \
+  -f "tag_name=$RELEASE_TAG" \
+  -f "target_commitish=$SOURCE_COMMIT" \
+  -f "name=$RELEASE_TITLE" \
+  -F "body=@$notes_file" \
+  -F "draft=false" \
+  -F "prerelease=false" \
+  -f "make_latest=false" >/dev/null
 release_published=true
-validate_release false
+check_release_assets published >/dev/null
 
 {
   echo "### Ubuntu 24.04 Confidential VM release published"

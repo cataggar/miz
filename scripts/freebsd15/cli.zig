@@ -241,6 +241,30 @@ pub const release_commands = [_]Command{
         },
     },
     .{
+        .name = "verify-draft-assets",
+        .options = &.{
+            "release",
+            "notes",
+            "expected",
+            "release-id",
+            "release-tag",
+            "release-title",
+            "source-commit",
+            "mode",
+            "asset-name",
+        },
+        .required = &.{
+            "release",
+            "notes",
+            "expected",
+            "release-id",
+            "release-tag",
+            "release-title",
+            "source-commit",
+            "mode",
+        },
+    },
+    .{
         .name = "release-stale-assets",
         .options = &.{ "release", "expected" },
         .required = &.{ "release", "expected" },
@@ -377,6 +401,7 @@ const release_usage_text =
     \\  matrix, azure-matrix, describe, include-count, candidate, azure-result,
     \\  candidate-binding, stage, compare, stage-expected, stage-evidence,
     \\  publish-expected, tag-object, verify-release-metadata,
+    \\  verify-draft-assets,
     \\  release-stale-assets, verify-remote-release,
     \\  verify-downloaded-release, verify-published-release
     \\
@@ -568,6 +593,39 @@ fn dispatchRelease(
             requiredOption(options, "release-title"),
             requiredOption(options, "source-commit"),
         );
+    }
+    if (std.mem.eql(u8, name, "verify-draft-assets")) {
+        const mode_text = requiredOption(options, "mode");
+        const mode: support.github_release.DraftAssetTableMode =
+            if (std.mem.eql(u8, mode_text, "repair"))
+                .repair
+            else if (std.mem.eql(u8, mode_text, "asset"))
+                .asset
+            else if (std.mem.eql(u8, mode_text, "subset"))
+                .subset
+            else if (std.mem.eql(u8, mode_text, "exact"))
+                .exact
+            else
+                return error.Usage;
+        return support.github_release.validateDraftAssetTableFiles(
+            context.arena,
+            context.io,
+            requiredOption(options, "release"),
+            requiredOption(options, "notes"),
+            requiredOption(options, "expected"),
+            try integerOption(options, "release-id", 0),
+            .{
+                .tag = requiredOption(options, "release-tag"),
+                .commit = requiredOption(options, "source-commit"),
+                .title = requiredOption(options, "release-title"),
+                .body = "",
+                .prerelease = false,
+            },
+            mode,
+            options.find("asset-name"),
+            out,
+            &context.diagnostic,
+        ) catch return error.Invalid;
     }
     if (std.mem.eql(u8, name, "release-stale-assets")) {
         return publication.writeStaleAssetIds(

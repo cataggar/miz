@@ -4215,7 +4215,7 @@ test "the publisher is draft-first, allowlisted, and fail-safe" {
     try script.expectContains("--run-id \"$GITHUB_RUN_ID\"");
     try script.expectContains("--run-attempt \"$GITHUB_RUN_ATTEMPT\"");
     try script.expectContains("--draft");
-    try script.expectContains("stale-asset-ids");
+    try script.expectContains("repair-asset-ids");
     try script.expectContains("retaining resumable draft $RELEASE_TAG");
     try script.expectContains("--json isDraft");
     try script.expectOmits("date -u +%Y%m%d");
@@ -4228,17 +4228,23 @@ test "the publisher is draft-first, allowlisted, and fail-safe" {
     try script.expectOmits("--draft >/dev/null 2>&1 || true");
     try script.expectContains("gh release download \"$RELEASE_TAG\"");
     try script.expectContains("\"$RELEASE_TOOL\" github-release-downloaded");
+    try script.expectOmits("gh release upload");
+    try script.expectOmits("--clobber");
+    try script.expectContains("github-draft-assets");
+    try script.expectContains(
+        "https://uploads.github.com/repos/$REPOSITORY/releases/$release_id/assets?name=$asset_name",
+    );
     try source.expectOrder(
         script.text,
         "gh release create \"$RELEASE_TAG\"",
-        "gh release upload \"$RELEASE_TAG\"",
+        "https://uploads.github.com/repos/$REPOSITORY/releases/$release_id/assets?name=$asset_name",
         "publish",
     );
     const download_index = try script.indexOf("\"$RELEASE_TOOL\" github-release-downloaded");
     const remainder = script.text[download_index..];
     try source.expectContainsIn(
         remainder,
-        "gh release edit \"$RELEASE_TAG\"",
+        "gh api --method PATCH \"$release_api\"",
         "publish",
     );
     // Publication depends on no interpreter.
@@ -4364,12 +4370,12 @@ fn remoteReleaseForExpected(
         if (line.len == 0) continue;
         var fields = std.mem.splitScalar(u8, line, '\t');
         const name = fields.next().?;
-        _ = fields.next().?;
+        const sha256 = fields.next().?;
         const size = fields.next().?;
         try output.print(
             allocator,
-            "{s}{{\"name\":\"{s}\",\"size\":{s}}}",
-            .{ if (first) "" else ",", name, size },
+            "{s}{{\"name\":\"{s}\",\"size\":{s},\"state\":\"uploaded\",\"digest\":\"sha256:{s}\"}}",
+            .{ if (first) "" else ",", name, size, sha256 },
         );
         first = false;
     }
@@ -4402,25 +4408,45 @@ test "github-release-assets binds each remote asset to one allowlist entry" {
     var subject = try tree();
     defer subject.deinit();
 
-    const exact =
-        \\{"draft": true, "assets": [
-        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2048},
-        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
-        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6144},
-        \\  {"name": "Ubuntu-26.04-aarch64.core.qcow2", "size": 8192}
-        \\]}
-    ;
+    const exact = try remoteReleaseForExpected(publication_allowlist, true);
+    defer allocator.free(exact);
     try expectAssetsAccepted(&subject, exact, "draft");
+    const null_digest = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        exact,
+        "\"digest\":\"sha256:" ++ "a" ** 64 ++ "\"",
+        "\"digest\":null",
+    );
+    defer allocator.free(null_digest);
+    try expectAssetsRejected(&subject, null_digest, "draft", draft_mismatch);
+    const starter = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        exact,
+        "\"state\":\"uploaded\"",
+        "\"state\":\"starter\"",
+    );
+    defer allocator.free(starter);
+    try expectAssetsRejected(&subject, starter, "draft", draft_mismatch);
+    const wrong_digest = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        exact,
+        "sha256:" ++ "a" ** 64,
+        "sha256:" ++ "f" ** 64,
+    );
+    defer allocator.free(wrong_digest);
+    try expectAssetsRejected(&subject, wrong_digest, "draft", draft_mismatch);
 
     // Order is not part of the contract; the binding is.
-    const reordered =
-        \\{"draft": true, "assets": [
-        \\  {"name": "Ubuntu-26.04-aarch64.core.qcow2", "size": 8192},
-        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6144},
-        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
-        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2048}
-        \\]}
-    ;
+    const reordered_allowlist =
+        "Ubuntu-26.04-aarch64.core.qcow2\t" ++ "d" ** 64 ++ "\t8192\n" ++
+        "Ubuntu-26.04-x86_64.core.qcow2\t" ++ "c" ** 64 ++ "\t6144\n" ++
+        "Ubuntu-26.04-aarch64.qcow2\t" ++ "b" ** 64 ++ "\t4096\n" ++
+        "Ubuntu-26.04-x86_64.qcow2\t" ++ "a" ** 64 ++ "\t2048\n";
+    const reordered = try remoteReleaseForExpected(reordered_allowlist, true);
+    defer allocator.free(reordered);
     try expectAssetsAccepted(&subject, reordered, "draft");
 
     // The count matches and every name is allowlisted, but one expected asset
@@ -4492,14 +4518,8 @@ test "github-release-assets holds the final stage to the same one-to-one set" {
     var subject = try tree();
     defer subject.deinit();
 
-    const exact =
-        \\{"draft": false, "assets": [
-        \\  {"name": "Ubuntu-26.04-x86_64.qcow2", "size": 2048},
-        \\  {"name": "Ubuntu-26.04-aarch64.qcow2", "size": 4096},
-        \\  {"name": "Ubuntu-26.04-x86_64.core.qcow2", "size": 6144},
-        \\  {"name": "Ubuntu-26.04-aarch64.core.qcow2", "size": 8192}
-        \\]}
-    ;
+    const exact = try remoteReleaseForExpected(publication_allowlist, false);
+    defer allocator.free(exact);
     try expectAssetsAccepted(&subject, exact, "final");
 
     const duplicated =

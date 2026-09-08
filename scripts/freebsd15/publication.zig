@@ -513,11 +513,13 @@ pub fn verifyRemoteRelease(
             .{try releaseAssetNamesText(context, assets)},
         );
         const raw = document.stringOf(asset.get("digest")) orelse "";
-        const observed = if (std.mem.startsWith(u8, raw, "sha256:"))
-            raw["sha256:".len..]
-        else
-            raw;
-        if (!std.mem.eql(u8, observed, wanted.sha256) or
+        const expected_digest = try std.fmt.allocPrint(
+            context.arena,
+            "sha256:{s}",
+            .{wanted.sha256},
+        );
+        if (!std.mem.eql(u8, raw, expected_digest) or
+            !document.eqlString(asset.get("state"), "uploaded") or
             document.integerOf(asset.get("size")) != wanted.bytes)
         {
             return context.fail("remote release asset mismatch: {s}", .{wanted.name});
@@ -685,6 +687,27 @@ pub fn verifyPublishedRelease(
         "published release did not retain the exact final allowlist",
         .{},
     );
+    for (expected) |wanted_asset| {
+        const asset = findReleaseAsset(assets, wanted_asset.name) orelse
+            return context.fail(
+                "published release did not retain the exact final allowlist",
+                .{},
+            );
+        const expected_digest = try std.fmt.allocPrint(
+            context.arena,
+            "sha256:{s}",
+            .{wanted_asset.sha256},
+        );
+        if (!document.eqlString(asset.get("state"), "uploaded") or
+            !document.eqlString(asset.get("digest"), expected_digest) or
+            document.integerOf(asset.get("size")) != wanted_asset.bytes)
+        {
+            return context.fail(
+                "published release did not retain exact uploaded asset digests",
+                .{},
+            );
+        }
+    }
 }
 
 test "the publication allowlist and the release-set table agree" {

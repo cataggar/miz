@@ -62,6 +62,7 @@ const usage_text =
     \\  verify-capture         independently revalidate protected capture provenance
     \\  verify-capture-publication validate sanitized durable provenance without raw Azure evidence
     \\  check-release-metadata require an exact resumable draft identity
+    \\  check-draft-assets    plan/validate exact numeric draft mutations
     \\  check-capture-release-assets plan draft repair or require the exact final asset
     \\
     \\verify-capture requires independently supplied workflow identities and every
@@ -169,6 +170,7 @@ const command_table = [_]Command{
     .{ .name = "verify-capture", .handler = runVerifyCapture },
     .{ .name = "verify-capture-publication", .handler = runVerifyCapturePublication },
     .{ .name = "check-release-metadata", .handler = runCheckReleaseMetadata },
+    .{ .name = "check-draft-assets", .handler = runCheckDraftAssets },
     .{ .name = "check-capture-release-assets", .handler = runCheckCaptureReleaseAssets },
 };
 
@@ -225,6 +227,53 @@ fn runCheckReleaseMetadata(context: Context, argv: []const []const u8) !void {
             .body = "",
             .prerelease = false,
         },
+        context.diagnostic,
+    );
+}
+
+fn runCheckDraftAssets(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "release",
+        "notes",
+        "expected",
+        "release-id",
+        "release-tag",
+        "release-title",
+        "source-commit",
+        "mode",
+        "asset-name",
+    });
+    const mode_text = try options.require("mode");
+    const mode: release.github_release.DraftAssetTableMode =
+        if (std.mem.eql(u8, mode_text, "repair"))
+            .repair
+        else if (std.mem.eql(u8, mode_text, "asset"))
+            .asset
+        else if (std.mem.eql(u8, mode_text, "subset"))
+            .subset
+        else if (std.mem.eql(u8, mode_text, "exact"))
+            .exact
+        else if (std.mem.eql(u8, mode_text, "published"))
+            .published
+        else
+            return error.Usage;
+    return release.github_release.validateDraftAssetTableFiles(
+        context.allocator,
+        context.io,
+        try options.require("release"),
+        try options.require("notes"),
+        try options.require("expected"),
+        try options.requireInteger("release-id"),
+        .{
+            .tag = try options.require("release-tag"),
+            .commit = try options.require("source-commit"),
+            .title = try options.require("release-title"),
+            .body = "",
+            .prerelease = false,
+        },
+        mode,
+        options.get("asset-name"),
+        context.out,
         context.diagnostic,
     );
 }
@@ -3381,6 +3430,7 @@ test "command surface is exact and rejects incomplete invocations" {
         "verify-capture",
         "verify-capture-publication",
         "check-release-metadata",
+        "check-draft-assets",
         "check-capture-release-assets",
     };
     try std.testing.expectEqual(names.len, command_table.len);

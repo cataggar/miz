@@ -76,14 +76,12 @@ preserve_draft_on_failure() {
   status=$?
   trap - EXIT INT TERM
   if [[ $status -ne 0 ]]; then
-    if $release_created; then
-      if $release_published; then
-        echo "::error::Post-publication verification failed; quarantine and inspect immutable release $RELEASE_TAG without mutating it"
-      elif $publish_attempted; then
-        echo "::error::Publication outcome is unconfirmed; inspect $RELEASE_TAG without attempting release mutation"
-      else
-        echo "::warning::Publication failed; retaining resumable draft $RELEASE_TAG"
-      fi
+    if $release_published; then
+      echo "::error::Post-publication verification failed; quarantine and inspect immutable release $RELEASE_TAG without mutating it"
+    elif $publish_attempted; then
+      echo "::error::Publication outcome is unconfirmed; inspect $RELEASE_TAG without attempting release mutation"
+    elif $release_created; then
+      echo "::warning::Publication failed; retaining resumable draft $RELEASE_TAG"
     elif $tag_created; then
       gh api --method DELETE "repos/$REPOSITORY/git/refs/tags/$RELEASE_TAG" \
         >/dev/null 2>&1 || true
@@ -141,15 +139,8 @@ else
   tag_created=true
 fi
 
-if [[ "$release_exists" == true ]]; then
-  gh release edit "$RELEASE_TAG" \
-    --repo "$REPOSITORY" \
-    --verify-tag \
-    --draft \
-    --latest=false \
-    --title "$RELEASE_TITLE" \
-    --notes-file "$notes_file" >/dev/null
-else
+if [[ "$release_exists" != true ]]; then
+  release_created=true
   gh release create "$RELEASE_TAG" \
     --repo "$REPOSITORY" \
     --verify-tag \
@@ -159,7 +150,6 @@ else
     --title "$RELEASE_TITLE" \
     --notes-file "$notes_file" >/dev/null
 fi
-release_created=true
 
 release_id=${release_id:-$(gh release view "$RELEASE_TAG" \
   --repo "$REPOSITORY" \
@@ -175,27 +165,58 @@ gh api "$release_api" >"$release_file"
   --release-title "$RELEASE_TITLE" \
   --source-commit "$SOURCE_COMMIT"
 
+verify_draft_assets() {
+  local mode=$1
+  local asset_name=${2:-}
+  local -a args=(
+    verify-draft-assets
+    --release "$release_file"
+    --notes "$notes_file"
+    --expected "$expected_file"
+    --release-id "$release_id"
+    --release-tag "$RELEASE_TAG"
+    --release-title "$RELEASE_TITLE"
+    --source-commit "$SOURCE_COMMIT"
+    --mode "$mode"
+  )
+  if [[ -n "$asset_name" ]]; then
+    args+=(--asset-name "$asset_name")
+  fi
+  gh api "$release_api" >"$release_file"
+  "$release_tool" "${args[@]}"
+}
+
+repair_file="$STAGING_ROOT/repair-asset-ids"
+while true; do
+  verify_draft_assets repair >"$repair_file"
+  asset_id=
+  read -r asset_id <"$repair_file" || true
+  [[ -n "$asset_id" ]] || break
+  [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+  release_created=true
+  gh api --method DELETE "repos/$REPOSITORY/releases/assets/$asset_id"
+done
+verify_draft_assets subset >/dev/null
+
 while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
   test "$(sha256sum "$assets_dir/$asset_name" | awk '{print $1}')" = "$expected_sha"
   test "$(stat --format='%s' "$assets_dir/$asset_name")" = "$expected_bytes"
-  gh release upload "$RELEASE_TAG" "$assets_dir/$asset_name" \
-    --clobber \
-    --repo "$REPOSITORY"
+  [[ "$asset_name" =~ ^[A-Za-z0-9._-]+$ ]]
+  upload_status=$(verify_draft_assets asset "$asset_name")
+  if [[ "$upload_status" == keep ]]; then
+    continue
+  fi
+  [[ "$upload_status" == upload ]]
+  release_created=true
+  gh api --method POST \
+    -H 'Content-Type: application/octet-stream' \
+    --input "$assets_dir/$asset_name" \
+    "https://uploads.github.com/repos/$REPOSITORY/releases/$release_id/assets?name=$asset_name" \
+    >/dev/null
+  verify_draft_assets subset >/dev/null
 done <"$expected_file"
 
-gh api "$release_api" >"$release_file"
-"$release_tool" release-stale-assets \
-  --release "$release_file" \
-  --expected "$expected_file" >"$STAGING_ROOT/stale-asset-ids"
-while read -r asset_id; do
-  [[ "$asset_id" =~ ^[0-9]+$ ]]
-  gh api --method DELETE "repos/$REPOSITORY/releases/assets/$asset_id"
-done <"$STAGING_ROOT/stale-asset-ids"
-
-gh api "$release_api" >"$release_file"
-"$release_tool" verify-remote-release \
-  --release "$release_file" \
-  --expected "$expected_file"
+verify_draft_assets exact >/dev/null
 
 mkdir "$verify_dir"
 gh release download "$RELEASE_TAG" \
@@ -205,19 +226,17 @@ gh release download "$RELEASE_TAG" \
   --directory "$verify_dir" \
   --expected "$expected_file"
 
-gh api "$release_api" >"$release_file"
-"$release_tool" verify-remote-release \
-  --release "$release_file" \
-  --expected "$expected_file"
+verify_draft_assets exact >/dev/null
 
 publish_attempted=true
-gh release edit "$RELEASE_TAG" \
-  --repo "$REPOSITORY" \
-  --verify-tag \
-  --draft=false \
-  --latest=false \
-  --title "$RELEASE_TITLE" \
-  --notes-file "$notes_file" >/dev/null
+gh api --method PATCH "$release_api" \
+  -f "tag_name=$RELEASE_TAG" \
+  -f "target_commitish=$SOURCE_COMMIT" \
+  -f "name=$RELEASE_TITLE" \
+  -F "body=@$notes_file" \
+  -F "draft=false" \
+  -F "prerelease=false" \
+  -f "make_latest=false" >/dev/null
 release_published=true
 
 gh api "$release_api" >"$release_file"

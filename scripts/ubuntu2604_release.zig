@@ -91,6 +91,7 @@ const usage_text =
     \\  github-tag-object             print the tag ref object identity
     \\  github-tag-target             print a tag object's target identity
     \\  github-release-metadata       require an exact resumable draft identity
+    \\  github-draft-assets           plan/validate exact numeric draft mutations
     \\  github-stale-assets           print release assets outside the allowlist
     \\  github-release-assets         check remote release assets
     \\  github-release-downloaded     check downloaded release assets
@@ -511,6 +512,52 @@ fn dispatch(
                 .body = "",
                 .prerelease = false,
             },
+            diagnostic,
+        );
+    }
+
+    if (std.mem.eql(u8, command, "github-draft-assets")) {
+        var options = try cli.parse(allocator, argv, &.{
+            "--release",
+            "--notes",
+            "--expected",
+            "--release-id",
+            "--release-tag",
+            "--release-title",
+            "--source-commit",
+            "--mode",
+            "--asset-name",
+        });
+        defer options.deinit();
+        const mode_text = try options.require("--mode");
+        const mode: support.github_release.DraftAssetTableMode =
+            if (std.mem.eql(u8, mode_text, "repair"))
+                .repair
+            else if (std.mem.eql(u8, mode_text, "asset"))
+                .asset
+            else if (std.mem.eql(u8, mode_text, "subset"))
+                .subset
+            else if (std.mem.eql(u8, mode_text, "exact"))
+                .exact
+            else
+                return error.Usage;
+        return support.github_release.validateDraftAssetTableFiles(
+            allocator,
+            io,
+            try options.require("--release"),
+            try options.require("--notes"),
+            try options.require("--expected"),
+            try options.requireInteger("--release-id"),
+            .{
+                .tag = try options.require("--release-tag"),
+                .commit = try options.require("--source-commit"),
+                .title = try options.require("--release-title"),
+                .body = "",
+                .prerelease = false,
+            },
+            mode,
+            options.get("--asset-name"),
+            context.out,
             diagnostic,
         );
     }

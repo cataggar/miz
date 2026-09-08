@@ -100,6 +100,7 @@ jq -e \
    (.isPrerelease == false) and
    (.assets | length == 1) and
    (.assets[0].name == $asset) and
+   (.assets[0].state == "uploaded") and
    (.assets[0].size == $bytes) and
    (.assets[0].digest == $digest)' "$source_release_file" >/dev/null
 
@@ -211,14 +212,12 @@ preserve_draft_on_failure() {
   status=$?
   trap - EXIT INT TERM
   if [[ $status -ne 0 ]]; then
-    if [[ "$release_mutated" == true ]]; then
-      if [[ "$release_published" == true ]]; then
-        echo "::error::Post-publication verification failed; quarantine and inspect immutable reissue $REISSUE_TAG without mutating it"
-      elif [[ "$publish_attempted" == true ]]; then
-        echo "::error::Publication outcome is unconfirmed; inspect $REISSUE_TAG without attempting release mutation"
-      else
-        echo "::warning::Reissue failed; retaining resumable draft $REISSUE_TAG"
-      fi
+    if [[ "$release_published" == true ]]; then
+      echo "::error::Post-publication verification failed; quarantine and inspect immutable reissue $REISSUE_TAG without mutating it"
+    elif [[ "$publish_attempted" == true ]]; then
+      echo "::error::Publication outcome is unconfirmed; inspect $REISSUE_TAG without attempting release mutation"
+    elif [[ "$release_mutated" == true ]]; then
+      echo "::warning::Reissue failed; retaining resumable draft $REISSUE_TAG"
     elif [[ "$tag_created" == true ]]; then
       gh api --method DELETE \
         "repos/$REPOSITORY/git/refs/tags/$REISSUE_TAG" >/dev/null 2>&1 || true
@@ -242,15 +241,8 @@ else
   tag_created=true
 fi
 
-if [[ "$release_exists" == true ]]; then
-  gh release edit "$REISSUE_TAG" \
-    --repo "$REPOSITORY" \
-    --verify-tag \
-    --draft \
-    --latest=false \
-    --title "$RELEASE_TITLE" \
-    --notes-file "$notes_file" >/dev/null
-else
+if [[ "$release_exists" != true ]]; then
+  release_mutated=true
   gh release create "$REISSUE_TAG" \
     --repo "$REPOSITORY" \
     --verify-tag \
@@ -260,7 +252,6 @@ else
     --title "$RELEASE_TITLE" \
     --notes-file "$notes_file" >/dev/null
 fi
-release_mutated=true
 
 release_id=${existing_release_id:-$(gh release view "$REISSUE_TAG" \
   --repo "$REPOSITORY" \
@@ -276,28 +267,58 @@ gh api "$release_api" >"$release_file"
   --release-title "$RELEASE_TITLE" \
   --source-commit "$TOOLING_COMMIT"
 
+check_draft_assets() {
+  local mode=$1
+  local asset_name=${2:-}
+  local -a args=(
+    github-draft-assets
+    --release "$release_file"
+    --notes "$notes_file"
+    --expected "$expected_file"
+    --release-id "$release_id"
+    --release-tag "$REISSUE_TAG"
+    --release-title "$RELEASE_TITLE"
+    --source-commit "$TOOLING_COMMIT"
+    --mode "$mode"
+  )
+  if [[ -n "$asset_name" ]]; then
+    args+=(--asset-name "$asset_name")
+  fi
+  gh api "$release_api" >"$release_file"
+  "$RELEASE_TOOL" "${args[@]}"
+}
+
+repair_file="$STAGING_ROOT/repair-asset-ids"
+while true; do
+  check_draft_assets repair >"$repair_file"
+  asset_id=
+  read -r asset_id <"$repair_file" || true
+  [[ -n "$asset_id" ]] || break
+  [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+  release_mutated=true
+  gh api --method DELETE "repos/$REPOSITORY/releases/assets/$asset_id"
+done
+check_draft_assets subset >/dev/null
+
 while IFS=$'\t' read -r name expected_sha expected_bytes; do
   test "$(sha256sum "$ASSETS_DIR/$name" | awk '{print $1}')" = "$expected_sha"
   test "$(stat --format='%s' "$ASSETS_DIR/$name")" = "$expected_bytes"
-  gh release upload "$REISSUE_TAG" "$ASSETS_DIR/$name" \
-    --clobber \
-    --repo "$REPOSITORY"
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]]
+  upload_status=$(check_draft_assets asset "$name")
+  if [[ "$upload_status" == keep ]]; then
+    continue
+  fi
+  [[ "$upload_status" == upload ]]
+  release_mutated=true
+  gh api --method POST \
+    -H 'Content-Type: application/octet-stream' \
+    --input "$ASSETS_DIR/$name" \
+    "https://uploads.github.com/repos/$REPOSITORY/releases/$release_id/assets?name=$name" \
+    >/dev/null
+  check_draft_assets subset >/dev/null
 done <"$expected_file"
 
-gh api "$release_api" >"$release_file"
-"$RELEASE_TOOL" github-stale-assets \
-  --release "$release_file" \
-  --expected "$expected_file" >"$STAGING_ROOT/stale-asset-ids"
-while read -r asset_id; do
-  [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
-  gh api --method DELETE "repos/$REPOSITORY/releases/assets/$asset_id"
-done <"$STAGING_ROOT/stale-asset-ids"
-
-gh api "$release_api" >"$release_file"
-"$RELEASE_TOOL" github-release-assets \
-  --release "$release_file" \
-  --expected "$expected_file" \
-  --stage draft
+check_draft_assets exact >/dev/null
 
 mkdir "$verify_dir"
 gh release download "$REISSUE_TAG" \
@@ -321,11 +342,7 @@ gh release download "$REISSUE_TAG" \
   --key "$CANDIDATE_KEY" \
   --source-commit "$SOURCE_COMMIT" >/dev/null
 
-gh api "$release_api" >"$release_file"
-"$RELEASE_TOOL" github-release-assets \
-  --release "$release_file" \
-  --expected "$expected_file" \
-  --stage draft
+check_draft_assets exact >/dev/null
 
 gh release view "$SOURCE_RELEASE_TAG" \
   --repo "$REPOSITORY" \
@@ -340,17 +357,20 @@ jq -e \
    (.isPrerelease == false) and
    (.assets | length == 1) and
    (.assets[0].name == $asset) and
+   (.assets[0].state == "uploaded") and
    (.assets[0].size == $bytes) and
    (.assets[0].digest == $digest)' "$source_release_file" >/dev/null
 
+check_draft_assets exact >/dev/null
 publish_attempted=true
-gh release edit "$REISSUE_TAG" \
-  --repo "$REPOSITORY" \
-  --verify-tag \
-  --draft=false \
-  --latest=false \
-  --title "$RELEASE_TITLE" \
-  --notes-file "$notes_file" >/dev/null
+gh api --method PATCH "$release_api" \
+  -f "tag_name=$REISSUE_TAG" \
+  -f "target_commitish=$TOOLING_COMMIT" \
+  -f "name=$RELEASE_TITLE" \
+  -F "body=@$notes_file" \
+  -F "draft=false" \
+  -F "prerelease=false" \
+  -f "make_latest=false" >/dev/null
 release_published=true
 
 gh api "$release_api" >"$release_file"

@@ -1543,6 +1543,10 @@ jobs:
           )
           test "${#remote_main[@]}" -eq 1
           test "${remote_main[0]}" = "$GITHUB_SHA"
+          GH_TOKEN="$POLICY_GH_TOKEN" \
+            scripts/ubuntu2404_confidential_provenance_tag.sh \
+            require-absent "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
+            "$VALIDATION_DIR/tag-before-publish"
           GH_TOKEN="$PUBLICATION_GH_TOKEN" gh api "${api_headers[@]}" \
             "repos/$GITHUB_REPOSITORY/releases/$release_id" \
             >"$release_json"
@@ -1557,10 +1561,6 @@ jobs:
             --asset-sha256 "$EXPECTED_RESULT_SHA256" \
             --asset-size "$expected_asset_size" \
             --mode final
-          GH_TOKEN="$POLICY_GH_TOKEN" \
-            scripts/ubuntu2404_confidential_provenance_tag.sh \
-            require-absent "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
-            "$VALIDATION_DIR/tag-before-publish"
           EXPECTED_RELEASE_NOTES="$expected_notes" \
             GH_TOKEN="$PUBLICATION_GH_TOKEN" \
             scripts/ubuntu2404_confidential_publish_release.sh \

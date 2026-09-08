@@ -309,10 +309,8 @@ pub fn writeStaleAssetIds(
 
 pub const ReleaseState = enum { draft, published };
 
-/// The remote release must hold exactly the four expected assets. While the
-/// release is still a draft the sizes are compared too; once published, the
-/// name set is what the final check re-proves, together with the draft flag
-/// having been cleared.
+/// The remote release must hold exactly the expected assets, each fully
+/// uploaded with GitHub's exact SHA-256 digest and size.
 pub fn checkReleaseAssets(
     allocator: Allocator,
     release_document: *const ObjectMap,
@@ -320,6 +318,7 @@ pub fn checkReleaseAssets(
     state: ReleaseState,
     diagnostic: *Diagnostic,
 ) PublishError!void {
+    _ = allocator;
     const assets = contracts.arrayOrNull(release_document.get("assets")) orelse &.{};
     const draft = release_document.get("draft");
     if (draft == null or draft.? != .bool) return diagnostic.fail(
@@ -328,74 +327,63 @@ pub fn checkReleaseAssets(
         .{},
     );
 
-    switch (state) {
-        .draft => {
-            var actual = try actualAssetSizes(allocator, assets, diagnostic);
-            defer actual.deinit(allocator);
-            var matches = assets.len == expected.len and
-                actual.count() == expected.len;
-            if (matches) {
-                for (expected) |row| {
-                    const size = actual.get(row.name) orelse {
-                        matches = false;
-                        break;
-                    };
-                    if (size != row.bytes) {
-                        matches = false;
-                        break;
-                    }
-                }
-            }
-            if (!matches) {
-                const repr = try assetSizeRepr(allocator, assets);
-                defer allocator.free(repr);
-                return diagnostic.fail(
-                    error.ReleaseAllowlistMismatch,
-                    "remote release asset allowlist/size mismatch: {s}",
-                    .{repr},
-                );
-            }
-            if (!draft.?.bool) return diagnostic.fail(
-                error.ReleaseNotDraft,
-                "release stopped being a draft before verification",
-                .{},
-            );
-        },
-        .published => {
-            var names: std.StringHashMapUnmanaged(void) = .empty;
-            defer names.deinit(allocator);
+    const draft_matches = switch (state) {
+        .draft => draft.?.bool,
+        .published => !draft.?.bool,
+    };
+    var matches = draft_matches and assets.len == expected.len;
+    if (matches) {
+        for (expected) |row| {
+            var found: ?ObjectMap = null;
             for (assets) |asset| {
-                const fields = contracts.objectOrNull(asset) orelse
-                    return diagnostic.fail(
-                        error.ReleaseAllowlistMismatch,
-                        "published release did not retain the exact final allowlist",
-                        .{},
-                    );
-                const name = contracts.stringOrNull(fields.get("name")) orelse
-                    return diagnostic.fail(
-                        error.ReleaseAllowlistMismatch,
-                        "published release did not retain the exact final allowlist",
-                        .{},
-                    );
-                try names.put(allocator, name, {});
-            }
-            var matches = !draft.?.bool and
-                assets.len == expected.len and
-                names.count() == expected.len;
-            if (matches) {
-                for (expected) |row| {
-                    if (!names.contains(row.name)) {
-                        matches = false;
-                        break;
-                    }
+                const fields = contracts.objectOrNull(asset) orelse {
+                    matches = false;
+                    break;
+                };
+                if (!contracts.isString(fields.get("name"), row.name)) continue;
+                if (found != null) {
+                    matches = false;
+                    break;
                 }
+                found = fields;
             }
-            if (!matches) return diagnostic.fail(
-                error.ReleaseAllowlistMismatch,
-                "published release did not retain the exact final allowlist",
-                .{},
-            );
-        },
+            if (!matches) break;
+            const actual = found orelse {
+                matches = false;
+                break;
+            };
+            var digest_buffer: [71]u8 = undefined;
+            const expected_digest = std.fmt.bufPrint(
+                &digest_buffer,
+                "sha256:{s}",
+                .{row.sha256},
+            ) catch unreachable;
+            const size = contracts.integerOrNull(actual.get("size")) orelse -1;
+            if (size < 0 or @as(u64, @intCast(size)) != row.bytes or
+                !contracts.isString(actual.get("state"), "uploaded") or
+                !contracts.isString(actual.get("digest"), expected_digest))
+            {
+                matches = false;
+                break;
+            }
+        }
+    }
+    if (!matches) {
+        if (state == .draft and !draft.?.bool) return diagnostic.fail(
+            error.ReleaseNotDraft,
+            "release stopped being a draft before verification",
+            .{},
+        );
+        if (state == .published) return diagnostic.fail(
+            error.ReleaseAllowlistMismatch,
+            "published release did not retain the exact final allowlist",
+            .{},
+        );
+        return diagnostic.fail(
+            error.ReleaseAllowlistMismatch,
+            "remote release asset allowlist/state/digest/size mismatch",
+            .{},
+        );
     }
 }
 
@@ -783,10 +771,10 @@ test "a peeled tag object must name a real object identity" {
 
 const release_json =
     \\{"draft": true, "assets": [
-    \\ {"id": 1, "name": "AzureLinux-4.0-x86_64.qcow2", "size": 11},
-    \\ {"id": 2, "name": "AzureLinux-4.0-aarch64.qcow2", "size": 22},
-    \\ {"id": 3, "name": "AzureLinux-4.0-x86_64.core.qcow2", "size": 33},
-    \\ {"id": 4, "name": "AzureLinux-4.0-aarch64.core.qcow2", "size": 44}]}
+    \\ {"id": 1, "name": "AzureLinux-4.0-x86_64.qcow2", "size": 11, "state": "uploaded", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+    \\ {"id": 2, "name": "AzureLinux-4.0-aarch64.qcow2", "size": 22, "state": "uploaded", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+    \\ {"id": 3, "name": "AzureLinux-4.0-x86_64.core.qcow2", "size": 33, "state": "uploaded", "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
+    \\ {"id": 4, "name": "AzureLinux-4.0-aarch64.core.qcow2", "size": 44, "state": "uploaded", "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"}]}
 ;
 
 test "the remote release must hold exactly the expected four" {
@@ -809,10 +797,10 @@ test "the remote release must hold exactly the expected four" {
 
     var published = try parse(
         \\{"draft": false, "assets": [
-        \\ {"id": 1, "name": "AzureLinux-4.0-x86_64.qcow2", "size": 11},
-        \\ {"id": 2, "name": "AzureLinux-4.0-aarch64.qcow2", "size": 22},
-        \\ {"id": 3, "name": "AzureLinux-4.0-x86_64.core.qcow2", "size": 33},
-        \\ {"id": 4, "name": "AzureLinux-4.0-aarch64.core.qcow2", "size": 44}]}
+        \\ {"id": 1, "name": "AzureLinux-4.0-x86_64.qcow2", "size": 11, "state": "uploaded", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+        \\ {"id": 2, "name": "AzureLinux-4.0-aarch64.qcow2", "size": 22, "state": "uploaded", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+        \\ {"id": 3, "name": "AzureLinux-4.0-x86_64.core.qcow2", "size": 33, "state": "uploaded", "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
+        \\ {"id": 4, "name": "AzureLinux-4.0-aarch64.core.qcow2", "size": 44, "state": "uploaded", "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"}]}
     );
     defer published.deinit();
     try checkReleaseAssets(
@@ -836,10 +824,10 @@ test "the remote release must hold exactly the expected four" {
 
     var resized = try parse(
         \\{"draft": true, "assets": [
-        \\ {"id": 1, "name": "AzureLinux-4.0-x86_64.qcow2", "size": 12},
-        \\ {"id": 2, "name": "AzureLinux-4.0-aarch64.qcow2", "size": 22},
-        \\ {"id": 3, "name": "AzureLinux-4.0-x86_64.core.qcow2", "size": 33},
-        \\ {"id": 4, "name": "AzureLinux-4.0-aarch64.core.qcow2", "size": 44}]}
+        \\ {"id": 1, "name": "AzureLinux-4.0-x86_64.qcow2", "size": 12, "state": "uploaded", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+        \\ {"id": 2, "name": "AzureLinux-4.0-aarch64.qcow2", "size": 22, "state": "uploaded", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+        \\ {"id": 3, "name": "AzureLinux-4.0-x86_64.core.qcow2", "size": 33, "state": "uploaded", "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
+        \\ {"id": 4, "name": "AzureLinux-4.0-aarch64.core.qcow2", "size": 44, "state": "uploaded", "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"}]}
     );
     defer resized.deinit();
     try std.testing.expectError(error.ReleaseAllowlistMismatch, checkReleaseAssets(
@@ -849,19 +837,59 @@ test "the remote release must hold exactly the expected four" {
         .draft,
         &diagnostic,
     ));
-    try std.testing.expect(std.mem.startsWith(
-        u8,
+    try std.testing.expectEqualStrings(
+        "remote release asset allowlist/state/digest/size mismatch",
         diagnostic.message(),
-        "remote release asset allowlist/size mismatch: {'AzureLinux-4.0-x86_64.qcow2': 12",
+    );
+
+    inline for ([_][]const u8{
+        "null",
+        "\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+    }) |bad_digest| {
+        const bad_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"draft\":true,\"assets\":[" ++
+                "{{\"id\":1,\"name\":\"AzureLinux-4.0-x86_64.qcow2\",\"size\":11,\"state\":\"uploaded\",\"digest\":{s}}}," ++
+                "{{\"id\":2,\"name\":\"AzureLinux-4.0-aarch64.qcow2\",\"size\":22,\"state\":\"uploaded\",\"digest\":\"sha256:" ++ "2" ** 64 ++ "\"}}," ++
+                "{{\"id\":3,\"name\":\"AzureLinux-4.0-x86_64.core.qcow2\",\"size\":33,\"state\":\"uploaded\",\"digest\":\"sha256:" ++ "3" ** 64 ++ "\"}}," ++
+                "{{\"id\":4,\"name\":\"AzureLinux-4.0-aarch64.core.qcow2\",\"size\":44,\"state\":\"uploaded\",\"digest\":\"sha256:" ++ "4" ** 64 ++ "\"}}]}}",
+            .{bad_digest},
+        );
+        defer allocator.free(bad_json);
+        var bad = try parse(bad_json);
+        defer bad.deinit();
+        try std.testing.expectError(error.ReleaseAllowlistMismatch, checkReleaseAssets(
+            allocator,
+            &bad.value.object,
+            expected,
+            .draft,
+            &diagnostic,
+        ));
+    }
+
+    var starter = try parse(
+        \\{"draft":true,"assets":[
+        \\ {"id":1,"name":"AzureLinux-4.0-x86_64.qcow2","size":11,"state":"starter","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+        \\ {"id":2,"name":"AzureLinux-4.0-aarch64.qcow2","size":22,"state":"uploaded","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+        \\ {"id":3,"name":"AzureLinux-4.0-x86_64.core.qcow2","size":33,"state":"uploaded","digest":"sha256:3333333333333333333333333333333333333333333333333333333333333333"},
+        \\ {"id":4,"name":"AzureLinux-4.0-aarch64.core.qcow2","size":44,"state":"uploaded","digest":"sha256:4444444444444444444444444444444444444444444444444444444444444444"}]}
+    );
+    defer starter.deinit();
+    try std.testing.expectError(error.ReleaseAllowlistMismatch, checkReleaseAssets(
+        allocator,
+        &starter.value.object,
+        expected,
+        .draft,
+        &diagnostic,
     ));
 
     var sidecar = try parse(
         \\{"draft": true, "assets": [
-        \\ {"id": 1, "name": "AzureLinux-4.0-x86_64.qcow2", "size": 11},
-        \\ {"id": 2, "name": "AzureLinux-4.0-aarch64.qcow2", "size": 22},
-        \\ {"id": 3, "name": "AzureLinux-4.0-x86_64.core.qcow2", "size": 33},
-        \\ {"id": 4, "name": "AzureLinux-4.0-aarch64.core.qcow2", "size": 44},
-        \\ {"id": 5, "name": "AzureLinux-4.0-x86_64.qcow2.sha256", "size": 65}]}
+        \\ {"id": 1, "name": "AzureLinux-4.0-x86_64.qcow2", "size": 11, "state": "uploaded", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
+        \\ {"id": 2, "name": "AzureLinux-4.0-aarch64.qcow2", "size": 22, "state": "uploaded", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
+        \\ {"id": 3, "name": "AzureLinux-4.0-x86_64.core.qcow2", "size": 33, "state": "uploaded", "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
+        \\ {"id": 4, "name": "AzureLinux-4.0-aarch64.core.qcow2", "size": 44, "state": "uploaded", "digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"},
+        \\ {"id": 5, "name": "AzureLinux-4.0-x86_64.qcow2.sha256", "size": 65, "state": "uploaded", "digest": null}]}
     );
     defer sidecar.deinit();
     try std.testing.expectError(error.ReleaseAllowlistMismatch, checkReleaseAssets(
