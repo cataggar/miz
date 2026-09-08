@@ -2319,7 +2319,7 @@ test "the Azure acceptance job runs for the release set's whole matrix" {
     try support.expectContains(section, "scripts/freebsd15_azure_acceptance.sh cleanup");
 }
 
-test "only the Azure acceptance job reaches the protected configuration" {
+test "only the Azure acceptance job receives protected Azure configuration" {
     const gpa = std.testing.allocator;
     var tree = try Tree.create(gpa);
     defer tree.deinit();
@@ -2369,7 +2369,7 @@ test "only the Azure acceptance job reaches the protected configuration" {
         environments += 1;
         index = at + 1;
     }
-    try std.testing.expectEqual(@as(usize, 1), environments);
+    try std.testing.expectEqual(@as(usize, 2), environments);
     try support.expectAbsent(flow, "environment: freebsd15-release");
     try support.expectAbsent(outside, "secrets.AZURE_");
     try support.expectAbsent(outside, "vars[matrix.location_variable]");
