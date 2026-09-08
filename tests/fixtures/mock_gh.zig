@@ -1,0 +1,445 @@
+//! Stateful GitHub CLI stand-in for immutable-release transaction tests.
+
+const std = @import("std");
+
+const Allocator = std.mem.Allocator;
+const Dir = std.Io.Dir;
+const Io = std.Io;
+
+const release_id: i64 = 42;
+const stable_latest_id: i64 = 7;
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    const root = init.environ_map.get("MIZ_MOCK_GH_ROOT") orelse
+        return error.MissingMockRoot;
+    const scenario = init.environ_map.get("MIZ_MOCK_GH_SCENARIO") orelse "fresh";
+    const tag = init.environ_map.get("MIZ_MOCK_GH_TAG") orelse "v1.2.3";
+    const version = init.environ_map.get("MIZ_MOCK_GH_VERSION") orelse "1.2.3";
+    const commit = init.environ_map.get("MIZ_MOCK_GH_COMMIT") orelse
+        "0123456789abcdef0123456789abcdef01234567";
+    try appendLog(allocator, io, root, argv[1..]);
+    if (argv.len < 2) return error.MissingCommand;
+
+    var stdout_buffer: [64 * 1024]u8 = undefined;
+    var stdout_file: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    const out = &stdout_file.interface;
+    if (std.mem.eql(u8, argv[1], "release")) {
+        try releaseCommand(allocator, io, root, scenario, argv[2..]);
+    } else if (std.mem.eql(u8, argv[1], "api")) {
+        try apiCommand(
+            allocator,
+            io,
+            root,
+            scenario,
+            tag,
+            version,
+            commit,
+            argv[2..],
+            out,
+        );
+    } else {
+        return error.UnsupportedCommand;
+    }
+    try out.flush();
+}
+
+fn apiCommand(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    scenario: []const u8,
+    tag: []const u8,
+    version: []const u8,
+    commit: []const u8,
+    argv: []const []const u8,
+    out: *std.Io.Writer,
+) !void {
+    const endpoint = for (argv) |argument| {
+        if (std.mem.startsWith(u8, argument, "repos/")) break argument;
+    } else return error.MissingApiEndpoint;
+    const method = optionValue(argv, "--method") orelse "GET";
+
+    if (std.mem.indexOf(u8, endpoint, "/git/ref/tags/") != null) {
+        const sha = if (std.mem.eql(u8, scenario, "tag-mismatch"))
+            "ffffffffffffffffffffffffffffffffffffffff"
+        else
+            commit;
+        try out.print(
+            "{{\"object\":{{\"type\":\"commit\",\"sha\":\"{s}\"}}}}\n",
+            .{sha},
+        );
+        return;
+    }
+    if (std.mem.endsWith(u8, endpoint, "/releases?per_page=100")) {
+        const stage = try readStage(allocator, io, root);
+        defer allocator.free(stage);
+        if (std.mem.eql(u8, stage, "absent")) {
+            try out.writeAll("[[]]\n");
+        } else {
+            try out.writeAll("[[");
+            try writeRelease(allocator, io, root, scenario, tag, version, commit, out);
+            if (std.mem.eql(u8, scenario, "duplicate-release")) {
+                try out.writeByte(',');
+                try writeRelease(
+                    allocator,
+                    io,
+                    root,
+                    scenario,
+                    tag,
+                    version,
+                    commit,
+                    out,
+                );
+            }
+            try out.writeAll("]]\n");
+        }
+        return;
+    }
+    if (std.mem.endsWith(u8, endpoint, "/releases/latest")) {
+        const prerelease = std.mem.indexOfScalar(u8, version, '-') != null;
+        try out.print(
+            "{{\"id\":{d}}}\n",
+            .{if (prerelease) stable_latest_id else release_id},
+        );
+        return;
+    }
+    if (std.mem.endsWith(u8, endpoint, "/releases") and
+        std.mem.eql(u8, method, "POST"))
+    {
+        try writeStage(io, root, "draft");
+        try ensureRemoteDirectory(allocator, io, root);
+        try writeRelease(allocator, io, root, scenario, tag, version, commit, out);
+        return;
+    }
+    if (std.mem.endsWith(u8, endpoint, "/releases/42") and
+        std.mem.eql(u8, method, "PATCH"))
+    {
+        try writeStage(io, root, "published");
+        const response_scenario = if (std.mem.eql(
+            u8,
+            scenario,
+            "post-publish-failure",
+        ))
+            "fresh"
+        else if (std.mem.eql(u8, scenario, "immutable-regression"))
+            "immutable-enabled"
+        else
+            scenario;
+        try writeRelease(
+            allocator,
+            io,
+            root,
+            response_scenario,
+            tag,
+            version,
+            commit,
+            out,
+        );
+        return;
+    }
+    if (std.mem.endsWith(u8, endpoint, "/releases/42")) {
+        try writeRelease(allocator, io, root, scenario, tag, version, commit, out);
+        return;
+    }
+    if (std.mem.indexOf(u8, endpoint, "/releases/assets/") != null and
+        std.mem.eql(u8, method, "DELETE"))
+    {
+        const id = try parseTrailingId(endpoint);
+        try deleteAssetById(allocator, io, root, id);
+        return;
+    }
+    if (std.mem.indexOf(u8, endpoint, "/releases/assets/") != null) {
+        const id = try parseTrailingId(endpoint);
+        const bytes = try readAssetById(allocator, io, root, id);
+        defer allocator.free(bytes);
+        try out.writeAll(bytes);
+        if (std.mem.eql(u8, scenario, "corrupt-download")) {
+            try out.writeAll("corrupt");
+        }
+        return;
+    }
+    return error.UnsupportedApiEndpoint;
+}
+
+fn releaseCommand(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    scenario: []const u8,
+    argv: []const []const u8,
+) !void {
+    if (argv.len < 3 or !std.mem.eql(u8, argv[0], "upload")) {
+        return error.UnsupportedReleaseCommand;
+    }
+    if (std.mem.eql(u8, scenario, "upload-failure")) {
+        return error.MockUploadFailure;
+    }
+    const source = argv[2];
+    const name = std.fs.path.basename(source);
+    if (std.mem.eql(u8, scenario, "missing-remote") and
+        std.mem.endsWith(u8, name, "windows-arm64.sbom.spdx.json"))
+    {
+        return;
+    }
+    const bytes = try Dir.cwd().readFileAlloc(
+        io,
+        source,
+        allocator,
+        .limited(1024 * 1024),
+    );
+    defer allocator.free(bytes);
+    try ensureRemoteDirectory(allocator, io, root);
+    const destination = try std.fs.path.join(
+        allocator,
+        &.{ root, "remote", name },
+    );
+    defer allocator.free(destination);
+    if (std.mem.eql(u8, scenario, "changed-remote") and
+        std.mem.endsWith(u8, name, "windows-arm64.sbom.spdx.json"))
+    {
+        const changed = try std.mem.concat(allocator, u8, &.{ bytes, "changed" });
+        defer allocator.free(changed);
+        try Dir.cwd().writeFile(io, .{ .sub_path = destination, .data = changed });
+    } else {
+        try Dir.cwd().writeFile(io, .{ .sub_path = destination, .data = bytes });
+    }
+    if (std.mem.eql(u8, scenario, "change-local") and
+        std.mem.endsWith(u8, name, "linux-musl-x64.tar.gz"))
+    {
+        try Dir.cwd().writeFile(io, .{ .sub_path = source, .data = "changed locally" });
+    }
+}
+
+fn writeRelease(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    scenario: []const u8,
+    tag: []const u8,
+    version: []const u8,
+    commit: []const u8,
+    out: *std.Io.Writer,
+) !void {
+    const stage = try readStage(allocator, io, root);
+    defer allocator.free(stage);
+    const draft = std.mem.eql(u8, stage, "draft");
+    const published = std.mem.eql(u8, stage, "published");
+    const bad_after_publish = published and
+        std.mem.eql(u8, scenario, "post-publish-failure");
+    const title = if (std.mem.eql(u8, scenario, "metadata-mismatch") or
+        bad_after_publish)
+        "foreign title"
+    else
+        try std.fmt.allocPrint(allocator, "miz {s}", .{version});
+    defer if (!std.mem.eql(u8, title, "foreign title")) allocator.free(title);
+    const body = try std.fmt.allocPrint(
+        allocator,
+        "**Install:**\n\n```console\nghr install cataggar/miz@{s}\n```\n",
+        .{tag},
+    );
+    defer allocator.free(body);
+    try out.print(
+        "{{\"id\":{d},\"tag_name\":",
+        .{release_id},
+    );
+    try writeJsonString(out, tag);
+    try out.writeAll(",\"target_commitish\":");
+    try writeJsonString(out, commit);
+    try out.writeAll(",\"name\":");
+    try writeJsonString(out, title);
+    try out.writeAll(",\"body\":");
+    try writeJsonString(out, body);
+    try out.print(
+        ",\"draft\":{s},\"prerelease\":{s},\"immutable\":{s},\"assets\":[",
+        .{
+            if (draft) "true" else "false",
+            if (std.mem.indexOfScalar(u8, version, '-') != null) "true" else "false",
+            if (published and std.mem.eql(u8, scenario, "immutable-enabled"))
+                "true"
+            else
+                "false",
+        },
+    );
+    try writeAssets(allocator, io, root, out);
+    try out.writeAll("]}");
+}
+
+fn writeAssets(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    out: *std.Io.Writer,
+) !void {
+    const remote = try std.fs.path.join(allocator, &.{ root, "remote" });
+    defer allocator.free(remote);
+    var directory = Dir.cwd().openDir(io, remote, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer directory.close(io);
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
+    }
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        try names.append(allocator, try allocator.dupe(u8, entry.name));
+    }
+    std.mem.sort([]u8, names.items, {}, struct {
+        fn less(_: void, left: []u8, right: []u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.less);
+    for (names.items, 0..) |name, index| {
+        if (index != 0) try out.writeByte(',');
+        const path = try std.fs.path.join(allocator, &.{ remote, name });
+        defer allocator.free(path);
+        const bytes = try Dir.cwd().readFileAlloc(
+            io,
+            path,
+            allocator,
+            .limited(1024 * 1024),
+        );
+        defer allocator.free(bytes);
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+        const hex = std.fmt.bytesToHex(hash, .lower);
+        try out.print("{{\"id\":{d},\"name\":", .{assetId(name)});
+        try writeJsonString(out, name);
+        try out.print(
+            ",\"size\":{d},\"state\":\"uploaded\",\"digest\":\"sha256:{s}\"}}",
+            .{ bytes.len, &hex },
+        );
+    }
+}
+
+fn appendLog(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    argv: []const []const u8,
+) !void {
+    const path = try std.fs.path.join(allocator, &.{ root, "commands.log" });
+    defer allocator.free(path);
+    var file = Dir.cwd().openFile(io, path, .{ .mode = .write_only }) catch |err| switch (err) {
+        error.FileNotFound => try Dir.cwd().createFile(io, path, .{}),
+        else => return err,
+    };
+    defer file.close(io);
+    const stat = try file.stat(io);
+    var allocating: std.Io.Writer.Allocating = .init(allocator);
+    defer allocating.deinit();
+    for (argv) |argument| {
+        try allocating.writer.print("{d}:", .{argument.len});
+        try allocating.writer.writeAll(argument);
+        try allocating.writer.writeByte('\x1f');
+    }
+    try allocating.writer.writeByte('\n');
+    try file.writePositionalAll(io, allocating.written(), stat.size);
+}
+
+fn writeJsonString(out: *std.Io.Writer, text: []const u8) !void {
+    var stringify: std.json.Stringify = .{
+        .writer = out,
+        .options = .{},
+    };
+    try stringify.write(text);
+}
+
+fn readStage(allocator: Allocator, io: Io, root: []const u8) ![]u8 {
+    const path = try std.fs.path.join(allocator, &.{ root, "stage" });
+    defer allocator.free(path);
+    const bytes = Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(32),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return allocator.dupe(u8, "absent"),
+        else => return err,
+    };
+    return bytes;
+}
+
+fn writeStage(io: Io, root: []const u8, stage: []const u8) !void {
+    var buffer: [1024]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buffer, "{s}/stage", .{root});
+    try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = stage });
+}
+
+fn ensureRemoteDirectory(allocator: Allocator, io: Io, root: []const u8) !void {
+    const remote = try std.fs.path.join(allocator, &.{ root, "remote" });
+    defer allocator.free(remote);
+    try Dir.cwd().createDirPath(io, remote);
+}
+
+fn optionValue(argv: []const []const u8, name: []const u8) ?[]const u8 {
+    for (argv, 0..) |argument, index| {
+        if (std.mem.eql(u8, argument, name) and index + 1 < argv.len) {
+            return argv[index + 1];
+        }
+    }
+    return null;
+}
+
+fn parseTrailingId(endpoint: []const u8) !i64 {
+    const slash = std.mem.lastIndexOfScalar(u8, endpoint, '/') orelse
+        return error.InvalidAssetId;
+    return std.fmt.parseInt(i64, endpoint[slash + 1 ..], 10);
+}
+
+fn assetId(name: []const u8) i64 {
+    var value: u64 = 1000;
+    for (name, 0..) |byte, index| value += @as(u64, byte) * (index + 1);
+    return @intCast(value);
+}
+
+fn deleteAssetById(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    id: i64,
+) !void {
+    const remote = try std.fs.path.join(allocator, &.{ root, "remote" });
+    defer allocator.free(remote);
+    var directory = try Dir.cwd().openDir(io, remote, .{ .iterate = true });
+    defer directory.close(io);
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind == .file and assetId(entry.name) == id) {
+            try directory.deleteFile(io, entry.name);
+            return;
+        }
+    }
+    return error.AssetNotFound;
+}
+
+fn readAssetById(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    id: i64,
+) ![]u8 {
+    const remote = try std.fs.path.join(allocator, &.{ root, "remote" });
+    defer allocator.free(remote);
+    var directory = try Dir.cwd().openDir(io, remote, .{ .iterate = true });
+    defer directory.close(io);
+    var iterator = directory.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file or assetId(entry.name) != id) continue;
+        const path = try std.fs.path.join(allocator, &.{ remote, entry.name });
+        defer allocator.free(path);
+        return Dir.cwd().readFileAlloc(
+            io,
+            path,
+            allocator,
+            .limited(1024 * 1024),
+        );
+    }
+    return error.AssetNotFound;
+}

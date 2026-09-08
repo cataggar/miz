@@ -983,6 +983,90 @@ pub fn build(b: *std.Build) void {
         "Run shared release-tooling and Trusted Launch contract tests",
     );
     release_support_test_step.dependOn(&run_release_support_tests.step);
+    const miz_release_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/miz_release.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const miz_release_exe = b.addExecutable(.{
+        .name = "miz_release",
+        .root_module = miz_release_mod,
+    });
+    ci_production_entrypoint_check.dependOn(&miz_release_exe.step);
+    const install_miz_release = b.addInstallArtifact(miz_release_exe, .{});
+    const install_miz_release_step = b.step(
+        "install-miz-release",
+        "Install the one-way GitHub release publisher",
+    );
+    install_miz_release_step.dependOn(&install_miz_release.step);
+    const miz_release_tests = b.addTest(.{
+        .root_module = miz_release_mod,
+    });
+    const run_miz_release_tests = b.addRunArtifact(miz_release_tests);
+    const immutable_release_test_step = b.step(
+        "test-immutable-releases",
+        "Test and guard repository-wide immutable release publication",
+    );
+    immutable_release_test_step.dependOn(&run_miz_release_tests.step);
+    const mock_gh_exe = b.addExecutable(.{
+        .name = "miz_release_mock_gh",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/fixtures/mock_gh.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const install_mock_gh = b.addInstallArtifact(mock_gh_exe, .{});
+    const immutable_release_transaction_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/immutable_releases.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_immutable_release_transaction_tests = b.addRunArtifact(
+        immutable_release_transaction_tests,
+    );
+    run_immutable_release_transaction_tests.has_side_effects = true;
+    run_immutable_release_transaction_tests.setEnvironmentVariable(
+        "MIZ_IMMUTABLE_RELEASE_ROOT",
+        b.build_root.path orelse ".",
+    );
+    run_immutable_release_transaction_tests.setEnvironmentVariable(
+        "MIZ_RELEASE_PUBLISHER",
+        b.getInstallPath(.bin, "miz_release"),
+    );
+    run_immutable_release_transaction_tests.setEnvironmentVariable(
+        "MIZ_RELEASE_MOCK_GH",
+        b.getInstallPath(.bin, "miz_release_mock_gh"),
+    );
+    run_immutable_release_transaction_tests.step.dependOn(
+        &install_miz_release.step,
+    );
+    run_immutable_release_transaction_tests.step.dependOn(
+        &install_mock_gh.step,
+    );
+    immutable_release_test_step.dependOn(
+        &run_immutable_release_transaction_tests.step,
+    );
+    const immutable_release_guard_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/immutable_release_guard.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_immutable_release_guard_tests = b.addRunArtifact(
+        immutable_release_guard_tests,
+    );
+    run_immutable_release_guard_tests.has_side_effects = true;
+    run_immutable_release_guard_tests.setEnvironmentVariable(
+        "MIZ_IMMUTABLE_RELEASE_ROOT",
+        b.build_root.path orelse ".",
+    );
+    immutable_release_test_step.dependOn(
+        &run_immutable_release_guard_tests.step,
+    );
     const azure_trusted_launch_contract_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/azure_trusted_launch_contract.zig"),
@@ -2582,6 +2666,11 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_make_oci_fixture_tests.step);
         aggregate_test_step.dependOn(&run_freebsd_boot_tests.step);
         aggregate_test_step.dependOn(&run_release_support_tests.step);
+        aggregate_test_step.dependOn(&run_miz_release_tests.step);
+        aggregate_test_step.dependOn(
+            &run_immutable_release_transaction_tests.step,
+        );
+        aggregate_test_step.dependOn(&run_immutable_release_guard_tests.step);
         aggregate_test_step.dependOn(
             &run_azure_trusted_launch_contract_tests.step,
         );

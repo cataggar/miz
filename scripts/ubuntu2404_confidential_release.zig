@@ -61,6 +61,7 @@ const usage_text =
     \\  capture-result         write durable source-to-capture provenance with signed MAA evidence
     \\  verify-capture         independently revalidate protected capture provenance
     \\  verify-capture-publication validate sanitized durable provenance without raw Azure evidence
+    \\  check-release-metadata require an exact resumable draft identity
     \\
     \\verify-capture requires independently supplied workflow identities and every
     \\raw evidence file. Azure ARM, OpenID, and JWKS file authenticity must come
@@ -166,6 +167,7 @@ const command_table = [_]Command{
     .{ .name = "capture-result", .handler = runCaptureResult },
     .{ .name = "verify-capture", .handler = runVerifyCapture },
     .{ .name = "verify-capture-publication", .handler = runVerifyCapturePublication },
+    .{ .name = "check-release-metadata", .handler = runCheckReleaseMetadata },
 };
 
 fn run(context: Context, argv: []const []const u8) !void {
@@ -198,6 +200,30 @@ fn readObject(
         path,
         document_max_bytes,
         diagnostic,
+    );
+}
+
+fn runCheckReleaseMetadata(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "release",
+        "notes",
+        "release-tag",
+        "release-title",
+        "source-commit",
+    });
+    return release.github_release.validateDraftMetadataFiles(
+        context.allocator,
+        context.io,
+        try options.require("release"),
+        try options.require("notes"),
+        .{
+            .tag = try options.require("release-tag"),
+            .commit = try options.require("source-commit"),
+            .title = try options.require("release-title"),
+            .body = "",
+            .prerelease = false,
+        },
+        context.diagnostic,
     );
 }
 
@@ -3309,6 +3335,7 @@ test "command surface is exact and rejects incomplete invocations" {
         "capture-result",
         "verify-capture",
         "verify-capture-publication",
+        "check-release-metadata",
     };
     try std.testing.expectEqual(names.len, command_table.len);
     var discard: Writer.Discarding = .init(&.{});

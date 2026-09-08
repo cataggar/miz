@@ -189,18 +189,36 @@ if release_is_draft=$(
     echo "::error::Final reissue $REISSUE_TAG is immutable"
     exit 1
   fi
+  existing_release_id=$(gh release view "$REISSUE_TAG" \
+    --repo "$REPOSITORY" \
+    --json databaseId \
+    --jq .databaseId)
+  [[ "$existing_release_id" =~ ^[1-9][0-9]*$ ]]
+  gh api "repos/$REPOSITORY/releases/$existing_release_id" >"$release_file"
+  "$RELEASE_TOOL" github-release-metadata \
+    --release "$release_file" \
+    --notes "$notes_file" \
+    --release-tag "$REISSUE_TAG" \
+    --release-title "$RELEASE_TITLE" \
+    --source-commit "$TOOLING_COMMIT"
 fi
 
 tag_created=false
 release_mutated=false
+publish_attempted=false
+release_published=false
 preserve_draft_on_failure() {
   status=$?
   trap - EXIT INT TERM
   if [[ $status -ne 0 ]]; then
     if [[ "$release_mutated" == true ]]; then
-      echo "::warning::Reissue failed; retaining $REISSUE_TAG as a draft"
-      gh release edit "$REISSUE_TAG" \
-        --repo "$REPOSITORY" --draft >/dev/null 2>&1 || true
+      if [[ "$release_published" == true ]]; then
+        echo "::error::Post-publication verification failed; quarantine and inspect immutable reissue $REISSUE_TAG without mutating it"
+      elif [[ "$publish_attempted" == true ]]; then
+        echo "::error::Publication outcome is unconfirmed; inspect $REISSUE_TAG without attempting release mutation"
+      else
+        echo "::warning::Reissue failed; retaining resumable draft $REISSUE_TAG"
+      fi
     elif [[ "$tag_created" == true ]]; then
       gh api --method DELETE \
         "repos/$REPOSITORY/git/refs/tags/$REISSUE_TAG" >/dev/null 2>&1 || true
@@ -243,10 +261,10 @@ else
 fi
 release_mutated=true
 
-release_id=$(gh release view "$REISSUE_TAG" \
+release_id=${existing_release_id:-$(gh release view "$REISSUE_TAG" \
   --repo "$REPOSITORY" \
   --json databaseId \
-  --jq .databaseId)
+  --jq .databaseId)}
 [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
 release_api="repos/$REPOSITORY/releases/$release_id"
 
@@ -295,6 +313,12 @@ gh release download "$REISSUE_TAG" \
   --key "$CANDIDATE_KEY" \
   --source-commit "$SOURCE_COMMIT" >/dev/null
 
+gh api "$release_api" >"$release_file"
+"$RELEASE_TOOL" github-release-assets \
+  --release "$release_file" \
+  --expected "$expected_file" \
+  --stage draft
+
 gh release view "$SOURCE_RELEASE_TAG" \
   --repo "$REPOSITORY" \
   --json tagName,isDraft,isPrerelease,assets >"$source_release_file"
@@ -311,6 +335,7 @@ jq -e \
    (.assets[0].size == $bytes) and
    (.assets[0].digest == $digest)' "$source_release_file" >/dev/null
 
+publish_attempted=true
 gh release edit "$REISSUE_TAG" \
   --repo "$REPOSITORY" \
   --verify-tag \
@@ -318,6 +343,7 @@ gh release edit "$REISSUE_TAG" \
   --latest=false \
   --title "$RELEASE_TITLE" \
   --notes-file "$notes_file" >/dev/null
+release_published=true
 
 gh api "$release_api" >"$release_file"
 "$RELEASE_TOOL" github-release-assets \
@@ -337,4 +363,5 @@ gh api "$release_api" >"$release_file"
 } >>"$GITHUB_STEP_SUMMARY"
 
 release_mutated=false
+publish_attempted=false
 trap - EXIT INT TERM

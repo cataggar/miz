@@ -210,6 +210,9 @@ test "publication revalidates both artifacts before a three-asset release" {
         "--run-id \"$GITHUB_RUN_ID\"",
         "--run-attempt \"$GITHUB_RUN_ATTEMPT\"",
         "test \"$(wc -l <\"$expected_file\")\" -eq 3",
+        "--json isDraft",
+        "Final release $RELEASE_TAG is immutable",
+        "\"$RELEASE_TOOL\" check-release-metadata",
         "gh release upload",
         "validate_release true",
         "gh release download",
@@ -217,8 +220,11 @@ test "publication revalidates both artifacts before a three-asset release" {
         "Ubuntu-24.04-x86_64.confidential.qcow2",
         "provenance_name=$candidate_name.provenance.json",
         "Ubuntu-24.04-x86_64.confidential.azure-acceptance.json",
+        "release_published=true",
+        "quarantine and inspect immutable release",
     }) |needle| try expectContains(publisher, needle);
     try expectAbsent(publisher, "eval ");
+    try expectAbsent(publisher, "--draft >/dev/null 2>&1 || true");
 }
 
 test "publisher is executable valid shell and documents the exact support boundary" {

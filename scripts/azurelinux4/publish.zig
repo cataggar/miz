@@ -268,6 +268,16 @@ pub fn writeStaleAssetIds(
     out: *Writer,
     diagnostic: *Diagnostic,
 ) PublishError!void {
+    const draft = release_document.get("draft") orelse return diagnostic.fail(
+        error.ReleaseAllowlistMismatch,
+        "release draft state is missing",
+        .{},
+    );
+    if (draft != .bool or !draft.bool) return diagnostic.fail(
+        error.ReleaseAllowlistMismatch,
+        "stale assets may be deleted only from a draft release",
+        .{},
+    );
     const assets = contracts.arrayOrNull(release_document.get("assets")) orelse
         return diagnostic.fail(
             error.ReleaseAllowlistMismatch,

@@ -224,6 +224,28 @@ pub const release_commands = [_]Command{
         .required = &.{ "refs", "tag" },
     },
     .{
+        .name = "verify-release-metadata",
+        .options = &.{
+            "release",
+            "notes",
+            "release-tag",
+            "release-title",
+            "source-commit",
+        },
+        .required = &.{
+            "release",
+            "notes",
+            "release-tag",
+            "release-title",
+            "source-commit",
+        },
+    },
+    .{
+        .name = "release-stale-assets",
+        .options = &.{ "release", "expected" },
+        .required = &.{ "release", "expected" },
+    },
+    .{
         .name = "verify-remote-release",
         .options = &.{ "release", "expected" },
         .required = &.{ "release", "expected" },
@@ -354,7 +376,8 @@ const release_usage_text =
     \\commands:
     \\  matrix, azure-matrix, describe, include-count, candidate, azure-result,
     \\  candidate-binding, stage, compare, stage-expected, stage-evidence,
-    \\  publish-expected, tag-object, verify-remote-release,
+    \\  publish-expected, tag-object, verify-release-metadata,
+    \\  release-stale-assets, verify-remote-release,
     \\  verify-downloaded-release, verify-published-release
     \\
 ;
@@ -533,6 +556,24 @@ fn dispatchRelease(
             context,
             requiredOption(options, "refs"),
             requiredOption(options, "tag"),
+            out,
+        );
+    }
+    if (std.mem.eql(u8, name, "verify-release-metadata")) {
+        return publication.verifyReleaseMetadata(
+            context,
+            requiredOption(options, "release"),
+            requiredOption(options, "notes"),
+            requiredOption(options, "release-tag"),
+            requiredOption(options, "release-title"),
+            requiredOption(options, "source-commit"),
+        );
+    }
+    if (std.mem.eql(u8, name, "release-stale-assets")) {
+        return publication.writeStaleAssetIds(
+            context,
+            requiredOption(options, "release"),
+            requiredOption(options, "expected"),
             out,
         );
     }

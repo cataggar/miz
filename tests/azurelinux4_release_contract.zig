@@ -391,8 +391,15 @@ test "the publisher verifies drafts by release id" {
     const script = try readTracked(allocator, std.testing.io, publish_path);
     defer allocator.free(script);
     try expectContains(script, "--json databaseId");
+    try expectContains(script, "--json isDraft");
+    try expectContains(script, "Final release $RELEASE_TAG is immutable");
+    try expectContains(script, "\"$release_tool\" check-release-metadata \\");
+    try expectContains(script, "publish_attempted=true");
+    try expectContains(script, "release_published=true");
+    try expectContains(script, "quarantine and inspect immutable release");
+    try expectAbsent(script, "--draft >/dev/null 2>&1 || true");
     try expectContains(script, "release_api=\"repos/$REPOSITORY/releases/$release_id\"");
-    try expectCount(script, "gh api \"$release_api\"", 3);
+    try expectCount(script, "gh api \"$release_api\"", 4);
     try expectAbsent(script, "releases/tags/$RELEASE_TAG");
     // Every remote state check goes through the one tool that parses the
     // expected-asset table, in the order the publication requires.

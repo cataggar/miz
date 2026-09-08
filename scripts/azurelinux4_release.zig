@@ -74,6 +74,7 @@ const usage_text =
     \\  publish-expected       print the expected asset table from the publish manifest
     \\  tag-ref                print the object an exact release tag ref points at
     \\  tag-object             print the object a peeled annotated tag points at
+    \\  check-release-metadata require an exact resumable draft identity
     \\  release-stale-assets   print the asset IDs a release holds outside the allowlist
     \\  check-release-assets   require the exact remote allowlist in draft or published state
     \\  check-downloads        re-hash a downloaded release against the expected asset table
@@ -207,6 +208,7 @@ const command_table = [_]Command{
     .{ .name = "publish-expected", .handler = runPublishExpected },
     .{ .name = "tag-ref", .handler = runTagRef },
     .{ .name = "tag-object", .handler = runTagObject },
+    .{ .name = "check-release-metadata", .handler = runCheckReleaseMetadata },
     .{ .name = "release-stale-assets", .handler = runReleaseStaleAssets },
     .{ .name = "check-release-assets", .handler = runCheckReleaseAssets },
     .{ .name = "check-downloads", .handler = runCheckDownloads },
@@ -748,6 +750,30 @@ fn runReleaseStaleAssets(context: Context, argv: []const []const u8) !void {
     );
 }
 
+fn runCheckReleaseMetadata(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "release",
+        "notes",
+        "release-tag",
+        "release-title",
+        "source-commit",
+    });
+    return release.github_release.validateDraftMetadataFiles(
+        context.allocator,
+        context.io,
+        try options.require("release"),
+        try options.require("notes"),
+        .{
+            .tag = try options.require("release-tag"),
+            .commit = try options.require("source-commit"),
+            .title = try options.require("release-title"),
+            .body = "",
+            .prerelease = false,
+        },
+        context.diagnostic,
+    );
+}
+
 fn runCheckReleaseAssets(context: Context, argv: []const []const u8) !void {
     const options = try parseOptions(argv, &.{ "release", "expected", "state" });
     const state_text = try options.require("state");
@@ -926,6 +952,7 @@ test "every command the shell and workflow call is dispatched" {
         "publish-expected",
         "tag-ref",
         "tag-object",
+        "check-release-metadata",
         "release-stale-assets",
         "check-release-assets",
         "check-downloads",

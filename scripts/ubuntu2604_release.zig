@@ -90,6 +90,7 @@ const usage_text =
     \\  publish-expected              print the expected published asset table
     \\  github-tag-object             print the tag ref object identity
     \\  github-tag-target             print a tag object's target identity
+    \\  github-release-metadata       require an exact resumable draft identity
     \\  github-stale-assets           print release assets outside the allowlist
     \\  github-release-assets         check remote release assets
     \\  github-release-downloaded     check downloaded release assets
@@ -487,6 +488,31 @@ fn dispatch(
             .output = try options.require("--output"),
             .notes = try options.require("--notes"),
         }, diagnostic);
+    }
+
+    if (std.mem.eql(u8, command, "github-release-metadata")) {
+        var options = try cli.parse(allocator, argv, &.{
+            "--release",
+            "--notes",
+            "--release-tag",
+            "--release-title",
+            "--source-commit",
+        });
+        defer options.deinit();
+        return support.github_release.validateDraftMetadataFiles(
+            allocator,
+            io,
+            try options.require("--release"),
+            try options.require("--notes"),
+            .{
+                .tag = try options.require("--release-tag"),
+                .commit = try options.require("--source-commit"),
+                .title = try options.require("--release-title"),
+                .body = "",
+                .prerelease = false,
+            },
+            diagnostic,
+        );
     }
 
     return workflow.dispatch(context.allocator, context.io, context.out, .{

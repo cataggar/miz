@@ -11,7 +11,7 @@ if [[ -z ${CANDIDATE:-} || -z ${PROVENANCE:-} ||
   echo "::error::Required Ubuntu 24.04 Confidential VM publication configuration is incomplete"
   exit 1
 fi
-for tool in date gh jq sha256sum stat; do
+for tool in gh jq sha256sum stat; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required publication tool $tool is unavailable"
     exit 1
@@ -102,12 +102,19 @@ tag_commit=${peeled_tag:-$direct_tag}
 test "$tag_commit" = "$SOURCE_COMMIT"
 
 release_mutated=false
+publish_attempted=false
+release_published=false
 keep_draft_on_failure() {
   status=$?
   trap - EXIT INT TERM
   if [[ $status -ne 0 && "$release_mutated" == true ]]; then
-    echo "::warning::Publication failed; retaining $RELEASE_TAG as a draft"
-    gh release edit "$RELEASE_TAG" --repo "$REPOSITORY" --draft >/dev/null 2>&1 || true
+    if [[ "$release_published" == true ]]; then
+      echo "::error::Post-publication verification failed; quarantine and inspect immutable release $RELEASE_TAG without mutating it"
+    elif [[ "$publish_attempted" == true ]]; then
+      echo "::error::Publication outcome is unconfirmed; inspect $RELEASE_TAG without attempting release mutation"
+    else
+      echo "::warning::Publication failed; retaining resumable draft $RELEASE_TAG"
+    fi
   fi
   exit "$status"
 }
@@ -122,11 +129,22 @@ if release_is_draft=$(
     --jq .isDraft 2>/dev/null
 ); then
   release_exists=true
-  if [[ "$release_is_draft" != true &&
-        "$(date -u +%Y%m%d)" != "${RELEASE_TAG##*-}" ]]; then
-    echo "::error::Final release $RELEASE_TAG is immutable after its tag date"
+  if [[ "$release_is_draft" != true ]]; then
+    echo "::error::Final release $RELEASE_TAG is immutable"
     exit 1
   fi
+  existing_release_id=$(gh release view "$RELEASE_TAG" \
+    --repo "$REPOSITORY" \
+    --json databaseId \
+    --jq .databaseId)
+  [[ "$existing_release_id" =~ ^[0-9]+$ ]]
+  gh api "repos/$REPOSITORY/releases/$existing_release_id" >"$release_file"
+  "$RELEASE_TOOL" check-release-metadata \
+    --release "$release_file" \
+    --notes "$notes_file" \
+    --release-tag "$RELEASE_TAG" \
+    --release-title "$RELEASE_TITLE" \
+    --source-commit "$SOURCE_COMMIT"
 fi
 
 if [[ "$release_exists" == true ]]; then
@@ -147,10 +165,10 @@ else
     --notes-file "$notes_file" >/dev/null
 fi
 release_mutated=true
-release_id=$(gh release view "$RELEASE_TAG" \
+release_id=${existing_release_id:-$(gh release view "$RELEASE_TAG" \
   --repo "$REPOSITORY" \
   --json databaseId \
-  --jq .databaseId)
+  --jq .databaseId)}
 [[ "$release_id" =~ ^[0-9]+$ ]]
 release_api="repos/$REPOSITORY/releases/$release_id"
 
@@ -163,6 +181,12 @@ while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
 done <"$expected_file"
 
 gh api "$release_api" >"$release_file"
+"$RELEASE_TOOL" check-release-metadata \
+  --release "$release_file" \
+  --notes "$notes_file" \
+  --release-tag "$RELEASE_TAG" \
+  --release-title "$RELEASE_TITLE" \
+  --source-commit "$SOURCE_COMMIT"
 jq -r \
   --arg candidate "$candidate_name" \
   --arg provenance "$provenance_name" \
@@ -210,6 +234,8 @@ while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
   test "$(stat --format='%s' "$verify_dir/$asset_name")" = "$expected_bytes"
 done <"$expected_file"
 
+validate_release true
+publish_attempted=true
 gh release edit "$RELEASE_TAG" \
   --repo "$REPOSITORY" \
   --verify-tag \
@@ -217,6 +243,7 @@ gh release edit "$RELEASE_TAG" \
   --latest=false \
   --title "$RELEASE_TITLE" \
   --notes-file "$notes_file" >/dev/null
+release_published=true
 validate_release false
 
 {
@@ -230,4 +257,5 @@ validate_release false
 } >>"$GITHUB_STEP_SUMMARY"
 
 release_mutated=false
+publish_attempted=false
 trap - EXIT INT TERM

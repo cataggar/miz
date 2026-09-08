@@ -10,6 +10,27 @@ bare-metal images, and locally bootable QEMU images. See
 container, boot, `miz build-image`, `miz build-iso`, and
 `miz recustomize-iso` workflows.
 
+## Immutable GitHub releases
+
+Every repository release producer follows one transaction: create or resume an
+exactly matching draft, upload or replace only the allowlisted assets, remove
+stale assets while the release is still a draft, validate remote metadata and
+asset digests, independently download and hash every asset, revalidate the
+draft, and publish exactly once. Stable releases explicitly become latest;
+prereleases and image/provenance releases explicitly do not.
+
+A failure before publication leaves a resumable draft. Retrying is allowed
+only when the tag, target commit, title, notes, and prerelease state still
+match the original transaction. A published release is never reopened,
+edited, clobbered, or corrected. If post-publication verification fails, the
+result must be quarantined and investigated without mutation. If any
+published artifact is wrong, issue a new tag and a new release.
+
+Run `zig build test-immutable-releases` when changing a release workflow,
+publisher, or GitHub release API call. The repository-wide guard intentionally
+rejects new producer surfaces until their complete draft transaction has been
+reviewed and allowlisted.
+
 ## Layout
 
 ```

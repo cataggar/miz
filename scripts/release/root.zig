@@ -13,6 +13,7 @@ pub const contract = @import("contract.zig");
 pub const file = @import("file.zig");
 pub const digest = @import("digest.zig");
 pub const json_document = @import("json_document.zig");
+pub const github_release = @import("github_release.zig");
 pub const azure_vhd_layout = @import("azure_vhd_layout.zig");
 pub const azure_compute = @import("azure_compute.zig");
 pub const azure_confidential_vm = @import("azure_confidential_vm.zig");
@@ -25,6 +26,7 @@ test {
     _ = file;
     _ = digest;
     _ = json_document;
+    _ = github_release;
     _ = azure_vhd_layout;
     _ = azure_compute;
     _ = azure_confidential_vm;

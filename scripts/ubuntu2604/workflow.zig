@@ -808,6 +808,16 @@ pub fn dispatch(
             diagnostic,
         );
         defer document.deinit();
+        const draft = document.get("draft") orelse return fail(
+            diagnostic,
+            "release draft state is absent",
+            .{},
+        );
+        if (draft != .bool or !draft.bool) return fail(
+            diagnostic,
+            "stale assets may be deleted only from a draft release",
+            .{},
+        );
         const assets = support.arrayOf(document.get("assets")) orelse return fail(
             diagnostic,
             "release asset listing is absent",

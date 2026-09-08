@@ -529,6 +529,72 @@ pub fn verifyRemoteRelease(
     }
 }
 
+/// A retained draft may be resumed only when it is the exact release this
+/// invocation would have created. Asset differences are repaired later, but
+/// identity, title, notes, target, and prerelease state are never adopted.
+pub fn verifyReleaseMetadata(
+    context: *Context,
+    release_path: []const u8,
+    notes_path: []const u8,
+    release_tag: []const u8,
+    release_title: []const u8,
+    source_commit: []const u8,
+) Error!void {
+    support.github_release.validateDraftMetadataFiles(
+        context.arena,
+        context.io,
+        release_path,
+        notes_path,
+        .{
+            .tag = release_tag,
+            .commit = source_commit,
+            .title = release_title,
+            .body = "",
+            .prerelease = false,
+        },
+        &context.diagnostic,
+    ) catch return error.Invalid;
+}
+
+/// IDs of assets not present in the exact expected table. Cleanup is called
+/// only after a fresh draft-state check and before publication.
+pub fn writeStaleAssetIds(
+    context: *Context,
+    release_path: []const u8,
+    expected_path: []const u8,
+    writer: *Writer,
+) Error!void {
+    const expected = try readExpected(context, expected_path);
+    const release = try candidate_support.readObject(context, release_path);
+    const draft = release.object.get("draft");
+    if (draft == null or draft.? != .bool or !draft.?.bool) {
+        return context.fail(
+            "stale assets may be deleted only from a draft release",
+            .{},
+        );
+    }
+    const assets = document.arrayOf(release.object.get("assets")) orelse
+        return context.fail("remote release asset mismatch: {s}", .{"<no assets>"});
+    for (assets.items) |asset_value| {
+        const asset = document.objectOf(asset_value) orelse
+            return context.fail("remote release contains an invalid asset", .{});
+        const name = document.stringOf(asset.get("name")) orelse
+            return context.fail("remote release contains an unnamed asset", .{});
+        var allowed = false;
+        for (expected) |item| {
+            if (std.mem.eql(u8, item.name, name)) allowed = true;
+        }
+        if (allowed) continue;
+        const id = document.integerOf(asset.get("id")) orelse
+            return context.fail("remote release asset {s} has no id", .{name});
+        if (id <= 0) return context.fail(
+            "remote release asset {s} has an invalid id",
+            .{name},
+        );
+        writer.print("{d}\n", .{id}) catch return error.OutOfMemory;
+    }
+}
+
 fn findReleaseAsset(assets: std.json.Array, name: []const u8) ?std.json.ObjectMap {
     for (assets.items) |item| {
         const asset = document.objectOf(item) orelse continue;

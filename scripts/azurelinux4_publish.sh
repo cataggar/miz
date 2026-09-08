@@ -45,17 +45,50 @@ rm -rf -- "$assets_dir" "$verify_dir"
 test "$(wc -l <"$expected_file")" -eq 4
 
 release_mutated=false
+publish_attempted=false
+release_published=false
 keep_draft_on_failure() {
   status=$?
   trap - EXIT INT TERM
   if [[ $status -ne 0 && "$release_mutated" == true ]]; then
-    echo "::warning::Publication failed; retaining $RELEASE_TAG as a draft"
-    gh release edit "$RELEASE_TAG" --repo "$REPOSITORY" --draft >/dev/null 2>&1 || true
+    if [[ "$release_published" == true ]]; then
+      echo "::error::Post-publication verification failed; quarantine and inspect immutable release $RELEASE_TAG without mutating it"
+    elif [[ "$publish_attempted" == true ]]; then
+      echo "::error::Publication outcome is unconfirmed; inspect $RELEASE_TAG without attempting release mutation"
+    else
+      echo "::warning::Publication failed; retaining resumable draft $RELEASE_TAG"
+    fi
   fi
   exit "$status"
 }
 trap keep_draft_on_failure EXIT
 trap 'exit 130' INT TERM
+
+release_exists=false
+if release_is_draft=$(
+  gh release view "$RELEASE_TAG" \
+    --repo "$REPOSITORY" \
+    --json isDraft \
+    --jq .isDraft 2>/dev/null
+); then
+  release_exists=true
+  if [[ "$release_is_draft" != true ]]; then
+    echo "::error::Final release $RELEASE_TAG is immutable"
+    exit 1
+  fi
+  existing_release_id=$(gh release view "$RELEASE_TAG" \
+    --repo "$REPOSITORY" \
+    --json databaseId \
+    --jq .databaseId)
+  [[ "$existing_release_id" =~ ^[0-9]+$ ]]
+  gh api "repos/$REPOSITORY/releases/$existing_release_id" >"$release_file"
+  "$release_tool" check-release-metadata \
+    --release "$release_file" \
+    --notes "$notes_file" \
+    --release-tag "$RELEASE_TAG" \
+    --release-title "$RELEASE_TITLE" \
+    --source-commit "$SOURCE_COMMIT"
+fi
 
 gh api "repos/$REPOSITORY/git/matching-refs/tags/$RELEASE_TAG" --paginate >"$refs_file"
 readarray -t tag_object < <(
@@ -84,7 +117,7 @@ else
   fi
 fi
 
-if gh release view "$RELEASE_TAG" --repo "$REPOSITORY" >/dev/null 2>&1; then
+if [[ "$release_exists" == true ]]; then
   gh release edit "$RELEASE_TAG" \
     --repo "$REPOSITORY" \
     --verify-tag \
@@ -102,10 +135,10 @@ else
     --notes-file "$notes_file" >/dev/null
 fi
 release_mutated=true
-release_id=$(gh release view "$RELEASE_TAG" \
+release_id=${existing_release_id:-$(gh release view "$RELEASE_TAG" \
   --repo "$REPOSITORY" \
   --json databaseId \
-  --jq .databaseId)
+  --jq .databaseId)}
 [[ "$release_id" =~ ^[0-9]+$ ]]
 release_api="repos/$REPOSITORY/releases/$release_id"
 
@@ -141,6 +174,13 @@ gh release download "$RELEASE_TAG" \
   --directory "$verify_dir" \
   --expected "$expected_file"
 
+gh api "$release_api" >"$release_file"
+"$release_tool" check-release-assets \
+  --release "$release_file" \
+  --expected "$expected_file" \
+  --state draft
+
+publish_attempted=true
 gh release edit "$RELEASE_TAG" \
   --repo "$REPOSITORY" \
   --verify-tag \
@@ -148,6 +188,7 @@ gh release edit "$RELEASE_TAG" \
   --latest=false \
   --title "$RELEASE_TITLE" \
   --notes-file "$notes_file" >/dev/null
+release_published=true
 
 gh api "$release_api" >"$release_file"
 "$release_tool" check-release-assets \
@@ -168,4 +209,5 @@ gh api "$release_api" >"$release_file"
 } >>"$GITHUB_STEP_SUMMARY"
 
 release_mutated=false
+publish_attempted=false
 trap - EXIT INT TERM

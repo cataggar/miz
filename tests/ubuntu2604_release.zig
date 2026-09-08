@@ -4216,10 +4216,15 @@ test "the publisher is draft-first, allowlisted, and fail-safe" {
     try script.expectContains("--run-attempt \"$GITHUB_RUN_ATTEMPT\"");
     try script.expectContains("--draft");
     try script.expectContains("stale-asset-ids");
-    try script.expectContains("retaining $RELEASE_TAG as a draft");
+    try script.expectContains("retaining resumable draft $RELEASE_TAG");
     try script.expectContains("--json isDraft");
-    try script.expectContains("date -u +%Y%m%d");
-    try script.expectContains("Final release $RELEASE_TAG is immutable after its tag date");
+    try script.expectOmits("date -u +%Y%m%d");
+    try script.expectContains("Final release $RELEASE_TAG is immutable");
+    try script.expectContains("\"$RELEASE_TOOL\" github-release-metadata");
+    try script.expectContains("publish_attempted=true");
+    try script.expectContains("release_published=true");
+    try script.expectContains("quarantine and inspect immutable release");
+    try script.expectOmits("--draft >/dev/null 2>&1 || true");
     try script.expectContains("gh release download \"$RELEASE_TAG\"");
     try script.expectContains("\"$RELEASE_TOOL\" github-release-downloaded");
     try source.expectOrder(
