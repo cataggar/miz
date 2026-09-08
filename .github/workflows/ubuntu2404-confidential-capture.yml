@@ -42,6 +42,8 @@ env:
   SOURCE_PROVENANCE_NAME: Ubuntu-24.04-x86_64.confidential.qcow2.provenance.json
   SOURCE_ACCEPTANCE_NAME: Ubuntu-24.04-x86_64.confidential.azure-acceptance.json
   PUBLICATION_LOCK_ID: ubuntu2404-confidential-cvm-target-version
+  PROVENANCE_RULESET_NAME: ubuntu2404-confidential-provenance-tags
+  PROVENANCE_TAG_PATTERN: 'refs/tags/miz-provenance/ubuntu2404-confidential-cvm/**'
   GH_API_VERSION: 2026-03-10
 
 jobs:
@@ -54,6 +56,7 @@ jobs:
     permissions:
       contents: read
     outputs:
+      workflow_commit: ${{ steps.resolve.outputs.workflow_commit }}
       tool_commit: ${{ steps.resolve.outputs.tool_commit }}
       source_commit: ${{ steps.resolve.outputs.source_commit }}
       source_release_id: ${{ steps.resolve.outputs.source_release_id }}
@@ -85,14 +88,32 @@ jobs:
           repositories: ${{ github.event.repository.name }}
           permission-actions: read
           permission-administration: read
-          permission-contents: read
+          permission-contents: write
 
-      - name: Check out current main
+      - name: Check out exact approved dispatch commit
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: main
+          ref: ${{ github.sha }}
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Validate approved dispatch head and protected tag policy
+        env:
+          GH_TOKEN: ${{ steps.github_app_token.outputs.token }}
+          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          mapfile -t remote_main < <(
+            git ls-remote origin refs/heads/main | awk '{print $1}'
+          )
+          test "${#remote_main[@]}" -eq 1
+          if [[ "${remote_main[0]}" != "$GITHUB_SHA" ]]; then
+            echo "::error::main advanced after dispatch approval; redispatch the workflow"
+            exit 1
+          fi
+          scripts/ubuntu2404_confidential_github_policy.sh \
+            .capture/prepare/github-policy
 
       - name: Require immutable releases and resolve exact origin identities
         id: resolve
@@ -160,7 +181,9 @@ jobs:
           recovery_artifact_digest=
           dispatch_artifact_id=
           dispatch_artifact_digest=
-          tool_commit=$(git rev-parse HEAD)
+          workflow_commit=$(git rev-parse HEAD)
+          test "$workflow_commit" = "$GITHUB_SHA"
+          tool_commit=$workflow_commit
           if [[ "$recovery_mode" == true ]]; then
             gh api "${api_headers[@]}" \
               "repos/$GITHUB_REPOSITORY/actions/runs/$origin_run_id/attempts/$origin_run_attempt" \
@@ -278,25 +301,18 @@ jobs:
           fi
           git fetch --no-tags --depth=1 origin "$tool_commit"
           test "$(git rev-parse FETCH_HEAD)" = "$tool_commit"
-          if [[ "$recovery_mode" == false ]]; then
-            remote_main=$(
-              git ls-remote origin refs/heads/main | awk 'NR == 1 {print $1}'
-            )
-            test "$remote_main" = "$tool_commit"
-          fi
 
           direct_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
           peeled_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
           source_commit=${peeled_source:-$direct_source}
           [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
 
-          provenance_release_tag="Ubuntu-24.04-confidential-cvm-$TARGET_GALLERY_VERSION"
+          provenance_release_tag="miz-provenance/ubuntu2404-confidential-cvm/v$TARGET_GALLERY_VERSION/origin-$origin_run_id-attempt-$origin_run_attempt/tool-$tool_commit"
           provenance_release_title="Ubuntu 24.04 Confidential VM gallery provenance $TARGET_GALLERY_VERSION"
           provenance_asset_name="Ubuntu-24.04-x86_64.confidential-cvm-$TARGET_GALLERY_VERSION.provenance.json"
-          direct_provenance=$(git ls-remote origin "refs/tags/$provenance_release_tag" | awk 'NR == 1 {print $1}')
-          peeled_provenance=$(git ls-remote origin "refs/tags/$provenance_release_tag^{}" | awk 'NR == 1 {print $1}')
-          provenance_commit=${peeled_provenance:-$direct_provenance}
-          test "$provenance_commit" = "$tool_commit"
+          scripts/ubuntu2404_confidential_provenance_tag.sh \
+            require-absent "$provenance_release_tag" "$tool_commit" \
+            .capture/prepare/provenance-tag
 
           source_release_json=.capture/prepare/source-release.json
           gh api "${api_headers[@]}" \
@@ -352,6 +368,7 @@ jobs:
             --arg name "$SOURCE_ACCEPTANCE_NAME" \
             '.assets[] | select(.name == $name) | .id' "$source_release_json")
           {
+            echo "workflow_commit=$workflow_commit"
             echo "tool_commit=$tool_commit"
             echo "source_commit=$source_commit"
             echo "source_release_id=$source_release_id"
@@ -397,6 +414,7 @@ jobs:
       result_uploaded: ${{ steps.capture_status.outputs.result_uploaded }}
       cleanup_failed: ${{ steps.capture_status.outputs.cleanup_failed }}
     env:
+      WORKFLOW_COMMIT: ${{ needs.prepare.outputs.workflow_commit }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       TOOL_COMMIT: ${{ needs.prepare.outputs.tool_commit }}
       RECOVERY_MODE: ${{ needs.prepare.outputs.recovery_mode }}
@@ -453,19 +471,21 @@ jobs:
           repositories: ${{ github.event.repository.name }}
           permission-actions: read
           permission-administration: read
-          permission-contents: read
+          permission-contents: write
 
-      - name: Check out immutable capture tooling
+      - name: Check out exact approved workflow tooling
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ needs.prepare.outputs.tool_commit }}
+          ref: ${{ needs.prepare.outputs.workflow_commit }}
           persist-credentials: false
 
       - name: Validate protected configuration and private contexts
         run: |
           set -euo pipefail
           umask 077
-          test "$(git rev-parse HEAD)" = "$TOOL_COMMIT"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$GITHUB_SHA" = "$WORKFLOW_COMMIT"
+          [[ "$TOOL_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           uuid='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
           [[ "$CAPTURE_PRINCIPAL_CLIENT_ID" =~ $uuid ]]
           [[ "$PUBLICATION_PRINCIPAL_CLIENT_ID" =~ $uuid ]]
@@ -801,6 +821,26 @@ jobs:
             --definition-id "$target_definition_id" \
             --version-id "$target_definition_id/versions/$TARGET_IMAGE_VERSION"
           echo "capture_result_sha256=$result_sha256" >>"$GITHUB_OUTPUT"
+
+      - name: Revalidate dispatch head and tag policy before Azure
+        if: steps.result_discovery.outputs.result_artifact_id == ''
+        env:
+          GH_TOKEN: ${{ steps.github_app_token.outputs.token }}
+          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$GITHUB_SHA" = "$WORKFLOW_COMMIT"
+          mapfile -t remote_main < <(
+            git ls-remote origin refs/heads/main | awk '{print $1}'
+          )
+          test "${#remote_main[@]}" -eq 1
+          if [[ "${remote_main[0]}" != "$GITHUB_SHA" ]]; then
+            echo "::error::main advanced before Azure mutation; redispatch the workflow"
+            exit 1
+          fi
+          scripts/ubuntu2404_confidential_github_policy.sh \
+            .capture/pre-azure-github-policy
 
       - name: Log in capture principal with protected-environment OIDC
         if: steps.result_discovery.outputs.result_artifact_id == ''
@@ -1145,6 +1185,7 @@ jobs:
     permissions:
       contents: read
     env:
+      WORKFLOW_COMMIT: ${{ needs.prepare.outputs.workflow_commit }}
       TOOL_COMMIT: ${{ needs.prepare.outputs.tool_commit }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       SOURCE_RELEASE_TAG: ${{ inputs.source_release_tag }}
@@ -1183,10 +1224,10 @@ jobs:
           permission-contents: write
           permission-workflows: write
 
-      - name: Check out immutable publication verifier
+      - name: Check out exact approved publication verifier
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ needs.prepare.outputs.tool_commit }}
+          ref: ${{ needs.prepare.outputs.workflow_commit }}
           persist-credentials: false
 
       - name: Download exact named durable result artifact
@@ -1222,7 +1263,9 @@ jobs:
           umask 077
           test "$GITHUB_REPOSITORY" = cataggar/miz
           test "$GITHUB_REF" = refs/heads/main
-          test "$(git rev-parse HEAD)" = "$TOOL_COMMIT"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$GITHUB_SHA" = "$WORKFLOW_COMMIT"
+          [[ "$TOOL_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           [[ "$EXPECTED_RESULT_SHA256" =~ ^[0-9a-f]{64}$ ]]
           result="$RESULT_DIR/capture-result.json"
           test "$(find "$RESULT_DIR" -maxdepth 1 -type f | wc -l)" -eq 1
@@ -1250,6 +1293,7 @@ jobs:
       - name: Create validate and publish an exact one-asset release
         env:
           GH_TOKEN: ${{ steps.github_app_token.outputs.token }}
+          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
         run: |
           set -euo pipefail
           umask 077
@@ -1257,6 +1301,18 @@ jobs:
             -H 'Accept: application/vnd.github+json'
             -H "X-GitHub-Api-Version: $GH_API_VERSION"
           )
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$GITHUB_SHA" = "$WORKFLOW_COMMIT"
+          mapfile -t remote_main < <(
+            git ls-remote origin refs/heads/main | awk '{print $1}'
+          )
+          test "${#remote_main[@]}" -eq 1
+          if [[ "${remote_main[0]}" != "$GITHUB_SHA" ]]; then
+            echo "::error::main advanced before provenance publication; recover with a new dispatch"
+            exit 1
+          fi
+          scripts/ubuntu2404_confidential_github_policy.sh \
+            "$VALIDATION_DIR/github-policy-before-release"
           gh api "${api_headers[@]}" \
             "repos/$GITHUB_REPOSITORY/immutable-releases" \
             >"$VALIDATION_DIR/immutable-releases.json"
@@ -1266,9 +1322,9 @@ jobs:
               echo "::error::Immutable releases are no longer guaranteed"
               exit 1
             }
-          direct_tag=$(git ls-remote origin "refs/tags/$PROVENANCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
-          peeled_tag=$(git ls-remote origin "refs/tags/$PROVENANCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
-          test "${peeled_tag:-$direct_tag}" = "$TOOL_COMMIT"
+          scripts/ubuntu2404_confidential_provenance_tag.sh \
+            require-absent "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
+            "$VALIDATION_DIR/tag-before-release"
           direct_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
           peeled_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
           test "${peeled_source:-$direct_source}" = "$SOURCE_COMMIT"
@@ -1334,21 +1390,11 @@ jobs:
               .tag_name == $tag and .name == $title and
               .target_commitish == $tool_commit and
               .body == $notes and .prerelease == false and
-              (
-                (
-                  .draft == true and .immutable == false and
-                  (.assets | length == 0 or length == 1) and
-                  all(.assets[];
-                    .name == $name and .state == "uploaded" and
-                    (.id | type == "number" and . > 0))
-                ) or
-                (
-                  .draft == false and .immutable == true and
-                  (.assets | length == 1) and
-                  .assets[0].name == $name and
-                  .assets[0].state == "uploaded"
-                )
-              )
+              .draft == true and .immutable == false and
+              (.assets | length == 0 or length == 1) and
+              all(.assets[];
+                .name == $name and .state == "uploaded" and
+                (.id | type == "number" and . > 0))
               ' "$1" >/dev/null
           }
           validate_release_identity "$release_json"
@@ -1359,6 +1405,9 @@ jobs:
             "repos/$GITHUB_REPOSITORY/releases/$release_id" \
             >"$release_json"
           validate_release_identity "$release_json"
+          scripts/ubuntu2404_confidential_provenance_tag.sh \
+            require-absent "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
+            "$VALIDATION_DIR/tag-after-draft"
           if [[ "$(jq -r '.draft' "$release_json")" == true &&
               "$(jq -r '.assets | length' "$release_json")" == 0 ]]; then
             gh api --method POST "${api_headers[@]}" \
@@ -1399,12 +1448,32 @@ jobs:
             --location "$TARGET_LOCATION" \
             --definition-id "$target_definition_id" \
             --version-id "$target_definition_id/versions/$TARGET_IMAGE_VERSION"
-          if [[ "$(jq -r '.draft' "$release_json")" == true ]]; then
-            gh api --method PATCH "${api_headers[@]}" \
-              -F draft=false \
-              "repos/$GITHUB_REPOSITORY/releases/$release_id" \
-              >"$release_json"
-          fi
+          scripts/ubuntu2404_confidential_github_policy.sh \
+            "$VALIDATION_DIR/github-policy-before-publish"
+          gh api "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            >"$VALIDATION_DIR/immutable-releases-before-publish.json"
+          jq -e '.enabled == true' \
+            "$VALIDATION_DIR/immutable-releases-before-publish.json" >/dev/null
+          mapfile -t remote_main < <(
+            git ls-remote origin refs/heads/main | awk '{print $1}'
+          )
+          test "${#remote_main[@]}" -eq 1
+          test "${remote_main[0]}" = "$GITHUB_SHA"
+          gh api "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            >"$release_json"
+          validate_release_identity "$release_json"
+          scripts/ubuntu2404_confidential_provenance_tag.sh \
+            require-absent "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
+            "$VALIDATION_DIR/tag-before-publish"
+          gh api --method PATCH "${api_headers[@]}" \
+            -F draft=false \
+            "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+            >"$release_json"
+          scripts/ubuntu2404_confidential_provenance_tag.sh \
+            require-lightweight "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
+            "$VALIDATION_DIR/tag-after-publish"
           published_release="$VALIDATION_DIR/published-release.json"
           gh api "${api_headers[@]}" \
             "repos/$GITHUB_REPOSITORY/releases/tags/$PROVENANCE_RELEASE_TAG" \

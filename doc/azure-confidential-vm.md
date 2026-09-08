@@ -213,10 +213,18 @@ that those exact candidate bytes passed the protected deployment.
 accepted three-asset source release into a full ConfidentialVM gallery image.
 It is manual-dispatch only, accepts only `cataggar/miz` `main`, and serializes
 every target version through the stable, non-canceling concurrency group
-`ubuntu2404-confidential-cvm-target-version`. Before dispatch, an operator must
-create the deterministically derived provenance tag
-`Ubuntu-24.04-confidential-cvm-MAJOR.MINOR.PATCH` at the exact current `main`
-tool commit. A release must not already exist for that tag.
+`ubuntu2404-confidential-cvm-target-version`. The approved dispatch commit is
+always `${{ github.sha }}`: every job checks out that exact commit, verifies
+`git rev-parse HEAD == GITHUB_SHA`, and freshly requires remote `main` still to
+equal `GITHUB_SHA` before Azure or release mutation. If `main` advances while
+environment approval or validation is pending, the run fails and must be
+redispatched; it never checks out or executes the newer code.
+
+The workflow owns the provenance tag name:
+`miz-provenance/ubuntu2404-confidential-cvm/vMAJOR.MINOR.PATCH/origin-RUN_ID-attempt-RUN_ATTEMPT/tool-TOOL_COMMIT`.
+The tag and release must both be absent for a new dispatch. Do not pre-create
+the tag. Recovery reuses the original run, attempt, and evidence `TOOL_COMMIT`,
+so it deterministically derives the same name.
 
 Create the GitHub environment `ubuntu2404-confidential-capture`, restrict it to
 the `main` branch, require at least one designated release reviewer, and
@@ -262,14 +270,65 @@ Install a dedicated GitHub App on only `cataggar/miz` with repository
 permissions **Administration: read**, **Actions: read**, **Contents: write**,
 and **Workflows: write**. The pinned official
 `actions/create-github-app-token` action mints a fresh installation token in
-each protected job, requests only read access in preflight/capture, requests
-Contents/Workflows write only for provenance publication to the retained tool
-commit, and revokes each token at job completion. Never expose or upload the
-App private key or installation token. The accepted source release itself must
+each protected job. Every token requests **Administration: read** and
+**Contents: write** because GitHub omits `bypass_actors` from a ruleset response
+for a principal without repository write access; the workflow must inspect the
+complete bypass list before Azure mutation. Only the publication token requests
+**Workflows: write**, and only the publication job contains contents mutation
+API calls. Every token is revoked at job completion. Never expose or upload
+the App private key or installation token. `CAPTURE_GITHUB_APP_ID` is the
+GitHub App/integration ID used by a ruleset `Integration` bypass actor; it is
+not the App installation ID. The accepted source release itself must
 report `immutable=true`, be published, and be neither a draft nor a
 prerelease. Its exact tag must resolve to the recorded source commit. A
 repository or token for which the setting or release immutability cannot be
 queried is not eligible for capture.
+
+Create exactly one repository tag ruleset named
+`ubuntu2404-confidential-provenance-tags`. No organization/enterprise parent
+tag ruleset or additional repository tag ruleset may apply: the workflow asks
+`GET /repos/cataggar/miz/rulesets?includes_parents=true&targets=tag`, requires
+exactly one result, retrieves its full representation, and fails closed on an
+inherited, ambiguous, inactive, or unsupported shape. Provision the ruleset
+with this exact request body, replacing the example numeric actor ID with the
+GitHub App ID:
+
+```json
+{
+  "name": "ubuntu2404-confidential-provenance-tags",
+  "target": "tag",
+  "enforcement": "active",
+  "bypass_actors": [
+    {
+      "actor_id": 123456,
+      "actor_type": "Integration",
+      "bypass_mode": "always"
+    }
+  ],
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "refs/tags/miz-provenance/ubuntu2404-confidential-cvm/**"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {"type": "creation"},
+    {"type": "update"},
+    {"type": "deletion"}
+  ]
+}
+```
+
+Create it manually with the repository rulesets
+`POST /repos/cataggar/miz/rulesets` endpoint; do not grant any other bypass
+actor or use `pull_request`/`exempt` bypass mode. The active creation, update,
+and deletion rules make the protected publishing App the only actor that can
+create, move, or delete a matching tag. The workflow verifies the exact
+conditions, rules, and sole `Integration`/`always` bypass through
+**Administration: read** before Azure mutation and again before release
+creation and publication. It never creates or modifies the ruleset.
 
 Before dispatch, provision a unique empty scratch resource group named
 `miz-u2404-cvm-capture-<32-lowercase-hex>` in the configured subscription and
@@ -421,6 +480,14 @@ pre-PUT group or a post-upload durable group.
 Recovery downloads the exact origin artifact, verifies the GitHub artifact
 digest, owner-only permissions, exact schema and full source/tool/target/origin
 identity, then freshly retrieves Azure and MAA evidence from retained scratch.
+The origin attempt must still be the exact workflow-dispatch event in
+`cataggar/miz`, on `main`, at the expected workflow path, and its `head_sha`
+must equal the recorded evidence `TOOL_COMMIT`. Recovery separately checks out
+and executes only the current approved dispatch `GITHUB_SHA`; it fetches the
+origin commit only to prove that retained evidence commit still exists. Thus an
+older origin script is never executed merely because recovery evidence names
+it, while the durable result continues to be verified against the exact
+original tool commit.
 If the exact target version exists, its tags, snapshot source, security
 contract, region, replication state, and origin must all match before recovery
 continues final deployment and attestation; recovery never issues a second
@@ -458,11 +525,25 @@ JSON to a controlled draft GitHub release, downloads and revalidates that exact
 asset, then publishes the release. An exact owned draft may be resumed only
 when tag, tool commit, title, origin identity, recovery intent digest, and any
 staged asset all match; a foreign or mismatched draft is refused, and a
-published release is never overwritten. Draft discovery lists releases with
+published release is never overwritten. The final provenance tag remains
+absent while the draft and its one asset are validated. Immediately before
+publication the workflow revalidates immutable releases, the exact active tag
+ruleset, current `main`, draft identity, and tag absence. The protected
+publishing App token then changes that exact draft to published, allowing the
+GitHub release API to create a lightweight tag atomically at the draft's exact
+`target_commitish=TOOL_COMMIT`. A pre-existing tag would cause the workflow to
+abort instead; `target_commitish` is never trusted for an existing tag. After
+publication the workflow reads
+`GET /repos/cataggar/miz/git/ref/tags/TAG`, requires a lightweight
+`object.type=commit` ref at exactly `TOOL_COMMIT`, and then applies the
+immutable release and one-asset/hash checks.
+
+Draft discovery lists releases with
 pagination, refuses duplicate exact tags, captures the numeric release ID from
 the REST creation/list result, and uses `/releases/{id}` for every draft
 re-read, upload, and publish operation. The tag endpoint is used only after the
-release is published. After publication the workflow
+release is published; pre-publication checks use the matching-refs endpoint
+only to prove that the exact tag is absent. After publication the workflow
 requires GitHub to report the release immutable with the exact tag, title, and
 commit and exactly one asset with the exact name and SHA-256. Full raw Azure
 and MAA verification has already succeeded inside the protected Azure job; the

@@ -7,6 +7,10 @@ const Dir = std.Io.Dir;
 const workflow_path =
     ".github/workflows/ubuntu2404-confidential-capture.yml";
 const harness_path = "scripts/ubuntu2404_confidential_capture.sh";
+const github_policy_path =
+    "scripts/ubuntu2404_confidential_github_policy.sh";
+const provenance_tag_path =
+    "scripts/ubuntu2404_confidential_provenance_tag.sh";
 const guide_path = "doc/azure-confidential-vm.md";
 const max_source_bytes = 4 * 1024 * 1024;
 const max_output_bytes = 1024 * 1024;
@@ -150,6 +154,35 @@ test "capture workflow is dispatch-only guarded and fully pinned" {
     try expectCount(workflow, "id-token: write", 1);
     try expectAbsent(workflow, "uses: actions/checkout@v");
     try expectAbsent(workflow, "uses: azure/login@v");
+    try expectCount(workflow, "ref: ${{ github.sha }}", 1);
+    try expectCount(
+        workflow,
+        "ref: ${{ needs.prepare.outputs.workflow_commit }}",
+        2,
+    );
+    try expectAbsent(
+        workflow,
+        "ref: ${{ needs.prepare.outputs.tool_commit }}",
+    );
+    try expectAbsent(workflow, "\n          ref: main\n");
+    try expectCount(
+        workflow,
+        "test \"$(git rev-parse HEAD)\" = \"$GITHUB_SHA\"",
+        5,
+    );
+    try expectCount(
+        workflow,
+        "git ls-remote origin refs/heads/main",
+        4,
+    );
+    try expectContains(
+        workflow,
+        "main advanced after dispatch approval; redispatch the workflow",
+    );
+    try expectContains(
+        workflow,
+        "main advanced before Azure mutation; redispatch the workflow",
+    );
 
     var lines = std.mem.splitScalar(u8, workflow, '\n');
     while (lines.next()) |line| {
@@ -161,6 +194,40 @@ test "capture workflow is dispatch-only guarded and fully pinned" {
         const sha = suffix[0 .. std.mem.indexOfScalar(u8, suffix, ' ') orelse suffix.len];
         try std.testing.expect(isHexSha(sha));
     }
+}
+
+test "approved dispatch checkout stays fixed and rejects moved main" {
+    try runShellFixture(std.testing.allocator, "dispatch-head-fixture.sh",
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\git init --bare --initial-branch=main remote.git >/dev/null
+        \\git clone remote.git work >/dev/null 2>&1
+        \\cd work
+        \\git config user.name fixture
+        \\git config user.email fixture@example.invalid
+        \\echo approved >workflow
+        \\git add workflow
+        \\git commit -m approved >/dev/null
+        \\git push origin HEAD:main >/dev/null 2>&1
+        \\dispatch_sha=$(git rev-parse HEAD)
+        \\git checkout --detach "$dispatch_sha" >/dev/null 2>&1
+        \\test "$(git rev-parse HEAD)" = "$dispatch_sha"
+        \\test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$dispatch_sha"
+        \\git switch main >/dev/null 2>&1
+        \\echo advanced >>workflow
+        \\git commit -am advanced >/dev/null
+        \\git push origin HEAD:main >/dev/null 2>&1
+        \\advanced_sha=$(git rev-parse HEAD)
+        \\test "$advanced_sha" != "$dispatch_sha"
+        \\git checkout --detach "$dispatch_sha" >/dev/null 2>&1
+        \\test "$(git rev-parse HEAD)" = "$dispatch_sha"
+        \\remote_main=$(git ls-remote origin refs/heads/main | awk '{print $1}')
+        \\test "$remote_main" = "$advanced_sha"
+        \\if [[ "$remote_main" == "$dispatch_sha" ]]; then
+        \\  exit 90
+        \\fi
+        \\
+    );
 }
 
 test "protected GitHub App tokens gate administration reads and retained workflow commits" {
@@ -184,12 +251,12 @@ test "protected GitHub App tokens gate administration reads and retained workflo
         "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349",
         3,
     );
-    try expectCount(workflow, "secrets.CAPTURE_GITHUB_APP_ID", 3);
+    try expectCount(workflow, "secrets.CAPTURE_GITHUB_APP_ID", 6);
     try expectCount(workflow, "secrets.CAPTURE_GITHUB_APP_PRIVATE_KEY", 3);
     try expectCount(workflow, "permission-administration: read", 3);
     try expectCount(workflow, "permission-actions: read", 3);
-    try expectCount(workflow, "permission-contents: read", 2);
-    try expectCount(workflow, "permission-contents: write", 1);
+    try expectAbsent(workflow, "permission-contents: read");
+    try expectCount(workflow, "permission-contents: write", 3);
     try expectCount(workflow, "permission-workflows: write", 1);
     try expectAbsent(workflow, "\n      contents: write\n");
 
@@ -212,6 +279,180 @@ test "protected GitHub App tokens gate administration reads and retained workflo
     try expectContains(
         publication,
         "permission-contents: write\n          permission-workflows: write",
+    );
+    try expectAbsent(prepare, "gh api --method POST");
+    try expectAbsent(prepare, "gh api --method PATCH");
+    try expectAbsent(capture, "gh api --method POST");
+    try expectAbsent(capture, "gh api --method PATCH");
+}
+
+test "ruleset verifier uses current REST shapes and exact App bypass" {
+    const allocator = std.testing.allocator;
+    const workflow = try readTracked(allocator, workflow_path);
+    defer allocator.free(workflow);
+    const policy = try readTracked(allocator, github_policy_path);
+    defer allocator.free(policy);
+
+    try expectCount(
+        workflow,
+        "scripts/ubuntu2404_confidential_github_policy.sh",
+        4,
+    );
+    for ([_][]const u8{
+        "rulesets?includes_parents=true&targets=tag&per_page=100",
+        "rulesets/$ruleset_id?includes_parents=true",
+        ".target == \"tag\"",
+        ".source_type == \"Repository\"",
+        ".source == $repository",
+        ".enforcement == \"active\"",
+        "actor_id: $app_id",
+        "actor_type: \"Integration\"",
+        "bypass_mode: \"always\"",
+        ".include == [$pattern]",
+        ".exclude == []",
+        "[\"creation\", \"deletion\", \"update\"]",
+        "all(.[]; (keys | sort) == [\"type\"])",
+    }) |needle| try expectContains(policy, needle);
+    try expectAbsent(policy, "installation-id");
+    try expectAbsent(workflow, "installation-id");
+    try expectAbsent(policy, "OrganizationAdmin");
+    try expectAbsent(policy, "RepositoryRole");
+
+    try runShellFixture(allocator, "github-policy-fixture.sh",
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\mkdir bin
+        \\cat >bin/gh <<'GH'
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\endpoint=
+        \\for argument in "$@"; do
+        \\  [[ "$argument" == repos/* ]] && endpoint=$argument
+        \\done
+        \\printf '%s\n' "$endpoint" >>"$GH_LOG"
+        \\if [[ "$endpoint" == *'/rulesets?'* ]]; then
+        \\  case "${GH_MODE:-valid}" in
+        \\    missing) printf '%s\n' '[[]]' ;;
+        \\    ambiguous) printf '%s\n' '[[{"id":42,"name":"ubuntu2404-confidential-provenance-tags"},{"id":43,"name":"other-tag-ruleset"}]]' ;;
+        \\    *) printf '%s\n' '[[{"id":42,"name":"ubuntu2404-confidential-provenance-tags"}]]' ;;
+        \\  esac
+        \\  exit
+        \\fi
+        \\source_type=Repository
+        \\enforcement=active
+        \\bypass='[{"actor_id":1234,"actor_type":"Integration","bypass_mode":"always"}]'
+        \\conditions='{"ref_name":{"include":["refs/tags/miz-provenance/ubuntu2404-confidential-cvm/**"],"exclude":[]}}'
+        \\rules='[{"type":"creation"},{"type":"update"},{"type":"deletion"}]'
+        \\case "${GH_MODE:-valid}" in
+        \\  parent) source_type=Organization ;;
+        \\  inactive) enforcement=evaluate ;;
+        \\  wrong-app) bypass='[{"actor_id":9876,"actor_type":"Integration","bypass_mode":"always"}]' ;;
+        \\  extra-bypass) bypass='[{"actor_id":1234,"actor_type":"Integration","bypass_mode":"always"},{"actor_id":6,"actor_type":"User","bypass_mode":"always"}]' ;;
+        \\  extra-condition) conditions='{"ref_name":{"include":["refs/tags/miz-provenance/ubuntu2404-confidential-cvm/**"],"exclude":[]},"repository_name":{"include":["miz"],"exclude":[]}}' ;;
+        \\  missing-rule) rules='[{"type":"creation"},{"type":"update"}]' ;;
+        \\esac
+        \\jq -n \
+        \\  --arg source_type "$source_type" \
+        \\  --arg enforcement "$enforcement" \
+        \\  --argjson bypass "$bypass" \
+        \\  --argjson conditions "$conditions" \
+        \\  --argjson rules "$rules" \
+        \\  '{id:42,name:"ubuntu2404-confidential-provenance-tags",target:"tag",
+        \\    source_type:$source_type,source:"cataggar/miz",enforcement:$enforcement,
+        \\    bypass_actors:$bypass,conditions:$conditions,rules:$rules}'
+        \\GH
+        \\chmod +x bin/gh
+        \\export PATH="$PWD/bin:$PATH"
+        \\export GH_LOG="$PWD/gh.log"
+        \\export GH_TOKEN=fixture
+        \\export GITHUB_REPOSITORY=cataggar/miz
+        \\export GH_API_VERSION=2026-03-10
+        \\export EXPECTED_PUBLISHER_APP_ID=1234
+        \\export PROVENANCE_RULESET_NAME=ubuntu2404-confidential-provenance-tags
+        \\export PROVENANCE_TAG_PATTERN='refs/tags/miz-provenance/ubuntu2404-confidential-cvm/**'
+        \\policy="$MIZ_UBUNTU2404_CONFIDENTIAL_ROOT/scripts/ubuntu2404_confidential_github_policy.sh"
+        \\GH_MODE=valid "$policy" valid
+        \\grep -F 'repos/cataggar/miz/rulesets?includes_parents=true&targets=tag&per_page=100' gh.log >/dev/null
+        \\grep -F 'repos/cataggar/miz/rulesets/42?includes_parents=true' gh.log >/dev/null
+        \\for mode in missing ambiguous parent inactive wrong-app extra-bypass extra-condition missing-rule; do
+        \\  if GH_MODE=$mode "$policy" "$mode" >/dev/null 2>&1; then
+        \\    exit 90
+        \\  fi
+        \\done
+        \\
+    );
+}
+
+test "provenance tag verifier enforces absence then exact lightweight ref" {
+    const allocator = std.testing.allocator;
+    const workflow = try readTracked(allocator, workflow_path);
+    defer allocator.free(workflow);
+    const tag_policy = try readTracked(allocator, provenance_tag_path);
+    defer allocator.free(tag_policy);
+
+    for ([_][]const u8{
+        "git/matching-refs/tags/$tag_name",
+        "([.[] | select(.ref == $ref)] | length) == 0",
+        "git/ref/tags/$tag_name",
+        ".object.type == \"commit\"",
+        ".object.sha == $commit",
+    }) |needle| try expectContains(tag_policy, needle);
+    try expectCount(workflow, "require-absent \"$PROVENANCE_RELEASE_TAG\"", 3);
+    try expectCount(workflow, "require-lightweight \"$PROVENANCE_RELEASE_TAG\"", 1);
+
+    try runShellFixture(allocator, "provenance-tag-fixture.sh",
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\mkdir bin
+        \\cat >bin/gh <<'GH'
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\endpoint=
+        \\for argument in "$@"; do
+        \\  [[ "$argument" == repos/* ]] && endpoint=$argument
+        \\done
+        \\printf '%s\n' "$endpoint" >>"$GH_LOG"
+        \\ref='refs/tags/miz-provenance/ubuntu2404-confidential-cvm/v1.2.3/origin-123-attempt-4/tool-0123456789abcdef0123456789abcdef01234567'
+        \\commit=0123456789abcdef0123456789abcdef01234567
+        \\if [[ "$endpoint" == *'/matching-refs/'* ]]; then
+        \\  if [[ "${GH_MODE:-absent}" == exists ]]; then
+        \\    jq -n --arg ref "$ref" --arg commit "$commit" \
+        \\      '[{ref:$ref,object:{type:"commit",sha:$commit}}]'
+        \\  else
+        \\    printf '%s\n' '[]'
+        \\  fi
+        \\else
+        \\  object_type=commit
+        \\  object_commit=$commit
+        \\  [[ "${GH_MODE:-exact}" == annotated ]] && object_type=tag
+        \\  [[ "${GH_MODE:-exact}" == wrong-commit ]] && object_commit=ffffffffffffffffffffffffffffffffffffffff
+        \\  jq -n --arg ref "$ref" --arg type "$object_type" --arg commit "$object_commit" \
+        \\    '{ref:$ref,object:{type:$type,sha:$commit}}'
+        \\fi
+        \\GH
+        \\chmod +x bin/gh
+        \\export PATH="$PWD/bin:$PATH"
+        \\export GH_LOG="$PWD/gh.log"
+        \\export GH_TOKEN=fixture
+        \\export GITHUB_REPOSITORY=cataggar/miz
+        \\export GH_API_VERSION=2026-03-10
+        \\tag='miz-provenance/ubuntu2404-confidential-cvm/v1.2.3/origin-123-attempt-4/tool-0123456789abcdef0123456789abcdef01234567'
+        \\commit=0123456789abcdef0123456789abcdef01234567
+        \\policy="$MIZ_UBUNTU2404_CONFIDENTIAL_ROOT/scripts/ubuntu2404_confidential_provenance_tag.sh"
+        \\GH_MODE=absent "$policy" require-absent "$tag" "$commit" absent
+        \\if GH_MODE=exists "$policy" require-absent "$tag" "$commit" exists >/dev/null 2>&1; then
+        \\  exit 90
+        \\fi
+        \\GH_MODE=exact "$policy" require-lightweight "$tag" "$commit" exact
+        \\if GH_MODE=annotated "$policy" require-lightweight "$tag" "$commit" annotated >/dev/null 2>&1; then
+        \\  exit 91
+        \\fi
+        \\if GH_MODE=wrong-commit "$policy" require-lightweight "$tag" "$commit" wrong >/dev/null 2>&1; then
+        \\  exit 92
+        \\fi
+        \\grep -F 'git/matching-refs/tags/' gh.log >/dev/null
+        \\grep -F 'git/ref/tags/' gh.log >/dev/null
+        \\
     );
 }
 
@@ -244,8 +485,13 @@ test "immutable source release and provenance identities fail closed" {
         "test \"sha256:$(sha256sum .capture/prepare/recovery.zip",
         ".schema == 5 and .stage == \"prepared\"",
         "refs/tags/$SOURCE_RELEASE_TAG^{}",
-        "provenance_release_tag=\"Ubuntu-24.04-confidential-cvm-$TARGET_GALLERY_VERSION\"",
-        "test \"$provenance_commit\" = \"$tool_commit\"",
+        "workflow_commit=$(git rev-parse HEAD)",
+        "test \"$workflow_commit\" = \"$GITHUB_SHA\"",
+        "tool_commit=$workflow_commit",
+        "git fetch --no-tags --depth=1 origin \"$tool_commit\"",
+        "provenance_release_tag=\"miz-provenance/ubuntu2404-confidential-cvm/v$TARGET_GALLERY_VERSION/origin-$origin_run_id-attempt-$origin_run_attempt/tool-$tool_commit\"",
+        "ubuntu2404_confidential_provenance_tag.sh",
+        "require-absent \"$provenance_release_tag\" \"$tool_commit\"",
         ".draft == false",
         ".prerelease == false",
         "(.assets | type == \"array\" and length == 3)",
@@ -257,6 +503,8 @@ test "immutable source release and provenance identities fail closed" {
         prepare,
         "actions/runs/$origin_run_id\"",
     );
+    try expectAbsent(prepare, "direct_provenance=");
+    try expectAbsent(prepare, "peeled_provenance=");
 }
 
 test "source acquisition is exact and validated before Azure" {
@@ -298,8 +546,13 @@ test "source acquisition is exact and validated before Azure" {
         capture_job,
         "- name: Log in capture principal with protected-environment OIDC",
     );
+    const github_preflight = try indexOf(
+        capture_job,
+        "- name: Revalidate dispatch head and tag policy before Azure",
+    );
     try std.testing.expect(immutable_source < first_login);
     try std.testing.expect(validate_source < first_login);
+    try std.testing.expect(github_preflight < first_login);
 }
 
 test "dual OIDC contexts and staged freshness ordering are fixed" {
@@ -419,7 +672,10 @@ test "publication boundary uploads one sanitized result and never deletes target
         "gh api --method POST \"${api_headers[@]}\"",
         "repos/$GITHUB_REPOSITORY/releases/$release_id",
         "uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets",
-        "if [[ \"$(jq -r '.draft' \"$release_json\")\" == true",
+        "github-policy-before-publish",
+        "immutable-releases-before-publish.json",
+        "tag-before-publish",
+        "require-lightweight \"$PROVENANCE_RELEASE_TAG\" \"$TOOL_COMMIT\"",
         "origin-run-id: $ORIGIN_RUN_ID",
         "recovery-intent-sha256: $RECOVERY_INTENT_SHA256",
         "-F draft=false",
@@ -454,6 +710,10 @@ test "durable recovery preserves origin and gates PUT cleanup and publication" {
     for ([_][]const u8{
         "origin_run_id:",
         "origin_run_attempt:",
+        "WORKFLOW_COMMIT: ${{ needs.prepare.outputs.workflow_commit }}",
+        "ref: ${{ needs.prepare.outputs.workflow_commit }}",
+        "test \"$GITHUB_SHA\" = \"$WORKFLOW_COMMIT\"",
+        "test \"$origin_head_sha\" = \"$tool_commit\"",
         "recovery_artifact_name=\"ubuntu2404-confidential-capture-recovery-$origin_run_id-$origin_run_attempt-$TARGET_GALLERY_VERSION\"",
         "dispatch_artifact_name=\"ubuntu2404-confidential-capture-dispatch-$origin_run_id-$origin_run_attempt-$TARGET_GALLERY_VERSION\"",
         "result_artifact_name=\"ubuntu2404-confidential-capture-result-$origin_run_id-$origin_run_attempt-$TARGET_GALLERY_VERSION\"",
@@ -563,6 +823,9 @@ test "draft release creation resume and ambiguity use numeric REST identity" {
         ".target_commitish == $tool_commit",
         ".body == $notes",
         "uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets",
+        "ubuntu2404_confidential_github_policy.sh",
+        "require-absent \"$PROVENANCE_RELEASE_TAG\" \"$TOOL_COMMIT\"",
+        "require-lightweight \"$PROVENANCE_RELEASE_TAG\" \"$TOOL_COMMIT\"",
         "-F draft=false",
     }) |needle| try expectContains(publication, needle);
     try expectCount(
@@ -582,15 +845,15 @@ test "draft release fixtures accept fresh and exact resume but reject foreign an
     try runShellFixture(std.testing.allocator, "release-selection-fixture.sh",
         \\#!/usr/bin/env bash
         \\set -euo pipefail
-        \\tag=Ubuntu-24.04-confidential-cvm-1.2.3
+        \\tag=miz-provenance/ubuntu2404-confidential-cvm/v1.2.3/origin-123-attempt-4/tool-0123456789abcdef0123456789abcdef01234567
         \\title='Ubuntu 24.04 Confidential VM gallery provenance 1.2.3'
         \\asset=Ubuntu-24.04-x86_64.confidential-cvm-1.2.3.provenance.json
         \\tool_commit=0123456789abcdef0123456789abcdef01234567
         \\notes='exact origin and intent'
         \\fresh='[[]]'
-        \\exact='[[{"id":7,"tag_name":"Ubuntu-24.04-confidential-cvm-1.2.3","name":"Ubuntu 24.04 Confidential VM gallery provenance 1.2.3","target_commitish":"0123456789abcdef0123456789abcdef01234567","body":"exact origin and intent","draft":true,"immutable":false,"prerelease":false,"assets":[]}]]'
-        \\foreign='[[{"id":8,"tag_name":"Ubuntu-24.04-confidential-cvm-1.2.3","name":"foreign","target_commitish":"0123456789abcdef0123456789abcdef01234567","body":"wrong origin","draft":true,"immutable":false,"prerelease":false,"assets":[]}]]'
-        \\duplicate='[[{"id":7,"tag_name":"Ubuntu-24.04-confidential-cvm-1.2.3"},{"id":9,"tag_name":"Ubuntu-24.04-confidential-cvm-1.2.3"}]]'
+        \\exact='[[{"id":7,"tag_name":"miz-provenance/ubuntu2404-confidential-cvm/v1.2.3/origin-123-attempt-4/tool-0123456789abcdef0123456789abcdef01234567","name":"Ubuntu 24.04 Confidential VM gallery provenance 1.2.3","target_commitish":"0123456789abcdef0123456789abcdef01234567","body":"exact origin and intent","draft":true,"immutable":false,"prerelease":false,"assets":[]}]]'
+        \\foreign='[[{"id":8,"tag_name":"miz-provenance/ubuntu2404-confidential-cvm/v1.2.3/origin-123-attempt-4/tool-0123456789abcdef0123456789abcdef01234567","name":"foreign","target_commitish":"0123456789abcdef0123456789abcdef01234567","body":"wrong origin","draft":true,"immutable":false,"prerelease":false,"assets":[]}]]'
+        \\duplicate='[[{"id":7,"tag_name":"miz-provenance/ubuntu2404-confidential-cvm/v1.2.3/origin-123-attempt-4/tool-0123456789abcdef0123456789abcdef01234567"},{"id":9,"tag_name":"miz-provenance/ubuntu2404-confidential-cvm/v1.2.3/origin-123-attempt-4/tool-0123456789abcdef0123456789abcdef01234567"}]]'
         \\select_exact() {
         \\  jq -c --arg tag "$tag" '[.[][] | select(.tag_name == $tag)]'
         \\}
@@ -689,7 +952,19 @@ test "operator guide fixes prerequisites RBAC and quarantine boundary" {
         "`CAPTURE_GITHUB_APP_ID`",
         "`CAPTURE_GITHUB_APP_PRIVATE_KEY`",
         "**Administration: read**",
+        "**Contents: write**",
         "**Workflows: write**",
+        "omits `bypass_actors` from a ruleset response",
+        "GitHub App/integration ID",
+        "not the App installation ID",
+        "`ubuntu2404-confidential-provenance-tags`",
+        "GET /repos/cataggar/miz/rulesets?includes_parents=true&targets=tag",
+        "\"actor_type\": \"Integration\"",
+        "\"bypass_mode\": \"always\"",
+        "\"refs/tags/miz-provenance/ubuntu2404-confidential-cvm/**\"",
+        "{\"type\": \"creation\"}",
+        "{\"type\": \"deletion\"}",
+        "Do not pre-create\nthe tag",
         "`scratch_resource_group`",
         "`miz-u2404-cvm-capture-<32-lowercase-hex>`",
         "require at least one designated release reviewer",
@@ -708,6 +983,8 @@ test "operator guide fixes prerequisites RBAC and quarantine boundary" {
         "retained for 90 days",
         "never issues a second\nPUT",
         "exact owned draft may be resumed",
+        "target_commitish=TOOL_COMMIT",
+        "object.type=commit",
         "quarantined",
         "manual",
         "live Azure qualification run",
