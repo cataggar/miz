@@ -239,6 +239,7 @@ Configure:
 | Secret | `AZURE_SUBSCRIPTION_ID` | common capture/target subscription |
 | Secret | `CAPTURE_GITHUB_APP_ID` | repository-installed protected capture GitHub App ID |
 | Secret | `CAPTURE_GITHUB_APP_PRIVATE_KEY` | PEM private key for that GitHub App |
+| Variable | `CAPTURE_RELEASE_WRITER_POLICY` | exact `owner-and-publisher-app-only-v1` acknowledgement after the manual installed-App audit |
 | Variable | `AZURE_LOCATION` | previously live-qualified region |
 | Variable | `AZURE_VM_SIZE` | previously live-qualified AMD SEV-SNP SKU |
 | Variable | `TARGET_RESOURCE_GROUP` | pre-provisioned durable resource group |
@@ -280,19 +281,43 @@ reads and artifact download; the content token performs the draft
 create/read/upload/publish operations and never performs an Administration
 query. Every token is revoked at job completion. Never expose or upload the
 App private key or an installation token. `CAPTURE_GITHUB_APP_ID` is the
-GitHub App/integration ID used by a ruleset `Integration` bypass actor and the
-single permitted content-writing installation.
+GitHub App/integration ID used by the sole ruleset `Integration` bypass actor
+and identifies the intended publisher in the protected configuration.
 It is not the App installation ID. The accepted source release itself must
 report `immutable=true`, be published, and be neither a draft nor a
 prerelease. Its exact tag must resolve
 to the recorded source commit. A repository or token for which the setting,
-writer inventory, or release immutability cannot be queried is not eligible
-for capture.
+human-writer policy, ruleset, or release immutability cannot be queried is not
+eligible for capture.
+
+The GitHub repository trust root is the repository owner and administrators,
+the identities approved to write or merge default-branch workflow code, and
+the protected-environment administrators and reviewers. For this personal
+repository the collaborator check below mechanically constrains human
+push/maintain/admin access to `cataggar`, but a trusted administrator can
+always change approved workflow code, collaborators, Apps, repository
+settings, or environment configuration. Compromised trusted administrators
+are outside the security boundary. This is the explicit trusted computing
+base: anyone who can approve or merge a workflow change can already alter the
+capture workflow.
+
+GitHub does not document a repository endpoint that enumerates every installed
+GitHub App and its repository permissions. Before setting or retaining the
+protected-environment variable `CAPTURE_RELEASE_WRITER_POLICY`, environment
+administrators and reviewers must manually audit the Apps installed on
+`cataggar/miz` and confirm that no App other than the publishing App has
+**Contents: write**. Set the exact value
+`owner-and-publisher-app-only-v1` only while that audit remains true. The value
+is an operational acknowledgement, not cryptographic proof. The workflow
+fails when it is absent or different and checks it in the protected `prepare`
+job, before Azure access, and again at every GitHub release mutation boundary.
+It is deliberately an environment variable rather than a dispatch input, so a
+dispatcher cannot self-assert the prerequisite.
 
 The security boundary deliberately supports only the personal repository
 `cataggar/miz`. Before Azure access and at every GitHub release mutation
-boundary, the policy token requires all of the following without changing any
-setting:
+boundary, the policy token requires all mechanically enumerable conditions
+below without changing any setting:
 
 - `GET /repos/cataggar/miz` reports `owner.login=cataggar`,
   `owner.type=User`, and no organization object. Organization teams, base
@@ -304,15 +329,6 @@ setting:
   `permissions.admin` booleans, with no writer except the repository owner.
   OAuth Apps and user tokens act through one of these user identities, so the
   trusted owner is the only unavoidable user release writer.
-- Paginated `GET /repos/cataggar/miz/installations?per_page=100` returns a
-  complete Administration inventory containing each installation's numeric
-  `app_id` and `permissions` object. Exactly one installation may report
-  `permissions.contents=write`: `CAPTURE_GITHUB_APP_ID`, which must also
-  report `permissions.administration=write` and
-  `permissions.workflows=write`. A 404, redacted/omitted permissions object,
-  duplicate App ID, or additional Contents-write App fails closed. Do not
-  dispatch on a GitHub deployment that cannot expose this complete response to
-  the Administration-write installation token.
 - `GET /repos/cataggar/miz/actions/permissions/workflow` reports
   `default_workflow_permissions=read` and
   `can_approve_pull_request_reviews=false`. Only workflow code accepted by the
@@ -320,9 +336,9 @@ setting:
 
 Deploy keys cannot call the releases API and receive no tag-ruleset bypass.
 Personal repositories have no team or organization custom-role grants. The
-repository owner remains the security root and can always change collaborators,
-Apps, settings, or default-branch code; all non-owner release writers are
-prohibited rather than treated as mutually trusted.
+repository owner remains the human writer and administrator trust root; all
+non-owner human release writers are prohibited rather than treated as mutually
+trusted.
 
 Create exactly one repository tag ruleset named
 `ubuntu2404-confidential-provenance-tags`. No organization/enterprise parent
@@ -572,11 +588,12 @@ staged asset all match; a foreign or mismatched draft is refused, and a
 published release is never overwritten. The final provenance tag remains
 absent while the draft and its one asset are validated. Immediately before
 draft discovery, draft creation, asset upload, and publication, the workflow
-revalidates the personal-repository single-writer inventory and exact active
-tag ruleset. It also revalidates immutable releases, current `main`, draft
-identity, asset digest, and tag absence immediately before publication. Draft
-create, resume, upload, validation, and publication remain in one protected
-job after its single environment approval, with no later approval or wait gap.
+revalidates the protected release-writer acknowledgement, owner-only human
+writer policy, and exact active tag ruleset. It also revalidates immutable
+releases, current `main`, draft identity, asset digest, and tag absence
+immediately before publication. Draft create, resume, upload, validation, and
+publication remain in one protected job after its single environment approval,
+with no later approval or wait gap.
 The isolated content token then PATCHes the exact draft while resending
 `tag_name`, `target_commitish=TOOL_COMMIT`, title, body, `prerelease=false`,
 and the string-valued `make_latest="false"` together with `draft=false`. This

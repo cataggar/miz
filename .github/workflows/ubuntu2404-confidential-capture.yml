@@ -55,6 +55,8 @@ jobs:
     environment: ubuntu2404-confidential-capture
     permissions:
       contents: read
+    env:
+      CAPTURE_RELEASE_WRITER_POLICY: ${{ vars.CAPTURE_RELEASE_WRITER_POLICY }}
     outputs:
       workflow_commit: ${{ steps.resolve.outputs.workflow_commit }}
       tool_commit: ${{ steps.resolve.outputs.tool_commit }}
@@ -414,6 +416,7 @@ jobs:
       result_uploaded: ${{ steps.capture_status.outputs.result_uploaded }}
       cleanup_failed: ${{ steps.capture_status.outputs.cleanup_failed }}
     env:
+      CAPTURE_RELEASE_WRITER_POLICY: ${{ vars.CAPTURE_RELEASE_WRITER_POLICY }}
       WORKFLOW_COMMIT: ${{ needs.prepare.outputs.workflow_commit }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       TOOL_COMMIT: ${{ needs.prepare.outputs.tool_commit }}
@@ -1185,6 +1188,7 @@ jobs:
     permissions:
       contents: read
     env:
+      CAPTURE_RELEASE_WRITER_POLICY: ${{ vars.CAPTURE_RELEASE_WRITER_POLICY }}
       WORKFLOW_COMMIT: ${{ needs.prepare.outputs.workflow_commit }}
       TOOL_COMMIT: ${{ needs.prepare.outputs.tool_commit }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}

@@ -338,10 +338,9 @@ test "repository writer boundary and ruleset policy fail closed" {
         "((.organization? // null) == null)",
         "collaborators?affiliation=all&per_page=100",
         ".permissions.push or .permissions.maintain or .permissions.admin",
-        "repos/$GITHUB_REPOSITORY/installations?per_page=100",
-        ".permissions.administration == \"write\"",
-        ".permissions.contents == \"write\"",
-        ".permissions.workflows == \"write\"",
+        "CAPTURE_RELEASE_WRITER_POLICY",
+        "owner-and-publisher-app-only-v1",
+        "protected release-writer policy acknowledgement is absent or wrong",
         "actions/permissions/workflow",
         ".default_workflow_permissions == \"read\"",
         ".can_approve_pull_request_reviews == false",
@@ -363,6 +362,19 @@ test "repository writer boundary and ruleset policy fail closed" {
     try expectAbsent(workflow, "installation-id");
     try expectAbsent(policy, "OrganizationAdmin");
     try expectAbsent(policy, "RepositoryRole");
+    try expectAbsent(
+        policy,
+        "repos/$GITHUB_REPOSITORY/installations",
+    );
+    try expectAbsent(
+        workflow,
+        "repos/$GITHUB_REPOSITORY/installations",
+    );
+    try expectCount(
+        workflow,
+        "CAPTURE_RELEASE_WRITER_POLICY: ${{ vars.CAPTURE_RELEASE_WRITER_POLICY }}",
+        3,
+    );
 
     try runShellFixture(allocator, "github-policy-fixture.sh",
         \\#!/usr/bin/env bash
@@ -405,24 +417,6 @@ test "repository writer boundary and ruleset policy fail closed" {
         \\      ;;
         \\    *)
         \\      printf '%s\n' "[[$owner]]"
-        \\      ;;
-        \\  esac
-        \\  exit
-        \\fi
-        \\if [[ "$endpoint" == *'/installations?'* ]]; then
-        \\  publisher='{"app_id":1234,"permissions":{"administration":"write","actions":"read","contents":"write","workflows":"write"}}'
-        \\  case "${GH_MODE:-valid}" in
-        \\    extra-writer-app)
-        \\      printf '%s\n' "[[$publisher,{\"app_id\":5678,\"permissions\":{\"contents\":\"write\"}}]]"
-        \\      ;;
-        \\    missing-installation-permissions)
-        \\      printf '%s\n' '[[{"app_id":1234}]]'
-        \\      ;;
-        \\    wrong-publisher-permissions)
-        \\      printf '%s\n' '[[{"app_id":1234,"permissions":{"administration":"read","contents":"write","workflows":"write"}}]]'
-        \\      ;;
-        \\    *)
-        \\      printf '%s\n' "[[$publisher]]"
         \\      ;;
         \\  esac
         \\  exit
@@ -488,17 +482,27 @@ test "repository writer boundary and ruleset policy fail closed" {
         \\export EXPECTED_PUBLISHER_APP_ID=1234
         \\export PROVENANCE_RULESET_NAME=ubuntu2404-confidential-provenance-tags
         \\export PROVENANCE_TAG_PATTERN='refs/tags/miz-provenance/ubuntu2404-confidential-cvm/*/*/*'
+        \\export CAPTURE_RELEASE_WRITER_POLICY=owner-and-publisher-app-only-v1
         \\policy="$MIZ_UBUNTU2404_CONFIDENTIAL_ROOT/scripts/ubuntu2404_confidential_github_policy.sh"
         \\GH_MODE=valid "$policy" valid
         \\grep -F 'repos/cataggar/miz/collaborators?affiliation=all&per_page=100' gh.log >/dev/null
-        \\grep -F 'repos/cataggar/miz/installations?per_page=100' gh.log >/dev/null
+        \\if grep -F 'repos/cataggar/miz/installations' gh.log >/dev/null; then
+        \\  exit 90
+        \\fi
         \\grep -F 'repos/cataggar/miz/actions/permissions/workflow' gh.log >/dev/null
         \\grep -F 'repos/cataggar/miz/rulesets?includes_parents=true&targets=tag&per_page=100' gh.log >/dev/null
         \\grep -F 'repos/cataggar/miz/rulesets/42?includes_parents=true' gh.log >/dev/null
+        \\if env -u CAPTURE_RELEASE_WRITER_POLICY \
+        \\    GH_MODE=valid "$policy" missing-acknowledgement >/dev/null 2>&1; then
+        \\  exit 91
+        \\fi
+        \\if CAPTURE_RELEASE_WRITER_POLICY=wrong \
+        \\    GH_MODE=valid "$policy" wrong-acknowledgement >/dev/null 2>&1; then
+        \\  exit 92
+        \\fi
         \\for mode in \
         \\  org-repository wrong-owner extra-writer \
-        \\  missing-collaborator-permissions extra-writer-app \
-        \\  missing-installation-permissions wrong-publisher-permissions \
+        \\  missing-collaborator-permissions \
         \\  unsafe-workflow-default missing ambiguous parent inactive \
         \\  wrong-app extra-bypass missing-bypass extra-condition missing-rule
         \\do
@@ -1217,12 +1221,16 @@ test "operator guide fixes prerequisites RBAC and quarantine boundary" {
         "permissions.push",
         "permissions.maintain",
         "permissions.admin",
-        "installations?per_page=100",
-        "permissions.contents=write",
+        "`CAPTURE_RELEASE_WRITER_POLICY`",
+        "`owner-and-publisher-app-only-v1`",
+        "manually audit",
+        "not cryptographic proof",
+        "trusted computing\nbase",
+        "Compromised trusted administrators\nare outside",
         "actions/permissions/workflow",
         "default_workflow_permissions=read",
         "can_approve_pull_request_reviews=false",
-        "repository owner remains the security root",
+        "repository owner remains the human writer and administrator trust root",
         "`ubuntu2404-confidential-provenance-tags`",
         "GET /repos/cataggar/miz/rulesets?includes_parents=true&targets=tag",
         "\"actor_type\": \"Integration\"",
@@ -1252,10 +1260,11 @@ test "operator guide fixes prerequisites RBAC and quarantine boundary" {
         "exact owned draft may be resumed",
         "target_commitish=TOOL_COMMIT",
         "make_latest=\"false\"",
-        "one protected\njob",
+        "one protected job",
         "object.type=commit",
         "quarantined",
         "manual",
         "live Azure qualification run",
     }) |needle| try expectContains(guide, needle);
+    try expectAbsent(guide, "GET /repos/cataggar/miz/installations");
 }

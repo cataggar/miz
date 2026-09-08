@@ -17,6 +17,11 @@ test "$GITHUB_REPOSITORY_OWNER" = cataggar
 test "$PROVENANCE_RULESET_NAME" = ubuntu2404-confidential-provenance-tags
 test "$PROVENANCE_TAG_PATTERN" = \
   'refs/tags/miz-provenance/ubuntu2404-confidential-cvm/*/*/*'
+if [[ "${CAPTURE_RELEASE_WRITER_POLICY:-}" != \
+    "owner-and-publisher-app-only-v1" ]]; then
+  echo "::error::The protected release-writer policy acknowledgement is absent or wrong"
+  exit 1
+fi
 
 mkdir -m 0700 -p "$output_dir"
 api_headers=(
@@ -26,8 +31,6 @@ api_headers=(
 repository="$output_dir/repository.json"
 collaborator_pages="$output_dir/collaborator-pages.json"
 collaborators="$output_dir/collaborators.json"
-installation_pages="$output_dir/installation-pages.json"
-installations="$output_dir/installations.json"
 workflow_permissions="$output_dir/workflow-permissions.json"
 ruleset_pages="$output_dir/tag-ruleset-pages.json"
 rulesets="$output_dir/tag-rulesets.json"
@@ -77,38 +80,6 @@ jq -e \
     (.login | ascii_downcase)] | unique) == [$owner_login]
   ' "$collaborators" >/dev/null || {
   echo "::error::Only the personal repository owner may have write access"
-  exit 1
-}
-
-# This Administration API response must enumerate every App installation with
-# its granted repository permissions. An unavailable or redacted route fails
-# before any protected mutation.
-gh api --paginate --slurp "${api_headers[@]}" \
-  "repos/$GITHUB_REPOSITORY/installations?per_page=100" \
-  >"$installation_pages"
-jq -e \
-  'type == "array" and all(.[]; type == "array")' \
-  "$installation_pages" >/dev/null
-jq '[.[][]]' "$installation_pages" >"$installations"
-jq -e \
-  --argjson app_id "$EXPECTED_PUBLISHER_APP_ID" \
-  '
-  type == "array" and length >= 1 and
-  all(.[];
-    type == "object" and
-    (.app_id | type == "number" and . > 0) and
-    (.permissions | type == "object") and
-    ((.permissions.contents? // "none") |
-      . == "none" or . == "read" or . == "write")) and
-  ([.[].app_id] | length) == ([.[].app_id] | unique | length) and
-  ([.[] | select(.app_id == $app_id)] | length) == 1 and
-  ([.[] | select(.app_id == $app_id)][0] |
-    .permissions.administration == "write" and
-    .permissions.contents == "write" and
-    .permissions.workflows == "write") and
-  ([.[] | select(.permissions.contents? == "write") | .app_id]) == [$app_id]
-  ' "$installations" >/dev/null || {
-  echo "::error::The publishing App must be the only Contents-write installation"
   exit 1
 }
 
