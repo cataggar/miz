@@ -1,5 +1,28 @@
 # Library API
 
+## Package a standalone UEFI application
+
+`miz.efi_application_image.build` creates an ESP-only GPT disk without
+pretending the payload is a Linux distribution. Raw and fixed VHD are the
+supported outputs:
+
+```zig
+const report = try miz.efi_application_image.build(allocator, io, .{
+    .efi_path = "BOOTX64.EFI",
+    .output_path = "unikernel.vhd",
+    .output_format = .vhd,
+    .architecture = .x86_64,
+    .esp_size = 64 * miz.azure.one_mib,
+});
+```
+
+The call validates PE32+ machine and EFI-application subsystem fields, sizes
+the FAT32 ESP before creating output, writes `/EFI/BOOT/BOOTX64.EFI` (or the
+AArch64 fallback), verifies both GPT copies and the boot-file digest, and
+requires fixed VHD virtual size alignment. Existing output paths are never
+overwritten. Deterministic identities are derived from the input digest,
+architecture, and requested sizes.
+
 ## Grow an existing Ubuntu QCOW2 image
 
 `miz.root_resize.growExistingQcow2` performs the complete native growth

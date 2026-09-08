@@ -70,6 +70,8 @@ miz build-image --iso azurelinux.iso --container ./oci-layout --size 4G -o outpu
 miz build-image --iso azurelinux.iso --container ./oci-layout --size 384M --skip-iso-rootfs -o output-minimal.raw -O raw
 miz build-image --iso azurelinux.iso --container ./oci-layout --size 4G --verity -o output.vhd
 miz build-image --iso azurelinux.iso --container ./oci-layout --size 4G --boot-mode uki --esp-size 512M -o output-uki.vhd
+miz build-efi-application --efi BOOTX64.EFI -O raw -o application.raw
+miz build-efi-application --efi BOOTX64.EFI -O vhd -o application.vhd
 miz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G -o output-live.iso                 # regenerate a customized LiveOS ISO
 miz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --uefi-boot-image boot/grub2/efiboot.img -o output-live.iso
 miz build-iso --iso azurelinux.iso --container ./oci-layout --rootfs-size 2G --source-date-epoch 1735689600 -o output-live.iso   # byte-for-byte reproducible
@@ -80,6 +82,49 @@ miz capture --source disk.qcow2 --source-root gpt:2 -O raw -o captured.raw --dry
 miz qemu AzureLinux
 miz qemu AzureLinux --snapshot
 ```
+
+## Packaging a standalone UEFI application
+
+`miz build-efi-application` is the root-filesystem-free path for payloads
+that are already complete UEFI applications, such as unikernels. It validates
+that the input is a PE32+ EFI application for x86-64 or AArch64, writes it to
+the architecture fallback path (`/EFI/BOOT/BOOTX64.EFI` or
+`/EFI/BOOT/BOOTAA64.EFI`) in a native FAT32 ESP, and wraps that ESP in a
+protective-MBR + GPT disk. It does not invent a Linux root partition, distro
+metadata, kernel command line, or GRUB configuration.
+
+The default ESP is 64 MiB at the 1 MiB boundary. The disk size is the smallest
+whole-MiB size that leaves room for the backup GPT; override it with
+`--disk-size` when a consumer requires a larger virtual disk. `--esp-size` and
+`--disk-size` must both be whole MiB. The input defaults to a 512 MiB bound,
+configurable with `--max-efi-size`, and FAT32's own 4 GiB file ceiling remains
+mandatory.
+
+Only raw and VHD output are accepted. VHD output is always fixed, never
+dynamic, and its virtual size is already 1 MiB-aligned for Azure Gen2. Existing
+output and scratch paths are refused rather than truncated. Disk GUIDs, the ESP
+partition GUID and volume ID, FAT metadata, and the VHD footer UUID/timestamp
+are deterministically derived from the input bytes, architecture, and sizes,
+so identical invocations produce identical artifacts.
+
+```console
+# Native GPT disk for firmware/QEMU.
+miz build-efi-application \
+  --efi BOOTX64.EFI --architecture x86_64 \
+  --esp-size 64M -O raw -o unikernel.raw
+
+# Native Azure-upload-shaped fixed VHD, with the same guest-visible disk.
+miz build-efi-application \
+  --efi BOOTX64.EFI --architecture x86_64 \
+  --esp-size 64M -O vhd -o unikernel.vhd
+
+miz check unikernel.vhd
+miz azure fixup --generation 2 unikernel.vhd
+```
+
+These checks establish image structure and Azure fixed-VHD shape only. They do
+not establish that the application has storage/network drivers or that it has
+booted on Hyper-V/Azure; those remain deployment acceptance gates.
 
 `miz write` is the only CLI path that writes a complete image to an existing
 block device. It accepts raw, VHD, VHDX, and qcow2 sources without first
