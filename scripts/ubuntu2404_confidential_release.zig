@@ -60,6 +60,7 @@ const usage_text =
     \\  check-captured-vm      validate inherited security on a VM from the full version
     \\  capture-result         write durable source-to-capture provenance with signed MAA evidence
     \\  verify-capture         independently revalidate protected capture provenance
+    \\  verify-capture-publication validate sanitized durable provenance without raw Azure evidence
     \\
     \\verify-capture requires independently supplied workflow identities and every
     \\raw evidence file. Azure ARM, OpenID, and JWKS file authenticity must come
@@ -68,6 +69,9 @@ const usage_text =
     \\does not authenticate their transport origin.
     \\capture-result and verify-capture also require --scratch-resource-group,
     \\--scratch-inventory, and the separately configured --target-resource-group.
+    \\verify-capture-publication checks the exact durable result digest and
+    \\protected source, tool, run, subscription, location, and target identities.
+    \\It does not reauthenticate discarded raw Azure or MAA transport evidence.
     \\
 ;
 
@@ -161,6 +165,7 @@ const command_table = [_]Command{
     .{ .name = "check-captured-vm", .handler = runCheckCapturedVm },
     .{ .name = "capture-result", .handler = runCaptureResult },
     .{ .name = "verify-capture", .handler = runVerifyCapture },
+    .{ .name = "verify-capture-publication", .handler = runVerifyCapturePublication },
 };
 
 fn run(context: Context, argv: []const []const u8) !void {
@@ -2136,6 +2141,7 @@ pub const capture_result_option_schema = [_][]const u8{
     "provenance",
     "qcow",
     "source-commit",
+    "source-release-tag",
     "source-location",
     "source-vm-size",
     "source-run-id",
@@ -2148,6 +2154,7 @@ pub const capture_result_option_schema = [_][]const u8{
     "staging-gallery-request",
     "staging-gallery-response",
     "subscription-id",
+    "tool-commit",
     "location",
     "repository",
     "run-id",
@@ -2186,6 +2193,7 @@ pub const capture_verify_option_schema = [_][]const u8{
     "provenance",
     "qcow",
     "source-commit",
+    "source-release-tag",
     "source-location",
     "source-vm-size",
     "source-run-id",
@@ -2198,6 +2206,7 @@ pub const capture_verify_option_schema = [_][]const u8{
     "staging-gallery-request",
     "staging-gallery-response",
     "subscription-id",
+    "tool-commit",
     "location",
     "repository",
     "run-id",
@@ -2279,6 +2288,7 @@ fn captureExpected(
         .source = .{
             .repository = try options.require("source-repository"),
             .commit = try options.require("source-commit"),
+            .release_tag = try options.require("source-release-tag"),
             .location = try options.require("source-location"),
             .vm_size = try options.require("source-vm-size"),
             .run_id = try options.require("source-run-id"),
@@ -2310,6 +2320,7 @@ fn captureExpected(
                 ),
             },
         },
+        .tool_commit = try options.require("tool-commit"),
         .repository = try options.require("repository"),
         .subscription_id = try options.require("subscription-id"),
         .location = try options.require("location"),
@@ -3160,6 +3171,68 @@ fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
     });
 }
 
+fn runVerifyCapturePublication(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "result",
+        "expected-result-sha256",
+        "source-commit",
+        "source-release-tag",
+        "tool-commit",
+        "repository",
+        "run-id",
+        "run-attempt",
+        "subscription-id",
+        "location",
+        "definition-id",
+        "version-id",
+    });
+    const expected_sha256 = try options.require("expected-result-sha256");
+    _ = release.digest.parseHex(expected_sha256) catch return error.Usage;
+    const result_path = try options.require("result");
+    const observed = try release.digest.hashFile(
+        context.io,
+        result_path,
+        document_max_bytes,
+    );
+    if (!std.mem.eql(u8, expected_sha256, &observed.hex)) {
+        return invalid(
+            context.diagnostic,
+            "durable capture result SHA-256 mismatch",
+            .{},
+        );
+    }
+    var document = try readObject(
+        context.allocator,
+        context.io,
+        result_path,
+        context.diagnostic,
+    );
+    defer document.deinit();
+    try requireSameRevision(
+        observed.identity,
+        document.identity,
+        "durable capture result",
+        context.diagnostic,
+    );
+    try capture.validatePublicationResult(
+        document.object(),
+        .{
+            .source_commit = try options.require("source-commit"),
+            .source_release_tag = try options.require("source-release-tag"),
+            .tool_commit = try options.require("tool-commit"),
+            .repository = try options.require("repository"),
+            .run_id = try options.require("run-id"),
+            .run_attempt = try options.require("run-attempt"),
+            .subscription_id = try options.require("subscription-id"),
+            .location = try options.require("location"),
+            .image_definition_id = try options.require("definition-id"),
+            .image_version_id = try options.require("version-id"),
+        },
+        context.diagnostic,
+    );
+    try context.out.print("{s}\n", .{&observed.hex});
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var arena: std.heap.ArenaAllocator = .init(init.gpa);
@@ -3235,6 +3308,7 @@ test "command surface is exact and rejects incomplete invocations" {
         "check-captured-vm",
         "capture-result",
         "verify-capture",
+        "verify-capture-publication",
     };
     try std.testing.expectEqual(names.len, command_table.len);
     var discard: Writer.Discarding = .init(&.{});

@@ -14,11 +14,16 @@ const Diagnostic = release.contract.Diagnostic;
 const ObjectMap = std.json.ObjectMap;
 const Value = std.json.Value;
 
-pub const schema: i64 = 2;
+pub const schema: i64 = 3;
 pub const result_type = "miz-ubuntu2404-confidential-azure-capture";
 pub const source_acceptance_type =
     "miz-ubuntu2404-confidential-azure-acceptance";
 pub const repository = "cataggar/miz";
+pub const source_qcow_name = "Ubuntu-24.04-x86_64.confidential.qcow2";
+pub const source_provenance_name =
+    "Ubuntu-24.04-x86_64.confidential.qcow2.provenance.json";
+pub const source_acceptance_name =
+    "Ubuntu-24.04-x86_64.confidential.azure-acceptance.json";
 
 pub const Artifact = struct {
     qcow_sha256: []const u8,
@@ -31,6 +36,7 @@ pub const Artifact = struct {
 pub const SourceExpected = struct {
     repository: []const u8,
     commit: []const u8,
+    release_tag: []const u8,
     location: []const u8,
     vm_size: []const u8,
     run_id: []const u8,
@@ -41,6 +47,7 @@ pub const SourceExpected = struct {
 
 pub const Expected = struct {
     source: SourceExpected,
+    tool_commit: []const u8,
     repository: []const u8,
     subscription_id: []const u8,
     location: []const u8,
@@ -103,6 +110,19 @@ pub const Evidence = struct {
 
 pub const Source = struct {
     gallery_image_version_id: []const u8,
+};
+
+pub const PublicationExpected = struct {
+    source_commit: []const u8,
+    source_release_tag: []const u8,
+    tool_commit: []const u8,
+    repository: []const u8,
+    run_id: []const u8,
+    run_attempt: []const u8,
+    subscription_id: []const u8,
+    location: []const u8,
+    image_definition_id: []const u8,
+    image_version_id: []const u8,
 };
 
 fn invalid(
@@ -187,6 +207,19 @@ fn validCommit(text: []const u8) bool {
     return true;
 }
 
+fn validSourceReleaseTag(text: []const u8) bool {
+    const prefix = "Ubuntu-24.04-confidential-";
+    if (!std.mem.startsWith(u8, text, prefix) or
+        text.len != prefix.len + 8)
+    {
+        return false;
+    }
+    for (text[prefix.len..]) |character| {
+        if (character < '0' or character > '9') return false;
+    }
+    return true;
+}
+
 fn validGuid(text: []const u8) bool {
     if (text.len != 36) return false;
     for (text, 0..) |character, index| {
@@ -253,7 +286,11 @@ fn validVersionName(name: []const u8) bool {
     var count: usize = 0;
     while (components.next()) |component| {
         count += 1;
-        if (count > 3 or component.len == 0) return false;
+        if (count > 3 or component.len == 0 or
+            (component.len > 1 and component[0] == '0'))
+        {
+            return false;
+        }
         for (component) |character| {
             if (character < '0' or character > '9') return false;
         }
@@ -450,16 +487,9 @@ pub fn validateCaptureGalleryIds(
 
 fn validScratchResourceGroup(
     resource_group: []const u8,
-    run_id: []const u8,
-    run_attempt: []const u8,
 ) bool {
     if (!validResourceGroupName(resource_group)) return false;
-    var prefix_buffer: [96]u8 = undefined;
-    const prefix = std.fmt.bufPrint(
-        &prefix_buffer,
-        "miz-u2404-cvm-capture-{s}-{s}-",
-        .{ run_id, run_attempt },
-    ) catch return false;
+    const prefix = "miz-u2404-cvm-capture-";
     if (resource_group.len != prefix.len + 32 or
         !std.mem.startsWith(u8, resource_group, prefix))
     {
@@ -654,6 +684,8 @@ fn validateExpected(
     if (!std.mem.eql(u8, expected.source.repository, repository) or
         !std.mem.eql(u8, expected.repository, repository) or
         !validCommit(expected.source.commit) or
+        !validCommit(expected.tool_commit) or
+        !validSourceReleaseTag(expected.source.release_tag) or
         !validDecimal(expected.source.run_id, 20) or
         !validDecimal(expected.source.run_attempt, 10) or
         !validDecimal(expected.run_id, 20) or
@@ -670,11 +702,7 @@ fn validateExpected(
         expected.source.artifact.virtual_size == 0 or
         !std.ascii.eqlIgnoreCase(expected.source.location, expected.location) or
         !validEndpoint(expected.attestation_endpoint) or
-        !validScratchResourceGroup(
-            expected.scratch_resource_group,
-            expected.run_id,
-            expected.run_attempt,
-        ) or
+        !validScratchResourceGroup(expected.scratch_resource_group) or
         !validResourceGroupName(expected.target_resource_group) or
         std.ascii.eqlIgnoreCase(
             expected.scratch_resource_group,
@@ -1129,12 +1157,28 @@ pub fn result(
             expected.source.run_attempt,
         ) },
     });
+    const source_release_assets = try release.azure_compute.object(allocator, &.{
+        .{ "azure_acceptance", try release.azure_compute.object(allocator, &.{
+            .{ "name", release.azure_compute.string(source_acceptance_name) },
+            .{ "sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_acceptance_sha256)) },
+        }) },
+        .{ "build_provenance", try release.azure_compute.object(allocator, &.{
+            .{ "name", release.azure_compute.string(source_provenance_name) },
+            .{ "sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_provenance_sha256)) },
+        }) },
+        .{ "qcow2", try release.azure_compute.object(allocator, &.{
+            .{ "name", release.azure_compute.string(source_qcow_name) },
+            .{ "sha256", release.azure_compute.string(expected.source.artifact.qcow_sha256) },
+        }) },
+    });
     const source_value = try release.azure_compute.object(allocator, &.{
         .{ "acceptance", source_acceptance },
         .{ "artifact", source_artifact },
         .{ "commit", release.azure_compute.string(expected.source.commit) },
         .{ "accepted_gallery_image_version_id", release.azure_compute.string(source.gallery_image_version_id) },
         .{ "release", release.azure_compute.string("24.04") },
+        .{ "release_assets", source_release_assets },
+        .{ "release_tag", release.azure_compute.string(expected.source.release_tag) },
         .{ "staging_gallery_image_version_id", release.azure_compute.string(expected.source.staging_image_version_id) },
     });
     const vm_value = try release.azure_compute.object(allocator, &.{
@@ -1213,6 +1257,7 @@ pub fn result(
         .{ "scratch_resource_group", release.azure_compute.string(expected.scratch_resource_group) },
         .{ "source", source_value },
         .{ "subscription_id", release.azure_compute.string(expected.subscription_id) },
+        .{ "tool_commit", release.azure_compute.string(expected.tool_commit) },
         .{ "type", release.azure_compute.string(result_type) },
         .{ "workflow", try workflowValue(
             allocator,
@@ -1274,6 +1319,420 @@ pub fn validateResult(
         "capture result does not match independently validated external evidence",
         .{},
     );
+}
+
+fn requireExactString(
+    parent: *const ObjectMap,
+    name: []const u8,
+    expected: []const u8,
+    label: []const u8,
+    diagnostic: *Diagnostic,
+) !void {
+    try equal(try string(parent, name, label, diagnostic), expected, label, diagnostic);
+}
+
+fn requireDigest(
+    parent: *const ObjectMap,
+    name: []const u8,
+    label: []const u8,
+    diagnostic: *Diagnostic,
+) ![]const u8 {
+    const value = try string(parent, name, label, diagnostic);
+    _ = release.digest.parseHex(value) catch
+        return invalid(diagnostic, "{s} is invalid", .{label});
+    return value;
+}
+
+fn requireBoolean(
+    parent: *const ObjectMap,
+    name: []const u8,
+    expected: bool,
+    label: []const u8,
+    diagnostic: *Diagnostic,
+) !void {
+    const value = parent.get(name) orelse
+        return invalid(diagnostic, "{s} is missing", .{label});
+    if (value != .bool or value.bool != expected) {
+        return invalid(diagnostic, "{s} is invalid", .{label});
+    }
+}
+
+fn rejectRawSecretFields(
+    value: Value,
+    diagnostic: *Diagnostic,
+) !void {
+    switch (value) {
+        .array => |items| for (items.items) |item| {
+            try rejectRawSecretFields(item, diagnostic);
+        },
+        .object => |map| {
+            var iterator = map.iterator();
+            while (iterator.next()) |entry| {
+                const key = entry.key_ptr.*;
+                for ([_][]const u8{
+                    "access_token",
+                    "authorization",
+                    "jwt",
+                    "nonce",
+                    "oidc_token",
+                    "private_key",
+                    "sas",
+                    "ssh_key",
+                    "token",
+                }) |forbidden| {
+                    if (std.ascii.eqlIgnoreCase(key, forbidden)) {
+                        return invalid(
+                            diagnostic,
+                            "capture result contains a raw secret field",
+                            .{},
+                        );
+                    }
+                }
+                try rejectRawSecretFields(entry.value_ptr.*, diagnostic);
+            }
+        },
+        else => {},
+    }
+}
+
+pub fn validatePublicationResult(
+    root: *const ObjectMap,
+    expected: PublicationExpected,
+    diagnostic: *Diagnostic,
+) !void {
+    if (!exact(root.*, &.{
+        "architecture",
+        "capture",
+        "evidence",
+        "final_acceptance",
+        "gallery",
+        "location",
+        "release",
+        "schema",
+        "scratch_resource_group",
+        "source",
+        "subscription_id",
+        "tool_commit",
+        "type",
+        "workflow",
+    }) or try integer(root, "schema", "capture schema", diagnostic) != schema) {
+        return invalid(diagnostic, "durable capture result shape is invalid", .{});
+    }
+    if (!std.mem.eql(u8, expected.repository, repository) or
+        !validCommit(expected.source_commit) or
+        !validCommit(expected.tool_commit) or
+        !validSourceReleaseTag(expected.source_release_tag) or
+        !validDecimal(expected.run_id, 20) or
+        !validDecimal(expected.run_attempt, 10) or
+        !validGuid(expected.subscription_id) or
+        expected.location.len == 0)
+    {
+        return invalid(diagnostic, "publication expectation is invalid", .{});
+    }
+    try validateCaptureGalleryIds(
+        expected.image_definition_id,
+        expected.image_version_id,
+        expected.subscription_id,
+        diagnostic,
+    );
+    try requireExactString(root, "type", result_type, "capture type", diagnostic);
+    try requireExactString(root, "architecture", "x64", "capture architecture", diagnostic);
+    try requireExactString(root, "release", "24.04", "capture release", diagnostic);
+    try requireExactString(root, "location", expected.location, "capture location", diagnostic);
+    try requireExactString(
+        root,
+        "subscription_id",
+        expected.subscription_id,
+        "capture subscription",
+        diagnostic,
+    );
+    try requireExactString(
+        root,
+        "tool_commit",
+        expected.tool_commit,
+        "capture tool commit",
+        diagnostic,
+    );
+
+    const workflow = try object(root, "workflow", "capture workflow", diagnostic);
+    if (!exact(workflow, &.{ "repository", "run_attempt", "run_id" })) {
+        return invalid(diagnostic, "capture workflow shape is invalid", .{});
+    }
+    try requireExactString(
+        &workflow,
+        "repository",
+        expected.repository,
+        "capture repository",
+        diagnostic,
+    );
+    try requireExactString(&workflow, "run_id", expected.run_id, "capture run ID", diagnostic);
+    try requireExactString(
+        &workflow,
+        "run_attempt",
+        expected.run_attempt,
+        "capture run attempt",
+        diagnostic,
+    );
+
+    const source = try object(root, "source", "capture source", diagnostic);
+    if (!exact(source, &.{
+        "acceptance",
+        "accepted_gallery_image_version_id",
+        "artifact",
+        "commit",
+        "release",
+        "release_assets",
+        "release_tag",
+        "staging_gallery_image_version_id",
+    })) return invalid(diagnostic, "capture source shape is invalid", .{});
+    try requireExactString(
+        &source,
+        "commit",
+        expected.source_commit,
+        "source commit",
+        diagnostic,
+    );
+    try requireExactString(
+        &source,
+        "release_tag",
+        expected.source_release_tag,
+        "source release tag",
+        diagnostic,
+    );
+    try requireExactString(&source, "release", "24.04", "source release", diagnostic);
+    try validateSourceVersionId(
+        try string(
+            &source,
+            "accepted_gallery_image_version_id",
+            "accepted source version",
+            diagnostic,
+        ),
+        expected.subscription_id,
+        diagnostic,
+    );
+    try validateSourceVersionId(
+        try string(
+            &source,
+            "staging_gallery_image_version_id",
+            "staging source version",
+            diagnostic,
+        ),
+        expected.subscription_id,
+        diagnostic,
+    );
+
+    const artifact = try object(&source, "artifact", "source artifact", diagnostic);
+    if (!exact(artifact, &.{
+        "qcow_sha256",
+        "qcow_size",
+        "vhd_sha256",
+        "vhd_size",
+        "virtual_size",
+    })) return invalid(diagnostic, "source artifact shape is invalid", .{});
+    const qcow_sha256 = try requireDigest(
+        &artifact,
+        "qcow_sha256",
+        "source QCOW2 SHA-256",
+        diagnostic,
+    );
+    _ = try requireDigest(&artifact, "vhd_sha256", "source VHD SHA-256", diagnostic);
+    for ([_][]const u8{ "qcow_size", "vhd_size", "virtual_size" }) |field| {
+        _ = try positive(try integer(&artifact, field, field, diagnostic), field, diagnostic);
+    }
+
+    const evidence = try object(root, "evidence", "capture evidence", diagnostic);
+    const evidence_fields = [_][]const u8{
+        "capture_disk_sha256",
+        "capture_vm_instance_sha256",
+        "capture_vm_sha256",
+        "final_vm_instance_sha256",
+        "final_vm_sha256",
+        "gallery_request_sha256",
+        "gallery_response_sha256",
+        "image_definition_sha256",
+        "jwks_sha256",
+        "nonce_sha256",
+        "openid_sha256",
+        "scratch_inventory_sha256",
+        "snapshot_sha256",
+        "source_acceptance_sha256",
+        "source_provenance_sha256",
+        "source_staging_definition_sha256",
+        "source_staging_disk_sha256",
+        "source_staging_gallery_request_sha256",
+        "source_staging_gallery_response_sha256",
+        "source_staging_managed_image_sha256",
+        "token_sha256",
+    };
+    if (!exact(evidence, &evidence_fields)) {
+        return invalid(diagnostic, "capture evidence shape is invalid", .{});
+    }
+    for (evidence_fields) |field| {
+        _ = try requireDigest(&evidence, field, field, diagnostic);
+    }
+
+    const release_assets = try object(
+        &source,
+        "release_assets",
+        "source release assets",
+        diagnostic,
+    );
+    if (!exact(release_assets, &.{ "azure_acceptance", "build_provenance", "qcow2" })) {
+        return invalid(diagnostic, "source release asset shape is invalid", .{});
+    }
+    const asset_contract = [_]struct {
+        []const u8,
+        []const u8,
+        []const u8,
+    }{
+        .{ "azure_acceptance", source_acceptance_name, "source_acceptance_sha256" },
+        .{ "build_provenance", source_provenance_name, "source_provenance_sha256" },
+        .{ "qcow2", source_qcow_name, "qcow_sha256" },
+    };
+    for (asset_contract) |entry| {
+        const asset = try object(&release_assets, entry[0], entry[0], diagnostic);
+        if (!exact(asset, &.{ "name", "sha256" })) {
+            return invalid(diagnostic, "source release asset entry is invalid", .{});
+        }
+        try requireExactString(&asset, "name", entry[1], "source asset name", diagnostic);
+        const expected_digest = if (std.mem.eql(u8, entry[2], "qcow_sha256"))
+            qcow_sha256
+        else
+            try string(&evidence, entry[2], "source asset digest", diagnostic);
+        try requireExactString(
+            &asset,
+            "sha256",
+            expected_digest,
+            "source asset SHA-256",
+            diagnostic,
+        );
+    }
+
+    const gallery = try object(root, "gallery", "capture gallery", diagnostic);
+    if (!exact(gallery, &.{ "definition", "version" })) {
+        return invalid(diagnostic, "capture gallery shape is invalid", .{});
+    }
+    const definition = try object(&gallery, "definition", "capture definition", diagnostic);
+    if (!exact(definition, &.{ "id", "security_type" })) {
+        return invalid(diagnostic, "capture definition shape is invalid", .{});
+    }
+    try requireExactString(
+        &definition,
+        "id",
+        expected.image_definition_id,
+        "capture definition ID",
+        diagnostic,
+    );
+    try requireExactString(
+        &definition,
+        "security_type",
+        release.azure_confidential_vm.captured_image_security_type,
+        "capture definition security type",
+        diagnostic,
+    );
+    const version = try object(&gallery, "version", "capture version", diagnostic);
+    if (!exact(version, &.{
+        "encryption_type",
+        "id",
+        "replication_mode",
+        "request",
+        "response",
+        "source_snapshot_id",
+    })) return invalid(diagnostic, "capture version shape is invalid", .{});
+    try requireExactString(
+        &version,
+        "id",
+        expected.image_version_id,
+        "capture version ID",
+        diagnostic,
+    );
+    try requireExactString(
+        &version,
+        "encryption_type",
+        release.azure_confidential_vm.gallery_os_disk_encryption_type,
+        "capture version encryption",
+        diagnostic,
+    );
+    try requireExactString(
+        &version,
+        "replication_mode",
+        "Full",
+        "capture replication mode",
+        diagnostic,
+    );
+    try validateSnapshotId(
+        try string(&version, "source_snapshot_id", "capture snapshot ID", diagnostic),
+        expected.subscription_id,
+        diagnostic,
+    );
+    _ = try object(&version, "request", "capture gallery request", diagnostic);
+    _ = try object(&version, "response", "capture gallery response", diagnostic);
+
+    const final_acceptance = try object(
+        root,
+        "final_acceptance",
+        "final acceptance",
+        diagnostic,
+    );
+    if (!exact(final_acceptance, &.{ "attestation", "vm" })) {
+        return invalid(diagnostic, "final acceptance shape is invalid", .{});
+    }
+    const attestation = try object(
+        &final_acceptance,
+        "attestation",
+        "final attestation",
+        diagnostic,
+    );
+    if (!exact(attestation, &.{
+        "compliance",
+        "debuggable",
+        "issuer",
+        "secure_boot",
+        "tee",
+        "vm_id",
+        "vtpm",
+    })) return invalid(diagnostic, "final attestation shape is invalid", .{});
+    try requireExactString(
+        &attestation,
+        "compliance",
+        "azure-compliant-cvm",
+        "final attestation compliance",
+        diagnostic,
+    );
+    try requireExactString(
+        &attestation,
+        "tee",
+        "AMD SEV-SNP",
+        "final attestation TEE",
+        diagnostic,
+    );
+    try requireBoolean(
+        &attestation,
+        "debuggable",
+        false,
+        "final attestation debuggable state",
+        diagnostic,
+    );
+    try requireBoolean(
+        &attestation,
+        "secure_boot",
+        true,
+        "final attestation Secure Boot state",
+        diagnostic,
+    );
+    try requireBoolean(
+        &attestation,
+        "vtpm",
+        true,
+        "final attestation vTPM state",
+        diagnostic,
+    );
+    if (!validEndpoint(try string(&attestation, "issuer", "attestation issuer", diagnostic)) or
+        !validGuid(try string(&attestation, "vm_id", "attested VM ID", diagnostic)))
+    {
+        return invalid(diagnostic, "final attestation identity is invalid", .{});
+    }
+    try rejectRawSecretFields(.{ .object = root.* }, diagnostic);
 }
 
 test "Azure capture resource IDs are structural and exact" {
@@ -1352,7 +1811,7 @@ test "Azure capture resource IDs are structural and exact" {
 
 const test_subscription = "00000000-0000-0000-0000-000000000000";
 const test_group =
-    "miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff";
+    "miz-u2404-cvm-capture-00112233445566778899aabbccddeeff";
 const test_prefix = "/subscriptions/" ++ test_subscription ++
     "/resourceGroups/" ++ test_group ++ "/providers/Microsoft.Compute/";
 const test_source_version = "/subscriptions/" ++ test_subscription ++
@@ -1378,6 +1837,7 @@ fn testExpected() Expected {
         .source = .{
             .repository = repository,
             .commit = "0123456789abcdef0123456789abcdef01234567",
+            .release_tag = "Ubuntu-24.04-confidential-20260907",
             .location = "eastus2",
             .vm_size = "Standard_DC2as_v5",
             .run_id = "123",
@@ -1391,6 +1851,7 @@ fn testExpected() Expected {
                 .virtual_size = 3584,
             },
         },
+        .tool_commit = "fedcba9876543210fedcba9876543210fedcba98",
         .repository = repository,
         .subscription_id = test_subscription,
         .location = "eastus2",
@@ -1435,17 +1896,17 @@ fn testEvidence() Evidence {
     };
 }
 
-test "capture expectations enforce exact randomized scratch scope" {
+test "capture expectations enforce exact generic randomized scratch scope" {
     var diagnostic: Diagnostic = .{};
     try validateExpected(std.testing.allocator, testExpected(), &diagnostic);
 
     const invalid_groups = [_][]const u8{
-        "miz-u2404-cvm-capture-456-2",
-        "miz-u2404-cvm-capture-456-2-00112233445566778899AABBCCDDEEFF",
-        "miz-u2404-cvm-capture-456-2-0011223344556677",
-        "miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff-extra",
-        "miz-u2404-cvm-capture-4567-2-00112233445566778899aabbccddeeff",
-        "miz-u2404-cvm-capture-45-6-2-00112233445566778899aabbccddeeff",
+        "miz-u2404-cvm-capture-0011223344556677",
+        "miz-u2404-cvm-capture-00112233445566778899AABBCCDDEEFF",
+        "miz-u2404-cvm-capture-00112233445566778899aabbccddeefg",
+        "miz-u2404-cvm-capture-00112233445566778899aabbccddeeff-extra",
+        "miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff",
+        "other-u2404-cvm-capture-00112233445566778899aabbccddeeff",
     };
     for (invalid_groups) |group| {
         diagnostic = .{};
@@ -1460,7 +1921,7 @@ test "capture expectations enforce exact randomized scratch scope" {
     var expected = testExpected();
     expected.capture_disk_id =
         "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/" ++
-        "miz-u2404-cvm-capture-456-2-ffeeddccbbaa99887766554433221100" ++
+        "miz-u2404-cvm-capture-ffeeddccbbaa99887766554433221100" ++
         "/providers/Microsoft.Compute/disks/capture-os";
     diagnostic = .{};
     try std.testing.expectError(
@@ -1495,17 +1956,17 @@ test "capture expectations enforce exact randomized scratch scope" {
 test "scratch ARM scope parsing is case-insensitive and segment-safe" {
     var diagnostic: Diagnostic = .{};
     try validateScratchArmId(
-        "/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/MIZ-U2404-CVM-CAPTURE-456-2-00112233445566778899AABBCCDDEEFF/PROVIDERS/Microsoft.Network/networkInterfaces/source",
+        "/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/MIZ-U2404-CVM-CAPTURE-00112233445566778899AABBCCDDEEFF/PROVIDERS/Microsoft.Network/networkInterfaces/source",
         test_subscription,
         test_group,
         "network interface",
         &diagnostic,
     );
     const invalid_ids = [_][]const u8{
-        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-456-2-ffeeddccbbaa99887766554433221100/providers/Microsoft.Compute/disks/data",
-        "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff/providers/Microsoft.Compute/disks/data",
-        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff-extra/providers/Microsoft.Compute/disks/data",
-        "prefix/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff/providers/Microsoft.Compute/disks/data",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-ffeeddccbbaa99887766554433221100/providers/Microsoft.Compute/disks/data",
+        "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/miz-u2404-cvm-capture-00112233445566778899aabbccddeeff/providers/Microsoft.Compute/disks/data",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-00112233445566778899aabbccddeeff-extra/providers/Microsoft.Compute/disks/data",
+        "prefix/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-00112233445566778899aabbccddeeff/providers/Microsoft.Compute/disks/data",
     };
     for (invalid_ids) |id| {
         diagnostic = .{};
@@ -1741,6 +2202,47 @@ test "capture result independently rejects provenance substitutions" {
         evidence,
         &diagnostic,
     );
+    const expected = testExpected();
+    const publication_expected: PublicationExpected = .{
+        .source_commit = expected.source.commit,
+        .source_release_tag = expected.source.release_tag,
+        .tool_commit = expected.tool_commit,
+        .repository = expected.repository,
+        .run_id = expected.run_id,
+        .run_attempt = expected.run_attempt,
+        .subscription_id = expected.subscription_id,
+        .location = expected.location,
+        .image_definition_id = expected.image_definition_id,
+        .image_version_id = expected.image_version_id,
+    };
+    try validatePublicationResult(
+        &valid_value.object,
+        publication_expected,
+        &diagnostic,
+    );
+    var mismatched_publication = publication_expected;
+    mismatched_publication.tool_commit = expected.source.commit;
+    diagnostic = .{};
+    try std.testing.expectError(
+        error.InvalidDocument,
+        validatePublicationResult(
+            &valid_value.object,
+            mismatched_publication,
+            &diagnostic,
+        ),
+    );
+    mismatched_publication = publication_expected;
+    mismatched_publication.image_version_id =
+        test_definition ++ "/versions/9.9.9";
+    diagnostic = .{};
+    try std.testing.expectError(
+        error.InvalidDocument,
+        validatePublicationResult(
+            &valid_value.object,
+            mismatched_publication,
+            &diagnostic,
+        ),
+    );
     const valid = try std.json.Stringify.valueAlloc(allocator, valid_value, .{});
 
     const substitutions = [_][2][]const u8{
@@ -1794,7 +2296,7 @@ test "capture result independently rejects provenance substitutions" {
         },
         .{
             "\"scratch_resource_group\":\"" ++ test_group ++ "\"",
-            "\"scratch_resource_group\":\"miz-u2404-cvm-capture-456-2-ffeeddccbbaa99887766554433221100\"",
+            "\"scratch_resource_group\":\"miz-u2404-cvm-capture-ffeeddccbbaa99887766554433221100\"",
         },
         .{
             "\"architecture\":\"x64\",\"capture\"",

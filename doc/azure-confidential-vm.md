@@ -207,6 +207,425 @@ and the enforced SEV-SNP, Secure Boot, vTPM, compliance, and non-debug state.
 The temporary Azure resources are deleted; the result is the durable evidence
 that those exact candidate bytes passed the protected deployment.
 
+## Protected ConfidentialVM capture workflow
+
+`.github/workflows/ubuntu2404-confidential-capture.yml` promotes one already
+accepted three-asset source release into a full ConfidentialVM gallery image.
+It is manual-dispatch only, accepts only `cataggar/miz` `main`, and serializes
+every target version through the stable, non-canceling concurrency group
+`ubuntu2404-confidential-cvm-target-version`. The approved dispatch commit is
+always `${{ github.sha }}`: every job checks out that exact commit, verifies
+`git rev-parse HEAD == GITHUB_SHA`, and freshly requires remote `main` still to
+equal `GITHUB_SHA` before Azure or release mutation. If `main` advances while
+environment approval or validation is pending, the run fails and must be
+redispatched; it never checks out or executes the newer code.
+
+The workflow owns the provenance tag name:
+`miz-provenance/ubuntu2404-confidential-cvm/vMAJOR.MINOR.PATCH/origin-RUN_ID-attempt-RUN_ATTEMPT/tool-TOOL_COMMIT`.
+The tag and release must both be absent for a new dispatch. Do not pre-create
+the tag. Recovery reuses the original run, attempt, and evidence `TOOL_COMMIT`,
+so it deterministically derives the same name.
+
+Create the GitHub environment `ubuntu2404-confidential-capture`, restrict it to
+the `main` branch, require at least one designated release reviewer, and
+disable self-review so the dispatcher cannot approve the deployment.
+Configure:
+
+| Kind | Name | Meaning |
+|---|---|---|
+| Secret | `AZURE_CAPTURE_CLIENT_ID` | narrow scratch/capture Entra application |
+| Secret | `AZURE_PUBLICATION_CLIENT_ID` | distinct exclusive version publisher |
+| Secret | `AZURE_TENANT_ID` | common Entra tenant |
+| Secret | `AZURE_SUBSCRIPTION_ID` | common capture/target subscription |
+| Secret | `CAPTURE_GITHUB_APP_ID` | repository-installed protected capture GitHub App ID |
+| Secret | `CAPTURE_GITHUB_APP_PRIVATE_KEY` | PEM private key for that GitHub App |
+| Variable | `CAPTURE_RELEASE_WRITER_POLICY` | exact `owner-and-publisher-app-only-v1` acknowledgement after the manual installed-App audit |
+| Variable | `AZURE_LOCATION` | previously live-qualified region |
+| Variable | `AZURE_VM_SIZE` | previously live-qualified AMD SEV-SNP SKU |
+| Variable | `TARGET_RESOURCE_GROUP` | pre-provisioned durable resource group |
+| Variable | `TARGET_GALLERY` | pre-provisioned private gallery |
+| Variable | `TARGET_IMAGE_DEFINITION` | pre-provisioned full ConfidentialVM definition |
+| Variable | `TARGET_OWNER_TAG` | durable `miz-owner` tag on every target parent |
+| Secret | `SCRATCH_RESERVATION_TAG` | owner-only reservation value on the empty pre-provisioned scratch RG |
+| Variable | `CAPTURE_TARGET_READ_SCOPE` | exact preexisting target resource-group ID |
+| Variable | `PUBLICATION_SNAPSHOT_READ_SCOPE` | exact pre-provisioned scratch resource-group ID |
+| Variable | `PUBLICATION_VERSION_WRITE_SCOPE` | exact preexisting target image-definition resource ID |
+
+Both applications need a federated credential with subject
+`repo:cataggar/miz:environment:ubuntu2404-confidential-capture`. They must not
+share a client ID. The workflow logs them into separate owner-only absolute
+Azure CLI configuration directories, verifies tenant, subscription, principal
+type, and signed-in client ID, and obtains the publisher token only after the
+capture state is exactly prepared. It refreshes the capture token immediately
+before publication validation and again on the unconditional cleanup path.
+No access token, OIDC request token, JWT, SAS, SSH key, Azure CLI configuration,
+or raw attestation bundle is serialized into recovery state or uploaded.
+
+Enable **immutable releases** in the repository settings before creating the
+accepted source release or dispatching capture. The workflow queries
+`GET /repos/cataggar/miz/immutable-releases` with the pinned official GitHub
+REST API version in a protected preflight before any Azure login or mutation
+and requires `enabled=true`; it never changes the repository setting.
+`GITHUB_TOKEN` cannot receive the required repository Administration access.
+Install a dedicated GitHub App on only `cataggar/miz` with repository
+permissions **Administration: write**, **Actions: read**, **Contents: write**,
+and **Workflows: write**. The pinned official
+`actions/create-github-app-token` action mints a fresh installation token in
+each protected job. The three policy tokens request **Administration: write**,
+**Actions: read**, and **Contents: read**. Ruleset write access is required
+because GitHub omits `bypass_actors` from a ruleset response for callers that
+cannot write the ruleset; an omitted bypass list is a hard failure. The
+publication job separately mints a token with only **Contents: write** and
+**Workflows: write**. The Administration-write policy token performs only
+reads and artifact download; the content token performs the draft
+create/read/upload/publish operations and never performs an Administration
+query. Every token is revoked at job completion. Never expose or upload the
+App private key or an installation token. `CAPTURE_GITHUB_APP_ID` is the
+GitHub App/integration ID used by the sole ruleset `Integration` bypass actor
+and identifies the intended publisher in the protected configuration.
+It is not the App installation ID. The accepted source release itself must
+report `immutable=true`, be published, and be neither a draft nor a
+prerelease. Its exact tag must resolve
+to the recorded source commit. A repository or token for which the setting,
+human-writer policy, ruleset, or release immutability cannot be queried is not
+eligible for capture.
+
+The GitHub repository trust root is the repository owner and administrators,
+the identities approved to write or merge default-branch workflow code, and
+the protected-environment administrators and reviewers. For this personal
+repository the collaborator check below mechanically constrains human
+push/maintain/admin access to `cataggar`, but a trusted administrator can
+always change approved workflow code, collaborators, Apps, repository
+settings, or environment configuration. Compromised trusted administrators
+are outside the security boundary. This is the explicit trusted computing
+base: anyone who can approve or merge a workflow change can already alter the
+capture workflow.
+
+GitHub does not document a repository endpoint that enumerates every installed
+GitHub App and its repository permissions. Before setting or retaining the
+protected-environment variable `CAPTURE_RELEASE_WRITER_POLICY`, environment
+administrators and reviewers must manually audit the Apps installed on
+`cataggar/miz` and confirm that no App other than the publishing App has
+**Contents: write**. Set the exact value
+`owner-and-publisher-app-only-v1` only while that audit remains true. The value
+is an operational acknowledgement, not cryptographic proof. The workflow
+fails when it is absent or different and checks it in the protected `prepare`
+job, before Azure access, and again at every GitHub release mutation boundary.
+It is deliberately an environment variable rather than a dispatch input, so a
+dispatcher cannot self-assert the prerequisite.
+
+The security boundary deliberately supports only the personal repository
+`cataggar/miz`. Before Azure access and at every GitHub release mutation
+boundary, the policy token requires all mechanically enumerable conditions
+below without changing any setting:
+
+- `GET /repos/cataggar/miz` reports `owner.login=cataggar`,
+  `owner.type=User`, and no organization object. Organization teams, base
+  permissions, and custom repository roles are therefore outside this bounded
+  design.
+- Paginated
+  `GET /repos/cataggar/miz/collaborators?affiliation=all&per_page=100`
+  returns complete `permissions.push`, `permissions.maintain`, and
+  `permissions.admin` booleans, with no writer except the repository owner.
+  OAuth Apps and user tokens act through one of these user identities, so the
+  trusted owner is the only unavoidable user release writer.
+- `GET /repos/cataggar/miz/actions/permissions/workflow` reports
+  `default_workflow_permissions=read` and
+  `can_approve_pull_request_reviews=false`. Only workflow code accepted by the
+  trusted owner on the default branch can explicitly elevate a job token.
+
+Deploy keys cannot call the releases API and receive no tag-ruleset bypass.
+Personal repositories have no team or organization custom-role grants. The
+repository owner remains the human writer and administrator trust root; all
+non-owner human release writers are prohibited rather than treated as mutually
+trusted.
+
+Create exactly one repository tag ruleset named
+`ubuntu2404-confidential-provenance-tags`. No organization/enterprise parent
+tag ruleset or additional repository tag ruleset may apply: the workflow asks
+`GET /repos/cataggar/miz/rulesets?includes_parents=true&targets=tag`, requires
+exactly one result, retrieves its full representation, and fails closed on an
+inherited, ambiguous, inactive, or unsupported shape. Provision the ruleset
+with this exact request body, replacing the example numeric actor ID with the
+GitHub App ID:
+
+```json
+{
+  "name": "ubuntu2404-confidential-provenance-tags",
+  "target": "tag",
+  "enforcement": "active",
+  "bypass_actors": [
+    {
+      "actor_id": 123456,
+      "actor_type": "Integration",
+      "bypass_mode": "always"
+    }
+  ],
+  "conditions": {
+    "ref_name": {
+      "include": [
+        "refs/tags/miz-provenance/ubuntu2404-confidential-cvm/*/*/*"
+      ],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {"type": "creation"},
+    {"type": "update"},
+    {"type": "deletion"}
+  ]
+}
+```
+
+Create it manually with the repository rulesets
+`POST /repos/cataggar/miz/rulesets` endpoint; do not grant any other bypass
+actor or use `pull_request`/`exempt` bypass mode. The active creation, update,
+and deletion rules make the protected publishing App the only actor that can
+create, move, or delete a matching tag. The workflow verifies the exact
+conditions, rules, and sole `Integration`/`always` bypass through
+**Administration: write** before Azure mutation and again before draft
+discovery, creation, asset upload, and publication. The three explicit `*`
+components match exactly the generated `vVERSION/origin-.../tool-SHA` suffix
+under `File.fnmatch` with `FNM_PATHNAME`; the former terminal `**` did not
+cross those path separators. The workflow never creates or modifies the
+ruleset.
+
+Before dispatch, provision a unique empty scratch resource group named
+`miz-u2404-cvm-capture-<32-lowercase-hex>` in the configured subscription and
+region. Generate the 128-bit suffix with a cryptographically secure random
+source; the name is deliberately independent of the future GitHub run ID so
+the resource group and its role assignments can be provisioned before
+dispatch.
+Give it exactly the tags
+`miz-owner=ubuntu2404-confidential-capture`,
+`miz-repository=cataggar/miz`, and
+`miz-reservation=SCRATCH_RESERVATION_TAG`. Pass its name as the required
+`scratch_resource_group` dispatch input. Both role assignments on this group
+therefore exist before dispatch. The harness refuses a missing, nonempty,
+mismatched, or already claimed group, atomically replaces the reservation tags
+with the immutable origin tags, and later deletes only that exact claimed
+group. The validated recovery state and exact ownership tags, not the generic
+resource-group name, bind it to the stable origin run and attempt.
+
+Use custom roles with no wildcard control-plane permissions. Assign the
+capture scratch-lifecycle role at that exact pre-provisioned scratch
+resource-group scope. Assign a separate custom role containing only
+`Microsoft.Compute/skus/read` at subscription scope for the configured
+region/SKU check. The scratch-lifecycle role's complete action list is:
+
+- `Microsoft.Resources/subscriptions/resourceGroups/read`,
+  `Microsoft.Resources/subscriptions/resourceGroups/write`, and
+  `Microsoft.Resources/subscriptions/resourceGroups/delete`;
+- `Microsoft.Resources/subscriptions/resourceGroups/resources/read`,
+  `Microsoft.Resources/tags/write`,
+  `Microsoft.Compute/disks/read`,
+  `Microsoft.Compute/disks/write`,
+  `Microsoft.Compute/disks/beginGetAccess/action`,
+  `Microsoft.Compute/disks/endGetAccess/action`,
+  `Microsoft.Compute/images/read`,
+  `Microsoft.Compute/images/write`,
+  `Microsoft.Compute/snapshots/read`,
+  `Microsoft.Compute/snapshots/write`,
+  `Microsoft.Compute/virtualMachines/read`,
+  `Microsoft.Compute/virtualMachines/write`,
+  `Microsoft.Compute/virtualMachines/start/action`,
+  `Microsoft.Compute/virtualMachines/deallocate/action`,
+  `Microsoft.Compute/virtualMachines/generalize/action`,
+  `Microsoft.Compute/virtualMachines/instanceView/read`,
+  `Microsoft.Compute/virtualMachines/extensions/read`,
+  `Microsoft.Compute/virtualMachines/extensions/write`,
+  `Microsoft.Compute/galleries/read`,
+  `Microsoft.Compute/galleries/write`,
+  `Microsoft.Compute/galleries/images/read`,
+  `Microsoft.Compute/galleries/images/write`,
+  `Microsoft.Compute/galleries/images/versions/read`,
+  `Microsoft.Compute/galleries/images/versions/write`,
+  `Microsoft.Network/virtualNetworks/read`,
+  `Microsoft.Network/virtualNetworks/write`,
+  `Microsoft.Network/virtualNetworks/subnets/read`,
+  `Microsoft.Network/virtualNetworks/subnets/write`,
+  `Microsoft.Network/virtualNetworks/subnets/join/action`,
+  `Microsoft.Network/networkSecurityGroups/read`,
+  `Microsoft.Network/networkSecurityGroups/write`,
+  `Microsoft.Network/networkSecurityGroups/join/action`,
+  `Microsoft.Network/networkSecurityGroups/securityRules/read`,
+  `Microsoft.Network/networkSecurityGroups/securityRules/write`,
+  `Microsoft.Network/publicIPAddresses/read`,
+  `Microsoft.Network/publicIPAddresses/write`,
+  `Microsoft.Network/publicIPAddresses/join/action`,
+  `Microsoft.Network/networkInterfaces/read`,
+  `Microsoft.Network/networkInterfaces/write`,
+  `Microsoft.Network/networkInterfaces/join/action`; and
+- in a separate read-only custom role assigned at the preexisting durable
+  target resource-group scope,
+  `Microsoft.Resources/subscriptions/resourceGroups/read`,
+  `Microsoft.Compute/galleries/read`,
+  `Microsoft.Compute/galleries/images/read`, and
+  `Microsoft.Compute/galleries/images/versions/read`. These reads cover target
+  parent validation, exact target-version validation, and the final deployment
+  from that version. The capture principal has no target version delete and no
+  target resource-group, gallery, image-definition, or version write.
+
+The exclusive publisher requires **two separate, pre-provisionable role
+assignments**:
+
+1. Assign a custom role containing only
+   `Microsoft.Compute/snapshots/read` at the pre-provisioned scratch
+   resource-group ID
+   `/subscriptions/SUBSCRIPTION_ID/resourceGroups/SCRATCH_RESOURCE_GROUP`.
+   The role has no other action and the harness accepts only the exact
+   origin-tagged snapshot ID in that group.
+2. Assign a second custom role at the **preexisting image-definition resource
+   ID**
+   `/subscriptions/SUBSCRIPTION_ID/resourceGroups/TARGET_RESOURCE_GROUP/providers/Microsoft.Compute/galleries/TARGET_GALLERY/images/TARGET_IMAGE_DEFINITION`.
+   Its complete action list is
+   `Microsoft.Compute/galleries/read`,
+   `Microsoft.Compute/galleries/images/read`,
+   `Microsoft.Compute/galleries/images/versions/read`, and
+   `Microsoft.Compute/galleries/images/versions/write`.
+
+The publisher has no version delete permission and no resource-group, gallery,
+or image-definition write/delete permission. In particular, do not attempt to
+assign its writer role at
+`.../images/TARGET_IMAGE_DEFINITION/versions/MAJOR.MINOR.PATCH`: that version
+scope does not exist before dispatch. The workflow never creates role
+definitions or assignments. The exclusive version writer plus the stable,
+non-canceling concurrency group is the check-to-PUT race boundary. Azure RBAC
+and a malicious subscription Owner are outside what the workflow or harness
+can prove, so operators must independently review effective assignments before
+dispatch.
+
+The durable target resource group, private gallery, and image definition must
+already exist in the same subscription and region as the accepted source. They
+carry exact `miz-owner` and `miz-repository=cataggar/miz` tags. The definition
+is Ubuntu 24.04 x64 AMD SEV-SNP, generalized Gen2, with
+`SecurityType=ConfidentialVM`; it is never created, updated, or deleted by the
+workflow. Azure creates the captured VM Guest State. The resulting full image
+creates Confidential VMs only: deployed VMs use `VMGuestStateOnly`, while the
+gallery version records `EncryptedVMGuestStateOnlyWithPmk`. Replication is
+`Full`, and source recreation, capture, snapshot, target, and final acceptance
+remain in the same region and subscription.
+
+The source release must be immutable, published, non-draft, non-prerelease, and
+contain exactly the QCOW2, build provenance JSON, and Azure acceptance JSON
+documented above. The workflow downloads those three assets by exact asset ID,
+validates their hashes and shape with the accepted-source tooling, and derives
+the source commit, source run/attempt, location, and VM size from the validated
+release evidence. It never adds an asset to that source release.
+
+The capture harness has explicit `prepare`, `adopt-recovery`,
+`inspect-recovery`, `publish`, `recover`, `finalize`, and `cleanup` stages.
+Recovery first runs the non-Azure
+`adopt-recovery` transition so a downloaded durable dispatch marker is
+atomically persisted as quarantined before result discovery, Azure login, or
+fresh target inspection. Normal dispatch fixes
+`origin_run_id` and `origin_run_attempt` to the initial run. Manual recovery
+requires both original values or neither; current retry identity never replaces
+the origin used in resource names, tags, artifact names, or durable provenance.
+Before target PUT, the workflow uploads only owner-readable sanitized
+`capture-state.json` and `recovery-intent.json`, then a separate sanitized PUT
+dispatch marker. All three artifacts are named from origin run, origin attempt,
+and target version and are retained for 90 days. They contain identities,
+resource IDs, state, and hashes only: no SAS, access token, OIDC token, JWT,
+nonce, key, Azure CLI configuration, OpenID document, JWKS, or raw attestation
+bundle.
+
+Once PUT is dispatched, scratch deletion is prohibited until the exact
+sanitized `capture-result.json` has been uploaded for 90 days and `finalize`
+has durably acknowledged its hash. A failed result upload, result
+acknowledgement, or post-PUT cleanup therefore leaves the origin-tagged scratch
+group visibly quarantined. An unconditional cleanup may delete only a
+pre-PUT group or a post-upload durable group.
+
+Recovery downloads the exact origin artifact, verifies the GitHub artifact
+digest, owner-only permissions, exact schema and full source/tool/target/origin
+identity, then freshly retrieves Azure and MAA evidence from retained scratch.
+The origin attempt must still be the exact workflow-dispatch event in
+`cataggar/miz`, on `main`, at the expected workflow path, and its `head_sha`
+must equal the recorded evidence `TOOL_COMMIT`. Recovery separately checks out
+and executes only the current approved dispatch `GITHUB_SHA`; it fetches the
+origin commit only to prove that retained evidence commit still exists. Thus an
+older origin script is never executed merely because recovery evidence names
+it, while the durable result continues to be verified against the exact
+original tool commit.
+If the exact target version exists, its tags, snapshot source, security
+contract, region, replication state, and origin must all match before recovery
+continues final deployment and attestation; recovery never issues a second
+PUT. If the version is absent and no durable dispatch marker exists, one new
+dispatch marker may be uploaded and publication may proceed once. An absent
+version after a durable dispatch marker, or any mismatched/missing artifact,
+digest, state, tag, or resource, is ambiguous and fails closed.
+
+If an origin-bound result artifact is already durable—for example, only
+scratch cleanup or provenance publication failed—the recovery dispatch searches
+the repository-wide exact artifact name across original and physical recovery
+runs. It verifies each REST artifact digest, the producing workflow identity,
+and the full result identity, refuses zero-or-multiple ambiguity where a result
+is required, and persists the one physical upload run ID. It then proceeds
+directly to provenance publication without another Azure login, target PUT,
+deployment, or attestation run. This preserves the original result digest and
+allows an exact owned draft release to resume.
+
+Use explicit manual recovery rather than rerunning with a new origin:
+
+```console
+gh workflow run ubuntu2404-confidential-capture.yml --ref main \
+  -f source_release_tag=Ubuntu-24.04-confidential-YYYYMMDD \
+  -f target_gallery_version=MAJOR.MINOR.PATCH \
+  -f scratch_resource_group=miz-u2404-cvm-capture-32_LOWERCASE_HEX \
+  -f origin_run_id=ORIGINAL_RUN_ID \
+  -f origin_run_attempt=ORIGINAL_RUN_ATTEMPT
+```
+
+Only the sanitized `capture-result.json` crosses into provenance publication.
+The publication job
+re-hashes it, validates protected source/tool/run/target identities with
+`verify-capture-publication`, uploads one deterministically named provenance
+JSON to a controlled draft GitHub release, downloads and revalidates that exact
+asset, then publishes the release. An exact owned draft may be resumed only
+when tag, tool commit, title, origin identity, recovery intent digest, and any
+staged asset all match; a foreign or mismatched draft is refused, and a
+published release is never overwritten. The final provenance tag remains
+absent while the draft and its one asset are validated. Immediately before
+draft discovery, draft creation, asset upload, and publication, the workflow
+revalidates the protected release-writer acknowledgement, owner-only human
+writer policy, and exact active tag ruleset. It also revalidates immutable
+releases, current `main`, draft identity, asset digest, and tag absence
+immediately before publication. Draft create, resume, upload, validation, and
+publication remain in one protected job after its single environment approval,
+with no later approval or wait gap.
+The isolated content token then PATCHes the exact draft while resending
+`tag_name`, `target_commitish=TOOL_COMMIT`, title, body, `prerelease=false`,
+and the string-valued `make_latest="false"` together with `draft=false`. This
+keeps the provenance-only release from replacing the repository's Latest
+release and narrows accidental identity drift; writer exclusivity remains the
+race-prevention boundary. The PATCH response must still contain the one exact
+asset digest before tag validation continues. GitHub creates a lightweight tag
+atomically at the exact target commit. A pre-existing tag would cause the
+workflow to abort instead; `target_commitish` is never trusted for an existing
+tag. After publication the workflow reads
+`GET /repos/cataggar/miz/git/ref/tags/TAG`, requires a lightweight
+`object.type=commit` ref at exactly `TOOL_COMMIT`, and then applies the
+immutable release and one-asset/hash checks.
+
+Draft discovery lists releases with
+pagination, refuses duplicate exact tags, captures the numeric release ID from
+the REST creation/list result, and uses `/releases/{id}` for every draft
+re-read, upload, and publish operation. The tag endpoint is used only after the
+release is published; pre-publication checks use the matching-refs endpoint
+only to prove that the exact tag is absent. After publication the workflow
+requires GitHub to report the release immutable with the exact tag, title, and
+commit and exactly one asset with the exact name and SHA-256. Full raw Azure
+and MAA verification has already succeeded inside the protected Azure job; the
+durable verifier does not claim to reauthenticate discarded transport
+evidence.
+
+This workflow is not a substitute for qualification. A new region, SKU,
+definition contract, Azure API behavior, role design, or harness change
+requires a supervised live Azure qualification run before production use.
+Repository CI and this implementation intentionally perform no live Azure
+execution.
+
 ## Attestation and operational limitations
 
 The guest attestation client and `azguestattestation1` package are pinned by

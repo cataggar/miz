@@ -22,8 +22,17 @@ TARGET_OFFER=ubuntu2404
 TARGET_SKU=confidential-x64
 
 command_name=${1:-run}
-if (( $# > 1 )) || [[ "$command_name" != run && "$command_name" != cleanup ]]; then
-  echo "usage: $0 run|cleanup" >&2
+if (( $# > 1 )) ||
+    [[ "$command_name" != run && "$command_name" != prepare &&
+      "$command_name" != publish && "$command_name" != recover &&
+    "$command_name" != adopt-recovery &&
+    "$command_name" != inspect-recovery &&
+      "$command_name" != export-recovery &&
+      "$command_name" != mark-recovery-durable &&
+      "$command_name" != export-dispatch &&
+      "$command_name" != mark-dispatch-durable &&
+      "$command_name" != finalize && "$command_name" != cleanup ]]; then
+  echo "usage: $0 prepare|adopt-recovery|inspect-recovery|export-recovery|mark-recovery-durable|export-dispatch|mark-dispatch-durable|publish|recover|finalize|cleanup|run" >&2
   exit 2
 fi
 
@@ -31,26 +40,94 @@ fi
 # protected workflow must use EXPECTED_PUBLICATION_LOCK as a stable,
 # non-canceling concurrency group and pre-authenticate
 # PUBLICATION_AZURE_CONFIG_DIR only as the exclusive
-# PUBLICATION_PRINCIPAL_CLIENT_ID. That OIDC principal must have target
-# parent/version read and version write, but no version delete or parent
-# write/delete. The default Azure context should have only narrow scratch-RG
-# rights plus target-version read for final validation. This script validates
-# those protected-context identities; it cannot prove RBAC or defend against a
-# malicious subscription Owner.
+# PUBLICATION_PRINCIPAL_CLIENT_ID. That OIDC principal uses two
+# pre-provisionable assignments: snapshot read only at the configured
+# preexisting scratch resource-group scope, and gallery/image/version read plus
+# version write at the preexisting image-definition scope. It has no version
+# delete or resource-group/gallery/image-definition write/delete. The capture
+# principal retains scratch lifecycle and target-version read/final deployment
+# rights.
+# This script validates those protected scopes and identities; it cannot prove
+# RBAC or defend against a malicious subscription Owner. The exclusive writer
+# and stable concurrency group are the check-to-PUT race boundary.
 
 fail() {
   printf '::error::%s\n' "$*" >&2
   return 1
 }
 
+valid_gallery_version() {
+  local value=$1 major minor patch
+  [[ "$value" =~ ^(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})$ ]] ||
+    return 1
+  IFS=. read -r major minor patch <<<"$value"
+  (( 10#$major <= 2147483647 &&
+      10#$minor <= 2147483647 &&
+      10#$patch <= 2147483647 &&
+      (10#$major != 0 || 10#$minor != 0 || 10#$patch != 0) ))
+}
+
 publication_az() {
   AZURE_CONFIG_DIR="$PUBLICATION_AZURE_CONFIG_DIR" az "$@"
+}
+
+private_directory_is_safe() {
+  local path=$1 metadata owner mode extra
+  [[ "$path" == /* && -d "$path" && ! -L "$path" ]] || return 1
+  metadata=$(stat -c '%u %a' -- "$path") || return 1
+  IFS=' ' read -r owner mode extra <<<"$metadata" || return 1
+  [[ -z "$extra" && "$owner" == "$EUID" && "$mode" == 700 ]]
+}
+
+require_capture_account() {
+  local subscription tenant principal_type principal_client_id
+  subscription=$(az account show --query id --output tsv) || return
+  tenant=$(az account show --query tenantId --output tsv) || return
+  principal_type=$(az account show --query user.type --output tsv) || return
+  principal_client_id=$(az account show --query user.name --output tsv) || return
+  [[ "${subscription,,}" == "${AZURE_SUBSCRIPTION_ID,,}" &&
+      "${tenant,,}" == "${AZURE_TENANT_ID,,}" &&
+      "$principal_type" == servicePrincipal &&
+      "${principal_client_id,,}" == "${CAPTURE_PRINCIPAL_CLIENT_ID,,}" ]] ||
+    {
+      fail "Azure login does not match the narrow capture principal, tenant, and subscription"
+      return
+    }
+}
+
+require_publication_account() {
+  local subscription tenant principal_type principal_client_id
+  subscription=$(publication_az account show --query id --output tsv) || return
+  tenant=$(publication_az account show --query tenantId --output tsv) || return
+  principal_type=$(publication_az account show --query user.type --output tsv) ||
+    return
+  principal_client_id=$(publication_az account show --query user.name --output tsv) ||
+    return
+  [[ "${subscription,,}" == "${AZURE_SUBSCRIPTION_ID,,}" &&
+      "${tenant,,}" == "${AZURE_TENANT_ID,,}" &&
+      "$principal_type" == servicePrincipal &&
+      "${principal_client_id,,}" == "${PUBLICATION_PRINCIPAL_CLIENT_ID,,}" ]] ||
+    {
+      fail "Azure login does not match the exclusive publication principal, tenant, and subscription"
+      return
+    }
 }
 
 require_cleanup_identity() {
   if [[ -z ${STATE_FILE:-} || -z ${GITHUB_REPOSITORY:-} ||
       -z ${GITHUB_RUN_ID:-} || -z ${GITHUB_RUN_ATTEMPT:-} ||
-      -z ${SOURCE_COMMIT:-} ]]; then
+      -z ${ORIGIN_RUN_ID:-} || -z ${ORIGIN_RUN_ATTEMPT:-} ||
+      -z ${SOURCE_COMMIT:-} || -z ${SOURCE_RELEASE_TAG:-} ||
+      -z ${TOOL_COMMIT:-} ||
+      -z ${AZURE_SUBSCRIPTION_ID:-} || -z ${AZURE_TENANT_ID:-} ||
+      -z ${CAPTURE_PRINCIPAL_CLIENT_ID:-} || -z ${AZURE_CONFIG_DIR:-} ||
+      -z ${TARGET_OWNER_TAG:-} || -z ${TARGET_RESOURCE_GROUP:-} ||
+      -z ${TARGET_GALLERY:-} || -z ${TARGET_IMAGE_DEFINITION:-} ||
+      -z ${TARGET_IMAGE_VERSION:-} ||
+      -z ${SCRATCH_RESOURCE_GROUP:-} ||
+      -z ${RECOVERY_ARTIFACT_NAME:-} ||
+      -z ${DISPATCH_ARTIFACT_NAME:-} ||
+      -z ${RESULT_ARTIFACT_NAME:-} ]]; then
     fail "Capture cleanup identity is incomplete"
     return 1
   fi
@@ -60,7 +137,10 @@ require_cleanup_identity() {
   fi
   if [[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ||
       ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ||
-      ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+      ! "$ORIGIN_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ||
+      ! "$ORIGIN_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ||
+      ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ||
+      ! "$TOOL_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
     fail "Capture cleanup identity is invalid"
     return 1
   fi
@@ -132,7 +212,7 @@ state_replace() {
     fail "Temporary capture cleanup state permissions are unsafe"
     return 1
   fi
-  if [[ ! "$size" =~ ^[1-9][0-9]*$ || "$size" -gt 16384 ]]; then
+  if [[ ! "$size" =~ ^[1-9][0-9]*$ || "$size" -gt 32768 ]]; then
     if ! rm -f -- "$next"; then
       fail "Could not remove failed temporary capture cleanup state"
     fi
@@ -161,40 +241,63 @@ state_file_is_safe() {
   metadata=$(stat -c '%u %a %s' -- "$path") || return 1
   IFS=' ' read -r owner mode size extra <<<"$metadata" || return 1
   [[ -z "$extra" && "$owner" == "$EUID" && "$mode" == 600 &&
-      "$size" =~ ^[1-9][0-9]*$ && "$size" -le 16384 ]]
+      "$size" =~ ^[1-9][0-9]*$ && "$size" -le 32768 ]]
 }
 
 state_matches_identity() {
   local path=${1:-$STATE_FILE}
   jq -e \
     --arg repository "$GITHUB_REPOSITORY" \
-    --arg run_id "$GITHUB_RUN_ID" \
-    --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+    --arg origin_run_id "$ORIGIN_RUN_ID" \
+    --arg origin_run_attempt "$ORIGIN_RUN_ATTEMPT" \
     --arg source_commit "$SOURCE_COMMIT" \
+    --arg source_release_tag "$SOURCE_RELEASE_TAG" \
+    --arg tool_commit "$TOOL_COMMIT" \
     --arg publication_lock "$EXPECTED_PUBLICATION_LOCK" \
+    --arg target_owner "$TARGET_OWNER_TAG" \
+    --arg target_resource_group "$TARGET_RESOURCE_GROUP" \
+    --arg target_gallery "$TARGET_GALLERY" \
+    --arg target_image_definition "$TARGET_IMAGE_DEFINITION" \
+    --arg target_image_version "$TARGET_IMAGE_VERSION" \
+    --arg scratch_resource_group "$SCRATCH_RESOURCE_GROUP" \
+    --arg recovery_artifact_name "$RECOVERY_ARTIFACT_NAME" \
+    --arg dispatch_artifact_name "$DISPATCH_ARTIFACT_NAME" \
+    --arg result_artifact_name "$RESULT_ARTIFACT_NAME" \
     '. as $state |
      keys == [
-       "outstanding_write_access", "repository", "run_attempt", "run_id",
-       "run_succeeded", "schema", "source_commit", "subscription_id", "target",
-       "temporary_group_create", "temporary_resource_group",
-       "temporary_resources"
+       "origin_run_attempt", "origin_run_id", "outstanding_write_access",
+       "recovery", "repository", "result", "run_succeeded", "schema",
+       "source_commit", "source_release_tag", "stage", "subscription_id",
+       "target", "temporary_group_create", "temporary_resource_group",
+       "temporary_resources", "tool_commit"
      ] and
-     .schema == 3 and
+     .schema == 5 and
      .repository == $repository and
-     .run_id == $run_id and
-     .run_attempt == $run_attempt and
+     .origin_run_id == $origin_run_id and
+     .origin_run_attempt == $origin_run_attempt and
      .source_commit == $source_commit and
+     .source_release_tag == $source_release_tag and
+     .tool_commit == $tool_commit and
+     (
+       .stage == "preparing" or
+       .stage == "prepared" or
+       .stage == "publishing" or
+       .stage == "result_ready" or
+       .stage == "completed"
+     ) and
      (.subscription_id | type == "string") and
      (.subscription_id | test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")) and
      (.temporary_resource_group | type == "string") and
-     (.temporary_resource_group | test("^miz-u2404-cvm-capture-[1-9][0-9]{0,19}-[1-9][0-9]{0,9}-[0-9a-f]{32}$")) and
+     .temporary_resource_group == $scratch_resource_group and
+     (.temporary_resource_group |
+       test("^miz-u2404-cvm-capture-[0-9a-f]{32}$")) and
      (
        .temporary_group_create == null or
        (
          (.temporary_group_create | type == "object") and
          (.temporary_group_create | keys == [
-           "owner_tag", "repository", "resource_id", "resource_name",
-           "run_attempt", "run_id", "source_commit", "status"
+           "origin_run_attempt", "origin_run_id", "owner_tag", "repository",
+           "resource_id", "resource_name", "source_commit", "status"
          ]) and
          (
            .temporary_group_create.status == "expected" or
@@ -210,8 +313,8 @@ state_matches_identity() {
          .temporary_group_create.owner_tag ==
            "ubuntu2404-confidential-capture" and
          .temporary_group_create.repository == $repository and
-         .temporary_group_create.run_id == $run_id and
-         .temporary_group_create.run_attempt == $run_attempt and
+         .temporary_group_create.origin_run_id == $origin_run_id and
+         .temporary_group_create.origin_run_attempt == $origin_run_attempt and
          .temporary_group_create.source_commit == $source_commit
        )
      ) and
@@ -234,18 +337,52 @@ state_matches_identity() {
      ([.temporary_resources[].id | ascii_downcase] | unique | length) ==
        (.temporary_resources | length) and
      (.run_succeeded | type == "boolean") and
+     (.recovery | type == "object") and
+     (.recovery | keys == [
+       "artifact_digest", "artifact_name", "intent_sha256", "status"
+     ]) and
+     .recovery.artifact_name == $recovery_artifact_name and
+     (
+       .recovery.artifact_digest == null or
+       (.recovery.artifact_digest | test("^sha256:[0-9a-f]{64}$"))
+     ) and
+     (
+       .recovery.intent_sha256 == null or
+       (.recovery.intent_sha256 | test("^[0-9a-f]{64}$"))
+     ) and
+     (
+       .recovery.status == "pending" or
+       .recovery.status == "exported" or
+       .recovery.status == "durable"
+     ) and
+     (.result | type == "object") and
+     (.result | keys == ["artifact_name", "sha256", "status"]) and
+     .result.artifact_name == $result_artifact_name and
+     (
+       .result.sha256 == null or
+       (.result.sha256 | test("^[0-9a-f]{64}$"))
+     ) and
+     (
+       .result.status == "pending" or
+       .result.status == "ready" or
+       .result.status == "durable"
+     ) and
      (.target | type == "object") and
      (.target | keys == [
        "definition_id", "gallery", "image_definition", "owner_tag",
        "publication", "resource_group", "version_id"
      ]) and
      (.target.owner_tag | type == "string") and
+     .target.owner_tag == $target_owner and
      (.target.owner_tag | test("^[A-Za-z0-9._:/-]{1,128}$")) and
      (.target.resource_group | type == "string") and
+     .target.resource_group == $target_resource_group and
      (.target.resource_group | test("^[A-Za-z0-9._()-]{1,90}$")) and
      (.target.gallery | type == "string") and
+     .target.gallery == $target_gallery and
      (.target.gallery | test("^[A-Za-z0-9_]{1,80}$")) and
      (.target.image_definition | type == "string") and
+     .target.image_definition == $target_image_definition and
      (.target.image_definition | test("^[A-Za-z0-9._()-]{1,80}$")) and
      (.target.definition_id | ascii_downcase) ==
        ("/subscriptions/" + $state.subscription_id + "/resourceGroups/" +
@@ -256,17 +393,26 @@ state_matches_identity() {
        ($state.target.definition_id + "/versions/" | ascii_downcase)
      )) and
      (.target.version_id | split("/") | last |
-       test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+       test("^(0|[1-9][0-9]{0,9})\\.(0|[1-9][0-9]{0,9})\\.(0|[1-9][0-9]{0,9})$")) and
+     (.target.version_id | split("/") | last) == $target_image_version and
      (.target.publication | type == "object") and
      (.target.publication | keys == [
-       "lock_id", "principal_client_id", "status"
+       "dispatch_artifact_digest", "dispatch_artifact_name", "lock_id",
+       "principal_client_id", "status"
      ]) and
      .target.publication.lock_id == $publication_lock and
+     .target.publication.dispatch_artifact_name == $dispatch_artifact_name and
+     (
+       .target.publication.dispatch_artifact_digest == null or
+       (.target.publication.dispatch_artifact_digest |
+         test("^sha256:[0-9a-f]{64}$"))
+     ) and
      (.target.publication.principal_client_id |
        test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")) and
      (
        .target.publication.status == "not_dispatched" or
-       .target.publication.status == "pending" or
+       .target.publication.status == "put_authorized" or
+       .target.publication.status == "put_dispatched" or
        .target.publication.status == "quarantined" or
        .target.publication.status == "published"
      ) and
@@ -356,7 +502,7 @@ validate_created_resource_document() {
      (.location | ascii_downcase) == ($location | ascii_downcase)' \
     "$metadata" >/dev/null &&
     owned_tags_match "$metadata" "$OWNER" "$GITHUB_REPOSITORY" \
-      "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"
+      "$ORIGIN_RUN_ID" "$ORIGIN_RUN_ATTEMPT" "$SOURCE_COMMIT"
 }
 
 record_expected_resource() {
@@ -388,7 +534,7 @@ validate_write_access_identity() {
   temporary_group=$(jq -er '.temporary_resource_group' "$STATE_FILE") || return
   subscription=$(jq -er '.subscription_id' "$STATE_FILE") || return
   [[ "$disk_group" == "$temporary_group" &&
-      "$disk_name" == "miz-u2404-capture-upload-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ]] ||
+      "$disk_name" == "miz-u2404-capture-upload-${ORIGIN_RUN_ID}-${ORIGIN_RUN_ATTEMPT}" ]] ||
     return 1
   expected_id="/subscriptions/$subscription/resourceGroups/$disk_group/providers/Microsoft.Compute/disks/$disk_name"
   [[ "${disk_id,,}" == "${expected_id,,}" ]]
@@ -438,7 +584,7 @@ revoke_outstanding_disk_write_access() {
       return
     }
   owned_tags_match "$metadata" "$OWNER" "$GITHUB_REPOSITORY" \
-    "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
+    "$ORIGIN_RUN_ID" "$ORIGIN_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
     {
       fail "Refusing to revoke a disk write grant without exact ownership tags"
       return
@@ -459,8 +605,8 @@ revoke_outstanding_disk_write_access() {
 }
 
 delete_temporary_group() {
-  local status publication_status run_succeeded group resource_id metadata stderr_file
-  local inventory subscription_id
+  local status publication_status result_status dispatch_digest
+  local group resource_id metadata stderr_file inventory subscription_id
   status=$(jq -r '.temporary_group_create.status // "none"' "$STATE_FILE")
   case "$status" in
     none) return 0 ;;
@@ -474,15 +620,27 @@ delete_temporary_group() {
   esac
   publication_status=$(jq -er '.target.publication.status' "$STATE_FILE") ||
     return
-  if [[ "$publication_status" == pending ||
+  result_status=$(jq -er '.result.status' "$STATE_FILE") || return
+  dispatch_digest=$(jq -r \
+    '.target.publication.dispatch_artifact_digest // ""' "$STATE_FILE") ||
+    return
+  if [[ -n ${DISPATCH_ARTIFACT_DIGEST:-} ]]; then
+    dispatch_digest=$DISPATCH_ARTIFACT_DIGEST
+  elif [[ -n ${ORIGIN_DISPATCH_ARTIFACT_DIGEST:-} ]]; then
+    dispatch_digest=$ORIGIN_DISPATCH_ARTIFACT_DIGEST
+  fi
+  if [[ -n "$dispatch_digest" && "$result_status" != durable ]]; then
+    fail "Capture result is not durably uploaded; retaining post-dispatch scratch resources for recovery"
+    return
+  fi
+  if [[ "$publication_status" == put_dispatched ||
       "$publication_status" == quarantined ]]; then
     fail "Target publication is unresolved; retaining the temporary resource group for break-glass review"
     return
   fi
-  run_succeeded=$(jq -r '.run_succeeded' "$STATE_FILE") || return
-  if [[ "$run_succeeded" != true &&
-      "$publication_status" != not_dispatched ]]; then
-    fail "Capture failed after target publication dispatch; retaining the temporary resource group for break-glass review"
+  if [[ "$publication_status" == published &&
+      "$result_status" != durable ]]; then
+    fail "Capture result is not durably uploaded; retaining post-PUT scratch resources for recovery"
     return
   fi
   group=$(jq -er '.temporary_group_create.resource_name' "$STATE_FILE") || return
@@ -509,7 +667,7 @@ delete_temporary_group() {
       return
     }
   if ! exact_owned_tags_match "$metadata" "$OWNER" "$GITHUB_REPOSITORY" \
-      "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"; then
+      "$ORIGIN_RUN_ID" "$ORIGIN_RUN_ATTEMPT" "$SOURCE_COMMIT"; then
     fail "Refusing to delete temporary resource group without exact ownership tags"
     return
   fi
@@ -530,8 +688,8 @@ delete_temporary_group() {
     --arg prefix "/subscriptions/$subscription_id/resourceGroups/$group/providers/" \
     --arg owner "$OWNER" \
     --arg repository "$GITHUB_REPOSITORY" \
-    --arg run_id "$GITHUB_RUN_ID" \
-    --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+    --arg run_id "$ORIGIN_RUN_ID" \
+    --arg run_attempt "$ORIGIN_RUN_ATTEMPT" \
     --arg source_commit "$SOURCE_COMMIT" \
     '
     type == "array" and length <= 64 and
@@ -591,14 +749,14 @@ cleanup_resources() {
     fail "Refusing cleanup because state identity does not match this run"
     return
   }
-  local account_subscription state_subscription
-  account_subscription=$(az account show --query id --output tsv) ||
+  local state_subscription
+  require_capture_account ||
     {
-      fail "Azure login is unavailable during cleanup"
+      fail "Azure login is unavailable or invalid during cleanup"
       return
     }
   state_subscription=$(jq -er '.subscription_id' "$STATE_FILE") || return
-  [[ "${account_subscription,,}" == "${state_subscription,,}" ]] || {
+  [[ "${AZURE_SUBSCRIPTION_ID,,}" == "${state_subscription,,}" ]] || {
     fail "Azure cleanup subscription does not match capture state"
     return
   }
@@ -617,19 +775,34 @@ fi
 require_cleanup_identity
 if [[ -z ${GITHUB_REF:-} || -z ${PROTECTED_ENVIRONMENT:-} ||
       -z ${CANDIDATE:-} || -z ${PROVENANCE:-} ||
-      -z ${SOURCE_ACCEPTANCE:-} || -z ${SOURCE_LOCATION:-} ||
+      -z ${SOURCE_ACCEPTANCE:-} || -z ${SOURCE_RELEASE_TAG:-} ||
+      -z ${SOURCE_LOCATION:-} ||
       -z ${SOURCE_VM_SIZE:-} || -z ${SOURCE_RUN_ID:-} ||
       -z ${SOURCE_RUN_ATTEMPT:-} || -z ${SOURCE_REPOSITORY:-} ||
-      -z ${AZURE_SUBSCRIPTION_ID:-} || -z ${AZURE_LOCATION:-} ||
+      -z ${AZURE_SUBSCRIPTION_ID:-} || -z ${AZURE_TENANT_ID:-} ||
+      -z ${AZURE_LOCATION:-} ||
       -z ${AZURE_VM_SIZE:-} || -z ${TARGET_RESOURCE_GROUP:-} ||
       -z ${TARGET_GALLERY:-} || -z ${TARGET_IMAGE_DEFINITION:-} ||
       -z ${TARGET_IMAGE_VERSION:-} || -z ${TARGET_LOCATION:-} ||
       -z ${TARGET_OWNER_TAG:-} || -z ${PUBLICATION_LOCK_ID:-} ||
+      -z ${SCRATCH_RESOURCE_GROUP:-} || -z ${SCRATCH_RESERVATION_TAG:-} ||
       -z ${CAPTURE_PRINCIPAL_CLIENT_ID:-} ||
       -z ${PUBLICATION_PRINCIPAL_CLIENT_ID:-} ||
-      -z ${PUBLICATION_AZURE_CONFIG_DIR:-} ||
-      -z ${RESULT_DIR:-} || -z ${MIZ:-} ]]; then
+      -z ${CAPTURE_TARGET_READ_SCOPE:-} ||
+      -z ${PUBLICATION_SNAPSHOT_READ_SCOPE:-} ||
+      -z ${PUBLICATION_VERSION_WRITE_SCOPE:-} ||
+      -z ${RECOVERY_ARTIFACT_NAME:-} ||
+      -z ${DISPATCH_ARTIFACT_NAME:-} ||
+      -z ${RESULT_ARTIFACT_NAME:-} ||
+      -z ${RECOVERY_DIR:-} || -z ${DISPATCH_DIR:-} ||
+      -z ${AZURE_CONFIG_DIR:-} || -z ${RESULT_DIR:-} || -z ${MIZ:-} ]]; then
   fail "Confidential VM capture configuration is incomplete"
+  exit 1
+fi
+if [[ "$command_name" == publish || "$command_name" == recover ||
+      "$command_name" == inspect-recovery || "$command_name" == run ]] &&
+    [[ -z ${PUBLICATION_AZURE_CONFIG_DIR:-} ]]; then
+  fail "Protected publication Azure context is incomplete"
   exit 1
 fi
 [[ "$GITHUB_REF" == "$EXPECTED_REF" &&
@@ -641,7 +814,9 @@ fi
   }
 [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]{0,19}$ &&
     "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ &&
+    "$SOURCE_RELEASE_TAG" =~ ^Ubuntu-24\.04-confidential-[0-9]{8}$ &&
     "$AZURE_SUBSCRIPTION_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ &&
+    "$AZURE_TENANT_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ &&
     "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ &&
     "$SOURCE_LOCATION" =~ ^[a-z0-9-]+$ &&
     "$TARGET_LOCATION" =~ ^[a-z0-9-]+$ &&
@@ -650,27 +825,73 @@ fi
     "$TARGET_RESOURCE_GROUP" =~ ^[A-Za-z0-9._()-]{1,90}$ &&
     "$TARGET_GALLERY" =~ ^[A-Za-z0-9_]{1,80}$ &&
     "$TARGET_IMAGE_DEFINITION" =~ ^[A-Za-z0-9._()-]{1,80}$ &&
-    "$TARGET_IMAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ &&
     "$TARGET_OWNER_TAG" =~ ^[A-Za-z0-9._:/-]{1,128}$ &&
+    "$SCRATCH_RESOURCE_GROUP" =~ ^miz-u2404-cvm-capture-[0-9a-f]{32}$ &&
+    "$SCRATCH_RESERVATION_TAG" =~ ^[A-Za-z0-9._:/-]{16,128}$ &&
     "$CAPTURE_PRINCIPAL_CLIENT_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ &&
     "$PUBLICATION_PRINCIPAL_CLIENT_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ &&
+    "$RECOVERY_ARTIFACT_NAME" =~ ^ubuntu2404-confidential-capture-recovery-[1-9][0-9]{0,19}-[1-9][0-9]{0,9}-(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})$ &&
+    "$DISPATCH_ARTIFACT_NAME" =~ ^ubuntu2404-confidential-capture-dispatch-[1-9][0-9]{0,19}-[1-9][0-9]{0,9}-(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})$ &&
+    "$RESULT_ARTIFACT_NAME" =~ ^ubuntu2404-confidential-capture-result-[1-9][0-9]{0,19}-[1-9][0-9]{0,9}-(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})$ &&
     "$ATTESTATION_ENDPOINT" =~ ^https://[a-z0-9.-]+\.attest\.azure\.net$ ]] ||
   {
     fail "Confidential VM capture configuration is invalid"
     exit 1
   }
+  valid_gallery_version "$TARGET_IMAGE_VERSION" ||
+    {
+      fail "Target gallery version is not a canonical nonzero semantic version"
+      exit 1
+    }
 [[ "$PUBLICATION_LOCK_ID" == "$EXPECTED_PUBLICATION_LOCK" ]] ||
   {
     fail "Protected publication lock identity is invalid"
     exit 1
   }
-[[ "$PUBLICATION_AZURE_CONFIG_DIR" == /* &&
-    -d "$PUBLICATION_AZURE_CONFIG_DIR" &&
-    ! -L "$PUBLICATION_AZURE_CONFIG_DIR" ]] ||
+expected_snapshot_scope="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$SCRATCH_RESOURCE_GROUP"
+expected_capture_target_scope="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP"
+expected_definition_scope="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP/providers/Microsoft.Compute/galleries/$TARGET_GALLERY/images/$TARGET_IMAGE_DEFINITION"
+[[ "${CAPTURE_TARGET_READ_SCOPE,,}" == "${expected_capture_target_scope,,}" &&
+    "${PUBLICATION_SNAPSHOT_READ_SCOPE,,}" == "${expected_snapshot_scope,,}" &&
+    "${PUBLICATION_VERSION_WRITE_SCOPE,,}" == "${expected_definition_scope,,}" ]] ||
   {
-    fail "Protected publication Azure context is invalid"
+    fail "Protected RBAC scopes must be the preexisting scratch RG, target RG, and image definition"
     exit 1
   }
+expected_recovery_artifact_name="ubuntu2404-confidential-capture-recovery-${ORIGIN_RUN_ID}-${ORIGIN_RUN_ATTEMPT}-${TARGET_IMAGE_VERSION}"
+expected_dispatch_artifact_name="ubuntu2404-confidential-capture-dispatch-${ORIGIN_RUN_ID}-${ORIGIN_RUN_ATTEMPT}-${TARGET_IMAGE_VERSION}"
+expected_result_artifact_name="ubuntu2404-confidential-capture-result-${ORIGIN_RUN_ID}-${ORIGIN_RUN_ATTEMPT}-${TARGET_IMAGE_VERSION}"
+[[ "$RECOVERY_ARTIFACT_NAME" == "$expected_recovery_artifact_name" &&
+    "$DISPATCH_ARTIFACT_NAME" == "$expected_dispatch_artifact_name" &&
+    "$RESULT_ARTIFACT_NAME" == "$expected_result_artifact_name" ]] ||
+  {
+    fail "Durable artifact names do not match the immutable origin identity"
+    exit 1
+  }
+private_directory_is_safe "$AZURE_CONFIG_DIR" ||
+  {
+    fail "Protected capture Azure context is not a private absolute directory"
+    exit 1
+  }
+private_directory_is_safe "$RECOVERY_DIR" &&
+  private_directory_is_safe "$DISPATCH_DIR" ||
+  {
+    fail "Recovery and dispatch directories must be private absolute directories"
+    exit 1
+  }
+if [[ "$command_name" == publish || "$command_name" == recover ||
+      "$command_name" == inspect-recovery || "$command_name" == run ]]; then
+  private_directory_is_safe "$PUBLICATION_AZURE_CONFIG_DIR" ||
+    {
+      fail "Protected publication Azure context is not a private absolute directory"
+      exit 1
+    }
+  [[ "$PUBLICATION_AZURE_CONFIG_DIR" != "$AZURE_CONFIG_DIR" ]] ||
+    {
+      fail "Capture and publication Azure contexts must be distinct"
+      exit 1
+    }
+fi
 [[ "${CAPTURE_PRINCIPAL_CLIENT_ID,,}" != "${PUBLICATION_PRINCIPAL_CLIENT_ID,,}" ]] ||
   {
     fail "Capture and publication principals must be distinct"
@@ -697,6 +918,10 @@ for tool in az azcopy curl jq openssl qemu-img scp sha256sum ssh ssh-keygen unzi
   }
 done
 
+if [[ "$command_name" != adopt-recovery ]]; then
+  require_capture_account
+fi
+
 report_error() {
   local status=$1 line=$2
   trap - ERR
@@ -705,22 +930,10 @@ report_error() {
 }
 trap 'report_error "$?" "$LINENO"' ERR
 
-mkdir -p "$RESULT_DIR" "$(dirname -- "$STATE_FILE")"
-chmod 0700 "$RESULT_DIR"
-[[ ! -e "$STATE_FILE" ]] ||
-  {
-    fail "Refusing to overwrite existing capture state"
-    exit 1
-  }
-
-name_seed="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-random_group_suffix=$(openssl rand -hex 16)
-[[ "$random_group_suffix" =~ ^[0-9a-f]{32}$ ]] ||
-  fail "Could not generate a 128-bit temporary resource-group suffix"
-resource_group="miz-u2404-cvm-capture-${name_seed}-${random_group_suffix}"
+name_seed="${ORIGIN_RUN_ID}-${ORIGIN_RUN_ATTEMPT}"
 upload_disk_name="miz-u2404-capture-upload-${name_seed}"
 managed_image_name="miz-u2404-capture-image-${name_seed}"
-staging_gallery="mizcvmcapture${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}"
+staging_gallery="mizcvmcapture${ORIGIN_RUN_ID}${ORIGIN_RUN_ATTEMPT}"
 staging_definition=mizu2404cvmsource
 staging_version=1.0.0
 source_vm_name="miz-cvm-source-${name_seed}"
@@ -743,6 +956,53 @@ final_public_ip_name="miz-cvm-final-pip-${name_seed}"
 final_nic_name="miz-cvm-final-nic-${name_seed}"
 admin_username=mizcapture
 
+uses_existing_state=false
+case "$command_name" in
+  publish|recover|export-recovery|mark-recovery-durable|export-dispatch|mark-dispatch-durable|finalize)
+    uses_existing_state=true
+    ;;
+esac
+
+if [[ "$command_name" == adopt-recovery ||
+    "$command_name" == inspect-recovery ]]; then
+  mkdir -p "$RESULT_DIR" "$(dirname -- "$STATE_FILE")"
+  chmod 0700 "$RESULT_DIR" "$(dirname -- "$STATE_FILE")"
+  recovery_state="$RECOVERY_DIR/capture-state.json"
+  recovery_intent="$RECOVERY_DIR/recovery-intent.json"
+  state_file_is_safe "$recovery_state" &&
+    state_file_is_safe "$recovery_intent" ||
+    {
+      fail "Recovery artifact files are missing, linked, empty, or not owner-only"
+      exit 1
+    }
+  if [[ "$command_name" == adopt-recovery || ! -e "$STATE_FILE" ]]; then
+    cp -- "$recovery_state" "$STATE_FILE"
+    chmod 0600 "$STATE_FILE"
+  fi
+  state_file_is_safe && state_matches_identity ||
+    {
+      fail "Downloaded recovery state identity, schema, or permissions are invalid"
+      exit 1
+    }
+  resource_group=$(jq -er '.temporary_resource_group' "$STATE_FILE")
+elif [[ "$uses_existing_state" == true ]]; then
+  state_file_is_safe && state_matches_identity ||
+    {
+      fail "Command requires valid owner-only capture recovery state"
+      exit 1
+    }
+  resource_group=$(jq -er '.temporary_resource_group' "$STATE_FILE")
+else
+  mkdir -p "$RESULT_DIR" "$(dirname -- "$STATE_FILE")"
+  chmod 0700 "$RESULT_DIR" "$(dirname -- "$STATE_FILE")"
+  [[ ! -e "$STATE_FILE" ]] ||
+    {
+      fail "Refusing to overwrite existing capture state"
+      exit 1
+    }
+  resource_group=$SCRATCH_RESOURCE_GROUP
+fi
+
 temporary_group_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group"
 target_definition_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP/providers/Microsoft.Compute/galleries/$TARGET_GALLERY/images/$TARGET_IMAGE_DEFINITION"
 target_version_id="$target_definition_id/versions/$TARGET_IMAGE_VERSION"
@@ -750,62 +1010,87 @@ staging_definition_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$res
 staging_version_id="$staging_definition_id/versions/$staging_version"
 snapshot_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/providers/Microsoft.Compute/snapshots/$snapshot_name"
 
-jq -n \
-  --arg repository "$GITHUB_REPOSITORY" \
-  --arg run_id "$GITHUB_RUN_ID" \
-  --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
-  --arg source_commit "$SOURCE_COMMIT" \
-  --arg subscription_id "$AZURE_SUBSCRIPTION_ID" \
-  --arg temporary_resource_group "$resource_group" \
-  --arg target_owner "$TARGET_OWNER_TAG" \
-  --arg target_resource_group "$TARGET_RESOURCE_GROUP" \
-  --arg target_gallery "$TARGET_GALLERY" \
-  --arg target_image_definition "$TARGET_IMAGE_DEFINITION" \
-  --arg definition_id "$target_definition_id" \
-  --arg version_id "$target_version_id" \
-  --arg publication_lock "$PUBLICATION_LOCK_ID" \
-  --arg publication_principal "$PUBLICATION_PRINCIPAL_CLIENT_ID" \
-  --arg temporary_owner "$OWNER" \
-  -c '{
-    schema: 3,
-    repository: $repository,
-    run_id: $run_id,
-    run_attempt: $run_attempt,
-    source_commit: $source_commit,
-    subscription_id: $subscription_id,
-    temporary_resource_group: $temporary_resource_group,
-    temporary_group_create: {
-      status: "expected",
-      resource_id: (
-        "/subscriptions/" + $subscription_id + "/resourceGroups/" +
-        $temporary_resource_group
-      ),
-      resource_name: $temporary_resource_group,
-      owner_tag: $temporary_owner,
+if [[ "$uses_existing_state" != true &&
+    "$command_name" != adopt-recovery &&
+    "$command_name" != inspect-recovery ]]; then
+  jq -n \
+    --arg repository "$GITHUB_REPOSITORY" \
+    --arg origin_run_id "$ORIGIN_RUN_ID" \
+    --arg origin_run_attempt "$ORIGIN_RUN_ATTEMPT" \
+    --arg source_commit "$SOURCE_COMMIT" \
+    --arg source_release_tag "$SOURCE_RELEASE_TAG" \
+    --arg tool_commit "$TOOL_COMMIT" \
+    --arg subscription_id "$AZURE_SUBSCRIPTION_ID" \
+    --arg temporary_resource_group "$resource_group" \
+    --arg target_owner "$TARGET_OWNER_TAG" \
+    --arg target_resource_group "$TARGET_RESOURCE_GROUP" \
+    --arg target_gallery "$TARGET_GALLERY" \
+    --arg target_image_definition "$TARGET_IMAGE_DEFINITION" \
+    --arg definition_id "$target_definition_id" \
+    --arg version_id "$target_version_id" \
+    --arg publication_lock "$PUBLICATION_LOCK_ID" \
+    --arg publication_principal "$PUBLICATION_PRINCIPAL_CLIENT_ID" \
+    --arg temporary_owner "$OWNER" \
+    --arg recovery_artifact_name "$RECOVERY_ARTIFACT_NAME" \
+    --arg dispatch_artifact_name "$DISPATCH_ARTIFACT_NAME" \
+    --arg result_artifact_name "$RESULT_ARTIFACT_NAME" \
+    -c '{
+      schema: 5,
+      stage: "preparing",
       repository: $repository,
-      run_id: $run_id,
-      run_attempt: $run_attempt,
-      source_commit: $source_commit
-    },
-    temporary_resources: [],
-    run_succeeded: false,
-    outstanding_write_access: null,
-    target: {
-      owner_tag: $target_owner,
-      resource_group: $target_resource_group,
-      gallery: $target_gallery,
-      image_definition: $target_image_definition,
-      definition_id: $definition_id,
-      version_id: $version_id,
-      publication: {
-        lock_id: $publication_lock,
-        principal_client_id: $publication_principal,
-        status: "not_dispatched"
+      origin_run_id: $origin_run_id,
+      origin_run_attempt: $origin_run_attempt,
+      source_commit: $source_commit,
+      source_release_tag: $source_release_tag,
+      tool_commit: $tool_commit,
+      subscription_id: $subscription_id,
+      temporary_resource_group: $temporary_resource_group,
+      temporary_group_create: {
+        status: "expected",
+        resource_id: (
+          "/subscriptions/" + $subscription_id + "/resourceGroups/" +
+          $temporary_resource_group
+        ),
+        resource_name: $temporary_resource_group,
+        owner_tag: $temporary_owner,
+        repository: $repository,
+        origin_run_id: $origin_run_id,
+        origin_run_attempt: $origin_run_attempt,
+        source_commit: $source_commit
+      },
+      temporary_resources: [],
+      run_succeeded: false,
+      outstanding_write_access: null,
+      recovery: {
+        artifact_name: $recovery_artifact_name,
+        artifact_digest: null,
+        intent_sha256: null,
+        status: "pending"
+      },
+      result: {
+        artifact_name: $result_artifact_name,
+        sha256: null,
+        status: "pending"
+      },
+      target: {
+        owner_tag: $target_owner,
+        resource_group: $target_resource_group,
+        gallery: $target_gallery,
+        image_definition: $target_image_definition,
+        definition_id: $definition_id,
+        version_id: $version_id,
+        publication: {
+          lock_id: $publication_lock,
+          principal_client_id: $publication_principal,
+          dispatch_artifact_name: $dispatch_artifact_name,
+          dispatch_artifact_digest: null,
+          status: "not_dispatched"
+        }
       }
-    }
-  }' >"$STATE_FILE"
-[[ $(stat -c %s -- "$STATE_FILE") -le 16384 ]]
-chmod 0600 "$STATE_FILE"
+    }' >"$STATE_FILE"
+  [[ $(stat -c %s -- "$STATE_FILE") -le 32768 ]]
+  chmod 0600 "$STATE_FILE"
+fi
 
 vhd="$RESULT_DIR/Ubuntu-24.04-x86_64.confidential.vhd"
 vhd_info="$RESULT_DIR/vhd-info.json"
@@ -820,22 +1105,33 @@ staging_gallery_json="$RESULT_DIR/staging-gallery.json"
 source_dir="$RESULT_DIR/source-validation"
 capture_dir="$RESULT_DIR/capture"
 final_dir="$RESULT_DIR/final-validation"
-mkdir -p "$source_dir" "$capture_dir" "$final_dir"
+if [[ "$uses_existing_state" != true ]]; then
+  mkdir -p "$source_dir" "$capture_dir" "$final_dir"
+  chmod 0700 "$source_dir" "$capture_dir" "$final_dir"
+fi
 private_key="$RESULT_DIR/id_ed25519"
 known_hosts="$RESULT_DIR/known_hosts"
 capture_result="$RESULT_DIR/capture-result.json"
+prepare_evidence_manifest="$RESULT_DIR/prepare-evidence.sha256"
 temporary_group_request="$RESULT_DIR/temporary-resource-group-request.json"
 temporary_group_response="$RESULT_DIR/temporary-resource-group-response.json"
 temporary_group_json="$RESULT_DIR/temporary-resource-group.json"
 target_group_json="$RESULT_DIR/target-resource-group.json"
 target_gallery_json="$RESULT_DIR/target-gallery.json"
 target_definition_json="$RESULT_DIR/target-definition.json"
+target_request="$RESULT_DIR/target-gallery-request.json"
+target_response="$RESULT_DIR/target-gallery-response.json"
+capture_vm_resource="$capture_dir/vm-resource.json"
+capture_vm_instance="$capture_dir/vm-instance.json"
+capture_disk_json="$capture_dir/os-disk.json"
+snapshot_json="$capture_dir/snapshot.json"
+publisher_snapshot_json="$capture_dir/publisher-snapshot.json"
 
 exact_tags=(
   "miz-owner=$OWNER"
   "miz-repository=$GITHUB_REPOSITORY"
-  "miz-run-id=$GITHUB_RUN_ID"
-  "miz-run-attempt=$GITHUB_RUN_ATTEMPT"
+  "miz-run-id=$ORIGIN_RUN_ID"
+  "miz-run-attempt=$ORIGIN_RUN_ATTEMPT"
   "miz-source-commit=$SOURCE_COMMIT"
 )
 UBUNTU2404_CONFIDENTIAL_GUEST_AZURE_TAGS=("${exact_tags[@]}")
@@ -941,16 +1237,33 @@ validate_temporary_group_document() {
     '(.location | ascii_downcase) == ($location | ascii_downcase)' \
     "$metadata" >/dev/null &&
     exact_owned_tags_match "$metadata" "$OWNER" "$GITHUB_REPOSITORY" \
-      "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"
+      "$ORIGIN_RUN_ID" "$ORIGIN_RUN_ATTEMPT" "$SOURCE_COMMIT"
+}
+
+validate_reserved_temporary_group_document() {
+  local metadata=$1
+  validate_temporary_group_identity \
+    "$metadata" "$temporary_group_id" "$resource_group" &&
+    jq -e \
+      --arg location "$AZURE_LOCATION" \
+      --arg owner "$OWNER" \
+      --arg repository "$GITHUB_REPOSITORY" \
+      --arg reservation "$SCRATCH_RESERVATION_TAG" \
+      '(.location | ascii_downcase) == ($location | ascii_downcase) and
+       .tags == {
+         "miz-owner": $owner,
+         "miz-repository": $repository,
+         "miz-reservation": $reservation
+       }' "$metadata" >/dev/null
 }
 
 validate_target_parents() {
-  if ! publication_az group show --name "$TARGET_RESOURCE_GROUP" --output json \
+  if ! az group show --name "$TARGET_RESOURCE_GROUP" --output json \
       >"$target_group_json"; then
     fail "Pre-provisioned target resource group is missing or unavailable"
     return
   fi
-  if ! publication_az sig show \
+  if ! az sig show \
       --resource-group "$TARGET_RESOURCE_GROUP" \
       --gallery-name "$TARGET_GALLERY" \
       --output json >"$target_gallery_json"; then
@@ -1044,6 +1357,32 @@ validate_target_parents() {
     --version-id "$target_version_id" >/dev/null
 }
 
+validate_publication_snapshot_access() {
+  if ! publication_az snapshot show --ids "$snapshot_id" --output json \
+      >"$publisher_snapshot_json"; then
+    fail "Publisher cannot read the exact runtime scratch snapshot"
+    return
+  fi
+  [[ "$("$RELEASE_TOOL" check-capture-snapshot \
+    --snapshot "$publisher_snapshot_json" \
+    --snapshot-id "$snapshot_id" \
+    --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+    --location "$AZURE_LOCATION" \
+    --source-version-id "$staging_version_id" \
+    --vm-id "$capture_vm_id" \
+    --disk-id "$capture_disk_id")" == "$snapshot_id" ]] ||
+    {
+      fail "Publisher snapshot read returned mismatched runtime evidence"
+      return
+    }
+  owned_tags_match "$publisher_snapshot_json" "$OWNER" "$GITHUB_REPOSITORY" \
+    "$ORIGIN_RUN_ID" "$ORIGIN_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
+    {
+      fail "Publisher snapshot read lost the immutable origin identity"
+      return
+    }
+}
+
 require_target_version_absent() {
   local phase=$1 stderr_file
   stderr_file="$RESULT_DIR/target-version-${phase}.stderr"
@@ -1063,39 +1402,78 @@ require_target_version_absent() {
   rm -f -- "$stderr_file"
 }
 
+require_target_version_absent_capture() {
+  local phase=$1 stderr_file
+  stderr_file="$RESULT_DIR/target-version-${phase}.stderr"
+  if az sig image-version show \
+      --ids "$target_version_id" --output json \
+      >"$RESULT_DIR/target-version-${phase}.json" 2>"$stderr_file"; then
+    rm -f -- "$stderr_file"
+    fail "Target gallery version already exists; refusing update or overwrite"
+    return
+  fi
+  if ! grep -Eq \
+      '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' \
+      "$stderr_file"; then
+    fail "Capture principal could not prove the target gallery version is absent"
+    return
+  fi
+  rm -f -- "$stderr_file"
+}
+
 quarantine_temporary_group_create() {
   state_replace '.temporary_group_create.status = "quarantined"' ||
-    fail "Could not quarantine ambiguous temporary resource-group creation"
+    fail "Could not quarantine ambiguous scratch reservation claim"
 }
 
 create_temporary_group() {
   persist_temporary_group_create ||
     {
-      fail "Could not persist pending temporary resource-group creation"
+      fail "Could not persist pending scratch reservation claim"
       return
     }
-  azure_confidential_vm_resource_group_create_args \
-    "$temporary_group_id" "$temporary_group_request"
-  if ! az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" \
+  if ! az group show --name "$resource_group" --output json \
       >"$temporary_group_response"; then
     quarantine_temporary_group_create
-    fail "Temporary resource-group create failed ambiguously; manual review is required"
+    fail "Pre-provisioned scratch resource group is missing or unavailable"
     return
   fi
-  if ! validate_temporary_group_document "$temporary_group_response"; then
+  if ! validate_reserved_temporary_group_document "$temporary_group_response"; then
     quarantine_temporary_group_create
-    fail "Temporary resource-group create response is invalid; manual review is required"
+    fail "Pre-provisioned scratch reservation identity or tags are invalid"
+    return
+  fi
+  if ! az resource list --resource-group "$resource_group" --output json \
+      >"${temporary_group_response}.inventory"; then
+    quarantine_temporary_group_create
+    fail "Could not inspect pre-provisioned scratch reservation contents"
+    return
+  fi
+  jq -e 'type == "array" and length == 0' \
+    "${temporary_group_response}.inventory" >/dev/null ||
+    {
+      quarantine_temporary_group_create
+      fail "Pre-provisioned scratch reservation is not empty"
+      return
+    }
+  if ! az tag update \
+      --operation Replace \
+      --resource-id "$temporary_group_id" \
+      --tags "${exact_tags[@]}" \
+      --output none; then
+    quarantine_temporary_group_create
+    fail "Scratch reservation claim failed ambiguously; manual review is required"
     return
   fi
   if ! az group show --name "$resource_group" --output json \
       >"$temporary_group_json"; then
     quarantine_temporary_group_create
-    fail "Could not freshly inspect the created temporary resource group"
+    fail "Could not freshly inspect the claimed scratch resource group"
     return
   fi
   if ! validate_temporary_group_document "$temporary_group_json"; then
     quarantine_temporary_group_create
-    fail "Created temporary resource group failed fresh ownership validation"
+    fail "Claimed scratch resource group failed fresh ownership validation"
     return
   fi
   state_replace \
@@ -1313,9 +1691,19 @@ quarantine_target_publication() {
 }
 
 publish_target_version_once() {
-  state_replace '.target.publication.status = "pending"' ||
+  jq -e '
+    .recovery.status == "durable" and
+    .target.publication.status == "put_authorized" and
+    (.target.publication.dispatch_artifact_digest |
+      test("^sha256:[0-9a-f]{64}$"))
+  ' "$STATE_FILE" >/dev/null ||
     {
-      fail "Could not persist pending target publication"
+      fail "Target PUT is not authorized by durable recovery and dispatch artifacts"
+      return
+    }
+  state_replace '.target.publication.status = "put_dispatched"' ||
+    {
+      fail "Could not persist target PUT dispatch before mutation"
       return
     }
   azure_confidential_vm_capture_gallery_version_put_args \
@@ -1348,7 +1736,7 @@ publish_target_version_once() {
   # Provenance tags remain evidence to validate, not an atomic ownership or
   # cleanup boundary.
   if ! owned_tags_match "$target_response" "$OWNER" "$GITHUB_REPOSITORY" \
-      "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"; then
+      "$ORIGIN_RUN_ID" "$ORIGIN_RUN_ATTEMPT" "$SOURCE_COMMIT"; then
     quarantine_target_publication
     fail "Target gallery version lost its exact run provenance tags"
     return
@@ -1428,8 +1816,8 @@ run_capture_vm_check() {
     --run-id "$SOURCE_RUN_ID" \
     --run-attempt "$SOURCE_RUN_ATTEMPT" \
     --repository "$SOURCE_REPOSITORY" \
-    --capture-run-id "$GITHUB_RUN_ID" \
-    --capture-run-attempt "$GITHUB_RUN_ATTEMPT" \
+    --capture-run-id "$ORIGIN_RUN_ID" \
+    --capture-run-attempt "$ORIGIN_RUN_ATTEMPT" \
     --scratch-resource-group "$resource_group" \
     --subscription-id "$AZURE_SUBSCRIPTION_ID" \
     --location "$AZURE_LOCATION" \
@@ -1443,6 +1831,621 @@ run_capture_vm_check() {
     --disk-id "$disk_id"
 }
 
+prepared_file_is_safe() {
+  local path=$1 metadata owner mode size extra
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  metadata=$(stat -c '%u %a %s' -- "$path") || return 1
+  IFS=' ' read -r owner mode size extra <<<"$metadata" || return 1
+  [[ -z "$extra" && "$owner" == "$EUID" &&
+      "$mode" =~ ^[0-7]{3,4}$ && "$size" =~ ^[1-9][0-9]*$ ]] || return 1
+  (( (8#$mode & 077) == 0 ))
+}
+
+require_prepared_state() {
+  state_file_is_safe && state_matches_identity ||
+    {
+      fail "Prepared capture recovery state is invalid"
+      return
+    }
+  jq -e --arg command "$command_name" '
+    .stage == "prepared" and
+    .run_succeeded == false and
+    .outstanding_write_access == null and
+    .temporary_group_create.status == "confirmed_created" and
+    (
+      .target.publication.status == "not_dispatched" or
+      (
+        ($command == "publish" or $command == "recover") and
+        .target.publication.status == "put_authorized"
+      ) or
+      (
+        $command == "inspect-recovery" and
+        .target.publication.status == "quarantined"
+      )
+    )
+  ' "$STATE_FILE" >/dev/null ||
+    {
+      fail "Capture recovery state is not exactly prepared"
+      return
+    }
+  for directory in \
+      "$(dirname -- "$STATE_FILE")" "$(dirname -- "$CANDIDATE")" \
+      "$RESULT_DIR" "$source_dir" "$capture_dir" "$final_dir"; do
+    private_directory_is_safe "$directory" ||
+      {
+        fail "Prepared capture evidence directory is not owner-only"
+        return
+      }
+  done
+  [[ -z $(find "$RESULT_DIR" -type l -print -quit) ]] ||
+    {
+      fail "Prepared capture evidence contains a symbolic link"
+      return
+    }
+  local path
+  for path in \
+      "$CANDIDATE" "$PROVENANCE" "$SOURCE_ACCEPTANCE" \
+      "$upload_disk_json" "$managed_image_json" "$staging_definition_json" \
+      "$staging_request" "$staging_response" "$capture_vm_resource" \
+      "$capture_vm_instance" "$capture_disk_json" "$snapshot_json" \
+      "$target_request" "$private_key" "$private_key.pub" \
+      "$prepare_evidence_manifest"; do
+    prepared_file_is_safe "$path" ||
+      {
+        fail "Prepared capture evidence is missing, empty, linked, or not owner-only"
+        return
+      }
+  done
+  sha256sum --check --status "$prepare_evidence_manifest" ||
+    {
+      fail "Prepared capture evidence changed after the prepare transition"
+      return
+    }
+}
+
+persist_prepared_state() {
+  chmod -R go-rwx -- "$RESULT_DIR"
+  chmod go-rwx -- "$CANDIDATE" "$PROVENANCE" "$SOURCE_ACCEPTANCE"
+  sha256sum \
+    "$CANDIDATE" \
+    "$PROVENANCE" \
+    "$SOURCE_ACCEPTANCE" \
+    "$upload_disk_json" \
+    "$managed_image_json" \
+    "$staging_definition_json" \
+    "$staging_request" \
+    "$staging_response" \
+    "$capture_vm_resource" \
+    "$capture_vm_instance" \
+    "$capture_disk_json" \
+    "$snapshot_json" \
+    "$target_request" \
+    "$private_key" \
+    "$private_key.pub" >"$prepare_evidence_manifest"
+  chmod 0600 "$prepare_evidence_manifest"
+  state_replace '.stage = "prepared"' ||
+    fail "Could not persist the exact prepared capture transition"
+  require_prepared_state
+  printf 'MIZ_CAPTURE_STAGE=prepared\n'
+}
+
+recovery_intent_file="$RECOVERY_DIR/recovery-intent.json"
+recovery_state_file="$RECOVERY_DIR/capture-state.json"
+dispatch_marker_file="$DISPATCH_DIR/put-dispatch.json"
+
+export_recovery_intent() {
+  require_prepared_state
+  rm -rf -- "$RECOVERY_DIR"
+  mkdir -m 0700 -p "$RECOVERY_DIR"
+  cp -- "$STATE_FILE" "$recovery_state_file"
+  chmod 0600 "$recovery_state_file"
+  local state_sha256 candidate_sha256 provenance_sha256 acceptance_sha256
+  local request_sha256
+  state_sha256=$(sha256sum "$recovery_state_file" | awk '{print $1}')
+  candidate_sha256=$(sha256sum "$CANDIDATE" | awk '{print $1}')
+  provenance_sha256=$(sha256sum "$PROVENANCE" | awk '{print $1}')
+  acceptance_sha256=$(sha256sum "$SOURCE_ACCEPTANCE" | awk '{print $1}')
+  request_sha256=$(sha256sum "$target_request" | awk '{print $1}')
+  jq -n -c \
+    --arg repository "$GITHUB_REPOSITORY" \
+    --arg origin_run_id "$ORIGIN_RUN_ID" \
+    --arg origin_run_attempt "$ORIGIN_RUN_ATTEMPT" \
+    --arg source_commit "$SOURCE_COMMIT" \
+    --arg source_release_tag "$SOURCE_RELEASE_TAG" \
+    --arg tool_commit "$TOOL_COMMIT" \
+    --arg subscription_id "$AZURE_SUBSCRIPTION_ID" \
+    --arg scratch_resource_group "$resource_group" \
+    --arg snapshot_id "$snapshot_id" \
+    --arg definition_id "$target_definition_id" \
+    --arg version_id "$target_version_id" \
+    --arg state_sha256 "$state_sha256" \
+    --arg candidate_sha256 "$candidate_sha256" \
+    --arg provenance_sha256 "$provenance_sha256" \
+    --arg acceptance_sha256 "$acceptance_sha256" \
+    --arg request_sha256 "$request_sha256" \
+    '{
+      schema: 1,
+      type: "miz-ubuntu2404-confidential-capture-recovery-intent",
+      repository: $repository,
+      origin_run_id: $origin_run_id,
+      origin_run_attempt: $origin_run_attempt,
+      source_commit: $source_commit,
+      source_release_tag: $source_release_tag,
+      tool_commit: $tool_commit,
+      subscription_id: $subscription_id,
+      scratch_resource_group: $scratch_resource_group,
+      snapshot_id: $snapshot_id,
+      definition_id: $definition_id,
+      version_id: $version_id,
+      state_sha256: $state_sha256,
+      source: {
+        qcow_sha256: $candidate_sha256,
+        provenance_sha256: $provenance_sha256,
+        acceptance_sha256: $acceptance_sha256
+      },
+      target_request_sha256: $request_sha256
+    }' >"$recovery_intent_file"
+  chmod 0600 "$recovery_intent_file"
+  jq -e '
+    [paths(scalars) as $path |
+      ($path[-1] | tostring | ascii_downcase) |
+      select(
+        . == "token" or . == "jwt" or . == "nonce" or . == "sas" or
+        . == "private_key" or . == "azure_config" or
+        . == "openid" or . == "jwks"
+      )
+    ] | length == 0
+  ' "$recovery_state_file" "$recovery_intent_file" >/dev/null ||
+    {
+      fail "Sanitized recovery artifact contains a forbidden sensitive field"
+      return
+    }
+  local intent_sha256
+  intent_sha256=$(sha256sum "$recovery_intent_file" | awk '{print $1}')
+  state_replace \
+    '.recovery.intent_sha256 = $intent_sha256 |
+     .recovery.status = "exported"' \
+    --arg intent_sha256 "$intent_sha256"
+  printf '%s\n' "$intent_sha256"
+}
+
+validate_recovery_intent() {
+  local state_sha256 candidate_sha256 provenance_sha256 acceptance_sha256
+  state_file_is_safe "$recovery_state_file" &&
+    state_file_is_safe "$recovery_intent_file" ||
+    {
+      fail "Recovery artifact files are not bounded owner-only regular files"
+      return
+    }
+  state_sha256=$(sha256sum "$recovery_state_file" | awk '{print $1}')
+  candidate_sha256=$(sha256sum "$CANDIDATE" | awk '{print $1}')
+  provenance_sha256=$(sha256sum "$PROVENANCE" | awk '{print $1}')
+  acceptance_sha256=$(sha256sum "$SOURCE_ACCEPTANCE" | awk '{print $1}')
+  jq -e \
+    --arg repository "$GITHUB_REPOSITORY" \
+    --arg origin_run_id "$ORIGIN_RUN_ID" \
+    --arg origin_run_attempt "$ORIGIN_RUN_ATTEMPT" \
+    --arg source_commit "$SOURCE_COMMIT" \
+    --arg source_release_tag "$SOURCE_RELEASE_TAG" \
+    --arg tool_commit "$TOOL_COMMIT" \
+    --arg subscription_id "$AZURE_SUBSCRIPTION_ID" \
+    --arg scratch_resource_group "$resource_group" \
+    --arg snapshot_id "$snapshot_id" \
+    --arg definition_id "$target_definition_id" \
+    --arg version_id "$target_version_id" \
+    --arg state_sha256 "$state_sha256" \
+    --arg candidate_sha256 "$candidate_sha256" \
+    --arg provenance_sha256 "$provenance_sha256" \
+    --arg acceptance_sha256 "$acceptance_sha256" \
+    'keys == [
+       "definition_id", "origin_run_attempt", "origin_run_id", "repository",
+       "schema", "scratch_resource_group", "snapshot_id", "source",
+       "source_commit", "source_release_tag", "state_sha256",
+       "subscription_id", "target_request_sha256", "tool_commit", "type",
+       "version_id"
+     ] and
+     .schema == 1 and
+     .type == "miz-ubuntu2404-confidential-capture-recovery-intent" and
+     .repository == $repository and
+     .origin_run_id == $origin_run_id and
+     .origin_run_attempt == $origin_run_attempt and
+     .source_commit == $source_commit and
+     .source_release_tag == $source_release_tag and
+     .tool_commit == $tool_commit and
+     (.subscription_id | ascii_downcase) ==
+       ($subscription_id | ascii_downcase) and
+     .scratch_resource_group == $scratch_resource_group and
+     (.snapshot_id | ascii_downcase) == ($snapshot_id | ascii_downcase) and
+     (.definition_id | ascii_downcase) == ($definition_id | ascii_downcase) and
+     (.version_id | ascii_downcase) == ($version_id | ascii_downcase) and
+     .state_sha256 == $state_sha256 and
+     .source == {
+       qcow_sha256: $candidate_sha256,
+       provenance_sha256: $provenance_sha256,
+       acceptance_sha256: $acceptance_sha256
+     } and
+     (.target_request_sha256 | test("^[0-9a-f]{64}$"))' \
+    "$recovery_intent_file" >/dev/null ||
+    {
+      fail "Recovery intent digest or full protected identity is invalid"
+      return
+    }
+}
+
+mark_recovery_durable() {
+  [[ "${RECOVERY_ARTIFACT_DIGEST:-}" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+    {
+      fail "Recovery artifact digest is missing or invalid"
+      return
+    }
+  local intent_sha256
+  intent_sha256=$(sha256sum "$recovery_intent_file" | awk '{print $1}')
+  local state_intent_sha256
+  state_intent_sha256=$(jq -r '.recovery.intent_sha256 // ""' "$STATE_FILE")
+  [[ -z "$state_intent_sha256" || "$state_intent_sha256" == "$intent_sha256" ]] ||
+    {
+      fail "Recovery intent digest does not match exported state"
+      return
+    }
+  state_replace \
+    '.recovery.intent_sha256 = $intent_sha256 |
+     .recovery.artifact_digest = $artifact_digest |
+     .recovery.status = "durable"' \
+    --arg intent_sha256 "$intent_sha256" \
+    --arg artifact_digest "$RECOVERY_ARTIFACT_DIGEST"
+}
+
+export_dispatch_marker() {
+  jq -e '
+    .stage == "prepared" and
+    .recovery.status == "durable" and
+    .target.publication.status == "not_dispatched"
+  ' "$STATE_FILE" >/dev/null ||
+    {
+      fail "PUT authorization requires durable recovery and an undispatched target"
+      return
+    }
+  rm -rf -- "$DISPATCH_DIR"
+  mkdir -m 0700 -p "$DISPATCH_DIR"
+  local intent_sha256 recovery_digest
+  intent_sha256=$(jq -er '.recovery.intent_sha256' "$STATE_FILE")
+  recovery_digest=$(jq -er '.recovery.artifact_digest' "$STATE_FILE")
+  jq -n -c \
+    --arg repository "$GITHUB_REPOSITORY" \
+    --arg origin_run_id "$ORIGIN_RUN_ID" \
+    --arg origin_run_attempt "$ORIGIN_RUN_ATTEMPT" \
+    --arg source_commit "$SOURCE_COMMIT" \
+    --arg source_release_tag "$SOURCE_RELEASE_TAG" \
+    --arg tool_commit "$TOOL_COMMIT" \
+    --arg version_id "$target_version_id" \
+    --arg snapshot_id "$snapshot_id" \
+    --arg recovery_artifact_name "$RECOVERY_ARTIFACT_NAME" \
+    --arg recovery_artifact_digest "$recovery_digest" \
+    --arg recovery_intent_sha256 "$intent_sha256" \
+    '{
+      schema: 1,
+      type: "miz-ubuntu2404-confidential-capture-put-dispatch",
+      repository: $repository,
+      origin_run_id: $origin_run_id,
+      origin_run_attempt: $origin_run_attempt,
+      source_commit: $source_commit,
+      source_release_tag: $source_release_tag,
+      tool_commit: $tool_commit,
+      version_id: $version_id,
+      snapshot_id: $snapshot_id,
+      recovery_artifact_name: $recovery_artifact_name,
+      recovery_artifact_digest: $recovery_artifact_digest,
+      recovery_intent_sha256: $recovery_intent_sha256
+    }' >"$dispatch_marker_file"
+  chmod 0600 "$dispatch_marker_file"
+}
+
+validate_dispatch_marker() {
+  state_file_is_safe "$dispatch_marker_file" ||
+    {
+      fail "PUT dispatch marker is missing, linked, or not owner-only"
+      return
+    }
+  local recovery_digest intent_sha256
+  recovery_digest=$(jq -er '.recovery.artifact_digest' "$STATE_FILE")
+  intent_sha256=$(jq -er '.recovery.intent_sha256' "$STATE_FILE")
+  jq -e \
+    --arg repository "$GITHUB_REPOSITORY" \
+    --arg origin_run_id "$ORIGIN_RUN_ID" \
+    --arg origin_run_attempt "$ORIGIN_RUN_ATTEMPT" \
+    --arg source_commit "$SOURCE_COMMIT" \
+    --arg source_release_tag "$SOURCE_RELEASE_TAG" \
+    --arg tool_commit "$TOOL_COMMIT" \
+    --arg version_id "$target_version_id" \
+    --arg snapshot_id "$snapshot_id" \
+    --arg recovery_artifact_name "$RECOVERY_ARTIFACT_NAME" \
+    --arg recovery_artifact_digest "$recovery_digest" \
+    --arg recovery_intent_sha256 "$intent_sha256" \
+    'keys == [
+       "origin_run_attempt", "origin_run_id", "recovery_artifact_digest",
+       "recovery_artifact_name", "recovery_intent_sha256", "repository",
+       "schema", "snapshot_id", "source_commit", "source_release_tag",
+       "tool_commit", "type", "version_id"
+     ] and
+     .schema == 1 and
+     .type == "miz-ubuntu2404-confidential-capture-put-dispatch" and
+     .repository == $repository and
+     .origin_run_id == $origin_run_id and
+     .origin_run_attempt == $origin_run_attempt and
+     .source_commit == $source_commit and
+     .source_release_tag == $source_release_tag and
+     .tool_commit == $tool_commit and
+     (.version_id | ascii_downcase) == ($version_id | ascii_downcase) and
+     (.snapshot_id | ascii_downcase) == ($snapshot_id | ascii_downcase) and
+     .recovery_artifact_name == $recovery_artifact_name and
+     .recovery_artifact_digest == $recovery_artifact_digest and
+     .recovery_intent_sha256 == $recovery_intent_sha256' \
+    "$dispatch_marker_file" >/dev/null ||
+    {
+      fail "PUT dispatch marker identity does not match the recovery intent"
+      return
+    }
+}
+
+mark_dispatch_durable() {
+  local publication_status=${1:-put_authorized}
+  [[ "$publication_status" == put_authorized ||
+      "$publication_status" == quarantined ]] ||
+    {
+      fail "PUT dispatch durable state is invalid"
+      return
+    }
+  [[ "${DISPATCH_ARTIFACT_DIGEST:-}" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+    {
+      fail "PUT dispatch artifact digest is missing or invalid"
+      return
+    }
+  validate_dispatch_marker || return
+  state_replace \
+    '.target.publication.dispatch_artifact_digest = $artifact_digest |
+     .target.publication.status = $publication_status' \
+    --arg artifact_digest "$DISPATCH_ARTIFACT_DIGEST" \
+    --arg publication_status "$publication_status"
+}
+
+finalize_durable_result() {
+  [[ "${CAPTURE_RESULT_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] ||
+    {
+      fail "Durable capture result digest is missing or invalid"
+      return
+    }
+  jq -e '
+    .stage == "result_ready" and
+    .target.publication.status == "published" and
+    .result.status == "ready"
+  ' "$STATE_FILE" >/dev/null ||
+    {
+      fail "Capture result is not ready for durable finalization"
+      return
+    }
+  local local_result_sha256
+  local_result_sha256=$(sha256sum "$capture_result" | awk '{print $1}')
+  [[ "$local_result_sha256" == "$CAPTURE_RESULT_SHA256" ]] ||
+    {
+      fail "Uploaded capture result digest does not match local sanitized result"
+      return
+    }
+  state_replace \
+    '.result.sha256 = $sha256 |
+     .result.status = "durable" |
+     .run_succeeded = true |
+     .stage = "completed"' \
+    --arg sha256 "$CAPTURE_RESULT_SHA256"
+  printf 'MIZ_CAPTURE_STAGE=completed\n'
+}
+
+refresh_recovery_prepared_evidence() {
+  mkdir -m 0700 -p "$source_dir" "$capture_dir" "$final_dir"
+  azure_trusted_launch_disk_show_args "$resource_group" "$upload_disk_name"
+  az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >"$upload_disk_json"
+  upload_disk_id=$("$RELEASE_TOOL" check-managed-disk --disk "$upload_disk_json")
+  azure_confidential_vm_managed_image_show_args \
+    "$resource_group" "$managed_image_name"
+  az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$managed_image_json"
+  managed_image_id=$(
+    "$RELEASE_TOOL" check-managed-image \
+      --image "$managed_image_json" \
+      --disk-id "$upload_disk_id"
+  )
+  azure_confidential_vm_image_definition_show_args \
+    "$resource_group" "$staging_gallery" "$staging_definition"
+  az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$staging_definition_json"
+  [[ "$("$RELEASE_TOOL" check-image-definition \
+    --definition "$staging_definition_json")" == "$staging_definition_id" ]]
+  azure_trusted_launch_gallery_version_get_args "$staging_version_id"
+  az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >"$staging_response"
+  "$RELEASE_TOOL" gallery-request \
+    --output "$staging_request" \
+    --location "$AZURE_LOCATION" \
+    --source-id "$managed_image_id"
+  local qcow_sha256 vhd_sha256 source_acceptance_sha256
+  qcow_sha256=$(sha256sum "$CANDIDATE" | awk '{print $1}')
+  vhd_sha256=$(jq -er '.artifact.vhd_sha256' "$SOURCE_ACCEPTANCE")
+  source_acceptance_sha256=$(sha256sum "$SOURCE_ACCEPTANCE" | awk '{print $1}')
+  jq \
+    --arg owner "$OWNER" \
+    --arg repository "$GITHUB_REPOSITORY" \
+    --arg run_id "$ORIGIN_RUN_ID" \
+    --arg run_attempt "$ORIGIN_RUN_ATTEMPT" \
+    --arg source_commit "$SOURCE_COMMIT" \
+    --arg qcow_sha256 "$qcow_sha256" \
+    --arg vhd_sha256 "$vhd_sha256" \
+    --arg source_acceptance_sha256 "$source_acceptance_sha256" \
+    '.tags = {
+      "miz-owner": $owner,
+      "miz-repository": $repository,
+      "miz-run-id": $run_id,
+      "miz-run-attempt": $run_attempt,
+      "miz-source-commit": $source_commit,
+      "miz-qcow-sha256": $qcow_sha256,
+      "miz-vhd-sha256": $vhd_sha256,
+      "miz-source-acceptance-sha256": $source_acceptance_sha256
+    }' "$staging_request" >"${staging_request}.tagged"
+  mv -f -- "${staging_request}.tagged" "$staging_request"
+  collect_vm_contract "$capture_vm_name" "$capture_vm_resource" "$capture_vm_instance"
+  capture_vm_id=$(jq -er '.id' "$capture_vm_resource")
+  capture_disk_id=$(jq -er \
+    '.storageProfile.osDisk.managedDisk.id' "$capture_vm_resource")
+  azure_confidential_vm_capture_disk_show_args "$capture_disk_id"
+  az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$capture_disk_json"
+  azure_confidential_vm_capture_snapshot_show_args \
+    "$resource_group" "$snapshot_name"
+  az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$snapshot_json"
+  "$RELEASE_TOOL" capture-gallery-request \
+    --output "$target_request" \
+    --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+    --location "$TARGET_LOCATION" \
+    --snapshot-id "$snapshot_id" \
+    --definition-id "$target_definition_id" \
+    --version-id "$target_version_id"
+  jq \
+    --arg owner "$OWNER" \
+    --arg repository "$GITHUB_REPOSITORY" \
+    --arg run_id "$ORIGIN_RUN_ID" \
+    --arg run_attempt "$ORIGIN_RUN_ATTEMPT" \
+    --arg source_commit "$SOURCE_COMMIT" \
+    '.tags = {
+      "miz-owner": $owner,
+      "miz-repository": $repository,
+      "miz-run-id": $run_id,
+      "miz-run-attempt": $run_attempt,
+      "miz-source-commit": $source_commit
+    }' "$target_request" >"${target_request}.tagged"
+  mv -f -- "${target_request}.tagged" "$target_request"
+  local regenerated_request_sha256 intended_request_sha256
+  regenerated_request_sha256=$(sha256sum "$target_request" | awk '{print $1}')
+  intended_request_sha256=$(jq -er \
+    '.target_request_sha256' "$recovery_intent_file")
+  [[ "$regenerated_request_sha256" == "$intended_request_sha256" ]] ||
+    {
+      fail "Regenerated target request does not match durable recovery intent"
+      return
+    }
+  rm -f -- "$private_key" "$private_key.pub"
+  ssh-keygen -q -t ed25519 -N '' -f "$private_key"
+  persist_prepared_state
+}
+
+validate_existing_target_version() {
+  "$RELEASE_TOOL" check-capture-gallery \
+    --request "$target_request" \
+    --response "$target_response" \
+    --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+    --location "$TARGET_LOCATION" \
+    --snapshot-id "$snapshot_id" \
+    --definition-id "$target_definition_id" \
+    --version-id "$target_version_id"
+  owned_tags_match "$target_response" "$OWNER" "$GITHUB_REPOSITORY" \
+    "$ORIGIN_RUN_ID" "$ORIGIN_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
+    {
+      fail "Existing target version does not match the immutable origin tags"
+      return
+    }
+  local states_file="${target_response}.state"
+  "$RELEASE_TOOL" capture-gallery-state \
+    --response "$target_response" >"$states_file"
+  local -a states
+  readarray -t states <"$states_file"
+  [[ ${#states[@]} -eq 2 &&
+      "${states[0]}" == Succeeded && "${states[1]}" == Completed ]] ||
+    {
+      fail "Existing target version is not successfully and fully replicated"
+      return
+    }
+}
+
+inspect_recovery_target() {
+  [[ "${RECOVERY_ARTIFACT_DIGEST:-}" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+    {
+      fail "Recovery artifact digest is unavailable"
+      return
+    }
+  [[ "${RECOVERY_ACTION_FILE:-}" == /* ]] ||
+    {
+      fail "Recovery action output path is invalid"
+      return
+    }
+  validate_recovery_intent || return
+  mark_recovery_durable || return
+    local marker_present=false stderr_file="$RESULT_DIR/target-version-recovery.stderr"
+    if [[ -e "$dispatch_marker_file" ]]; then
+      marker_present=true
+      mark_dispatch_durable quarantined || return
+    fi
+    refresh_recovery_prepared_evidence || return
+    validate_target_parents || return
+    validate_publication_snapshot_access || return
+  azure_confidential_vm_capture_gallery_version_get_args "$target_version_id"
+  if publication_az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" \
+      >"$target_response" 2>"$stderr_file"; then
+    rm -f -- "$stderr_file"
+    [[ "$marker_present" == true ]] ||
+      {
+        fail "Existing target version has no durable PUT dispatch marker"
+        return
+      }
+    validate_existing_target_version || return
+    state_replace '.target.publication.status = "put_authorized"'
+    printf 'resume\n' >"$RECOVERY_ACTION_FILE"
+  else
+    grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' \
+      "$stderr_file" ||
+      {
+        fail "Could not determine exact target version recovery state"
+        return
+      }
+    rm -f -- "$stderr_file"
+    [[ "$marker_present" == false ]] ||
+      {
+        fail "Target is absent after a durable PUT dispatch marker; refusing an ambiguous second PUT"
+        return
+      }
+    printf 'publish\n' >"$RECOVERY_ACTION_FILE"
+  fi
+  chmod 0600 "$RECOVERY_ACTION_FILE"
+}
+
+case "$command_name" in
+  adopt-recovery)
+    validate_recovery_intent
+    mark_recovery_durable
+    if [[ -e "$dispatch_marker_file" ]]; then
+      mark_dispatch_durable quarantined
+    fi
+    exit
+    ;;
+  export-recovery)
+    export_recovery_intent
+    exit
+    ;;
+  mark-recovery-durable)
+    mark_recovery_durable
+    exit
+    ;;
+  export-dispatch)
+    export_dispatch_marker
+    exit
+    ;;
+  mark-dispatch-durable)
+    mark_dispatch_durable
+    exit
+    ;;
+  inspect-recovery)
+    require_publication_account
+    inspect_recovery_target
+    exit
+    ;;
+  finalize)
+    finalize_durable_result
+    exit
+    ;;
+esac
+
 cleanup_on_exit() {
   local status=$? cleanup_status=0
   trap - EXIT INT TERM
@@ -1453,7 +2456,28 @@ cleanup_on_exit() {
   rm -f -- \
     "$source_dir/azguestattestation1.deb" "$source_dir/attestation-client.zip" \
     "$final_dir/azguestattestation1.deb" "$final_dir/attestation-client.zip"
-  cleanup_resources || cleanup_status=1
+  local publication_status result_status dispatch_digest
+  publication_status=$(jq -r '.target.publication.status // "unknown"' \
+    "$STATE_FILE" 2>/dev/null || printf unknown)
+  result_status=$(jq -r '.result.status // "unknown"' \
+    "$STATE_FILE" 2>/dev/null || printf unknown)
+  dispatch_digest=$(jq -r \
+    '.target.publication.dispatch_artifact_digest // ""' \
+    "$STATE_FILE" 2>/dev/null || printf unknown)
+  if [[ -n ${DISPATCH_ARTIFACT_DIGEST:-} ]]; then
+    dispatch_digest=$DISPATCH_ARTIFACT_DIGEST
+  elif [[ -n ${ORIGIN_DISPATCH_ARTIFACT_DIGEST:-} ]]; then
+    dispatch_digest=$ORIGIN_DISPATCH_ARTIFACT_DIGEST
+  fi
+  if [[ "$publication_status" == not_dispatched &&
+      -z "$dispatch_digest" ]] ||
+      [[ "$publication_status" == published &&
+        "$result_status" == durable ]]; then
+    cleanup_resources || cleanup_status=1
+  else
+    printf '::warning::Retaining quarantined scratch resources: publication=%s result=%s\n' \
+      "$publication_status" "$result_status" >&2
+  fi
   if (( cleanup_status != 0 && status == 0 )); then
     status=1
   fi
@@ -1462,58 +2486,18 @@ cleanup_on_exit() {
 trap cleanup_on_exit EXIT
 trap 'exit 130' INT TERM
 
-account_subscription=$(az account show --query id --output tsv)
-[[ "${account_subscription,,}" == "${AZURE_SUBSCRIPTION_ID,,}" ]] ||
-  fail "Azure login subscription does not match the protected input"
-capture_principal_type=$(az account show --query user.type --output tsv)
-capture_principal_client_id=$(az account show --query user.name --output tsv)
-[[ "$capture_principal_type" == servicePrincipal &&
-    "${capture_principal_client_id,,}" == "${CAPTURE_PRINCIPAL_CLIENT_ID,,}" ]] ||
-  fail "Azure login does not match the narrow capture principal"
-publication_account_subscription=$(
-  publication_az account show --query id --output tsv
-)
-publication_principal_type=$(
-  publication_az account show --query user.type --output tsv
-)
-publication_principal_client_id=$(
-  publication_az account show --query user.name --output tsv
-)
-[[ "${publication_account_subscription,,}" == "${AZURE_SUBSCRIPTION_ID,,}" ]] ||
-  fail "Publication principal subscription does not match the protected input"
-[[ "$publication_principal_type" == servicePrincipal &&
-    "${publication_principal_client_id,,}" == "${PUBLICATION_PRINCIPAL_CLIENT_ID,,}" ]] ||
-  fail "Azure login does not match the exclusive publication principal"
+if [[ "$command_name" == prepare || "$command_name" == run ]]; then
+  require_target_version_absent_capture prepare
 
-validate_target_parents
-require_target_version_absent startup
-
-# The random 128-bit suffix makes collision with an unrelated group
-# cryptographically negligible. Resource Group PUT remains an ordinary upsert,
-# so only an unambiguous response plus a fresh exact GET authorizes cleanup.
+# The scratch resource group and both role assignments already exist before
+# dispatch. Claiming its exact reservation tags avoids any role assignment at
+# a nonexistent dynamic scope and preserves the exclusive target writer.
 group_exists=$(az group exists --name "$resource_group" --output tsv)
 case "$group_exists" in
-  false) ;;
-  true) fail "Refusing to reuse temporary resource group $resource_group"; exit 1 ;;
+  true) ;;
+  false) fail "Pre-provisioned scratch resource group is missing"; exit 1 ;;
   *) fail "Azure returned an invalid resource-group existence result"; exit 1 ;;
 esac
-jq -n \
-  --arg location "$AZURE_LOCATION" \
-  --arg owner "$OWNER" \
-  --arg repository "$GITHUB_REPOSITORY" \
-  --arg run_id "$GITHUB_RUN_ID" \
-  --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
-  --arg source_commit "$SOURCE_COMMIT" \
-  '{
-    location: $location,
-    tags: {
-      "miz-owner": $owner,
-      "miz-repository": $repository,
-      "miz-run-id": $run_id,
-      "miz-run-attempt": $run_attempt,
-      "miz-source-commit": $source_commit
-    }
-  }' >"$temporary_group_request"
 create_temporary_group
 
 accepted_identity_file="$RESULT_DIR/accepted-identity.txt"
@@ -1650,8 +2634,8 @@ source_acceptance_sha256=$(sha256sum "$SOURCE_ACCEPTANCE" | awk '{print $1}')
 jq \
   --arg owner "$OWNER" \
   --arg repository "$GITHUB_REPOSITORY" \
-  --arg run_id "$GITHUB_RUN_ID" \
-  --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+  --arg run_id "$ORIGIN_RUN_ID" \
+  --arg run_attempt "$ORIGIN_RUN_ATTEMPT" \
   --arg source_commit "$SOURCE_COMMIT" \
   --arg qcow_sha256 "$qcow_sha256" \
   --arg vhd_sha256 "$vhd_sha256" \
@@ -1678,8 +2662,8 @@ wait_source_gallery_version "$staging_response" "$staging_version_id"
 jq -e \
   --arg owner "$OWNER" \
   --arg repository "$GITHUB_REPOSITORY" \
-  --arg run_id "$GITHUB_RUN_ID" \
-  --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+  --arg run_id "$ORIGIN_RUN_ID" \
+  --arg run_attempt "$ORIGIN_RUN_ATTEMPT" \
   --arg source_commit "$SOURCE_COMMIT" \
   --arg qcow_sha256 "$qcow_sha256" \
   --arg vhd_sha256 "$vhd_sha256" \
@@ -1870,13 +2854,11 @@ az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$snapshot_json"
   --vm-id "$capture_vm_id" \
   --disk-id "$capture_disk_id")" == "$snapshot_id" ]]
 owned_tags_match "$snapshot_json" "$OWNER" "$GITHUB_REPOSITORY" \
-  "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
+  "$ORIGIN_RUN_ID" "$ORIGIN_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
   fail "Capture snapshot lost its exact run ownership tags"
 record_expected_resource \
   "$snapshot_json" "$snapshot_id" "Microsoft.Compute/snapshots" "$snapshot_name"
 
-target_request="$RESULT_DIR/target-gallery-request.json"
-target_response="$RESULT_DIR/target-gallery-response.json"
 "$RELEASE_TOOL" capture-gallery-request \
   --output "$target_request" \
   --subscription-id "$AZURE_SUBSCRIPTION_ID" \
@@ -1887,8 +2869,8 @@ target_response="$RESULT_DIR/target-gallery-response.json"
 jq \
   --arg owner "$OWNER" \
   --arg repository "$GITHUB_REPOSITORY" \
-  --arg run_id "$GITHUB_RUN_ID" \
-  --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+  --arg run_id "$ORIGIN_RUN_ID" \
+  --arg run_attempt "$ORIGIN_RUN_ATTEMPT" \
   --arg source_commit "$SOURCE_COMMIT" \
   '.tags = {
     "miz-owner": $owner,
@@ -1898,12 +2880,120 @@ jq \
     "miz-source-commit": $source_commit
   }' "$target_request" >"${target_request}.tagged"
 mv -f -- "${target_request}.tagged" "$target_request"
+
+rm -f -- "$vhd" "$known_hosts"
+rm -rf -- "$source_dir"
+mkdir -m 0700 "$source_dir"
+persist_prepared_state
+if [[ "$command_name" == prepare ]]; then
+  trap - EXIT INT TERM
+  exit 0
+fi
+else
+  require_prepared_state
+fi
+
+require_publication_account
+
+accepted_identity_file="$RESULT_DIR/accepted-identity.txt"
+"$RELEASE_TOOL" verify-acceptance \
+  --result "$SOURCE_ACCEPTANCE" \
+  --provenance "$PROVENANCE" \
+  --qcow "$CANDIDATE" \
+  --source-commit "$SOURCE_COMMIT" \
+  --location "$SOURCE_LOCATION" \
+  --vm-size "$SOURCE_VM_SIZE" \
+  --run-id "$SOURCE_RUN_ID" \
+  --run-attempt "$SOURCE_RUN_ATTEMPT" >"$accepted_identity_file"
+readarray -t accepted_identity <"$accepted_identity_file"
+[[ ${#accepted_identity[@]} -eq 3 ]]
+qcow_sha256=${accepted_identity[0]}
+qcow_bytes=${accepted_identity[1]}
+virtual_size=${accepted_identity[2]}
+vhd_sha256=$(jq -er '.artifact.vhd_sha256' "$SOURCE_ACCEPTANCE")
+vhd_bytes=$(jq -er '.artifact.vhd_size' "$SOURCE_ACCEPTANCE")
+source_acceptance_sha256=$(sha256sum "$SOURCE_ACCEPTANCE" | awk '{print $1}')
+upload_disk_id=$("$RELEASE_TOOL" check-managed-disk --disk "$upload_disk_json")
+managed_image_id=$(
+  "$RELEASE_TOOL" check-managed-image \
+    --image "$managed_image_json" \
+    --disk-id "$upload_disk_id"
+)
+[[ "$("$RELEASE_TOOL" check-image-definition \
+  --definition "$staging_definition_json")" == "$staging_definition_id" ]]
+"$RELEASE_TOOL" check-gallery \
+  --request "$staging_request" \
+  --response "$staging_response" \
+  --image-version-id "$staging_version_id" \
+  --source-id "$managed_image_id"
+capture_vm_id=$(jq -er '.id' "$capture_vm_resource")
+capture_disk_id=$(jq -er '.storageProfile.osDisk.managedDisk.id' "$capture_vm_resource")
+run_capture_vm_check "$capture_vm_resource" "$capture_vm_id" "$capture_disk_id" \
+  >/dev/null
+azure_confidential_vm_capture_snapshot_show_args \
+  "$resource_group" "$snapshot_name"
+az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$snapshot_json"
+[[ "$("$RELEASE_TOOL" check-capture-snapshot \
+  --snapshot "$snapshot_json" \
+  --snapshot-id "$snapshot_id" \
+  --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+  --location "$AZURE_LOCATION" \
+  --source-version-id "$staging_version_id" \
+  --vm-id "$capture_vm_id" \
+  --disk-id "$capture_disk_id")" == "$snapshot_id" ]]
+owned_tags_match "$snapshot_json" "$OWNER" "$GITHUB_REPOSITORY" \
+  "$ORIGIN_RUN_ID" "$ORIGIN_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
+  fail "Prepared capture snapshot lost its exact run ownership tags"
+
+expected_target_request="$RESULT_DIR/target-gallery-request.expected.json"
+"$RELEASE_TOOL" capture-gallery-request \
+  --output "$expected_target_request" \
+  --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+  --location "$TARGET_LOCATION" \
+  --snapshot-id "$snapshot_id" \
+  --definition-id "$target_definition_id" \
+  --version-id "$target_version_id"
+jq \
+  --arg owner "$OWNER" \
+  --arg repository "$GITHUB_REPOSITORY" \
+  --arg run_id "$ORIGIN_RUN_ID" \
+  --arg run_attempt "$ORIGIN_RUN_ATTEMPT" \
+  --arg source_commit "$SOURCE_COMMIT" \
+  '.tags = {
+    "miz-owner": $owner,
+    "miz-repository": $repository,
+    "miz-run-id": $run_id,
+    "miz-run-attempt": $run_attempt,
+    "miz-source-commit": $source_commit
+  }' "$expected_target_request" >"${expected_target_request}.tagged"
+mv -f -- "${expected_target_request}.tagged" "$expected_target_request"
+cmp -s "$expected_target_request" "$target_request" ||
+  fail "Prepared target gallery request does not match protected target identity"
+rm -f -- "$expected_target_request"
+
 # Revalidate all durable parents and the exact version absence at the final
 # mutation boundary. The remaining check-to-PUT race is controlled only by the
 # stable workflow lock and exclusive least-privilege publisher principal.
 validate_target_parents
-require_target_version_absent pre-put
-publish_target_version_once
+validate_publication_snapshot_access
+state_replace '.stage = "publishing"' ||
+  fail "Could not persist the exact publishing transition"
+printf 'MIZ_CAPTURE_STAGE=publishing\n'
+if [[ "$command_name" == recover ]]; then
+  publication_status=$(jq -er '.target.publication.status' "$STATE_FILE")
+  [[ "$publication_status" == put_authorized ]] ||
+    fail "Recovery requires the exact durable PUT dispatch marker"
+  azure_confidential_vm_capture_gallery_version_get_args "$target_version_id"
+  publication_az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$target_response" ||
+    fail "Exact recovery target version is missing or unavailable"
+  validate_existing_target_version
+  state_replace '.target.publication.status = "published"' ||
+    fail "Could not persist validated existing target recovery"
+  printf 'MIZ_CAPTURE_TARGET=resumed-existing\n'
+else
+  require_target_version_absent pre-put
+  publish_target_version_once
+fi
 
 final_vm_resource="$final_dir/vm-resource.json"
 final_vm_instance="$final_dir/vm-instance.json"
@@ -1911,14 +3001,67 @@ final_guest_imds="$final_dir/guest-imds.json"
 final_token="$final_dir/attestation.jwt"
 final_openid="$final_dir/openid-configuration.json"
 final_jwks="$final_dir/jwks.json"
-create_vm_network "$final_public_ip_name" "$final_nic_name" final
-final_nic_id=$CREATED_NIC_ID
-azure_confidential_vm_captured_vm_create_args \
-  "$resource_group" "$final_vm_name" "$AZURE_LOCATION" "$AZURE_VM_SIZE" \
-  "$target_version_id" "$admin_username" "$private_key.pub" true \
-  "$final_nic_id" "$final_os_disk_name"
-AZURE_CONFIDENTIAL_VM_ARGS+=(--tags "${exact_tags[@]}")
-az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$final_dir/vm-create.json"
+final_vm_exists=false
+if az vm show \
+    --resource-group "$resource_group" \
+    --name "$final_vm_name" \
+    --output json >"$final_dir/vm-existing.json" \
+    2>"$final_dir/vm-existing.stderr"; then
+  final_vm_exists=true
+  rm -f -- "$final_dir/vm-existing.stderr"
+  [[ "$command_name" == recover ]] ||
+    fail "Final validation VM unexpectedly already exists"
+  owned_tags_match "$final_dir/vm-existing.json" "$OWNER" \
+    "$GITHUB_REPOSITORY" "$ORIGIN_RUN_ID" "$ORIGIN_RUN_ATTEMPT" \
+    "$SOURCE_COMMIT" ||
+    fail "Existing recovery validation VM has mismatched origin tags"
+  final_nic_id=$(jq -er \
+    '.networkProfile.networkInterfaces |
+     select(length == 1) | .[0].id' "$final_dir/vm-existing.json")
+  expected_final_nic_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/providers/Microsoft.Network/networkInterfaces/$final_nic_name"
+  [[ "${final_nic_id,,}" == "${expected_final_nic_id,,}" ]] ||
+    fail "Existing recovery validation VM has an unexpected NIC"
+  az network nic show --ids "$final_nic_id" --output json \
+    >"$final_dir/nic-existing.json"
+  record_expected_resource \
+    "$final_dir/nic-existing.json" "$final_nic_id" \
+    "Microsoft.Network/networkInterfaces" "$final_nic_name"
+  final_public_ip_id=$(jq -er \
+    '.ipConfigurations |
+     select(length == 1) | .[0].publicIPAddress.id' \
+    "$final_dir/nic-existing.json")
+  expected_final_public_ip_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/providers/Microsoft.Network/publicIPAddresses/$final_public_ip_name"
+  [[ "${final_public_ip_id,,}" == "${expected_final_public_ip_id,,}" ]] ||
+    fail "Existing recovery validation VM has an unexpected public IP"
+  az network public-ip show --ids "$final_public_ip_id" --output json \
+    >"$final_dir/public-ip-existing.json"
+  record_expected_resource \
+    "$final_dir/public-ip-existing.json" "$final_public_ip_id" \
+    "Microsoft.Network/publicIPAddresses" "$final_public_ip_name"
+  az vm start \
+    --resource-group "$resource_group" \
+    --name "$final_vm_name" \
+    --output none
+  az vm user update \
+    --resource-group "$resource_group" \
+    --name "$final_vm_name" \
+    --username "$admin_username" \
+    --ssh-key-value "$private_key.pub" \
+    --output none
+else
+  grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' \
+    "$final_dir/vm-existing.stderr" ||
+    fail "Could not determine final validation VM recovery state"
+  rm -f -- "$final_dir/vm-existing.stderr"
+  create_vm_network "$final_public_ip_name" "$final_nic_name" final
+  final_nic_id=$CREATED_NIC_ID
+  azure_confidential_vm_captured_vm_create_args \
+    "$resource_group" "$final_vm_name" "$AZURE_LOCATION" "$AZURE_VM_SIZE" \
+    "$target_version_id" "$admin_username" "$private_key.pub" true \
+    "$final_nic_id" "$final_os_disk_name"
+  AZURE_CONFIDENTIAL_VM_ARGS+=(--tags "${exact_tags[@]}")
+  az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$final_dir/vm-create.json"
+fi
 collect_vm_contract "$final_vm_name" "$final_vm_resource" "$final_vm_instance"
 record_vm_and_os_disk \
   "$final_vm_resource" "$final_vm_name" "$final_os_disk_name" \
@@ -1963,9 +3106,9 @@ azure_confidential_vm_snapshot_show_args "$resource_group" "$snapshot_name"
 az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$snapshot_json"
 azure_confidential_vm_capture_image_definition_show_args \
   "$TARGET_RESOURCE_GROUP" "$TARGET_GALLERY" "$TARGET_IMAGE_DEFINITION"
-publication_az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$target_definition_json"
+az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$target_definition_json"
 azure_confidential_vm_capture_gallery_version_get_args "$target_version_id"
-publication_az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$target_response"
+az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$target_response"
 collect_vm_contract "$final_vm_name" "$final_vm_resource" "$final_vm_instance"
 refresh_maa_metadata "$final_openid" "$final_jwks"
 
@@ -1983,8 +3126,8 @@ refresh_maa_metadata "$final_openid" "$final_jwks"
 jq -e \
   --arg owner "$OWNER" \
   --arg repository "$GITHUB_REPOSITORY" \
-  --arg run_id "$GITHUB_RUN_ID" \
-  --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+  --arg run_id "$ORIGIN_RUN_ID" \
+  --arg run_attempt "$ORIGIN_RUN_ATTEMPT" \
   --arg source_commit "$SOURCE_COMMIT" \
   --arg qcow_sha256 "$qcow_sha256" \
   --arg vhd_sha256 "$vhd_sha256" \
@@ -2017,7 +3160,7 @@ run_capture_vm_check "$capture_vm_resource" "$capture_vm_id" "$capture_disk_id" 
   --vm-id "$capture_vm_id" \
   --disk-id "$capture_disk_id")" == "$snapshot_id" ]]
 owned_tags_match "$snapshot_json" "$OWNER" "$GITHUB_REPOSITORY" \
-  "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
+  "$ORIGIN_RUN_ID" "$ORIGIN_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
   fail "Fresh capture snapshot evidence lost its exact run ownership tags"
 "$RELEASE_TOOL" check-capture-definition \
   --definition "$target_definition_json" \
@@ -2035,7 +3178,7 @@ owned_tags_match "$snapshot_json" "$OWNER" "$GITHUB_REPOSITORY" \
   --definition-id "$target_definition_id" \
   --version-id "$target_version_id"
 owned_tags_match "$target_response" "$OWNER" "$GITHUB_REPOSITORY" \
-  "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
+  "$ORIGIN_RUN_ID" "$ORIGIN_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
   fail "Fresh target gallery version evidence lost its exact run ownership tags"
 "$RELEASE_TOOL" check-captured-vm \
   --vm "$final_vm_resource" \
@@ -2090,6 +3233,7 @@ capture_common_args=(
   --provenance "$PROVENANCE"
   --qcow "$CANDIDATE"
   --source-commit "$SOURCE_COMMIT"
+  --source-release-tag "$SOURCE_RELEASE_TAG"
   --source-location "$SOURCE_LOCATION"
   --source-vm-size "$SOURCE_VM_SIZE"
   --source-run-id "$SOURCE_RUN_ID"
@@ -2102,10 +3246,11 @@ capture_common_args=(
   --staging-gallery-request "$staging_request"
   --staging-gallery-response "$staging_response"
   --subscription-id "$AZURE_SUBSCRIPTION_ID"
+  --tool-commit "$TOOL_COMMIT"
   --location "$AZURE_LOCATION"
   --repository "$GITHUB_REPOSITORY"
-  --run-id "$GITHUB_RUN_ID"
-  --run-attempt "$GITHUB_RUN_ATTEMPT"
+  --run-id "$ORIGIN_RUN_ID"
+  --run-attempt "$ORIGIN_RUN_ATTEMPT"
   --scratch-resource-group "$resource_group"
   --scratch-inventory "$scratch_inventory"
   --target-resource-group "$TARGET_RESOURCE_GROUP"
@@ -2157,4 +3302,10 @@ jq -e \
   "$capture_result" >/dev/null ||
   fail "Durable capture result contains a raw secret field"
 
-state_replace '.run_succeeded = true'
+capture_result_sha256=$(sha256sum "$capture_result" | awk '{print $1}')
+state_replace \
+  '.result.sha256 = $sha256 |
+   .result.status = "ready" |
+   .stage = "result_ready"' \
+  --arg sha256 "$capture_result_sha256"
+printf 'MIZ_CAPTURE_STAGE=result_ready\n'
