@@ -112,9 +112,9 @@ generated notes, and prerelease state still match the original transaction.
 Generated notes are created only for a new draft and retained byte-for-byte on
 retry. Draft releases never become the generated-notes predecessor. Stable
 main SemVer releases use the greatest lower published stable `v*` release;
-prereleases use the greatest lower published main SemVer release, including a
-published prerelease when it orders last. Image tags, malformed SemVer tags,
-and no-ref drafts are ignored. If the publication App token expires before the
+prereleases also use the greatest lower published stable `v*` release. Image
+tags, malformed SemVer tags, published prereleases, and no-ref drafts are
+ignored. If the publication App token expires before the
 one-way transition, the exact draft remains
 unpublished and a fresh-token rerun resumes it. A published release is never
 reopened, edited, clobbered, or corrected. A tag created before a failed draft

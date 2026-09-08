@@ -493,7 +493,7 @@ test "stable generated notes exclude published prereleases" {
     try expectAbsent(log, "previous_tag_name=v1.2.3-rc.1");
 }
 
-test "prerelease generated notes may follow a published prerelease" {
+test "prerelease generated notes use the previous published stable release" {
     var fixture = try Fixture.create(std.testing.allocator, "1.2.3-rc.2");
     defer fixture.deinit();
     const result = try fixture.run("published-prerelease", "1.2.3-rc.2");
@@ -501,7 +501,8 @@ test "prerelease generated notes may follow a published prerelease" {
     try expectSucceeded(result);
     const log = try fixture.log();
     defer std.testing.allocator.free(log);
-    try expectContains(log, "previous_tag_name=v1.2.3-rc.1");
+    try expectContains(log, "previous_tag_name=v1.2.2");
+    try expectAbsent(log, "previous_tag_name=v1.2.3-rc.1");
 }
 
 test "generated notes ignore a draft without a tag ref" {

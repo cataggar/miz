@@ -636,7 +636,8 @@ fn dispatchRelease(
             requiredOption(options, "repository"),
             &context.diagnostic,
         ) catch return error.Invalid;
-        return out.print("{d}\n", .{id});
+        out.print("{d}\n", .{id}) catch return error.OutOfMemory;
+        return;
     }
     if (std.mem.eql(u8, name, "check-release-policy")) {
         return support.github_release.validateRepositoryReleasePolicyFiles(

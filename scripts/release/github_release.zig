@@ -322,11 +322,6 @@ const Publisher = struct {
         const current_version = std.SemanticVersion.parse(
             self.options.version,
         ) catch unreachable;
-        const current_is_prerelease = std.mem.indexOfScalar(
-            u8,
-            std.mem.sliceTo(self.options.version, '+'),
-            '-',
-        ) != null;
         for (pages.value.array.items) |page| {
             if (page != .array) return self.fail(
                 "paginated release page is not an array",
@@ -390,7 +385,7 @@ const Publisher = struct {
                     "published release {s} prerelease state does not match its SemVer tag",
                     .{tag},
                 );
-                if (!current_is_prerelease and tag_is_prerelease) continue;
+                if (tag_is_prerelease) continue;
                 if (candidate_version.order(current_version) != .lt) continue;
                 if (self.previous_main_tag) |previous| {
                     const previous_version = std.SemanticVersion.parse(previous[1..]) catch

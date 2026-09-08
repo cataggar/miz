@@ -231,12 +231,7 @@ fn apiCommand(
     if (std.mem.endsWith(u8, endpoint, "/releases/generate-notes") and
         std.mem.eql(u8, method, "POST"))
     {
-        const expected_previous =
-            if (std.mem.eql(u8, scenario, "published-prerelease") and
-            std.mem.indexOfScalar(u8, version, '-') != null)
-                "v1.2.3-rc.1"
-            else
-                "v1.2.2";
+        const expected_previous = "v1.2.2";
         if (!std.mem.eql(u8, fieldValue(argv, "tag_name") orelse "", tag) or
             !std.mem.eql(
                 u8,
