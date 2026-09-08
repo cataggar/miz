@@ -62,27 +62,6 @@ pub const Report = struct {
     esp_volume_id: u32,
 };
 
-pub const Error = error{
-    InvalidEfiImage,
-    UnsupportedEfiArchitecture,
-    EfiArchitectureMismatch,
-    NotEfiApplication,
-    EfiFileExceedsLimit,
-    EfiFileTooLarge,
-    EfiInputChanged,
-    InvalidEfiSizeLimit,
-    UnsupportedOutputFormat,
-    InvalidOutputPath,
-    EspSizeNotMibAligned,
-    EspTooSmall,
-    EspTooLarge,
-    DiskSizeNotMibAligned,
-    DiskTooSmall,
-    SizeOverflow,
-    OutputImageCheckFailed,
-    OutputVerificationFailed,
-};
-
 const Inspection = struct {
     architecture: Architecture,
     size: u64,
@@ -335,14 +314,14 @@ fn copyInputToEsp(
     var offset: u64 = 0;
     while (offset < expected_size) {
         const wanted: usize = @intCast(@min(@as(u64, buffer.len), expected_size - offset));
-        const got = try input.readPositional(io, &.{buffer[0..wanted]}, offset);
+        const got = try input.readPositionalAll(io, buffer[0..wanted], offset);
         if (got == 0) return error.EfiInputChanged;
         hasher.update(buffer[0..got]);
         try writer.writeChunk(io, buffer[0..got]);
         offset += got;
     }
     var extra: [1]u8 = undefined;
-    if (try input.readPositional(io, &.{&extra}, expected_size) != 0) {
+    if (try input.readPositionalAll(io, &extra, expected_size) != 0) {
         return error.EfiInputChanged;
     }
     try writer.endFile(io);
@@ -412,7 +391,7 @@ fn verifyOutput(
     for (0..tree.nodeCount()) |index| {
         const entry = tree.entryAt(index);
         if (!std.mem.eql(u8, entry.path, boot_path)) continue;
-        if (entry.kind != .file) return false;
+        if (entry.kind != .file or entry.size != expected_size) return false;
         const content = entry.content orelse return false;
         var hasher = Sha256.init(.{});
         var buffer: [256 * 1024]u8 = undefined;
@@ -441,7 +420,7 @@ fn hashFile(file: Io.File, io: Io, size: u64) ![Sha256.digest_length]u8 {
     var offset: u64 = 0;
     while (offset < size) {
         const wanted: usize = @intCast(@min(@as(u64, buffer.len), size - offset));
-        const got = try file.readPositional(io, &.{buffer[0..wanted]}, offset);
+        const got = try file.readPositionalAll(io, buffer[0..wanted], offset);
         if (got == 0) return error.EfiInputChanged;
         hasher.update(buffer[0..got]);
         offset += got;
@@ -452,7 +431,7 @@ fn hashFile(file: Io.File, io: Io, size: u64) ![Sha256.digest_length]u8 {
 }
 
 fn readExact(file: Io.File, io: Io, buffer: []u8, offset: u64) !void {
-    if (try file.readPositional(io, &.{buffer}, offset) != buffer.len) {
+    if (try file.readPositionalAll(io, buffer, offset) != buffer.len) {
         return error.InvalidEfiImage;
     }
 }
