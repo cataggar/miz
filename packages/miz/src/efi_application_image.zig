@@ -106,10 +106,26 @@ const Identity = struct {
     vhd_unique_id: [16]u8,
 };
 
+const BuildHooks = struct {
+    before_verify: ?*const fn (ctx: *anyopaque, file: Io.File, io: Io) anyerror!void = null,
+    before_verify_ctx: ?*anyopaque = null,
+    before_publish: ?*const fn (ctx: *anyopaque) anyerror!void = null,
+    before_publish_ctx: ?*anyopaque = null,
+};
+
 pub fn build(
     allocator: std.mem.Allocator,
     io: Io,
     options: Options,
+) !Report {
+    return buildWithHooks(allocator, io, options, .{});
+}
+
+fn buildWithHooks(
+    allocator: std.mem.Allocator,
+    io: Io,
+    options: Options,
+    hooks: BuildHooks,
 ) !Report {
     if (options.output_path.len == 0) return error.InvalidOutputPath;
     if (options.output_format != .raw and options.output_format != .vhd) {
@@ -141,19 +157,26 @@ pub fn build(
         disk_size,
     );
 
-    const raw_path = if (options.output_format == .raw)
-        options.output_path
-    else
-        try std.fmt.allocPrint(allocator, "{s}.build-efi-application.raw", .{options.output_path});
-    defer if (options.output_format != .raw) allocator.free(raw_path);
-
-    var raw = try Image.createExclusive(io, raw_path, .raw, disk_size, .{});
-    var raw_open = true;
-    var keep_raw = false;
-    defer {
-        if (raw_open) raw.close(io);
-        if (!keep_raw) Io.Dir.cwd().deleteFile(io, raw_path) catch {};
+    const output_parent_path = std.fs.path.dirname(options.output_path) orelse ".";
+    const output_basename = std.fs.path.basename(options.output_path);
+    if (output_basename.len == 0 or std.mem.eql(u8, output_basename, ".") or
+        std.mem.eql(u8, output_basename, ".."))
+    {
+        return error.InvalidOutputPath;
     }
+    var output_parent = try Io.Dir.cwd().openDir(io, output_parent_path, .{});
+    defer output_parent.close(io);
+
+    var output_stage = try output_parent.createFileAtomic(io, output_basename, .{});
+    defer output_stage.deinit(io);
+    var raw_stage: ?Io.File.Atomic = if (options.output_format == .vhd)
+        try output_parent.createFileAtomic(io, output_basename, .{})
+    else
+        null;
+    defer if (raw_stage) |*stage| stage.deinit(io);
+
+    const raw_atomic = if (raw_stage) |*stage| stage else &output_stage;
+    var raw = try createImageInAtomic(raw_atomic, io, .raw, disk_size, .{});
 
     const esp_first_lba = esp_offset / gpt.sector_size;
     const esp_sectors = options.esp_size / gpt.sector_size;
@@ -186,30 +209,23 @@ pub fn build(
         inspection.sha256,
     )) return error.EfiInputChanged;
 
-    raw.close(io);
-    raw_open = false;
+    try raw.file.sync(io);
 
     if (options.output_format == .vhd) {
-        var source = try Image.openPathReadOnly(io, raw_path);
-        defer source.close(io);
-        var destination = try Image.createExclusive(io, options.output_path, .vhd, disk_size, .{
+        var destination = try createImageInAtomic(&output_stage, io, .vhd, disk_size, .{
             .vhd_subformat = .fixed,
             .unique_id = identity.vhd_unique_id,
             .timestamp_unix = vhd.timestamp_base,
         });
-        var destination_open = true;
-        var keep_output = false;
-        defer {
-            if (destination_open) destination.close(io);
-            if (!keep_output) Io.Dir.cwd().deleteFile(io, options.output_path) catch {};
+        _ = try image_mod.copyAll(io, raw, &destination, allocator);
+        try destination.file.sync(io);
+        if (hooks.before_verify) |hook| {
+            try hook(hooks.before_verify_ctx orelse return error.InvalidTestHook, destination.file, io);
         }
-        _ = try image_mod.copyAll(io, source, &destination, allocator);
-        destination.close(io);
-        destination_open = false;
         const verified = try verifyOutput(
             allocator,
             io,
-            options.output_path,
+            &destination,
             .vhd,
             inspection.sha256,
             inspection.size,
@@ -219,12 +235,15 @@ pub fn build(
             identity,
         );
         if (!verified) return error.OutputVerificationFailed;
-        keep_output = true;
+        try destination.file.sync(io);
     } else {
+        if (hooks.before_verify) |hook| {
+            try hook(hooks.before_verify_ctx orelse return error.InvalidTestHook, raw.file, io);
+        }
         const verified = try verifyOutput(
             allocator,
             io,
-            options.output_path,
+            &raw,
             .raw,
             inspection.sha256,
             inspection.size,
@@ -234,8 +253,13 @@ pub fn build(
             identity,
         );
         if (!verified) return error.OutputVerificationFailed;
-        keep_raw = true;
+        try raw.file.sync(io);
     }
+
+    if (hooks.before_publish) |hook| {
+        try hook(hooks.before_publish_ctx orelse return error.InvalidTestHook);
+    }
+    try output_stage.link(io);
 
     return .{
         .output_format = options.output_format,
@@ -250,6 +274,21 @@ pub fn build(
         .esp_partition_guid = identity.esp_partition_guid,
         .esp_volume_id = identity.esp_volume_id,
     };
+}
+
+fn createImageInAtomic(
+    stage: *Io.File.Atomic,
+    io: Io,
+    format: Format,
+    size: u64,
+    options: image_mod.CreateOptions,
+) !Image {
+    const file = stage.file;
+    stage.file_open = false;
+    const image = try Image.createFile(io, file, format, size, options);
+    stage.file = image.file;
+    stage.file_open = true;
+    return image;
 }
 
 pub fn validateFixedVhd(
@@ -410,41 +449,11 @@ fn inspect(
     const stat = try file.stat(io);
     if (stat.size > std.math.maxInt(u32)) return error.EfiFileTooLarge;
     if (stat.size > max_size) return error.EfiFileExceedsLimit;
-    if (stat.size < 64) return error.InvalidEfiImage;
-
-    var dos: [64]u8 = undefined;
-    try readExact(file, io, &dos, 0);
-    if (!std.mem.eql(u8, dos[0..2], "MZ")) return error.InvalidEfiImage;
-    const pe_offset: u64 = std.mem.readInt(u32, dos[0x3c..0x40], .little);
-    const coff_end = std.math.add(u64, pe_offset, 24) catch return error.InvalidEfiImage;
-    if (coff_end > stat.size) return error.InvalidEfiImage;
-
-    var coff: [24]u8 = undefined;
-    try readExact(file, io, &coff, pe_offset);
-    if (!std.mem.eql(u8, coff[0..4], "PE\x00\x00")) return error.InvalidEfiImage;
-    const architecture: Architecture = switch (std.mem.readInt(u16, coff[4..6], .little)) {
-        0x8664 => .x86_64,
-        0xaa64 => .aarch64,
-        else => return error.UnsupportedEfiArchitecture,
-    };
-    if (expected_architecture) |expected| {
-        if (architecture != expected) return error.EfiArchitectureMismatch;
-    }
-
-    const optional_size = std.mem.readInt(u16, coff[20..22], .little);
-    if (optional_size < 70) return error.InvalidEfiImage;
-    const optional_offset = coff_end;
-    const optional_end = std.math.add(u64, optional_offset, optional_size) catch
-        return error.InvalidEfiImage;
-    if (optional_end > stat.size) return error.InvalidEfiImage;
-    var optional_prefix: [70]u8 = undefined;
-    try readExact(file, io, &optional_prefix, optional_offset);
-    if (std.mem.readInt(u16, optional_prefix[0..2], .little) != 0x20b) {
-        return error.InvalidEfiImage;
-    }
-    if (std.mem.readInt(u16, optional_prefix[68..70], .little) != 10) {
-        return error.NotEfiApplication;
-    }
+    const architecture = try inspectPe(
+        FilePeReader{ .file = file, .io = io },
+        stat.size,
+        expected_architecture,
+    );
 
     return .{
         .architecture = architecture,
@@ -461,38 +470,95 @@ fn inspectContent(
 ) !void {
     if (size > std.math.maxInt(u32)) return error.EfiFileTooLarge;
     if (size > max_size) return error.EfiFileExceedsLimit;
+    _ = try inspectPe(
+        ContentPeReader{ .content = content },
+        size,
+        expected_architecture,
+    );
+}
+
+const pe_coff_size = 24;
+const pe_section_size = 40;
+
+const FilePeReader = struct {
+    file: Io.File,
+    io: Io,
+
+    fn readExact(self: FilePeReader, buffer: []u8, offset: u64) !void {
+        try readFileExact(self.file, self.io, buffer, offset);
+    }
+};
+
+const ContentPeReader = struct {
+    content: tree_cursor.Cursor.ContentReader,
+
+    fn readExact(self: ContentPeReader, buffer: []u8, offset: u64) !void {
+        try readTreeContentExact(self.content, buffer, offset);
+    }
+};
+
+fn inspectPe(
+    reader: anytype,
+    size: u64,
+    expected_architecture: ?Architecture,
+) !Architecture {
     if (size < 64) return error.InvalidEfiImage;
 
     var dos: [64]u8 = undefined;
-    try readContentExact(content, &dos, 0);
+    try reader.readExact(&dos, 0);
     if (!std.mem.eql(u8, dos[0..2], "MZ")) return error.InvalidEfiImage;
     const pe_offset: u64 = std.mem.readInt(u32, dos[0x3c..0x40], .little);
-    const coff_end = std.math.add(u64, pe_offset, 24) catch return error.InvalidEfiImage;
+    const coff_end = std.math.add(u64, pe_offset, pe_coff_size) catch
+        return error.InvalidEfiImage;
     if (coff_end > size) return error.InvalidEfiImage;
 
-    var coff: [24]u8 = undefined;
-    try readContentExact(content, &coff, pe_offset);
+    var coff: [pe_coff_size]u8 = undefined;
+    try reader.readExact(&coff, pe_offset);
     if (!std.mem.eql(u8, coff[0..4], "PE\x00\x00")) return error.InvalidEfiImage;
     const architecture: Architecture = switch (std.mem.readInt(u16, coff[4..6], .little)) {
         0x8664 => .x86_64,
         0xaa64 => .aarch64,
         else => return error.UnsupportedEfiArchitecture,
     };
-    if (architecture != expected_architecture) return error.EfiArchitectureMismatch;
+    if (expected_architecture) |expected| {
+        if (architecture != expected) return error.EfiArchitectureMismatch;
+    }
 
+    const section_count = std.mem.readInt(u16, coff[6..8], .little);
     const optional_size = std.mem.readInt(u16, coff[20..22], .little);
     if (optional_size < 70) return error.InvalidEfiImage;
     const optional_end = std.math.add(u64, coff_end, optional_size) catch
         return error.InvalidEfiImage;
     if (optional_end > size) return error.InvalidEfiImage;
     var optional_prefix: [70]u8 = undefined;
-    try readContentExact(content, &optional_prefix, coff_end);
+    try reader.readExact(&optional_prefix, coff_end);
     if (std.mem.readInt(u16, optional_prefix[0..2], .little) != 0x20b) {
         return error.InvalidEfiImage;
     }
     if (std.mem.readInt(u16, optional_prefix[68..70], .little) != 10) {
         return error.NotEfiApplication;
     }
+
+    const section_table_size = std.math.mul(u64, section_count, pe_section_size) catch
+        return error.InvalidEfiImage;
+    const section_table_end = std.math.add(u64, optional_end, section_table_size) catch
+        return error.InvalidEfiImage;
+    if (section_table_end > size) return error.InvalidEfiImage;
+
+    var section: [pe_section_size]u8 = undefined;
+    var section_offset = optional_end;
+    for (0..section_count) |_| {
+        try reader.readExact(&section, section_offset);
+        const raw_size: u64 = std.mem.readInt(u32, section[16..20], .little);
+        if (raw_size != 0) {
+            const raw_offset: u64 = std.mem.readInt(u32, section[20..24], .little);
+            const raw_end = std.math.add(u64, raw_offset, raw_size) catch
+                return error.InvalidEfiImage;
+            if (raw_end > size) return error.InvalidEfiImage;
+        }
+        section_offset += pe_section_size;
+    }
+    return architecture;
 }
 
 fn minimumEspSize(file_size: u64, boot_path: []const u8) !u64 {
@@ -557,7 +623,7 @@ fn copyInputToEsp(
 fn verifyOutput(
     allocator: std.mem.Allocator,
     io: Io,
-    path: []const u8,
+    image: *Image,
     format: Format,
     expected_sha256: [Sha256.digest_length]u8,
     expected_size: u64,
@@ -566,21 +632,19 @@ fn verifyOutput(
     esp_size: u64,
     identity: Identity,
 ) !bool {
-    var image = try Image.openPathReadOnly(io, path);
-    defer image.close(io);
     const info = try image.info(io);
     if (info.format != format or info.virtual_size != disk_size) return false;
     if (format == .vhd) {
         if (info.subformat != .fixed or disk_size % azure.one_mib != 0) return false;
-        const alignment = try azure.alignFixedVhd(&image, io);
+        const alignment = try azure.alignFixedVhd(image, io);
         if (alignment.was_resized or alignment.new_size != disk_size) return false;
     }
     const image_check = try image.check(io);
     if (!image_check.ok) return error.OutputImageCheckFailed;
 
-    const partition_style = try azure.checkPartitionStyle(image, io, allocator, .gen2);
+    const partition_style = try azure.checkPartitionStyle(image.*, io, allocator, .gen2);
     if (!partition_style.ok) return false;
-    var table = try gpt.readVerifiedGpt(image, io, allocator, gpt.default_max_partition_array_bytes);
+    var table = try gpt.readVerifiedGpt(image.*, io, allocator, gpt.default_max_partition_array_bytes);
     defer table.deinit(allocator);
     if (table.partitions.len != 1 or
         !std.mem.eql(u8, &table.primary_header.disk_guid, &identity.disk_guid))
@@ -596,7 +660,7 @@ fn verifyOutput(
         return false;
     }
 
-    var filesystem = try fat32.open(&image, io, .{
+    var filesystem = try fat32.open(image, io, .{
         .offset = esp_offset,
         .length = esp_size,
     });
@@ -671,13 +735,13 @@ fn hashContent(
     return digest;
 }
 
-fn readExact(file: Io.File, io: Io, buffer: []u8, offset: u64) !void {
+fn readFileExact(file: Io.File, io: Io, buffer: []u8, offset: u64) !void {
     if (try file.readPositionalAll(io, buffer, offset) != buffer.len) {
         return error.InvalidEfiImage;
     }
 }
 
-fn readContentExact(
+fn readTreeContentExact(
     content: tree_cursor.Cursor.ContentReader,
     buffer: []u8,
     offset: u64,
@@ -758,6 +822,23 @@ fn makeTestEfi(machine: u16, subsystem: u16) [512]u8 {
     return bytes;
 }
 
+const TestContent = struct {
+    bytes: []const u8,
+
+    fn readAt(ctx: *const anyopaque, buffer: []u8, offset: u64) tree_cursor.Cursor.ContentError!usize {
+        const self: *const TestContent = @ptrCast(@alignCast(ctx));
+        if (offset >= self.bytes.len) return 0;
+        const start: usize = @intCast(offset);
+        const amount = @min(buffer.len, self.bytes.len - start);
+        @memcpy(buffer[0..amount], self.bytes[start .. start + amount]);
+        return amount;
+    }
+
+    fn reader(self: *const TestContent) tree_cursor.Cursor.ContentReader {
+        return .{ .ctx = self, .read_at_fn = readAt };
+    }
+};
+
 fn hashPath(io: Io, path: []const u8) ![Sha256.digest_length]u8 {
     const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
     defer file.close(io);
@@ -806,6 +887,60 @@ test "inspect rejects invalid PE, unsupported architecture, and non-application 
     file = try Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     try std.testing.expectError(error.InvalidEfiImage, inspect(file, io, null, 1024));
+}
+
+test "shared PE validation bounds section tables and file-backed sections" {
+    const io = std.testing.io;
+    const path = "test-efi-application-sections.efi";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var bytes = makeTestEfi(0x8664, 10);
+    std.mem.writeInt(u16, bytes[0x86..0x88], std.math.maxInt(u16), .little);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &bytes });
+    var file = try Io.Dir.cwd().openFile(io, path, .{});
+    try std.testing.expectError(error.InvalidEfiImage, inspect(file, io, null, 1024));
+    file.close(io);
+    var content = TestContent{ .bytes = &bytes };
+    try std.testing.expectError(
+        error.InvalidEfiImage,
+        inspectContent(content.reader(), bytes.len, .x86_64, 1024),
+    );
+
+    bytes = makeTestEfi(0x8664, 10);
+    std.mem.writeInt(u32, bytes[0x188 + 16 .. 0x188 + 20], 32, .little);
+    std.mem.writeInt(u32, bytes[0x188 + 20 .. 0x188 + 24], 500, .little);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = &bytes });
+    file = try Io.Dir.cwd().openFile(io, path, .{});
+    try std.testing.expectError(error.InvalidEfiImage, inspect(file, io, null, 1024));
+    file.close(io);
+    content = .{ .bytes = &bytes };
+    try std.testing.expectError(
+        error.InvalidEfiImage,
+        inspectContent(content.reader(), bytes.len, .x86_64, 1024),
+    );
+
+    bytes = makeTestEfi(0x8664, 10);
+    content = .{ .bytes = &bytes };
+    try inspectContent(content.reader(), bytes.len, .x86_64, 1024);
+}
+
+const PublishRace = struct {
+    io: Io,
+    path: []const u8,
+    contents: []const u8,
+
+    fn createReplacement(ctx: *anyopaque) !void {
+        const self: *PublishRace = @ptrCast(@alignCast(ctx));
+        try Io.Dir.cwd().writeFile(self.io, .{
+            .sub_path = self.path,
+            .data = self.contents,
+        });
+    }
+};
+
+fn corruptStagedGpt(_: *anyopaque, file: Io.File, io: Io) !void {
+    try file.writePositionalAll(io, &.{ 0, 0 }, 510);
+    try file.sync(io);
 }
 
 test "build emits deterministic raw GPT and Azure-ready fixed VHD" {
@@ -922,4 +1057,74 @@ test "build refuses unsafe sizing, formats, and existing output" {
     const preserved = try Io.Dir.cwd().readFileAlloc(io, output_path, std.testing.allocator, .limited(16));
     defer std.testing.allocator.free(preserved);
     try std.testing.expectEqualStrings("keep", preserved);
+}
+
+test "build never removes a destination created during publication" {
+    const io = std.testing.io;
+    const input_path = "test-efi-application-race.efi";
+    const output_path = "test-efi-application-race.raw";
+    defer Io.Dir.cwd().deleteFile(io, input_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = input_path,
+        .data = &makeTestEfi(0x8664, 10),
+    });
+
+    var race = PublishRace{
+        .io = io,
+        .path = output_path,
+        .contents = "replacement",
+    };
+    try std.testing.expectError(error.PathAlreadyExists, buildWithHooks(
+        std.testing.allocator,
+        io,
+        .{
+            .efi_path = input_path,
+            .output_path = output_path,
+            .output_format = .raw,
+        },
+        .{
+            .before_publish = PublishRace.createReplacement,
+            .before_publish_ctx = &race,
+        },
+    ));
+    const preserved = try Io.Dir.cwd().readFileAlloc(
+        io,
+        output_path,
+        std.testing.allocator,
+        .limited(32),
+    );
+    defer std.testing.allocator.free(preserved);
+    try std.testing.expectEqualStrings("replacement", preserved);
+}
+
+test "failed staged-image verification publishes no output" {
+    const io = std.testing.io;
+    const input_path = "test-efi-application-verification.efi";
+    const output_path = "test-efi-application-verification.raw";
+    defer Io.Dir.cwd().deleteFile(io, input_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = input_path,
+        .data = &makeTestEfi(0x8664, 10),
+    });
+
+    var hook_context: u8 = 0;
+    try std.testing.expectError(error.OutputVerificationFailed, buildWithHooks(
+        std.testing.allocator,
+        io,
+        .{
+            .efi_path = input_path,
+            .output_path = output_path,
+            .output_format = .raw,
+        },
+        .{
+            .before_verify = corruptStagedGpt,
+            .before_verify_ctx = &hook_context,
+        },
+    ));
+    try std.testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(io, output_path, .{}),
+    );
 }
