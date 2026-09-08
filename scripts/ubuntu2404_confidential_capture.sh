@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/azure_trusted_launch_lib.sh
@@ -44,9 +45,24 @@ state_replace() {
   local filter=$1
   shift
   local next="${STATE_FILE}.next"
-  jq "$@" "$filter" "$STATE_FILE" >"$next"
+  rm -f -- "$next"
+  jq -c "$@" "$filter" "$STATE_FILE" >"$next"
+  [[ $(stat -c %s -- "$next") -le 16384 ]] || {
+    rm -f -- "$next"
+    fail "Capture cleanup state exceeds its size limit"
+    return
+  }
   chmod 0600 "$next"
   mv -f -- "$next" "$STATE_FILE"
+}
+
+state_file_is_safe() {
+  local metadata owner mode size
+  [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]] || return 1
+  metadata=$(stat -c '%u %a %s' -- "$STATE_FILE") || return
+  read -r owner mode size <<<"$metadata"
+  [[ "$owner" == "$EUID" && "$mode" == 600 &&
+      "$size" =~ ^[1-9][0-9]*$ && "$size" -le 16384 ]]
 }
 
 state_matches_identity() {
@@ -55,13 +71,40 @@ state_matches_identity() {
     --arg run_id "$GITHUB_RUN_ID" \
     --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
     --arg source_commit "$SOURCE_COMMIT" \
-    '.schema == 1 and
+    'keys == [
+       "outstanding_write_access", "repository", "run_attempt", "run_id",
+       "run_succeeded", "schema", "source_commit", "subscription_id", "target",
+       "temporary_group_created", "temporary_resource_group"
+     ] and
+     .schema == 1 and
      .repository == $repository and
      .run_id == $run_id and
      .run_attempt == $run_attempt and
      .source_commit == $source_commit and
+     (.subscription_id | type == "string") and
+     (.subscription_id | test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")) and
      (.temporary_resource_group | type == "string") and
-     (.temporary_resource_group | test("^miz-u2404-cvm-capture-[1-9][0-9]{0,19}-[1-9][0-9]{0,9}$"))' \
+     (.temporary_resource_group | test("^miz-u2404-cvm-capture-[1-9][0-9]{0,19}-[1-9][0-9]{0,9}$")) and
+     (.temporary_group_created | type == "boolean") and
+     (.run_succeeded | type == "boolean") and
+     (.target | type == "object") and
+     (.target | keys == [
+       "definition_created", "definition_id", "gallery", "image_definition",
+       "owner_tag", "resource_group", "version_created", "version_id"
+     ]) and
+     (
+       .outstanding_write_access == null or
+       (
+         (.outstanding_write_access | type == "object") and
+         (.outstanding_write_access | keys == [
+           "active", "disk_id", "disk_name", "resource_group"
+         ]) and
+         .outstanding_write_access.active == true and
+         (.outstanding_write_access.disk_id | type == "string") and
+         (.outstanding_write_access.disk_name | type == "string") and
+         (.outstanding_write_access.resource_group | type == "string")
+       )
+     )' \
     "$STATE_FILE" >/dev/null
 }
 
@@ -79,6 +122,81 @@ owned_tags_match() {
      .tags["miz-run-attempt"] == $run_attempt and
      .tags["miz-source-commit"] == $source_commit' \
     "$metadata" >/dev/null
+}
+
+validate_write_access_identity() {
+  local disk_id=$1 disk_group=$2 disk_name=$3 temporary_group subscription expected_id
+  temporary_group=$(jq -er '.temporary_resource_group' "$STATE_FILE") || return
+  subscription=$(jq -er '.subscription_id' "$STATE_FILE") || return
+  [[ "$disk_group" == "$temporary_group" &&
+      "$disk_name" == "miz-u2404-capture-upload-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" ]] ||
+    return 1
+  expected_id="/subscriptions/$subscription/resourceGroups/$disk_group/providers/Microsoft.Compute/disks/$disk_name"
+  [[ "${disk_id,,}" == "${expected_id,,}" ]]
+}
+
+revoke_outstanding_disk_write_access() {
+  local active disk_id disk_group disk_name metadata stderr_file
+  active=$(jq -r '.outstanding_write_access.active // false' "$STATE_FILE") ||
+    return
+  case "$active" in
+    false) return 0 ;;
+    true) ;;
+    *) fail "Capture cleanup state has an invalid disk write grant"; return ;;
+  esac
+  disk_id=$(jq -er '.outstanding_write_access.disk_id' "$STATE_FILE") || return
+  disk_group=$(jq -er '.outstanding_write_access.resource_group' "$STATE_FILE") ||
+    return
+  disk_name=$(jq -er '.outstanding_write_access.disk_name' "$STATE_FILE") ||
+    return
+  validate_write_access_identity "$disk_id" "$disk_group" "$disk_name" || {
+    fail "Refusing to revoke a disk write grant with invalid state identity"
+    return
+  }
+
+  metadata="${STATE_FILE}.write-access-disk.json"
+  stderr_file="${metadata}.stderr"
+  if ! az disk show --ids "$disk_id" --output json >"$metadata" 2>"$stderr_file"; then
+    if grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' "$stderr_file"; then
+      rm -f -- "$metadata" "$stderr_file"
+      state_replace '.outstanding_write_access = null'
+      return
+    fi
+    fail "Could not inspect the disk with an outstanding write grant"
+    return
+  fi
+  rm -f -- "$stderr_file"
+  jq -e \
+    --arg disk_id "$disk_id" \
+    --arg disk_group "$disk_group" \
+    --arg disk_name "$disk_name" \
+    '(.id | ascii_downcase) == ($disk_id | ascii_downcase) and
+     (.resourceGroup | ascii_downcase) == ($disk_group | ascii_downcase) and
+     .name == $disk_name' \
+    "$metadata" >/dev/null ||
+    {
+      fail "Refusing to revoke a disk write grant without exact disk identity"
+      return
+    }
+  owned_tags_match "$metadata" "$OWNER" "$GITHUB_REPOSITORY" \
+    "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
+    {
+      fail "Refusing to revoke a disk write grant without exact ownership tags"
+      return
+    }
+  if ! az disk revoke-access --ids "$disk_id" --output none; then
+    if az disk show --ids "$disk_id" --output none 2>"$stderr_file"; then
+      fail "Failed to revoke the outstanding disk write grant"
+      return
+    fi
+    if ! grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' \
+        "$stderr_file"; then
+      fail "Could not prove the disk disappeared after revoke failure"
+      return
+    fi
+  fi
+  rm -f -- "$metadata" "$stderr_file"
+  state_replace '.outstanding_write_access = null'
 }
 
 delete_created_version() {
@@ -204,18 +322,29 @@ cleanup_resources() {
     fail "jq is unavailable during cleanup"
     return
   }
+  state_file_is_safe || {
+    fail "Capture cleanup state is not a bounded owner-only regular file"
+    return
+  }
   state_matches_identity || {
     fail "Refusing cleanup because state identity does not match this run"
     return
   }
-  az account show --output none ||
+  local account_subscription state_subscription
+  account_subscription=$(az account show --query id --output tsv) ||
     {
       fail "Azure login is unavailable during cleanup"
       return
     }
+  state_subscription=$(jq -er '.subscription_id' "$STATE_FILE") || return
+  [[ "${account_subscription,,}" == "${state_subscription,,}" ]] || {
+    fail "Azure cleanup subscription does not match capture state"
+    return
+  }
 
   local succeeded cleanup_status=0
   succeeded=$(jq -r '.run_succeeded' "$STATE_FILE")
+  revoke_outstanding_disk_write_access || cleanup_status=1
   if [[ "$succeeded" != true ]]; then
     delete_created_version || cleanup_status=1
     delete_created_definition || cleanup_status=1
@@ -330,6 +459,7 @@ jq -n \
   --arg run_id "$GITHUB_RUN_ID" \
   --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
   --arg source_commit "$SOURCE_COMMIT" \
+  --arg subscription_id "$AZURE_SUBSCRIPTION_ID" \
   --arg temporary_resource_group "$resource_group" \
   --arg target_owner "$TARGET_OWNER_TAG" \
   --arg target_resource_group "$TARGET_RESOURCE_GROUP" \
@@ -337,15 +467,17 @@ jq -n \
   --arg target_image_definition "$TARGET_IMAGE_DEFINITION" \
   --arg definition_id "$target_definition_id" \
   --arg version_id "$target_version_id" \
-  '{
+  -c '{
     schema: 1,
     repository: $repository,
     run_id: $run_id,
     run_attempt: $run_attempt,
     source_commit: $source_commit,
+    subscription_id: $subscription_id,
     temporary_resource_group: $temporary_resource_group,
     temporary_group_created: false,
     run_succeeded: false,
+    outstanding_write_access: null,
     target: {
       owner_tag: $target_owner,
       resource_group: $target_resource_group,
@@ -357,6 +489,7 @@ jq -n \
       version_created: false
     }
   }' >"$STATE_FILE"
+[[ $(stat -c %s -- "$STATE_FILE") -le 16384 ]]
 chmod 0600 "$STATE_FILE"
 
 vhd="$RESULT_DIR/Ubuntu-24.04-x86_64.confidential.vhd"
@@ -396,20 +529,55 @@ tag_resource() {
 }
 
 tag_group_resources() {
-  local resource_id
-  while IFS= read -r resource_id; do
-    [[ -n "$resource_id" ]] && tag_resource "$resource_id"
-  done < <(
-    az resource list \
+  local resource_id resource_json resource_list size
+  resource_json="$RESULT_DIR/tag-resource-list.json"
+  resource_list="$RESULT_DIR/tag-resource-list.txt"
+  rm -f -- "$resource_json" "$resource_list"
+  if ! az resource list \
       --resource-group "$resource_group" \
       --query '[].id' \
-      --output tsv
-  )
+      --output json >"$resource_json"; then
+    fail "Could not list temporary resource-group resources for tagging"
+    return
+  fi
+  size=$(stat -c %s -- "$resource_json") || return
+  [[ "$size" -le 1048576 ]] || {
+    fail "Temporary resource-group resource list exceeds its size limit"
+    return
+  }
+  jq -e \
+    --arg prefix "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/" \
+    '
+    type == "array" and length <= 2048 and
+    all(.[]; type == "string" and length >= 1 and length <= 2048 and
+      (ascii_downcase | startswith($prefix | ascii_downcase)))
+  ' "$resource_json" >/dev/null ||
+    {
+      fail "Azure returned an invalid temporary resource-group resource list"
+      return
+    }
+  jq -r '.[]' "$resource_json" >"$resource_list"
+  size=$(stat -c %s -- "$resource_list") || return
+  [[ "$size" -le 1048576 ]] || {
+    fail "Temporary resource-group tag list exceeds its size limit"
+    return
+  }
+  while IFS= read -r resource_id; do
+    [[ -n "$resource_id" ]] || {
+      fail "Azure returned an empty resource ID while tagging"
+      return
+    }
+    tag_resource "$resource_id" || return
+  done <"$resource_list"
 }
 
 grant_disk_write_access() {
-  local disk_id=$1 duration_seconds=$2
+  local disk_id=$1 disk_group=$2 disk_name=$3 duration_seconds=$4
   local auth_header headers location request_dir response_body retry_after sas status token
+  validate_write_access_identity "$disk_id" "$disk_group" "$disk_name" || {
+    fail "Refusing to grant disk write access without exact run identity"
+    return
+  }
   request_dir="$RESULT_DIR/disk-access"
   rm -rf -- "$request_dir"
   mkdir -m 0700 "$request_dir"
@@ -456,6 +624,20 @@ grant_disk_write_access() {
   fi
   [[ "$status" == 200 ]] || return 1
   sas=$(jq -er '.accessSAS | strings | select(startswith("https://"))' "$response_body")
+  if ! state_replace \
+      --arg disk_id "$disk_id" \
+      --arg disk_group "$disk_group" \
+      --arg disk_name "$disk_name" \
+      '.outstanding_write_access = {
+        active: true,
+        disk_id: $disk_id,
+        resource_group: $disk_group,
+        disk_name: $disk_name
+      }'; then
+    az disk revoke-access --ids "$disk_id" --output none ||
+      fail "Failed to revoke a disk write grant after state recording failed"
+    return 1
+  fi
   printf '%s\n' "$sas"
 }
 
@@ -469,11 +651,11 @@ resource_absent() {
 }
 
 wait_gallery_version() {
-  local response=$1 version_id=$2 provisioning replication
+  local response=$1 version_id=$2 provisioning replication states_file
+  states_file="${response}.state"
   for _ in {1..180}; do
-    readarray -t states < <(
-      "$RELEASE_TOOL" capture-gallery-state --response "$response"
-    )
+    "$RELEASE_TOOL" capture-gallery-state --response "$response" >"$states_file"
+    readarray -t states <"$states_file"
     [[ ${#states[@]} -eq 2 ]]
     provisioning=${states[0]}
     replication=${states[1]}
@@ -589,16 +771,19 @@ run_capture_vm_check() {
 }
 
 cleanup_on_exit() {
-  local status=$?
+  local status=$? cleanup_status=0
   trap - EXIT INT TERM
-  ubuntu2404_confidential_guest_cleanup_validation_files || status=1
+  ubuntu2404_confidential_guest_cleanup_validation_files || cleanup_status=1
   rm -f -- "$vhd" "$private_key" "$private_key.pub" "$known_hosts"
   rm -rf -- "$RESULT_DIR/disk-access" \
     "$source_dir/attestation-client" "$final_dir/attestation-client"
   rm -f -- \
     "$source_dir/azguestattestation1.deb" "$source_dir/attestation-client.zip" \
     "$final_dir/azguestattestation1.deb" "$final_dir/attestation-client.zip"
-  cleanup_resources || status=1
+  cleanup_resources || cleanup_status=1
+  if (( cleanup_status != 0 && status == 0 )); then
+    status=1
+  fi
   exit "$status"
 }
 trap cleanup_on_exit EXIT
@@ -660,17 +845,17 @@ if ! resource_absent "$version_absent_stderr" \
 fi
 rm -f -- "$version_absent_stderr"
 
-readarray -t accepted_identity < <(
-  "$RELEASE_TOOL" verify-acceptance \
-    --result "$SOURCE_ACCEPTANCE" \
-    --provenance "$PROVENANCE" \
-    --qcow "$CANDIDATE" \
-    --source-commit "$SOURCE_COMMIT" \
-    --location "$SOURCE_LOCATION" \
-    --vm-size "$SOURCE_VM_SIZE" \
-    --run-id "$SOURCE_RUN_ID" \
-    --run-attempt "$SOURCE_RUN_ATTEMPT"
-)
+accepted_identity_file="$RESULT_DIR/accepted-identity.txt"
+"$RELEASE_TOOL" verify-acceptance \
+  --result "$SOURCE_ACCEPTANCE" \
+  --provenance "$PROVENANCE" \
+  --qcow "$CANDIDATE" \
+  --source-commit "$SOURCE_COMMIT" \
+  --location "$SOURCE_LOCATION" \
+  --vm-size "$SOURCE_VM_SIZE" \
+  --run-id "$SOURCE_RUN_ID" \
+  --run-attempt "$SOURCE_RUN_ATTEMPT" >"$accepted_identity_file"
+readarray -t accepted_identity <"$accepted_identity_file"
 [[ ${#accepted_identity[@]} -eq 3 ]]
 qcow_sha256=${accepted_identity[0]}
 qcow_bytes=${accepted_identity[1]}
@@ -690,14 +875,14 @@ accepted_source_version_id=$(
   --expected-virtual-size "$virtual_size" \
   "$CANDIDATE" "$vhd"
 qemu-img info -f vpc --output=json "$vhd" >"$vhd_info"
-readarray -t vhd_identity < <(
-  "$RELEASE_TOOL" verify-vhd \
-    --provenance "$PROVENANCE" \
-    --qcow "$CANDIDATE" \
-    --vhd "$vhd" \
-    --info "$vhd_info" \
-    --output "$conversion"
-)
+vhd_identity_file="$RESULT_DIR/vhd-identity.txt"
+"$RELEASE_TOOL" verify-vhd \
+  --provenance "$PROVENANCE" \
+  --qcow "$CANDIDATE" \
+  --vhd "$vhd" \
+  --info "$vhd_info" \
+  --output "$conversion" >"$vhd_identity_file"
+readarray -t vhd_identity <"$vhd_identity_file"
 [[ ${#vhd_identity[@]} -eq 3 ]]
 vhd_current_size=${vhd_identity[0]}
 vhd_bytes=${vhd_identity[1]}
@@ -731,12 +916,14 @@ az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >/dev/null
 azure_trusted_launch_disk_show_args "$resource_group" "$upload_disk_name"
 az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >"$upload_disk_json"
 upload_disk_id=$("$RELEASE_TOOL" check-managed-disk --disk "$upload_disk_json")
-upload_sas=$(grant_disk_write_access "$upload_disk_id" 7200)
+upload_sas=$(
+  grant_disk_write_access \
+    "$upload_disk_id" "$resource_group" "$upload_disk_name" 7200
+)
 [[ "$upload_sas" == https://* ]]
 azcopy copy "$vhd" "$upload_sas" --blob-type PageBlob
 upload_sas=
-azure_trusted_launch_disk_revoke_access_args "$resource_group" "$upload_disk_name"
-az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >/dev/null
+revoke_outstanding_disk_write_access
 azure_trusted_launch_disk_show_args "$resource_group" "$upload_disk_name"
 az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >"$upload_disk_json"
 [[ "$("$RELEASE_TOOL" check-managed-disk --disk "$upload_disk_json")" == "$upload_disk_id" ]]
@@ -840,12 +1027,12 @@ collect_vm_contract \
   "$source_dir/vm-full-instance.json"
 source_vm_resource_id=$(jq -er '.id' "$source_vm_resource")
 source_vm_unique_id=$(jq -er '.vmId' "$source_vm_resource")
-readarray -t source_checked < <(
-  "$RELEASE_TOOL" check-vm \
-    --resource "$source_vm_resource" \
-    --instance "$source_vm_instance" \
-    --image-version-id "$staging_version_id"
-)
+source_checked_file="$source_dir/checked-identity.txt"
+"$RELEASE_TOOL" check-vm \
+  --resource "$source_vm_resource" \
+  --instance "$source_vm_instance" \
+  --image-version-id "$staging_version_id" >"$source_checked_file"
+readarray -t source_checked <"$source_checked_file"
 [[ ${#source_checked[@]} -eq 2 &&
     "${source_checked[0]}" == "$source_vm_resource_id" &&
     "${source_checked[1],,}" == "${source_vm_unique_id,,}" ]]
@@ -904,20 +1091,21 @@ configure_vm_ssh "$capture_vm_name"
 ubuntu2404_confidential_guest_pre_capture_check \
   "$virtual_size" "$capture_vm_unique_id" "$capture_guest_imds"
 
-ssh "${UBUNTU2404_CONFIDENTIAL_GUEST_SSH_OPTIONS[@]}" \
-  "$UBUNTU2404_CONFIDENTIAL_GUEST_SSH_TARGET" \
-  'sudo -n waagent -deprovision+user -force && sudo -n shutdown -h now' \
-  >/dev/null 2>&1 || true
-ssh_stopped=false
-for _ in {1..90}; do
-  if ! ssh "${UBUNTU2404_CONFIDENTIAL_GUEST_SSH_OPTIONS[@]}" \
-      "$UBUNTU2404_CONFIDENTIAL_GUEST_SSH_TARGET" true >/dev/null 2>&1; then
-    ssh_stopped=true
-    break
+deprovision_and_schedule_shutdown() {
+  local proof
+  if ! proof=$(ssh "${UBUNTU2404_CONFIDENTIAL_GUEST_SSH_OPTIONS[@]}" \
+      "$UBUNTU2404_CONFIDENTIAL_GUEST_SSH_TARGET" \
+      "sudo -n -- sh -c 'set -eu; waagent -deprovision+user -force >/dev/null; shutdown -h +1 >/dev/null; printf \"%s\\\\n\" MIZ_DEPROVISION_SHUTDOWN_SCHEDULED'"); then
+    fail "Capture VM deprovision and shutdown scheduling failed"
+    return
   fi
-  sleep 5
-done
-[[ "$ssh_stopped" == true ]] || fail "Capture VM did not stop accepting SSH after shutdown"
+  [[ "$proof" == MIZ_DEPROVISION_SHUTDOWN_SCHEDULED ]] || {
+    fail "Capture VM did not prove deprovision and shutdown scheduling succeeded"
+    return
+  }
+}
+
+deprovision_and_schedule_shutdown
 
 shutdown_power_state=
 for _ in {1..90}; do
@@ -934,7 +1122,7 @@ for _ in {1..90}; do
 done
 [[ "$shutdown_power_state" == PowerState/stopped ||
     "$shutdown_power_state" == PowerState/deallocated ]] ||
-  fail "Capture VM did not reach a stopped power state after guest shutdown"
+  fail "Azure did not report a stopped capture VM after guest shutdown"
 
 azure_confidential_vm_deallocate_args "$resource_group" "$capture_vm_name"
 az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >/dev/null
@@ -1103,10 +1291,99 @@ ubuntu2404_confidential_guest_final_acceptance \
 final_guest_vm_id=$UBUNTU2404_CONFIDENTIAL_GUEST_VM_ID
 tag_group_resources
 
-# Refresh authenticated Azure resource evidence after reboot acceptance and use
-# the just-fetched MAA OpenID/JWKS documents without exposing the JWT or nonce.
+# Refresh every live Azure document and both public MAA documents at one
+# evidence boundary. The result and verifier consume these exact revisions.
+azure_trusted_launch_disk_show_args "$resource_group" "$upload_disk_name"
+az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >"$upload_disk_json"
+azure_confidential_vm_managed_image_show_args \
+  "$resource_group" "$managed_image_name"
+az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$managed_image_json"
+azure_confidential_vm_image_definition_show_args \
+  "$resource_group" "$staging_gallery" "$staging_definition"
+az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$staging_definition_json"
+azure_trusted_launch_gallery_version_get_args "$staging_version_id"
+az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >"$staging_response"
+collect_vm_contract "$capture_vm_name" "$capture_vm_resource" "$capture_vm_instance"
+azure_confidential_vm_capture_disk_show_args "$capture_disk_id"
+az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$capture_disk_json"
+azure_confidential_vm_snapshot_show_args "$resource_group" "$snapshot_name"
+az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$snapshot_json"
+azure_confidential_vm_capture_image_definition_show_args \
+  "$TARGET_RESOURCE_GROUP" "$TARGET_GALLERY" "$TARGET_IMAGE_DEFINITION"
+az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$target_definition_json"
+azure_confidential_vm_capture_gallery_version_get_args "$target_version_id"
+az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$target_response"
 collect_vm_contract "$final_vm_name" "$final_vm_resource" "$final_vm_instance"
 refresh_maa_metadata "$final_openid" "$final_jwks"
+
+[[ "$("$RELEASE_TOOL" check-managed-disk --disk "$upload_disk_json")" == "$upload_disk_id" ]]
+[[ "$("$RELEASE_TOOL" check-managed-image \
+  --image "$managed_image_json" \
+  --disk-id "$upload_disk_id")" == "$managed_image_id" ]]
+[[ "$("$RELEASE_TOOL" check-image-definition \
+  --definition "$staging_definition_json")" == "$staging_definition_id" ]]
+"$RELEASE_TOOL" check-gallery \
+  --request "$staging_request" \
+  --response "$staging_response" \
+  --image-version-id "$staging_version_id" \
+  --source-id "$managed_image_id"
+jq -e \
+  --arg owner "$OWNER" \
+  --arg repository "$GITHUB_REPOSITORY" \
+  --arg run_id "$GITHUB_RUN_ID" \
+  --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+  --arg source_commit "$SOURCE_COMMIT" \
+  --arg qcow_sha256 "$qcow_sha256" \
+  --arg vhd_sha256 "$vhd_sha256" \
+  --arg source_acceptance_sha256 "$source_acceptance_sha256" \
+  '.tags["miz-owner"] == $owner and
+   .tags["miz-repository"] == $repository and
+   .tags["miz-run-id"] == $run_id and
+   .tags["miz-run-attempt"] == $run_attempt and
+   .tags["miz-source-commit"] == $source_commit and
+   .tags["miz-qcow-sha256"] == $qcow_sha256 and
+   .tags["miz-vhd-sha256"] == $vhd_sha256 and
+   .tags["miz-source-acceptance-sha256"] == $source_acceptance_sha256' \
+  "$staging_response" >/dev/null ||
+  fail "Fresh staging gallery version lost its exact artifact and ownership binding"
+run_capture_vm_check "$capture_vm_resource" "$capture_vm_id" "$capture_disk_id" \
+  >/dev/null
+[[ "$("$RELEASE_TOOL" check-capture-disk \
+  --disk "$capture_disk_json" \
+  --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+  --location "$AZURE_LOCATION" \
+  --source-version-id "$staging_version_id" \
+  --vm-id "$capture_vm_id" \
+  --disk-id "$capture_disk_id")" == "$capture_disk_id" ]]
+[[ "$("$RELEASE_TOOL" check-capture-snapshot \
+  --snapshot "$snapshot_json" \
+  --snapshot-id "$snapshot_id" \
+  --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+  --location "$AZURE_LOCATION" \
+  --source-version-id "$staging_version_id" \
+  --vm-id "$capture_vm_id" \
+  --disk-id "$capture_disk_id")" == "$snapshot_id" ]]
+owned_tags_match "$snapshot_json" "$OWNER" "$GITHUB_REPOSITORY" \
+  "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
+  fail "Fresh capture snapshot evidence lost its exact run ownership tags"
+"$RELEASE_TOOL" check-capture-definition \
+  --definition "$target_definition_json" \
+  --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+  --location "$TARGET_LOCATION" \
+  --snapshot-id "$snapshot_id" \
+  --definition-id "$target_definition_id" \
+  --version-id "$target_version_id" >/dev/null
+"$RELEASE_TOOL" check-capture-gallery \
+  --request "$target_request" \
+  --response "$target_response" \
+  --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+  --location "$TARGET_LOCATION" \
+  --snapshot-id "$snapshot_id" \
+  --definition-id "$target_definition_id" \
+  --version-id "$target_version_id"
+owned_tags_match "$target_response" "$OWNER" "$GITHUB_REPOSITORY" \
+  "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
+  fail "Fresh target gallery version evidence lost its exact run ownership tags"
 "$RELEASE_TOOL" check-captured-vm \
   --vm "$final_vm_resource" \
   --subscription-id "$AZURE_SUBSCRIPTION_ID" \
@@ -1114,6 +1391,32 @@ refresh_maa_metadata "$final_openid" "$final_jwks"
   --version-id "$target_version_id" \
   --vm-id "$final_vm_id" \
   --disk-id "$final_disk_id" >/dev/null
+
+capture_evidence_manifest="$RESULT_DIR/capture-evidence.sha256"
+sha256sum \
+  "$upload_disk_json" \
+  "$managed_image_json" \
+  "$staging_definition_json" \
+  "$staging_response" \
+  "$capture_vm_resource" \
+  "$capture_vm_instance" \
+  "$capture_disk_json" \
+  "$snapshot_json" \
+  "$target_definition_json" \
+  "$target_response" \
+  "$final_vm_resource" \
+  "$final_vm_instance" \
+  "$final_token" \
+  "$final_openid" \
+  "$final_jwks" >"$capture_evidence_manifest"
+chmod 0600 "$capture_evidence_manifest"
+
+verify_capture_evidence_revisions() {
+  sha256sum --check --status "$capture_evidence_manifest" || {
+    fail "Capture evidence changed after the final freshness boundary"
+    return
+  }
+}
 
 final_now=$(date +%s)
 capture_common_args=(
@@ -1161,9 +1464,11 @@ capture_common_args=(
   --now "$final_now"
   --guest-vm-id "$final_guest_vm_id"
 )
+verify_capture_evidence_revisions
 "$RELEASE_TOOL" capture-result \
   "${capture_common_args[@]}" \
   --output "$capture_result"
+verify_capture_evidence_revisions
 "$RELEASE_TOOL" verify-capture \
   "${capture_common_args[@]}" \
   --result "$capture_result"
