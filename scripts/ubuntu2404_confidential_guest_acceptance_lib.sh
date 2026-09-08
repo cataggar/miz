@@ -179,6 +179,11 @@ ubuntu2404_confidential_guest_validate_persistent_data_disk() {
     --sku Standard_LRS \
     "${tag_args[@]}" \
     --output none || return
+  if declare -F ubuntu2404_confidential_guest_record_created_data_disk \
+      >/dev/null; then
+    ubuntu2404_confidential_guest_record_created_data_disk \
+      "$resource_group" "$data_disk_name" "$location" || return
+  fi
   az vm disk attach \
     --resource-group "$resource_group" \
     --vm-name "$vm_name" \

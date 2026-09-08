@@ -15,7 +15,11 @@ ATTESTATION_ENDPOINT=${ATTESTATION_ENDPOINT:-https://sharedeus2.eus2.attest.azur
 EXPECTED_REPOSITORY=cataggar/miz
 EXPECTED_REF=refs/heads/main
 EXPECTED_ENVIRONMENT=ubuntu2404-confidential-capture
+EXPECTED_PUBLICATION_LOCK=ubuntu2404-confidential-cvm-target-version
 OWNER=ubuntu2404-confidential-capture
+TARGET_PUBLISHER=miz
+TARGET_OFFER=ubuntu2404
+TARGET_SKU=confidential-x64
 
 command_name=${1:-run}
 if (( $# > 1 )) || [[ "$command_name" != run && "$command_name" != cleanup ]]; then
@@ -23,9 +27,24 @@ if (( $# > 1 )) || [[ "$command_name" != run && "$command_name" != cleanup ]]; t
   exit 2
 fi
 
+# Target publication is an upsert, not a create-only Azure operation. The
+# protected workflow must use EXPECTED_PUBLICATION_LOCK as a stable,
+# non-canceling concurrency group and pre-authenticate
+# PUBLICATION_AZURE_CONFIG_DIR only as the exclusive
+# PUBLICATION_PRINCIPAL_CLIENT_ID. That OIDC principal must have target
+# parent/version read and version write, but no version delete or parent
+# write/delete. The default Azure context should have only narrow scratch-RG
+# rights plus target-version read for final validation. This script validates
+# those protected-context identities; it cannot prove RBAC or defend against a
+# malicious subscription Owner.
+
 fail() {
   printf '::error::%s\n' "$*" >&2
   return 1
+}
+
+publication_az() {
+  AZURE_CONFIG_DIR="$PUBLICATION_AZURE_CONFIG_DIR" az "$@"
 }
 
 require_cleanup_identity() {
@@ -152,13 +171,15 @@ state_matches_identity() {
     --arg run_id "$GITHUB_RUN_ID" \
     --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
     --arg source_commit "$SOURCE_COMMIT" \
+    --arg publication_lock "$EXPECTED_PUBLICATION_LOCK" \
     '. as $state |
      keys == [
        "outstanding_write_access", "repository", "run_attempt", "run_id",
        "run_succeeded", "schema", "source_commit", "subscription_id", "target",
-       "temporary_group_create", "temporary_resource_group"
+       "temporary_group_create", "temporary_resource_group",
+       "temporary_resources"
      ] and
-     .schema == 2 and
+     .schema == 3 and
      .repository == $repository and
      .run_id == $run_id and
      .run_attempt == $run_attempt and
@@ -166,7 +187,7 @@ state_matches_identity() {
      (.subscription_id | type == "string") and
      (.subscription_id | test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")) and
      (.temporary_resource_group | type == "string") and
-     (.temporary_resource_group | test("^miz-u2404-cvm-capture-[1-9][0-9]{0,19}-[1-9][0-9]{0,9}$")) and
+     (.temporary_resource_group | test("^miz-u2404-cvm-capture-[1-9][0-9]{0,19}-[1-9][0-9]{0,9}-[0-9a-f]{32}$")) and
      (
        .temporary_group_create == null or
        (
@@ -175,8 +196,12 @@ state_matches_identity() {
            "owner_tag", "repository", "resource_id", "resource_name",
            "run_attempt", "run_id", "source_commit", "status"
          ]) and
-         (.temporary_group_create.status == "pending" or
-          .temporary_group_create.status == "confirmed") and
+         (
+           .temporary_group_create.status == "expected" or
+           .temporary_group_create.status == "pending" or
+           .temporary_group_create.status == "quarantined" or
+           .temporary_group_create.status == "confirmed_created"
+         ) and
          (.temporary_group_create.resource_id | ascii_downcase) ==
            ("/subscriptions/" + $state.subscription_id + "/resourceGroups/" +
             $state.temporary_resource_group | ascii_downcase) and
@@ -190,11 +215,29 @@ state_matches_identity() {
          .temporary_group_create.source_commit == $source_commit
        )
      ) and
+     (.temporary_resources | type == "array") and
+     (.temporary_resources | length <= 64) and
+     (all(.temporary_resources[];
+       (type == "object") and
+       (keys == ["id", "name", "type"]) and
+       (.id | type == "string") and
+       (.id | length >= 1 and length <= 2048) and
+       (.id | ascii_downcase | startswith(
+         ("/subscriptions/" + $state.subscription_id + "/resourceGroups/" +
+          $state.temporary_resource_group + "/providers/" | ascii_downcase)
+       )) and
+       (.name | type == "string") and
+       (.name | length >= 1 and length <= 512) and
+       (.type | type == "string") and
+       (.type | test("^[A-Za-z][A-Za-z0-9.]+/[A-Za-z][A-Za-z0-9/]+$"))
+     )) and
+     ([.temporary_resources[].id | ascii_downcase] | unique | length) ==
+       (.temporary_resources | length) and
      (.run_succeeded | type == "boolean") and
      (.target | type == "object") and
      (.target | keys == [
-       "definition_create", "definition_id", "gallery", "image_definition",
-       "owner_tag", "resource_group", "version_created", "version_id"
+       "definition_id", "gallery", "image_definition", "owner_tag",
+       "publication", "resource_group", "version_id"
      ]) and
      (.target.owner_tag | type == "string") and
      (.target.owner_tag | test("^[A-Za-z0-9._:/-]{1,128}$")) and
@@ -214,27 +257,18 @@ state_matches_identity() {
      )) and
      (.target.version_id | split("/") | last |
        test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
-     (.target.version_created | type == "boolean") and
+     (.target.publication | type == "object") and
+     (.target.publication | keys == [
+       "lock_id", "principal_client_id", "status"
+     ]) and
+     .target.publication.lock_id == $publication_lock and
+     (.target.publication.principal_client_id |
+       test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")) and
      (
-       .target.definition_create == null or
-       (
-         (.target.definition_create | type == "object") and
-         (.target.definition_create | keys == [
-           "owner_tag", "repository", "resource_id", "resource_name",
-           "run_attempt", "run_id", "source_commit", "status"
-         ]) and
-         (.target.definition_create.status == "pending" or
-          .target.definition_create.status == "confirmed") and
-         (.target.definition_create.resource_id | ascii_downcase) ==
-           ($state.target.definition_id | ascii_downcase) and
-         .target.definition_create.resource_name ==
-           $state.target.image_definition and
-         .target.definition_create.owner_tag == $state.target.owner_tag and
-         .target.definition_create.repository == $repository and
-         .target.definition_create.run_id == $run_id and
-         .target.definition_create.run_attempt == $run_attempt and
-         .target.definition_create.source_commit == $source_commit
-       )
+       .target.publication.status == "not_dispatched" or
+       .target.publication.status == "pending" or
+       .target.publication.status == "quarantined" or
+       .target.publication.status == "published"
      ) and
      (
        .outstanding_write_access == null or
@@ -299,15 +333,7 @@ validate_temporary_group_identity() {
 }
 
 validate_target_definition_identity() {
-  local metadata=$1 expected_id=${2:-} expected_name=${3:-}
-  if [[ -z "$expected_id" ]]; then
-    expected_id=$(jq -er '.target.definition_create.resource_id' "$STATE_FILE") ||
-      return
-  fi
-  if [[ -z "$expected_name" ]]; then
-    expected_name=$(jq -er '.target.definition_create.resource_name' "$STATE_FILE") ||
-      return
-  fi
+  local metadata=$1 expected_id=$2 expected_name=$3
   jq -e \
     --arg expected_id "$expected_id" \
     --arg name "$expected_name" \
@@ -315,6 +341,46 @@ validate_target_definition_identity() {
      .name == $name and
      (.type | ascii_downcase) == "microsoft.compute/galleries/images"' \
     "$metadata" >/dev/null
+}
+
+validate_created_resource_document() {
+  local metadata=$1 expected_id=$2 expected_type=$3 expected_name=$4
+  jq -e \
+    --arg expected_id "$expected_id" \
+    --arg expected_type "$expected_type" \
+    --arg expected_name "$expected_name" \
+    --arg location "$AZURE_LOCATION" \
+    '(.id | ascii_downcase) == ($expected_id | ascii_downcase) and
+     (.type | ascii_downcase) == ($expected_type | ascii_downcase) and
+     .name == $expected_name and
+     (.location | ascii_downcase) == ($location | ascii_downcase)' \
+    "$metadata" >/dev/null &&
+    owned_tags_match "$metadata" "$OWNER" "$GITHUB_REPOSITORY" \
+      "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"
+}
+
+record_expected_resource() {
+  local metadata=$1 expected_id=$2 expected_type=$3
+  local document_name=$4 inventory_name=${5:-$4}
+  validate_created_resource_document \
+    "$metadata" "$expected_id" "$expected_type" "$document_name" ||
+    {
+      fail "Created temporary resource failed exact identity, location, or tag validation"
+      return
+    }
+  state_replace \
+    'if any(.temporary_resources[];
+         (.id | ascii_downcase) == ($id | ascii_downcase))
+     then error("duplicate temporary resource")
+     else .temporary_resources += [{
+       id: $id,
+       type: $type,
+       name: $name
+     }] end' \
+    --arg id "$expected_id" \
+    --arg type "$expected_type" \
+    --arg name "$inventory_name" ||
+    fail "Could not append the exact temporary resource allowlist"
 }
 
 validate_write_access_identity() {
@@ -392,117 +458,45 @@ revoke_outstanding_disk_write_access() {
   state_replace '.outstanding_write_access = null'
 }
 
-delete_created_version() {
-  local created version_id metadata
-  created=$(jq -r '.target.version_created' "$STATE_FILE")
-  [[ "$created" == true ]] || return 0
-  version_id=$(jq -r '.target.version_id' "$STATE_FILE")
-  [[ "$version_id" == /subscriptions/*/resourceGroups/*/providers/Microsoft.Compute/galleries/*/images/*/versions/* ]] ||
-    return 1
-  metadata="${STATE_FILE}.version.json"
-  if ! az sig image-version show --ids "$version_id" --output json >"$metadata" 2>"${metadata}.stderr"; then
-    if grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' "${metadata}.stderr"; then
-      rm -f -- "$metadata" "${metadata}.stderr"
-      return 0
-    fi
-    fail "Could not inspect the target gallery version during cleanup"
-    return
-  fi
-  rm -f -- "${metadata}.stderr"
-  if ! owned_tags_match "$metadata" "$OWNER" "$GITHUB_REPOSITORY" \
-      "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"; then
-    fail "Refusing to delete target version without exact run ownership tags"
-    return
-  fi
-  az sig image-version delete --ids "$version_id" ||
-    fail "Failed to delete exact-owned target gallery version"
-}
-
-delete_created_definition() {
-  local status definition_id image_name gallery_name metadata owner_tag resource_group versions
-  status=$(jq -r '.target.definition_create.status // "none"' "$STATE_FILE")
-  case "$status" in
-    none) return 0 ;;
-    pending|confirmed) ;;
-    *) fail "Capture cleanup state has an invalid target definition create"; return ;;
-  esac
-  definition_id=$(jq -er '.target.definition_create.resource_id' "$STATE_FILE") ||
-    return
-  resource_group=$(jq -r '.target.resource_group' "$STATE_FILE")
-  gallery_name=$(jq -r '.target.gallery' "$STATE_FILE")
-  image_name=$(jq -er '.target.definition_create.resource_name' "$STATE_FILE") ||
-    return
-  [[ "$definition_id" == /subscriptions/*/resourceGroups/*/providers/Microsoft.Compute/galleries/*/images/* ]] ||
-    return 1
-  [[ "$resource_group" =~ ^[A-Za-z0-9._()-]{1,90}$ &&
-      "$gallery_name" =~ ^[A-Za-z0-9_]{1,80}$ &&
-      "$image_name" =~ ^[A-Za-z0-9._()-]{1,80}$ ]] ||
-    return 1
-  metadata="${STATE_FILE}.definition.json"
-  if ! az sig image-definition show --ids "$definition_id" --output json >"$metadata" 2>"${metadata}.stderr"; then
-    if grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' "${metadata}.stderr"; then
-      rm -f -- "$metadata" "${metadata}.stderr"
-      if ! state_replace '.target.definition_create = null'; then
-        return 1
-      fi
-      return 0
-    fi
-    fail "Could not inspect the target image definition during cleanup"
-    return
-  fi
-  rm -f -- "${metadata}.stderr"
-  validate_target_definition_identity "$metadata" ||
-    {
-      fail "Refusing to delete target definition without exact resource identity"
-      return
-    }
-  owner_tag=$(jq -r '.target.owner_tag' "$STATE_FILE")
-  if ! exact_owned_tags_match "$metadata" "$owner_tag" "$GITHUB_REPOSITORY" \
-      "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"; then
-    fail "Refusing to delete target definition without exact run ownership tags"
-    return
-  fi
-  versions="${STATE_FILE}.definition-versions.json"
-  az sig image-version list \
-    --resource-group "$resource_group" \
-    --gallery-name "$gallery_name" \
-    --gallery-image-definition "$image_name" \
-    --output json >"$versions" ||
-    {
-      fail "Could not prove that the target definition is empty"
-      return
-    }
-  jq -e 'type == "array" and length == 0' "$versions" >/dev/null ||
-    {
-      fail "Refusing to delete a non-empty target image definition"
-      return
-    }
-  az sig image-definition delete --ids "$definition_id" ||
-    {
-      fail "Failed to delete exact-owned empty target image definition"
-      return
-    }
-  state_replace '.target.definition_create = null'
-}
-
 delete_temporary_group() {
-  local status group resource_id metadata stderr_file
+  local status publication_status run_succeeded group resource_id metadata stderr_file
+  local inventory subscription_id
   status=$(jq -r '.temporary_group_create.status // "none"' "$STATE_FILE")
   case "$status" in
     none) return 0 ;;
-    pending|confirmed) ;;
+    expected) return 0 ;;
+    pending|quarantined)
+      fail "Temporary resource-group creation is quarantined and requires manual review"
+      return
+      ;;
+    confirmed_created) ;;
     *) fail "Capture cleanup state has an invalid temporary group create"; return ;;
   esac
+  publication_status=$(jq -er '.target.publication.status' "$STATE_FILE") ||
+    return
+  if [[ "$publication_status" == pending ||
+      "$publication_status" == quarantined ]]; then
+    fail "Target publication is unresolved; retaining the temporary resource group for break-glass review"
+    return
+  fi
+  run_succeeded=$(jq -r '.run_succeeded' "$STATE_FILE") || return
+  if [[ "$run_succeeded" != true &&
+      "$publication_status" != not_dispatched ]]; then
+    fail "Capture failed after target publication dispatch; retaining the temporary resource group for break-glass review"
+    return
+  fi
   group=$(jq -er '.temporary_group_create.resource_name' "$STATE_FILE") || return
   resource_id=$(jq -er '.temporary_group_create.resource_id' "$STATE_FILE") ||
     return
+  subscription_id=$(jq -er '.subscription_id' "$STATE_FILE") || return
   metadata="${STATE_FILE}.group.json"
   stderr_file="${metadata}.stderr"
   if ! az group show --name "$group" --output json >"$metadata" 2>"$stderr_file"; then
     if grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' \
         "$stderr_file"; then
       rm -f -- "$metadata" "$stderr_file"
-      state_replace '.temporary_group_create = null'
+      state_replace \
+        '.temporary_group_create = null | .temporary_resources = []'
       return
     fi
     fail "Could not inspect temporary resource-group ownership"
@@ -519,12 +513,56 @@ delete_temporary_group() {
     fail "Refusing to delete temporary resource group without exact ownership tags"
     return
   fi
+  inventory="${STATE_FILE}.inventory.json"
+  if ! az resource list \
+      --resource-group "$group" \
+      --output json >"$inventory"; then
+    fail "Could not freshly inventory the temporary resource group"
+    return
+  fi
+  [[ $(stat -c %s -- "$inventory") -le 1048576 ]] ||
+    {
+      fail "Temporary resource-group inventory exceeds its size limit"
+      return
+    }
+  jq -e \
+    --slurpfile state "$STATE_FILE" \
+    --arg prefix "/subscriptions/$subscription_id/resourceGroups/$group/providers/" \
+    --arg owner "$OWNER" \
+    --arg repository "$GITHUB_REPOSITORY" \
+    --arg run_id "$GITHUB_RUN_ID" \
+    --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+    --arg source_commit "$SOURCE_COMMIT" \
+    '
+    type == "array" and length <= 64 and
+    all(.[];
+      (.id | type == "string") and
+      (.id | ascii_downcase | startswith($prefix | ascii_downcase)) and
+      (.type | type == "string") and
+      (.name | type == "string") and
+      .tags["miz-owner"] == $owner and
+      .tags["miz-repository"] == $repository and
+      .tags["miz-run-id"] == $run_id and
+      .tags["miz-run-attempt"] == $run_attempt and
+      .tags["miz-source-commit"] == $source_commit and
+      (. as $live |
+       any($state[0].temporary_resources[];
+         (.id | ascii_downcase) == ($live.id | ascii_downcase) and
+         (.type | ascii_downcase) == ($live.type | ascii_downcase) and
+         .name == $live.name))
+    )
+    ' "$inventory" >/dev/null ||
+    {
+      fail "Temporary resource-group inventory contains an unknown, mismatched, or untagged resource"
+      return
+    }
   az group delete --name "$group" --yes ||
     {
       fail "Failed to delete exact-owned temporary resource group"
       return
     }
-  state_replace '.temporary_group_create = null'
+  state_replace \
+    '.temporary_group_create = null | .temporary_resources = []'
 }
 
 cleanup_resources() {
@@ -565,13 +603,8 @@ cleanup_resources() {
     return
   }
 
-  local succeeded cleanup_status=0
-  succeeded=$(jq -r '.run_succeeded' "$STATE_FILE")
+  local cleanup_status=0
   revoke_outstanding_disk_write_access || cleanup_status=1
-  if [[ "$succeeded" != true ]]; then
-    delete_created_version || cleanup_status=1
-    delete_created_definition || cleanup_status=1
-  fi
   delete_temporary_group || cleanup_status=1
   return "$cleanup_status"
 }
@@ -591,7 +624,11 @@ if [[ -z ${GITHUB_REF:-} || -z ${PROTECTED_ENVIRONMENT:-} ||
       -z ${AZURE_VM_SIZE:-} || -z ${TARGET_RESOURCE_GROUP:-} ||
       -z ${TARGET_GALLERY:-} || -z ${TARGET_IMAGE_DEFINITION:-} ||
       -z ${TARGET_IMAGE_VERSION:-} || -z ${TARGET_LOCATION:-} ||
-      -z ${TARGET_OWNER_TAG:-} || -z ${RESULT_DIR:-} || -z ${MIZ:-} ]]; then
+      -z ${TARGET_OWNER_TAG:-} || -z ${PUBLICATION_LOCK_ID:-} ||
+      -z ${CAPTURE_PRINCIPAL_CLIENT_ID:-} ||
+      -z ${PUBLICATION_PRINCIPAL_CLIENT_ID:-} ||
+      -z ${PUBLICATION_AZURE_CONFIG_DIR:-} ||
+      -z ${RESULT_DIR:-} || -z ${MIZ:-} ]]; then
   fail "Confidential VM capture configuration is incomplete"
   exit 1
 fi
@@ -615,9 +652,28 @@ fi
     "$TARGET_IMAGE_DEFINITION" =~ ^[A-Za-z0-9._()-]{1,80}$ &&
     "$TARGET_IMAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ &&
     "$TARGET_OWNER_TAG" =~ ^[A-Za-z0-9._:/-]{1,128}$ &&
+    "$CAPTURE_PRINCIPAL_CLIENT_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ &&
+    "$PUBLICATION_PRINCIPAL_CLIENT_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ &&
     "$ATTESTATION_ENDPOINT" =~ ^https://[a-z0-9.-]+\.attest\.azure\.net$ ]] ||
   {
     fail "Confidential VM capture configuration is invalid"
+    exit 1
+  }
+[[ "$PUBLICATION_LOCK_ID" == "$EXPECTED_PUBLICATION_LOCK" ]] ||
+  {
+    fail "Protected publication lock identity is invalid"
+    exit 1
+  }
+[[ "$PUBLICATION_AZURE_CONFIG_DIR" == /* &&
+    -d "$PUBLICATION_AZURE_CONFIG_DIR" &&
+    ! -L "$PUBLICATION_AZURE_CONFIG_DIR" ]] ||
+  {
+    fail "Protected publication Azure context is invalid"
+    exit 1
+  }
+[[ "${CAPTURE_PRINCIPAL_CLIENT_ID,,}" != "${PUBLICATION_PRINCIPAL_CLIENT_ID,,}" ]] ||
+  {
+    fail "Capture and publication principals must be distinct"
     exit 1
   }
 [[ "$SOURCE_LOCATION" == "$AZURE_LOCATION" &&
@@ -658,18 +714,33 @@ chmod 0700 "$RESULT_DIR"
   }
 
 name_seed="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-resource_group="miz-u2404-cvm-capture-${name_seed}"
+random_group_suffix=$(openssl rand -hex 16)
+[[ "$random_group_suffix" =~ ^[0-9a-f]{32}$ ]] ||
+  fail "Could not generate a 128-bit temporary resource-group suffix"
+resource_group="miz-u2404-cvm-capture-${name_seed}-${random_group_suffix}"
 upload_disk_name="miz-u2404-capture-upload-${name_seed}"
 managed_image_name="miz-u2404-capture-image-${name_seed}"
 staging_gallery="mizcvmcapture${GITHUB_RUN_ID}${GITHUB_RUN_ATTEMPT}"
 staging_definition=mizu2404cvmsource
 staging_version=1.0.0
 source_vm_name="miz-cvm-source-${name_seed}"
+source_os_disk_name="miz-cvm-source-os-${name_seed}"
 source_data_disk_name="miz-cvm-source-data-${name_seed}"
 capture_vm_name="miz-cvm-capture-${name_seed}"
+capture_os_disk_name="miz-cvm-capture-os-${name_seed}"
 snapshot_name="miz-cvm-snapshot-${name_seed}"
 final_vm_name="miz-cvm-final-${name_seed}"
+final_os_disk_name="miz-cvm-final-os-${name_seed}"
 final_data_disk_name="miz-cvm-final-data-${name_seed}"
+vnet_name="miz-cvm-vnet-${name_seed}"
+subnet_name=miz-cvm-subnet
+nsg_name="miz-cvm-nsg-${name_seed}"
+source_public_ip_name="miz-cvm-source-pip-${name_seed}"
+source_nic_name="miz-cvm-source-nic-${name_seed}"
+capture_public_ip_name="miz-cvm-capture-pip-${name_seed}"
+capture_nic_name="miz-cvm-capture-nic-${name_seed}"
+final_public_ip_name="miz-cvm-final-pip-${name_seed}"
+final_nic_name="miz-cvm-final-nic-${name_seed}"
 admin_username=mizcapture
 
 temporary_group_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group"
@@ -692,15 +763,31 @@ jq -n \
   --arg target_image_definition "$TARGET_IMAGE_DEFINITION" \
   --arg definition_id "$target_definition_id" \
   --arg version_id "$target_version_id" \
+  --arg publication_lock "$PUBLICATION_LOCK_ID" \
+  --arg publication_principal "$PUBLICATION_PRINCIPAL_CLIENT_ID" \
+  --arg temporary_owner "$OWNER" \
   -c '{
-    schema: 2,
+    schema: 3,
     repository: $repository,
     run_id: $run_id,
     run_attempt: $run_attempt,
     source_commit: $source_commit,
     subscription_id: $subscription_id,
     temporary_resource_group: $temporary_resource_group,
-    temporary_group_create: null,
+    temporary_group_create: {
+      status: "expected",
+      resource_id: (
+        "/subscriptions/" + $subscription_id + "/resourceGroups/" +
+        $temporary_resource_group
+      ),
+      resource_name: $temporary_resource_group,
+      owner_tag: $temporary_owner,
+      repository: $repository,
+      run_id: $run_id,
+      run_attempt: $run_attempt,
+      source_commit: $source_commit
+    },
+    temporary_resources: [],
     run_succeeded: false,
     outstanding_write_access: null,
     target: {
@@ -710,8 +797,11 @@ jq -n \
       image_definition: $target_image_definition,
       definition_id: $definition_id,
       version_id: $version_id,
-      definition_create: null,
-      version_created: false
+      publication: {
+        lock_id: $publication_lock,
+        principal_client_id: $publication_principal,
+        status: "not_dispatched"
+      }
     }
   }' >"$STATE_FILE"
 [[ $(stat -c %s -- "$STATE_FILE") -le 16384 ]]
@@ -726,6 +816,7 @@ managed_image_json="$RESULT_DIR/staging-managed-image.json"
 staging_definition_json="$RESULT_DIR/staging-definition.json"
 staging_request="$RESULT_DIR/staging-gallery-request.json"
 staging_response="$RESULT_DIR/staging-gallery-response.json"
+staging_gallery_json="$RESULT_DIR/staging-gallery.json"
 source_dir="$RESULT_DIR/source-validation"
 capture_dir="$RESULT_DIR/capture"
 final_dir="$RESULT_DIR/final-validation"
@@ -739,8 +830,6 @@ temporary_group_json="$RESULT_DIR/temporary-resource-group.json"
 target_group_json="$RESULT_DIR/target-resource-group.json"
 target_gallery_json="$RESULT_DIR/target-gallery.json"
 target_definition_json="$RESULT_DIR/target-definition.json"
-target_definition_request="$RESULT_DIR/target-definition-request.json"
-target_definition_response="$RESULT_DIR/target-definition-response.json"
 
 exact_tags=(
   "miz-owner=$OWNER"
@@ -753,55 +842,14 @@ UBUNTU2404_CONFIDENTIAL_GUEST_AZURE_TAGS=("${exact_tags[@]}")
 
 tag_resource() {
   local resource_id=$1
-  [[ "$resource_id" == /subscriptions/* ]] || return 1
+  [[ "${resource_id,,}" == \
+    "/subscriptions/${AZURE_SUBSCRIPTION_ID,,}/resourcegroups/${resource_group,,}/providers/"* ]] ||
+    return 1
   az tag update \
     --operation Merge \
     --resource-id "$resource_id" \
     --tags "${exact_tags[@]}" \
     --output none
-}
-
-tag_group_resources() {
-  local resource_id resource_json resource_list size
-  resource_json="$RESULT_DIR/tag-resource-list.json"
-  resource_list="$RESULT_DIR/tag-resource-list.txt"
-  rm -f -- "$resource_json" "$resource_list"
-  if ! az resource list \
-      --resource-group "$resource_group" \
-      --query '[].id' \
-      --output json >"$resource_json"; then
-    fail "Could not list temporary resource-group resources for tagging"
-    return
-  fi
-  size=$(stat -c %s -- "$resource_json") || return
-  [[ "$size" -le 1048576 ]] || {
-    fail "Temporary resource-group resource list exceeds its size limit"
-    return
-  }
-  jq -e \
-    --arg prefix "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/" \
-    '
-    type == "array" and length <= 2048 and
-    all(.[]; type == "string" and length >= 1 and length <= 2048 and
-      (ascii_downcase | startswith($prefix | ascii_downcase)))
-  ' "$resource_json" >/dev/null ||
-    {
-      fail "Azure returned an invalid temporary resource-group resource list"
-      return
-    }
-  jq -r '.[]' "$resource_json" >"$resource_list"
-  size=$(stat -c %s -- "$resource_list") || return
-  [[ "$size" -le 1048576 ]] || {
-    fail "Temporary resource-group tag list exceeds its size limit"
-    return
-  }
-  while IFS= read -r resource_id; do
-    [[ -n "$resource_id" ]] || {
-      fail "Azure returned an empty resource ID while tagging"
-      return
-    }
-    tag_resource "$resource_id" || return
-  done <"$resource_list"
 }
 
 grant_disk_write_access() {
@@ -880,81 +928,8 @@ grant_disk_write_access() {
   printf '%s\n' "$sas"
 }
 
-resource_absent() {
-  local stderr_file=$1
-  shift
-  if "$@" >/dev/null 2>"$stderr_file"; then
-    return 1
-  fi
-  grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' "$stderr_file"
-}
-
-run_conditional_create() {
-  local response=$1 resource_kind=$2 stderr_file status
-  shift 2
-  CONDITIONAL_CREATE_COLLISION=false
-  stderr_file="${response}.stderr"
-  rm -f -- "$response"
-  rm -f -- "$stderr_file"
-  if az "$@" >"$response" 2>"$stderr_file"; then
-    rm -f -- "$stderr_file"
-    return 0
-  else
-    status=$?
-  fi
-  rm -f -- "$response"
-  if grep -Eqi \
-      '(^|[^0-9])(409|412)([^0-9]|$)|Conflict|PreconditionFailed|ResourceAlreadyExists' \
-      "$stderr_file"; then
-    rm -f -- "$stderr_file"
-    CONDITIONAL_CREATE_COLLISION=true
-    return 1
-  fi
-  rm -f -- "$stderr_file"
-  fail "Conditional $resource_kind create failed ambiguously; retaining pending cleanup state"
-  return "$status"
-}
-
 persist_temporary_group_create() {
-  state_replace \
-    '.temporary_group_create = {
-      status: "pending",
-      resource_id: $resource_id,
-      resource_name: $resource_name,
-      owner_tag: $owner_tag,
-      repository: $repository,
-      run_id: $run_id,
-      run_attempt: $run_attempt,
-      source_commit: $source_commit
-    }' \
-    --arg resource_id "$temporary_group_id" \
-    --arg resource_name "$resource_group" \
-    --arg owner_tag "$OWNER" \
-    --arg repository "$GITHUB_REPOSITORY" \
-    --arg run_id "$GITHUB_RUN_ID" \
-    --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
-    --arg source_commit "$SOURCE_COMMIT"
-}
-
-persist_target_definition_create() {
-  state_replace \
-    '.target.definition_create = {
-      status: "pending",
-      resource_id: $resource_id,
-      resource_name: $resource_name,
-      owner_tag: $owner_tag,
-      repository: $repository,
-      run_id: $run_id,
-      run_attempt: $run_attempt,
-      source_commit: $source_commit
-    }' \
-    --arg resource_id "$target_definition_id" \
-    --arg resource_name "$TARGET_IMAGE_DEFINITION" \
-    --arg owner_tag "$TARGET_OWNER_TAG" \
-    --arg repository "$GITHUB_REPOSITORY" \
-    --arg run_id "$GITHUB_RUN_ID" \
-    --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
-    --arg source_commit "$SOURCE_COMMIT"
+  state_replace '.temporary_group_create.status = "pending"'
 }
 
 validate_temporary_group_document() {
@@ -969,13 +944,25 @@ validate_temporary_group_document() {
       "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"
 }
 
-validate_target_containers() {
-  az group show --name "$TARGET_RESOURCE_GROUP" --output json \
-    >"$target_group_json"
-  az sig show \
-    --resource-group "$TARGET_RESOURCE_GROUP" \
-    --gallery-name "$TARGET_GALLERY" \
-    --output json >"$target_gallery_json"
+validate_target_parents() {
+  if ! publication_az group show --name "$TARGET_RESOURCE_GROUP" --output json \
+      >"$target_group_json"; then
+    fail "Pre-provisioned target resource group is missing or unavailable"
+    return
+  fi
+  if ! publication_az sig show \
+      --resource-group "$TARGET_RESOURCE_GROUP" \
+      --gallery-name "$TARGET_GALLERY" \
+      --output json >"$target_gallery_json"; then
+    fail "Pre-provisioned target gallery is missing or unavailable"
+    return
+  fi
+  if ! publication_az sig image-definition show \
+      --ids "$target_definition_id" \
+      --output json >"$target_definition_json"; then
+    fail "Pre-provisioned target ConfidentialVM image definition is missing or unavailable"
+    return
+  fi
   jq -e \
     --arg expected_id "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP" \
     --arg name "$TARGET_RESOURCE_GROUP" \
@@ -1010,212 +997,46 @@ validate_target_containers() {
       fail "Target gallery subscription, location, or durable ownership is invalid"
       return
     }
-}
-
-validate_created_target_definition_response() {
-  local metadata=$1
   validate_target_definition_identity \
-    "$metadata" "$target_definition_id" "$TARGET_IMAGE_DEFINITION" &&
-    jq -e \
+    "$target_definition_json" "$target_definition_id" \
+    "$TARGET_IMAGE_DEFINITION" ||
+    {
+      fail "Target image definition identity or name is invalid"
+      return
+    }
+  jq -e \
     --arg location "$TARGET_LOCATION" \
     --arg owner "$TARGET_OWNER_TAG" \
     --arg repository "$GITHUB_REPOSITORY" \
-    --arg run_id "$GITHUB_RUN_ID" \
-    --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
-    --arg source_commit "$SOURCE_COMMIT" \
+    --arg publisher "$TARGET_PUBLISHER" \
+    --arg offer "$TARGET_OFFER" \
+    --arg sku "$TARGET_SKU" \
     '(.location | ascii_downcase) == ($location | ascii_downcase) and
-     .tags == {
-       "miz-owner": $owner,
-       "miz-repository": $repository,
-       "miz-run-id": $run_id,
-       "miz-run-attempt": $run_attempt,
-       "miz-source-commit": $source_commit
+     .tags["miz-owner"] == $owner and
+     .tags["miz-repository"] == $repository and
+     .identifier == {
+       publisher: $publisher,
+       offer: $offer,
+       sku: $sku
      } and
-     .properties.identifier == {
-       publisher: "miz",
-       offer: "ubuntu2404",
-       sku: "confidential-x64"
-     } and
-     .properties.osType == "Linux" and
-     .properties.osState == "Generalized" and
-     .properties.hyperVGeneration == "V2" and
-     .properties.architecture == "x64" and
-     ([.properties.features[]? | select(.name == "SecurityType")] == [{
+     .osType == "Linux" and
+     .osState == "Generalized" and
+     .hyperVGeneration == "V2" and
+     .architecture == "x64" and
+     .provisioningState == "Succeeded" and
+     ([.features[]? | select(.name == "SecurityType")] == [{
        name: "SecurityType", value: "ConfidentialVM"
-     }])' \
-    "$metadata" >/dev/null
-}
-
-resolve_temporary_group_collision() {
-  local metadata=$temporary_group_json stderr_file="${temporary_group_json}.stderr"
-  if ! az group show --name "$resource_group" --output json \
-      >"$metadata" 2>"$stderr_file"; then
-    rm -f -- "$metadata" "$stderr_file"
-    fail "Could not prove the conditional temporary resource-group collision was pre-existing"
-    return
-  fi
-  rm -f -- "$stderr_file"
-  validate_temporary_group_identity \
-    "$metadata" "$temporary_group_id" "$resource_group" ||
+     }]) and
+     ([paths as $path |
+       select(($path[-1] | tostring | ascii_downcase) | contains("uefi"))] |
+       length == 0)' \
+    "$target_definition_json" >/dev/null ||
     {
-      fail "Conditional temporary resource-group collision has mismatched identity"
+      fail "Target image definition contract, durable ownership, or stock UEFI boundary is invalid"
       return
     }
-  if exact_owned_tags_match "$metadata" "$OWNER" "$GITHUB_REPOSITORY" \
-      "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"; then
-    fail "Conditional temporary resource-group collision is run-owned; retaining pending cleanup state"
-    return
-  fi
-  state_replace '.temporary_group_create = null' ||
-    {
-      fail "Could not clear the proven non-owned temporary resource-group collision"
-      return
-    }
-  fail "Conditional temporary resource-group create collided with a pre-existing non-owned resource"
-}
-
-resolve_target_definition_collision() {
-  local metadata=$target_definition_json stderr_file="${target_definition_json}.stderr"
-  if ! az sig image-definition show --ids "$target_definition_id" --output json \
-      >"$metadata" 2>"$stderr_file"; then
-    rm -f -- "$metadata" "$stderr_file"
-    fail "Could not prove the conditional target image-definition collision was pre-existing"
-    return
-  fi
-  rm -f -- "$stderr_file"
-  validate_target_definition_identity \
-    "$metadata" "$target_definition_id" "$TARGET_IMAGE_DEFINITION" ||
-    {
-      fail "Conditional target image-definition collision has mismatched identity"
-      return
-    }
-  if exact_owned_tags_match "$metadata" "$TARGET_OWNER_TAG" \
-      "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
-      "$SOURCE_COMMIT"; then
-    fail "Conditional target image-definition collision is run-owned; retaining pending cleanup state"
-    return
-  fi
-  state_replace '.target.definition_create = null' ||
-    {
-      fail "Could not clear the proven non-owned target image-definition collision"
-      return
-    }
-  fail "Conditional target image-definition create collided with a pre-existing non-owned resource"
-}
-
-confirm_temporary_group_create() {
-  validate_temporary_group_document "$temporary_group_response" ||
-    {
-      fail "Conditional temporary resource-group response is invalid"
-      return
-    }
-  az group show --name "$resource_group" --output json >"$temporary_group_json" ||
-    {
-      fail "Could not freshly inspect the created temporary resource group"
-      return
-    }
-  validate_temporary_group_document "$temporary_group_json" ||
-    {
-      fail "Created temporary resource group failed fresh ownership validation"
-      return
-    }
-  state_replace '.temporary_group_create.status = "confirmed"' ||
-    fail "Could not confirm temporary resource-group cleanup ownership"
-}
-
-confirm_target_definition_create() {
-  validate_created_target_definition_response "$target_definition_response" ||
-    {
-      fail "Conditional target image-definition response is invalid"
-      return
-    }
-  az sig image-definition show --ids "$target_definition_id" --output json \
-    >"$target_definition_json" ||
-    {
-      fail "Could not freshly inspect the created target image definition"
-      return
-    }
-  validate_target_definition_document "$target_definition_json" exact ||
-    {
-      fail "Created target image definition failed fresh security validation"
-      return
-    }
-  state_replace '.target.definition_create.status = "confirmed"' ||
-    fail "Could not confirm target image-definition cleanup ownership"
-}
-
-create_temporary_group_conditionally() {
-  local create_status
-  persist_temporary_group_create ||
-    {
-      fail "Could not persist pending temporary resource-group creation"
-      return
-    }
-  azure_confidential_vm_resource_group_conditional_create_args \
-    "$temporary_group_id" "$temporary_group_request"
-  if run_conditional_create \
-      "$temporary_group_response" "temporary resource group" \
-      "${AZURE_CONFIDENTIAL_VM_ARGS[@]}"; then
-    confirm_temporary_group_create
-    return
-  else
-    create_status=$?
-  fi
-  if [[ "$CONDITIONAL_CREATE_COLLISION" == true ]]; then
-    resolve_temporary_group_collision
-    return
-  fi
-  return "$create_status"
-}
-
-create_target_definition_conditionally() {
-  local create_status
-  persist_target_definition_create ||
-    {
-      fail "Could not persist pending target image-definition creation"
-      return
-    }
-  azure_confidential_vm_capture_image_definition_conditional_create_args \
-    "$target_definition_id" "$target_definition_request"
-  if run_conditional_create \
-      "$target_definition_response" "target image definition" \
-      "${AZURE_CONFIDENTIAL_VM_ARGS[@]}"; then
-    confirm_target_definition_create
-    return
-  else
-    create_status=$?
-  fi
-  if [[ "$CONDITIONAL_CREATE_COLLISION" == true ]]; then
-    resolve_target_definition_collision
-    return
-  fi
-  return "$create_status"
-}
-
-validate_target_definition_document() {
-  local metadata=$1 ownership=$2
-  if [[ "$ownership" == exact ]]; then
-    exact_owned_tags_match "$metadata" "$TARGET_OWNER_TAG" \
-      "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
-      "$SOURCE_COMMIT" ||
-      {
-        fail "Created target definition lost its exact ownership tags"
-        return
-      }
-  else
-    jq -e \
-      --arg owner "$TARGET_OWNER_TAG" \
-      --arg repository "$GITHUB_REPOSITORY" \
-      '.tags["miz-owner"] == $owner and
-       .tags["miz-repository"] == $repository' \
-      "$metadata" >/dev/null ||
-      {
-        fail "Pre-existing target definition lacks durable ownership tags"
-        return
-      }
-  fi
   "$RELEASE_TOOL" check-capture-definition \
-    --definition "$metadata" \
+    --definition "$target_definition_json" \
     --subscription-id "$AZURE_SUBSCRIPTION_ID" \
     --location "$TARGET_LOCATION" \
     --snapshot-id "$snapshot_id" \
@@ -1223,13 +1044,235 @@ validate_target_definition_document() {
     --version-id "$target_version_id" >/dev/null
 }
 
+require_target_version_absent() {
+  local phase=$1 stderr_file
+  stderr_file="$RESULT_DIR/target-version-${phase}.stderr"
+  if publication_az sig image-version show \
+      --ids "$target_version_id" --output json \
+      >"$RESULT_DIR/target-version-${phase}.json" 2>"$stderr_file"; then
+    rm -f -- "$stderr_file"
+    fail "Target gallery version already exists; refusing update or overwrite"
+    return
+  fi
+  if ! grep -Eq \
+      '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' \
+      "$stderr_file"; then
+    fail "Could not prove the target gallery version is absent"
+    return
+  fi
+  rm -f -- "$stderr_file"
+}
+
+quarantine_temporary_group_create() {
+  state_replace '.temporary_group_create.status = "quarantined"' ||
+    fail "Could not quarantine ambiguous temporary resource-group creation"
+}
+
+create_temporary_group() {
+  persist_temporary_group_create ||
+    {
+      fail "Could not persist pending temporary resource-group creation"
+      return
+    }
+  azure_confidential_vm_resource_group_create_args \
+    "$temporary_group_id" "$temporary_group_request"
+  if ! az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" \
+      >"$temporary_group_response"; then
+    quarantine_temporary_group_create
+    fail "Temporary resource-group create failed ambiguously; manual review is required"
+    return
+  fi
+  if ! validate_temporary_group_document "$temporary_group_response"; then
+    quarantine_temporary_group_create
+    fail "Temporary resource-group create response is invalid; manual review is required"
+    return
+  fi
+  if ! az group show --name "$resource_group" --output json \
+      >"$temporary_group_json"; then
+    quarantine_temporary_group_create
+    fail "Could not freshly inspect the created temporary resource group"
+    return
+  fi
+  if ! validate_temporary_group_document "$temporary_group_json"; then
+    quarantine_temporary_group_create
+    fail "Created temporary resource group failed fresh ownership validation"
+    return
+  fi
+  state_replace \
+    '.temporary_group_create.status = "confirmed_created"' ||
+    fail "Could not confirm temporary resource-group cleanup eligibility"
+}
+
+create_common_network() {
+  local vnet_json="$RESULT_DIR/vnet.json" nsg_json="$RESULT_DIR/nsg.json"
+  local vnet_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/providers/Microsoft.Network/virtualNetworks/$vnet_name"
+  local nsg_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/providers/Microsoft.Network/networkSecurityGroups/$nsg_name"
+  az network vnet create \
+    --resource-group "$resource_group" \
+    --name "$vnet_name" \
+    --location "$AZURE_LOCATION" \
+    --subnet-name "$subnet_name" \
+    --tags "${exact_tags[@]}" \
+    --output none
+  az network vnet show \
+    --resource-group "$resource_group" \
+    --name "$vnet_name" \
+    --output json >"$vnet_json"
+  jq -e \
+    --arg subnet "$subnet_name" \
+    '[.subnets[]? | select(.name == $subnet)] | length == 1' \
+    "$vnet_json" >/dev/null ||
+    {
+      fail "Created virtual network lacks the exact capture subnet"
+      return
+    }
+  record_expected_resource \
+    "$vnet_json" "$vnet_id" "Microsoft.Network/virtualNetworks" "$vnet_name"
+
+  az network nsg create \
+    --resource-group "$resource_group" \
+    --name "$nsg_name" \
+    --location "$AZURE_LOCATION" \
+    --tags "${exact_tags[@]}" \
+    --output none
+  az network nsg show \
+    --resource-group "$resource_group" \
+    --name "$nsg_name" \
+    --output json >"$nsg_json"
+  record_expected_resource \
+    "$nsg_json" "$nsg_id" "Microsoft.Network/networkSecurityGroups" "$nsg_name"
+  az network nsg rule create \
+    --resource-group "$resource_group" \
+    --nsg-name "$nsg_name" \
+    --name SSH \
+    --priority 1000 \
+    --direction Inbound \
+    --access Allow \
+    --protocol Tcp \
+    --destination-port-ranges 22 \
+    --output none
+  az network nsg rule show \
+    --resource-group "$resource_group" \
+    --nsg-name "$nsg_name" \
+    --name SSH \
+    --query '{name:name,priority:priority,direction:direction,access:access,protocol:protocol,destinationPortRange:destinationPortRange}' \
+    --output json >"$RESULT_DIR/nsg-ssh-rule.json"
+  jq -e \
+    '. == {
+      name: "SSH",
+      priority: 1000,
+      direction: "Inbound",
+      access: "Allow",
+      protocol: "Tcp",
+      destinationPortRange: "22"
+    }' "$RESULT_DIR/nsg-ssh-rule.json" >/dev/null ||
+    {
+      fail "Created network security group lacks the exact SSH rule"
+      return
+    }
+}
+
+create_vm_network() {
+  local public_ip_name=$1 nic_name=$2 prefix=$3
+  local public_ip_json="$RESULT_DIR/${prefix}-public-ip.json"
+  local nic_json="$RESULT_DIR/${prefix}-nic.json"
+  local public_ip_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/providers/Microsoft.Network/publicIPAddresses/$public_ip_name"
+  local nic_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/providers/Microsoft.Network/networkInterfaces/$nic_name"
+  az network public-ip create \
+    --resource-group "$resource_group" \
+    --name "$public_ip_name" \
+    --location "$AZURE_LOCATION" \
+    --sku Standard \
+    --allocation-method Static \
+    --tags "${exact_tags[@]}" \
+    --output none
+  az network public-ip show \
+    --resource-group "$resource_group" \
+    --name "$public_ip_name" \
+    --output json >"$public_ip_json"
+  record_expected_resource \
+    "$public_ip_json" "$public_ip_id" \
+    "Microsoft.Network/publicIPAddresses" "$public_ip_name"
+  az network nic create \
+    --resource-group "$resource_group" \
+    --name "$nic_name" \
+    --location "$AZURE_LOCATION" \
+    --vnet-name "$vnet_name" \
+    --subnet "$subnet_name" \
+    --network-security-group "$nsg_name" \
+    --public-ip-address "$public_ip_name" \
+    --tags "${exact_tags[@]}" \
+    --output none
+  az network nic show \
+    --resource-group "$resource_group" \
+    --name "$nic_name" \
+    --output json >"$nic_json"
+  jq -e \
+    --arg subnet_id "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/providers/Microsoft.Network/virtualNetworks/$vnet_name/subnets/$subnet_name" \
+    --arg nsg_id "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/providers/Microsoft.Network/networkSecurityGroups/$nsg_name" \
+    --arg public_ip_id "$public_ip_id" \
+    '(.networkSecurityGroup.id | ascii_downcase) ==
+       ($nsg_id | ascii_downcase) and
+     ([.ipConfigurations[]? |
+       select(
+         (.subnet.id | ascii_downcase) == ($subnet_id | ascii_downcase) and
+         (.publicIPAddress.id | ascii_downcase) ==
+           ($public_ip_id | ascii_downcase)
+       )] | length == 1)' \
+    "$nic_json" >/dev/null ||
+    {
+      fail "Created NIC does not bind the exact VNet, NSG, and public IP"
+      return
+    }
+  record_expected_resource \
+    "$nic_json" "$nic_id" "Microsoft.Network/networkInterfaces" "$nic_name"
+  CREATED_NIC_ID=$nic_id
+}
+
+record_vm_and_os_disk() {
+  local vm_json=$1 vm_name=$2 os_disk_name=$3 disk_json=$4
+  local vm_id disk_id
+  vm_id=$(jq -er '.id' "$vm_json")
+  disk_id=$(jq -er '.storageProfile.osDisk.managedDisk.id' "$vm_json")
+  [[ "$(jq -er '.storageProfile.osDisk.name' "$vm_json")" == "$os_disk_name" ]] ||
+    {
+      fail "Azure VM did not use the explicit OS disk name"
+      return
+    }
+  record_expected_resource \
+    "$vm_json" "$vm_id" "Microsoft.Compute/virtualMachines" "$vm_name"
+  tag_resource "$disk_id"
+  azure_confidential_vm_capture_disk_show_args "$disk_id"
+  az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$disk_json"
+  record_expected_resource \
+    "$disk_json" "$disk_id" "Microsoft.Compute/disks" "$os_disk_name"
+}
+
+ubuntu2404_confidential_guest_record_created_data_disk() {
+  local disk_group=$1 disk_name=$2 location=$3
+  local disk_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$disk_group/providers/Microsoft.Compute/disks/$disk_name"
+  local disk_json="$RESULT_DIR/${disk_name}.json"
+  [[ "$disk_group" == "$resource_group" && "$location" == "$AZURE_LOCATION" ]] ||
+    return 1
+  az disk show --ids "$disk_id" --output json >"$disk_json"
+  record_expected_resource \
+    "$disk_json" "$disk_id" "Microsoft.Compute/disks" "$disk_name"
+}
+
 wait_gallery_version() {
   local response=$1 version_id=$2 provisioning replication states_file
   states_file="${response}.state"
   for _ in {1..180}; do
-    "$RELEASE_TOOL" capture-gallery-state --response "$response" >"$states_file"
-    readarray -t states <"$states_file"
-    [[ ${#states[@]} -eq 2 ]]
+    if ! "$RELEASE_TOOL" capture-gallery-state \
+        --response "$response" >"$states_file"; then
+      fail "Could not validate the target gallery LRO response"
+      return
+    fi
+    if ! readarray -t states <"$states_file" ||
+        [[ ${#states[@]} -ne 2 ]]; then
+      fail "Target gallery LRO state is malformed"
+      return
+    fi
     provisioning=${states[0]}
     replication=${states[1]}
     case "$provisioning" in
@@ -1256,9 +1299,65 @@ wait_gallery_version() {
     fi
     sleep 10
     azure_confidential_vm_capture_gallery_version_get_args "$version_id"
-    az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$response"
+    if ! publication_az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$response"; then
+      fail "Target gallery LRO poll failed ambiguously; refusing to retry"
+      return
+    fi
   done
   fail "Gallery full replication did not complete before the deadline"
+}
+
+quarantine_target_publication() {
+  state_replace '.target.publication.status = "quarantined"' ||
+    fail "Could not persist target publication quarantine"
+}
+
+publish_target_version_once() {
+  state_replace '.target.publication.status = "pending"' ||
+    {
+      fail "Could not persist pending target publication"
+      return
+    }
+  azure_confidential_vm_capture_gallery_version_put_args \
+    "$target_version_id" "$target_request"
+  # Do not retry this upsert. A transport or LRO failure can leave a live
+  # version even when the client cannot observe the final response.
+  if ! publication_az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" \
+      >"$target_response"; then
+    quarantine_target_publication
+    fail "Target version publication failed ambiguously; manual break-glass review is required"
+    return
+  fi
+  if ! wait_gallery_version "$target_response" "$target_version_id"; then
+    quarantine_target_publication
+    fail "Target version publication did not reach a clear success; manual break-glass review is required"
+    return
+  fi
+  if ! "$RELEASE_TOOL" check-capture-gallery \
+      --request "$target_request" \
+      --response "$target_response" \
+      --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+      --location "$TARGET_LOCATION" \
+      --snapshot-id "$snapshot_id" \
+      --definition-id "$target_definition_id" \
+      --version-id "$target_version_id"; then
+    quarantine_target_publication
+    fail "Published target version failed exact response validation"
+    return
+  fi
+  # Provenance tags remain evidence to validate, not an atomic ownership or
+  # cleanup boundary.
+  if ! owned_tags_match "$target_response" "$OWNER" "$GITHUB_REPOSITORY" \
+      "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"; then
+    quarantine_target_publication
+    fail "Target gallery version lost its exact run provenance tags"
+    return
+  fi
+  state_replace '.target.publication.status = "published"' ||
+    {
+      fail "Could not persist successful target publication"
+      return
+    }
 }
 
 wait_source_gallery_version() {
@@ -1365,7 +1464,32 @@ trap 'exit 130' INT TERM
 account_subscription=$(az account show --query id --output tsv)
 [[ "${account_subscription,,}" == "${AZURE_SUBSCRIPTION_ID,,}" ]] ||
   fail "Azure login subscription does not match the protected input"
+capture_principal_type=$(az account show --query user.type --output tsv)
+capture_principal_client_id=$(az account show --query user.name --output tsv)
+[[ "$capture_principal_type" == servicePrincipal &&
+    "${capture_principal_client_id,,}" == "${CAPTURE_PRINCIPAL_CLIENT_ID,,}" ]] ||
+  fail "Azure login does not match the narrow capture principal"
+publication_account_subscription=$(
+  publication_az account show --query id --output tsv
+)
+publication_principal_type=$(
+  publication_az account show --query user.type --output tsv
+)
+publication_principal_client_id=$(
+  publication_az account show --query user.name --output tsv
+)
+[[ "${publication_account_subscription,,}" == "${AZURE_SUBSCRIPTION_ID,,}" ]] ||
+  fail "Publication principal subscription does not match the protected input"
+[[ "$publication_principal_type" == servicePrincipal &&
+    "${publication_principal_client_id,,}" == "${PUBLICATION_PRINCIPAL_CLIENT_ID,,}" ]] ||
+  fail "Azure login does not match the exclusive publication principal"
 
+validate_target_parents
+require_target_version_absent startup
+
+# The random 128-bit suffix makes collision with an unrelated group
+# cryptographically negligible. Resource Group PUT remains an ordinary upsert,
+# so only an unambiguous response plus a fresh exact GET authorizes cleanup.
 group_exists=$(az group exists --name "$resource_group" --output tsv)
 case "$group_exists" in
   false) ;;
@@ -1389,61 +1513,7 @@ jq -n \
       "miz-source-commit": $source_commit
     }
   }' >"$temporary_group_request"
-create_temporary_group_conditionally
-
-jq -n \
-  --arg location "$TARGET_LOCATION" \
-  --arg owner "$TARGET_OWNER_TAG" \
-  --arg repository "$GITHUB_REPOSITORY" \
-  --arg run_id "$GITHUB_RUN_ID" \
-  --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
-  --arg source_commit "$SOURCE_COMMIT" \
-  '{
-    location: $location,
-    tags: {
-      "miz-owner": $owner,
-      "miz-repository": $repository,
-      "miz-run-id": $run_id,
-      "miz-run-attempt": $run_attempt,
-      "miz-source-commit": $source_commit
-    },
-    properties: {
-      identifier: {
-        publisher: "miz",
-        offer: "ubuntu2404",
-        sku: "confidential-x64"
-      },
-      osType: "Linux",
-      osState: "Generalized",
-      hyperVGeneration: "V2",
-      architecture: "x64",
-      features: [{
-        name: "SecurityType",
-        value: "ConfidentialVM"
-      }]
-    }
-  }' >"$target_definition_request"
-
-validate_target_containers
-
-definition_initial_stderr="$RESULT_DIR/target-definition-initial.stderr"
-definition_existed_initially=false
-if az sig image-definition show --ids "$target_definition_id" --output json \
-    >"$target_definition_json" 2>"$definition_initial_stderr"; then
-  definition_existed_initially=true
-  validate_target_definition_document "$target_definition_json" durable
-elif ! grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' \
-    "$definition_initial_stderr"; then
-  fail "Could not inspect the initial target image definition"
-fi
-rm -f -- "$definition_initial_stderr"
-
-version_absent_stderr="$RESULT_DIR/target-version-show.stderr"
-if ! resource_absent "$version_absent_stderr" \
-    az sig image-version show --ids "$target_version_id" --output json; then
-  fail "Target gallery version already exists; refusing update or overwrite"
-fi
-rm -f -- "$version_absent_stderr"
+create_temporary_group
 
 accepted_identity_file="$RESULT_DIR/accepted-identity.txt"
 "$RELEASE_TOOL" verify-acceptance \
@@ -1516,6 +1586,9 @@ az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >/dev/null
 azure_trusted_launch_disk_show_args "$resource_group" "$upload_disk_name"
 az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >"$upload_disk_json"
 upload_disk_id=$("$RELEASE_TOOL" check-managed-disk --disk "$upload_disk_json")
+record_expected_resource \
+  "$upload_disk_json" "$upload_disk_id" "Microsoft.Compute/disks" \
+  "$upload_disk_name"
 upload_sas=$(
   grant_disk_write_access \
     "$upload_disk_id" "$resource_group" "$upload_disk_name" 7200
@@ -1539,10 +1612,21 @@ managed_image_id=$(
     --image "$managed_image_json" \
     --disk-id "$upload_disk_id"
 )
+record_expected_resource \
+  "$managed_image_json" "$managed_image_id" "Microsoft.Compute/images" \
+  "$managed_image_name"
 
 azure_trusted_launch_gallery_create_args "$resource_group" "$staging_gallery" "$AZURE_LOCATION"
 AZURE_TRUSTED_LAUNCH_ARGS+=(--tags "${exact_tags[@]}")
 az "${AZURE_TRUSTED_LAUNCH_ARGS[@]}" >/dev/null
+az sig show \
+  --resource-group "$resource_group" \
+  --gallery-name "$staging_gallery" \
+  --output json >"$staging_gallery_json"
+record_expected_resource \
+  "$staging_gallery_json" \
+  "/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$resource_group/providers/Microsoft.Compute/galleries/$staging_gallery" \
+  "Microsoft.Compute/galleries" "$staging_gallery"
 azure_confidential_vm_image_definition_create_args \
   "$resource_group" "$staging_gallery" "$staging_definition" ubuntu2404 \
   confidential-source-x64 "$AZURE_LOCATION"
@@ -1552,6 +1636,10 @@ azure_confidential_vm_image_definition_show_args \
   "$resource_group" "$staging_gallery" "$staging_definition"
 az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$staging_definition_json"
 [[ "$("$RELEASE_TOOL" check-image-definition --definition "$staging_definition_json")" == "$staging_definition_id" ]]
+record_expected_resource \
+  "$staging_definition_json" "$staging_definition_id" \
+  "Microsoft.Compute/galleries/images" "$staging_definition" \
+  "$staging_gallery/$staging_definition"
 
 "$RELEASE_TOOL" gallery-request \
   --output "$staging_request" \
@@ -1605,8 +1693,15 @@ jq -e \
    .tags["miz-source-acceptance-sha256"] == $source_acceptance_sha256' \
   "$staging_response" >/dev/null ||
   fail "Staging gallery version lost its exact artifact and ownership binding"
+record_expected_resource \
+  "$staging_response" "$staging_version_id" \
+  "Microsoft.Compute/galleries/images/versions" "$staging_version" \
+  "$staging_gallery/$staging_definition/$staging_version"
 
 ssh-keygen -q -t ed25519 -N '' -f "$private_key"
+create_common_network
+create_vm_network "$source_public_ip_name" "$source_nic_name" source
+source_nic_id=$CREATED_NIC_ID
 
 source_vm_resource="$source_dir/vm-resource.json"
 source_vm_instance="$source_dir/vm-instance.json"
@@ -1616,15 +1711,18 @@ source_openid="$source_dir/openid-configuration.json"
 source_jwks="$source_dir/jwks.json"
 azure_confidential_vm_vm_create_args \
   "$resource_group" "$source_vm_name" "$AZURE_LOCATION" "$AZURE_VM_SIZE" \
-  "$staging_version_id" "$admin_username" "$private_key.pub" true
+  "$staging_version_id" "$admin_username" "$private_key.pub" true \
+  "$source_nic_id" "$source_os_disk_name"
 AZURE_CONFIDENTIAL_VM_ARGS+=(--tags "${exact_tags[@]}")
 az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$source_dir/vm-create.json"
-tag_group_resources
-collect_acceptance_vm_contract \
-  "$source_vm_name" "$source_vm_resource" "$source_vm_instance"
 collect_vm_contract \
   "$source_vm_name" "$source_dir/vm-full-resource.json" \
   "$source_dir/vm-full-instance.json"
+record_vm_and_os_disk \
+  "$source_dir/vm-full-resource.json" "$source_vm_name" \
+  "$source_os_disk_name" "$source_dir/os-disk.json"
+collect_acceptance_vm_contract \
+  "$source_vm_name" "$source_vm_resource" "$source_vm_instance"
 source_vm_resource_id=$(jq -er '.id' "$source_vm_resource")
 source_vm_unique_id=$(jq -er '.vmId' "$source_vm_resource")
 source_checked_file="$source_dir/checked-identity.txt"
@@ -1660,19 +1758,23 @@ readarray -t source_attestation_identity \
     "${source_attestation_identity[0]}" == "$ATTESTATION_ENDPOINT" &&
     "${source_attestation_identity[1]}" =~ ^[0-9a-f]{64}$ &&
     "${source_attestation_identity[2]}" =~ ^[0-9a-f]{64}$ ]]
-tag_group_resources
 
 capture_vm_resource="$capture_dir/vm-resource.json"
 capture_vm_instance="$capture_dir/vm-instance.json"
 capture_disk_json="$capture_dir/os-disk.json"
 capture_guest_imds="$capture_dir/guest-imds.json"
+create_vm_network "$capture_public_ip_name" "$capture_nic_name" capture
+capture_nic_id=$CREATED_NIC_ID
 azure_confidential_vm_vm_create_args \
   "$resource_group" "$capture_vm_name" "$AZURE_LOCATION" "$AZURE_VM_SIZE" \
-  "$staging_version_id" "$admin_username" "$private_key.pub" true
+  "$staging_version_id" "$admin_username" "$private_key.pub" true \
+  "$capture_nic_id" "$capture_os_disk_name"
 AZURE_CONFIDENTIAL_VM_ARGS+=(--tags "${exact_tags[@]}")
 az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$capture_dir/vm-create.json"
-tag_group_resources
 collect_vm_contract "$capture_vm_name" "$capture_vm_resource" "$capture_vm_instance"
+record_vm_and_os_disk \
+  "$capture_vm_resource" "$capture_vm_name" "$capture_os_disk_name" \
+  "$capture_disk_json"
 capture_vm_id=$(jq -er '.id' "$capture_vm_resource")
 capture_vm_unique_id=$(jq -er '.vmId' "$capture_vm_resource")
 capture_disk_id=$(jq -er '.storageProfile.osDisk.managedDisk.id' "$capture_vm_resource")
@@ -1769,18 +1871,8 @@ az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$snapshot_json"
 owned_tags_match "$snapshot_json" "$OWNER" "$GITHUB_REPOSITORY" \
   "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
   fail "Capture snapshot lost its exact run ownership tags"
-
-definition_was_created=false
-if [[ "$definition_existed_initially" == false ]]; then
-  validate_target_containers
-  create_target_definition_conditionally
-  definition_was_created=true
-else
-  validate_target_containers
-  az sig image-definition show --ids "$target_definition_id" --output json \
-    >"$target_definition_json"
-  validate_target_definition_document "$target_definition_json" durable
-fi
+record_expected_resource \
+  "$snapshot_json" "$snapshot_id" "Microsoft.Compute/snapshots" "$snapshot_name"
 
 target_request="$RESULT_DIR/target-gallery-request.json"
 target_response="$RESULT_DIR/target-gallery-response.json"
@@ -1805,30 +1897,12 @@ jq \
     "miz-source-commit": $source_commit
   }' "$target_request" >"${target_request}.tagged"
 mv -f -- "${target_request}.tagged" "$target_request"
-validate_target_containers
-az sig image-definition show --ids "$target_definition_id" --output json \
-  >"$target_definition_json"
-if [[ "$definition_was_created" == true ]]; then
-  validate_target_definition_document "$target_definition_json" exact
-else
-  validate_target_definition_document "$target_definition_json" durable
-fi
-state_replace '.target.version_created = true'
-azure_confidential_vm_capture_gallery_version_put_args \
-  "$target_version_id" "$target_request"
-az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$target_response"
-wait_gallery_version "$target_response" "$target_version_id"
-"$RELEASE_TOOL" check-capture-gallery \
-  --request "$target_request" \
-  --response "$target_response" \
-  --subscription-id "$AZURE_SUBSCRIPTION_ID" \
-  --location "$TARGET_LOCATION" \
-  --snapshot-id "$snapshot_id" \
-  --definition-id "$target_definition_id" \
-  --version-id "$target_version_id"
-owned_tags_match "$target_response" "$OWNER" "$GITHUB_REPOSITORY" \
-  "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT" ||
-  fail "Target gallery version lost its exact run ownership tags"
+# Revalidate all durable parents and the exact version absence at the final
+# mutation boundary. The remaining check-to-PUT race is controlled only by the
+# stable workflow lock and exclusive least-privilege publisher principal.
+validate_target_parents
+require_target_version_absent pre-put
+publish_target_version_once
 
 final_vm_resource="$final_dir/vm-resource.json"
 final_vm_instance="$final_dir/vm-instance.json"
@@ -1836,13 +1910,18 @@ final_guest_imds="$final_dir/guest-imds.json"
 final_token="$final_dir/attestation.jwt"
 final_openid="$final_dir/openid-configuration.json"
 final_jwks="$final_dir/jwks.json"
+create_vm_network "$final_public_ip_name" "$final_nic_name" final
+final_nic_id=$CREATED_NIC_ID
 azure_confidential_vm_captured_vm_create_args \
   "$resource_group" "$final_vm_name" "$AZURE_LOCATION" "$AZURE_VM_SIZE" \
-  "$target_version_id" "$admin_username" "$private_key.pub" true
+  "$target_version_id" "$admin_username" "$private_key.pub" true \
+  "$final_nic_id" "$final_os_disk_name"
 AZURE_CONFIDENTIAL_VM_ARGS+=(--tags "${exact_tags[@]}")
 az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$final_dir/vm-create.json"
-tag_group_resources
 collect_vm_contract "$final_vm_name" "$final_vm_resource" "$final_vm_instance"
+record_vm_and_os_disk \
+  "$final_vm_resource" "$final_vm_name" "$final_os_disk_name" \
+  "$final_dir/os-disk.json"
 final_vm_id=$(jq -er '.id' "$final_vm_resource")
 final_vm_unique_id=$(jq -er '.vmId' "$final_vm_resource")
 final_disk_id=$(jq -er '.storageProfile.osDisk.managedDisk.id' "$final_vm_resource")
@@ -1863,7 +1942,6 @@ ubuntu2404_confidential_guest_final_acceptance \
   "$final_dir/attestation-client.stderr" \
   "$resource_group" "$final_vm_name" "$final_data_disk_name" "$AZURE_LOCATION"
 final_guest_vm_id=$UBUNTU2404_CONFIDENTIAL_GUEST_VM_ID
-tag_group_resources
 
 # Refresh every live Azure document and both public MAA documents at one
 # evidence boundary. The result and verifier consume these exact revisions.
@@ -1884,9 +1962,9 @@ azure_confidential_vm_snapshot_show_args "$resource_group" "$snapshot_name"
 az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$snapshot_json"
 azure_confidential_vm_capture_image_definition_show_args \
   "$TARGET_RESOURCE_GROUP" "$TARGET_GALLERY" "$TARGET_IMAGE_DEFINITION"
-az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$target_definition_json"
+publication_az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$target_definition_json"
 azure_confidential_vm_capture_gallery_version_get_args "$target_version_id"
-az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$target_response"
+publication_az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$target_response"
 collect_vm_contract "$final_vm_name" "$final_vm_resource" "$final_vm_instance"
 refresh_maa_metadata "$final_openid" "$final_jwks"
 

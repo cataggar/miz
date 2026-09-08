@@ -74,6 +74,7 @@ azure_confidential_vm_managed_image_show_args() {
 azure_confidential_vm_vm_create_args() {
   local resource_group=$1 vm_name=$2 location=$3 vm_size=$4 image_version_id=$5
   local admin_username=$6 public_key=$7 managed_boot_diagnostics=${8:-false}
+  local nic_id=${9:-} os_disk_name=${10:-}
   AZURE_CONFIDENTIAL_VM_ARGS=(
     vm create
     --resource-group "$resource_group"
@@ -90,9 +91,19 @@ azure_confidential_vm_vm_create_args() {
     --os-disk-security-encryption-type VMGuestStateOnly
     --enable-secure-boot true
     --enable-vtpm true
-    --public-ip-sku Standard
-    --nsg-rule SSH
   )
+  if [[ -n "$nic_id" || -n "$os_disk_name" ]]; then
+    [[ -n "$nic_id" && -n "$os_disk_name" ]] || return 1
+    AZURE_CONFIDENTIAL_VM_ARGS+=(
+      --nics "$nic_id"
+      --os-disk-name "$os_disk_name"
+    )
+  else
+    AZURE_CONFIDENTIAL_VM_ARGS+=(
+      --public-ip-sku Standard
+      --nsg-rule SSH
+    )
+  fi
   if [[ "$managed_boot_diagnostics" == true ]]; then
     AZURE_CONFIDENTIAL_VM_ARGS+=(--boot-diagnostics-storage "")
   fi
@@ -102,6 +113,7 @@ azure_confidential_vm_vm_create_args() {
 azure_confidential_vm_captured_vm_create_args() {
   local resource_group=$1 vm_name=$2 location=$3 vm_size=$4 image_version_id=$5
   local admin_username=$6 public_key=$7 managed_boot_diagnostics=${8:-false}
+  local nic_id=${9:-} os_disk_name=${10:-}
   AZURE_CONFIDENTIAL_VM_ARGS=(
     vm create
     --resource-group "$resource_group"
@@ -114,9 +126,19 @@ azure_confidential_vm_captured_vm_create_args() {
     --ssh-key-values "$public_key"
     --enable-agent true
     --enable-auto-update false
-    --public-ip-sku Standard
-    --nsg-rule SSH
   )
+  if [[ -n "$nic_id" || -n "$os_disk_name" ]]; then
+    [[ -n "$nic_id" && -n "$os_disk_name" ]] || return 1
+    AZURE_CONFIDENTIAL_VM_ARGS+=(
+      --nics "$nic_id"
+      --os-disk-name "$os_disk_name"
+    )
+  else
+    AZURE_CONFIDENTIAL_VM_ARGS+=(
+      --public-ip-sku Standard
+      --nsg-rule SSH
+    )
+  fi
   if [[ "$managed_boot_diagnostics" == true ]]; then
     AZURE_CONFIDENTIAL_VM_ARGS+=(--boot-diagnostics-storage "")
   fi
@@ -151,7 +173,7 @@ azure_confidential_vm_capture_vm_resource_args() {
     vm show
     --resource-group "$resource_group"
     --name "$vm_name"
-    --query '{id:id,vmId:vmId,location:location,provisioningState:provisioningState,securityProfile:securityProfile,storageProfile:storageProfile}'
+    --query '{id:id,name:name,type:type,tags:tags,vmId:vmId,location:location,provisioningState:provisioningState,securityProfile:securityProfile,storageProfile:storageProfile}'
     --output json
   )
 }
@@ -243,25 +265,12 @@ azure_confidential_vm_capture_image_definition_show_args() {
   )
 }
 
-azure_confidential_vm_resource_group_conditional_create_args() {
+azure_confidential_vm_resource_group_create_args() {
   local resource_group_id=$1 request=$2
   AZURE_CONFIDENTIAL_VM_ARGS=(
     rest
     --method put
     --uri "https://management.azure.com${resource_group_id}?api-version=2022-09-01"
-    --headers 'If-None-Match=*'
-    --body "@$request"
-    --output json
-  )
-}
-
-azure_confidential_vm_capture_image_definition_conditional_create_args() {
-  local image_definition_id=$1 request=$2
-  AZURE_CONFIDENTIAL_VM_ARGS=(
-    rest
-    --method put
-    --uri "https://management.azure.com${image_definition_id}?api-version=2025-03-03"
-    --headers 'If-None-Match=*'
     --body "@$request"
     --output json
   )
@@ -273,7 +282,6 @@ azure_confidential_vm_capture_gallery_version_put_args() {
     rest
     --method put
     --uri "https://management.azure.com${image_version_id}?api-version=2025-03-03"
-    --headers 'If-None-Match=*'
     --body "@$request"
     --output json
   )
