@@ -422,6 +422,178 @@ test "conditional container creates persist pending before PUT and confirm after
     try std.testing.expect(version_definition < version_put);
 }
 
+test "state replacement preserves the last known-good recovery state" {
+    const allocator = std.testing.allocator;
+    const script = try readTracked(allocator, script_path);
+    defer allocator.free(script);
+    const identity_source = try section(
+        script,
+        "require_cleanup_identity() {",
+        "\nstate_replace() {",
+    );
+    const state_source = try section(
+        script,
+        "state_replace() {",
+        "\nowned_tags_match() {",
+    );
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository = try rootAlloc(allocator);
+    defer allocator.free(repository);
+    const root = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}",
+        .{ repository, tmp.sub_path },
+    );
+    defer allocator.free(root);
+    const fixture = try writeCleanupFixture(
+        allocator,
+        root,
+        false,
+        null,
+        null,
+        null,
+        false,
+    );
+    defer allocator.free(fixture.state);
+    defer allocator.free(fixture.log);
+    const bin = try std.fmt.allocPrint(allocator, "{s}/bin", .{root});
+    defer allocator.free(bin);
+    const jq_mock = try std.fmt.allocPrint(allocator, "{s}/jq", .{bin});
+    defer allocator.free(jq_mock);
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = jq_mock,
+        .data =
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\for arg in "$@"; do
+        \\  if [[ "$arg" != '.run_succeeded = true' ]]; then continue; fi
+        \\  case "${MOCK_MODE:-success}" in
+        \\    jq-fail) printf '{"schema":2}'; exit 71 ;;
+        \\    jq-empty) exit 0 ;;
+        \\    jq-malformed) printf '{not-json\n'; exit 0 ;;
+        \\    jq-oversized)
+        \\      printf '{"padding":"'
+        \\      head -c 17000 /dev/zero | tr '\0' x
+        \\      printf '"}\n'
+        \\      exit 0
+        \\      ;;
+        \\  esac
+        \\done
+        \\exec "$REAL_JQ" "$@"
+        \\
+        ,
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
+    const mv_mock = try std.fmt.allocPrint(allocator, "{s}/mv", .{bin});
+    defer allocator.free(mv_mock);
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = mv_mock,
+        .data =
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\[[ "${MOCK_MODE:-success}" != mv-fail ]] || exit 72
+        \\exec "$REAL_MV" "$@"
+        \\
+        ,
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
+    const chmod_mock = try std.fmt.allocPrint(allocator, "{s}/chmod", .{bin});
+    defer allocator.free(chmod_mock);
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = chmod_mock,
+        .data =
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\if [[ "${MOCK_MODE:-success}" == chmod-fail &&
+        \\    "${*: -1}" == *.next ]]; then
+        \\  exit 73
+        \\fi
+        \\exec "$REAL_CHMOD" "$@"
+        \\
+        ,
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
+    const original = try std.fmt.allocPrint(allocator, "{s}/original.json", .{root});
+    defer allocator.free(original);
+    const fixture_source = try std.fmt.allocPrint(
+        allocator,
+        \\#!/usr/bin/env bash
+        \\set -Eeuo pipefail
+        \\EXPECTED_REPOSITORY=cataggar/miz
+        \\GITHUB_REPOSITORY=cataggar/miz
+        \\GITHUB_RUN_ID=123
+        \\GITHUB_RUN_ATTEMPT=4
+        \\SOURCE_COMMIT=0123456789abcdef0123456789abcdef01234567
+        \\fail() {{ printf '%s\n' "$*" >&2; return 1; }}
+        \\{s}
+        \\unset STATE_FILE
+        \\if require_cleanup_identity; then
+        \\  echo 'incomplete cleanup identity was accepted' >&2
+        \\  exit 80
+        \\fi
+        \\STATE_FILE='{s}'
+        \\REAL_JQ=$(command -v jq)
+        \\REAL_MV=$(command -v mv)
+        \\REAL_CHMOD=$(command -v chmod)
+        \\export REAL_JQ REAL_MV REAL_CHMOD
+        \\PATH='{s}':"$PATH"
+        \\export PATH MOCK_MODE
+        \\{s}
+        \\cp -- "$STATE_FILE" '{s}'
+        \\reset_state() {{
+        \\  MOCK_MODE=success
+        \\  cp -- '{s}' "$STATE_FILE"
+        \\  chmod 0600 "$STATE_FILE"
+        \\  rm -f -- "$STATE_FILE.next"
+        \\}}
+        \\for mode in jq-fail jq-empty jq-malformed jq-oversized chmod-fail mv-fail; do
+        \\  reset_state
+        \\  MOCK_MODE=$mode
+        \\  if state_replace '.run_succeeded = true'; then
+        \\    echo "state replacement unexpectedly accepted $mode" >&2
+        \\    exit 81
+        \\  fi
+        \\  cmp -s -- '{s}' "$STATE_FILE"
+        \\  [[ ! -e "$STATE_FILE.next" ]]
+        \\  [[ $(stat -c %a -- "$STATE_FILE") == 600 ]]
+        \\done
+        \\reset_state
+        \\old_inode=$(stat -c %i -- "$STATE_FILE")
+        \\state_replace '.run_succeeded = true'
+        \\"$REAL_JQ" -e '.run_succeeded == true' "$STATE_FILE" >/dev/null
+        \\[[ $(stat -c %a -- "$STATE_FILE") == 600 ]]
+        \\[[ $(stat -c %i -- "$STATE_FILE") != "$old_inode" ]]
+        \\[[ ! -e "$STATE_FILE.next" ]]
+        \\
+    ,
+        .{
+            identity_source,
+            fixture.state,
+            bin,
+            state_source,
+            original,
+            original,
+            original,
+        },
+    );
+    defer allocator.free(fixture_source);
+    const result = try runShellSource(
+        allocator,
+        root,
+        "state-replace-fixture.sh",
+        fixture_source,
+    );
+    defer result.deinit(allocator);
+    if (!result.succeeded()) {
+        std.debug.print(
+            "state replacement fixture failed:\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ result.stdout, result.stderr },
+        );
+    }
+    try std.testing.expect(result.succeeded());
+}
+
 test "foreign conditional-create collisions clear pending without deletion" {
     const allocator = std.testing.allocator;
     const script = try readTracked(allocator, script_path);
@@ -429,7 +601,7 @@ test "foreign conditional-create collisions clear pending without deletion" {
     const state_replace_source = try section(
         script,
         "state_replace() {",
-        "\nstate_file_is_safe() {",
+        "\nowned_tags_match() {",
     );
     const exact_tags_source = try section(
         script,
@@ -610,7 +782,7 @@ test "interruption after conditional PUT leaves exact pending create records" {
     const state_replace_source = try section(
         script,
         "state_replace() {",
-        "\nstate_file_is_safe() {",
+        "\nowned_tags_match() {",
     );
     const persist_source = try section(
         script,
@@ -747,7 +919,7 @@ test "fresh GET failure after successful PUT retains pending create records" {
     const state_replace_source = try section(
         script,
         "state_replace() {",
-        "\nstate_file_is_safe() {",
+        "\nowned_tags_match() {",
     );
     const exact_tags_source = try section(
         script,
@@ -1493,7 +1665,7 @@ test "interrupted beginGetAccess leaves pending exact disk for cleanup revoke" {
     const state_replace_source = try section(
         script_source,
         "state_replace() {",
-        "\nstate_file_is_safe() {",
+        "\nowned_tags_match() {",
     );
     const validate_source = try section(
         script_source,
@@ -1551,8 +1723,10 @@ test "interrupted beginGetAccess leaves pending exact disk for cleanup revoke" {
         \\set -Eeuo pipefail
         \\STATE_FILE='{s}'
         \\RESULT_DIR='{s}'
+        \\GITHUB_REPOSITORY=cataggar/miz
         \\GITHUB_RUN_ID=123
         \\GITHUB_RUN_ATTEMPT=4
+        \\SOURCE_COMMIT=0123456789abcdef0123456789abcdef01234567
         \\MOCK_REQUEST='{s}'
         \\fail() {{ printf '%s\n' "$*" >&2; return 1; }}
         \\az() {{

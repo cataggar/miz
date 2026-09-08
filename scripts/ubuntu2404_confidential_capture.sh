@@ -29,43 +29,124 @@ fail() {
 }
 
 require_cleanup_identity() {
-  [[ -n ${STATE_FILE:-} && -n ${GITHUB_REPOSITORY:-} &&
-      -n ${GITHUB_RUN_ID:-} && -n ${GITHUB_RUN_ATTEMPT:-} &&
-      -n ${SOURCE_COMMIT:-} ]] ||
+  if [[ -z ${STATE_FILE:-} || -z ${GITHUB_REPOSITORY:-} ||
+      -z ${GITHUB_RUN_ID:-} || -z ${GITHUB_RUN_ATTEMPT:-} ||
+      -z ${SOURCE_COMMIT:-} ]]; then
     fail "Capture cleanup identity is incomplete"
-  [[ "$GITHUB_REPOSITORY" == "$EXPECTED_REPOSITORY" ]] ||
+    return 1
+  fi
+  if [[ "$GITHUB_REPOSITORY" != "$EXPECTED_REPOSITORY" ]]; then
     fail "Capture repository identity is invalid"
-  [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ &&
-      "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ &&
-      "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] ||
+    return 1
+  fi
+  if [[ ! "$GITHUB_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ||
+      ! "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ||
+      ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
     fail "Capture cleanup identity is invalid"
+    return 1
+  fi
 }
 
 state_replace() {
-  local filter=$1
-  shift
-  local next="${STATE_FILE}.next"
-  rm -f -- "$next"
-  jq -c "$@" "$filter" "$STATE_FILE" >"$next"
-  [[ $(stat -c %s -- "$next") -le 16384 ]] || {
-    rm -f -- "$next"
-    fail "Capture cleanup state exceeds its size limit"
-    return
-  }
-  chmod 0600 "$next"
-  mv -f -- "$next" "$STATE_FILE"
+  if (( $# < 1 )); then
+    fail "Capture cleanup state transformation is missing"
+    return 1
+  fi
+  local filter=$1 metadata next owner mode size extra
+  if ! shift; then
+    fail "Could not read the capture cleanup state transformation"
+    return 1
+  fi
+  if [[ -z ${STATE_FILE:-} ]]; then
+    fail "Capture cleanup state path is unavailable"
+    return 1
+  fi
+  next="${STATE_FILE}.next"
+  if ! rm -f -- "$next"; then
+    fail "Could not clear the temporary capture cleanup state"
+    return 1
+  fi
+  if ! state_file_is_safe "$STATE_FILE" ||
+      ! state_matches_identity "$STATE_FILE"; then
+    fail "Refusing to replace invalid capture cleanup state"
+    return 1
+  fi
+  if ! (umask 077; jq -c "$@" "$filter" "$STATE_FILE" >"$next"); then
+    if ! rm -f -- "$next"; then
+      fail "Could not remove failed temporary capture cleanup state"
+    fi
+    fail "Could not transform capture cleanup state"
+    return 1
+  fi
+  if [[ ! -f "$next" || -L "$next" ]]; then
+    if ! rm -f -- "$next"; then
+      fail "Could not remove failed temporary capture cleanup state"
+    fi
+    fail "Temporary capture cleanup state is not a regular file"
+    return 1
+  fi
+  if ! chmod 0600 "$next"; then
+    if ! rm -f -- "$next"; then
+      fail "Could not remove failed temporary capture cleanup state"
+    fi
+    fail "Could not secure temporary capture cleanup state"
+    return 1
+  fi
+  if ! metadata=$(stat -c '%u %a %s' -- "$next"); then
+    if ! rm -f -- "$next"; then
+      fail "Could not remove failed temporary capture cleanup state"
+    fi
+    fail "Could not inspect temporary capture cleanup state"
+    return 1
+  fi
+  if ! IFS=' ' read -r owner mode size extra <<<"$metadata"; then
+    if ! rm -f -- "$next"; then
+      fail "Could not remove failed temporary capture cleanup state"
+    fi
+    fail "Could not parse temporary capture cleanup state metadata"
+    return 1
+  fi
+  if [[ -n "$extra" || "$owner" != "$EUID" || "$mode" != 600 ]]; then
+    if ! rm -f -- "$next"; then
+      fail "Could not remove failed temporary capture cleanup state"
+    fi
+    fail "Temporary capture cleanup state permissions are unsafe"
+    return 1
+  fi
+  if [[ ! "$size" =~ ^[1-9][0-9]*$ || "$size" -gt 16384 ]]; then
+    if ! rm -f -- "$next"; then
+      fail "Could not remove failed temporary capture cleanup state"
+    fi
+    fail "Capture cleanup state is empty or exceeds its size limit"
+    return 1
+  fi
+  if ! state_matches_identity "$next"; then
+    if ! rm -f -- "$next"; then
+      fail "Could not remove failed temporary capture cleanup state"
+    fi
+    fail "Temporary capture cleanup state is invalid"
+    return 1
+  fi
+  if ! mv -fT -- "$next" "$STATE_FILE"; then
+    if ! rm -f -- "$next"; then
+      fail "Could not remove failed temporary capture cleanup state"
+    fi
+    fail "Could not atomically replace capture cleanup state"
+    return 1
+  fi
 }
 
 state_file_is_safe() {
-  local metadata owner mode size
-  [[ -f "$STATE_FILE" && ! -L "$STATE_FILE" ]] || return 1
-  metadata=$(stat -c '%u %a %s' -- "$STATE_FILE") || return
-  read -r owner mode size <<<"$metadata"
-  [[ "$owner" == "$EUID" && "$mode" == 600 &&
+  local path=${1:-$STATE_FILE} metadata owner mode size extra
+  [[ -f "$path" && ! -L "$path" ]] || return 1
+  metadata=$(stat -c '%u %a %s' -- "$path") || return 1
+  IFS=' ' read -r owner mode size extra <<<"$metadata" || return 1
+  [[ -z "$extra" && "$owner" == "$EUID" && "$mode" == 600 &&
       "$size" =~ ^[1-9][0-9]*$ && "$size" -le 16384 ]]
 }
 
 state_matches_identity() {
+  local path=${1:-$STATE_FILE}
   jq -e \
     --arg repository "$GITHUB_REPOSITORY" \
     --arg run_id "$GITHUB_RUN_ID" \
@@ -169,7 +250,7 @@ state_matches_identity() {
          (.outstanding_write_access.resource_group | type == "string")
        )
      )' \
-    "$STATE_FILE" >/dev/null
+    "$path" >/dev/null
 }
 
 owned_tags_match() {
