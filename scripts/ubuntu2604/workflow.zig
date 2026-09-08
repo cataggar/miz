@@ -808,6 +808,16 @@ pub fn dispatch(
             diagnostic,
         );
         defer document.deinit();
+        const draft = document.get("draft") orelse return fail(
+            diagnostic,
+            "release draft state is absent",
+            .{},
+        );
+        if (draft != .bool or !draft.bool) return fail(
+            diagnostic,
+            "stale assets may be deleted only from a draft release",
+            .{},
+        );
         const assets = support.arrayOf(document.get("assets")) orelse return fail(
             diagnostic,
             "release asset listing is absent",
@@ -833,6 +843,49 @@ pub fn dispatch(
             try out.print("{d}\n", .{id});
         }
         return;
+    }
+    if (std.mem.eql(u8, command, "github-immutable-releases")) {
+        var options = try parse(allocator, argv, &.{"--response"});
+        defer options.deinit();
+        return support.github_release.validateImmutableReleasesFile(
+            allocator,
+            io,
+            try options.require("--response"),
+            diagnostic,
+        );
+    }
+    if (std.mem.eql(u8, command, "select-release-ruleset")) {
+        var options = try parse(allocator, argv, &.{
+            "--repository",
+            "--rulesets-response",
+        });
+        defer options.deinit();
+        const id = try support.github_release.selectImmutableTagRulesetIdFile(
+            allocator,
+            io,
+            try options.require("--rulesets-response"),
+            try options.require("--repository"),
+            diagnostic,
+        );
+        return out.print("{d}\n", .{id});
+    }
+    if (std.mem.eql(u8, command, "check-release-policy")) {
+        var options = try parse(allocator, argv, &.{
+            "--repository",
+            "--immutable-response",
+            "--rulesets-response",
+            "--ruleset-detail-response",
+        });
+        defer options.deinit();
+        return support.github_release.validateRepositoryReleasePolicyFiles(
+            allocator,
+            io,
+            try options.require("--immutable-response"),
+            try options.require("--rulesets-response"),
+            try options.require("--ruleset-detail-response"),
+            try options.require("--repository"),
+            diagnostic,
+        );
     }
     if (std.mem.eql(u8, command, "github-release-assets")) {
         var options = try parse(allocator, argv, &.{
@@ -4183,6 +4236,11 @@ pub fn releaseAssets(
         return mismatch(final, 0, diagnostic);
     const draft = support.isTrue(document.get("draft"));
     if (final and draft) return mismatch(true, assets.len, diagnostic);
+    if (!final and !draft) return fail(
+        diagnostic,
+        "release stopped being a draft before verification",
+        .{},
+    );
     if (assets.len != expected.entries.items.len) {
         return mismatch(final, assets.len, diagnostic);
     }
@@ -4211,14 +4269,25 @@ pub fn releaseAssets(
         {
             return mismatch(final, assets.len, diagnostic);
         }
+        if (!support.stringIs(entry.get("state"), "uploaded")) {
+            return mismatch(final, assets.len, diagnostic);
+        }
+        var digest_buffer: [71]u8 = undefined;
+        const expected_digest = std.fmt.bufPrint(
+            &digest_buffer,
+            "sha256:{s}",
+            .{expected.entries.items[index].sha256},
+        ) catch unreachable;
+        if (!support.stringIs(entry.get("digest"), expected_digest)) {
+            return mismatch(final, assets.len, diagnostic);
+        }
     }
     for (claimed) |taken| {
         if (!taken) return mismatch(final, assets.len, diagnostic);
     }
-
-    if (!final and !draft) return fail(
+    if (final and !support.isTrue(document.get("immutable"))) return fail(
         diagnostic,
-        "release stopped being a draft before verification",
+        "published release is not immutable",
         .{},
     );
 }

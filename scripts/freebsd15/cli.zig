@@ -224,6 +224,77 @@ pub const release_commands = [_]Command{
         .required = &.{ "refs", "tag" },
     },
     .{
+        .name = "verify-release-metadata",
+        .options = &.{
+            "release",
+            "notes",
+            "release-tag",
+            "release-title",
+            "source-commit",
+        },
+        .required = &.{
+            "release",
+            "notes",
+            "release-tag",
+            "release-title",
+            "source-commit",
+        },
+    },
+    .{
+        .name = "check-immutable-releases",
+        .options = &.{"response"},
+        .required = &.{"response"},
+    },
+    .{
+        .name = "select-release-ruleset",
+        .options = &.{ "repository", "rulesets-response" },
+        .required = &.{ "repository", "rulesets-response" },
+    },
+    .{
+        .name = "check-release-policy",
+        .options = &.{
+            "repository",
+            "immutable-response",
+            "rulesets-response",
+            "ruleset-detail-response",
+        },
+        .required = &.{
+            "repository",
+            "immutable-response",
+            "rulesets-response",
+            "ruleset-detail-response",
+        },
+    },
+    .{
+        .name = "verify-draft-assets",
+        .options = &.{
+            "release",
+            "notes",
+            "expected",
+            "release-id",
+            "release-tag",
+            "release-title",
+            "source-commit",
+            "mode",
+            "asset-name",
+        },
+        .required = &.{
+            "release",
+            "notes",
+            "expected",
+            "release-id",
+            "release-tag",
+            "release-title",
+            "source-commit",
+            "mode",
+        },
+    },
+    .{
+        .name = "release-stale-assets",
+        .options = &.{ "release", "expected" },
+        .required = &.{ "release", "expected" },
+    },
+    .{
         .name = "verify-remote-release",
         .options = &.{ "release", "expected" },
         .required = &.{ "release", "expected" },
@@ -354,7 +425,10 @@ const release_usage_text =
     \\commands:
     \\  matrix, azure-matrix, describe, include-count, candidate, azure-result,
     \\  candidate-binding, stage, compare, stage-expected, stage-evidence,
-    \\  publish-expected, tag-object, verify-remote-release,
+    \\  publish-expected, tag-object, verify-release-metadata,
+    \\  check-immutable-releases, select-release-ruleset, check-release-policy,
+    \\  verify-draft-assets,
+    \\  release-stale-assets, verify-remote-release,
     \\  verify-downloaded-release, verify-published-release
     \\
 ;
@@ -533,6 +607,87 @@ fn dispatchRelease(
             context,
             requiredOption(options, "refs"),
             requiredOption(options, "tag"),
+            out,
+        );
+    }
+    if (std.mem.eql(u8, name, "verify-release-metadata")) {
+        return publication.verifyReleaseMetadata(
+            context,
+            requiredOption(options, "release"),
+            requiredOption(options, "notes"),
+            requiredOption(options, "release-tag"),
+            requiredOption(options, "release-title"),
+            requiredOption(options, "source-commit"),
+        );
+    }
+    if (std.mem.eql(u8, name, "check-immutable-releases")) {
+        return support.github_release.validateImmutableReleasesFile(
+            context.arena,
+            context.io,
+            requiredOption(options, "response"),
+            &context.diagnostic,
+        ) catch return error.Invalid;
+    }
+    if (std.mem.eql(u8, name, "select-release-ruleset")) {
+        const id = support.github_release.selectImmutableTagRulesetIdFile(
+            context.arena,
+            context.io,
+            requiredOption(options, "rulesets-response"),
+            requiredOption(options, "repository"),
+            &context.diagnostic,
+        ) catch return error.Invalid;
+        out.print("{d}\n", .{id}) catch return error.OutOfMemory;
+        return;
+    }
+    if (std.mem.eql(u8, name, "check-release-policy")) {
+        return support.github_release.validateRepositoryReleasePolicyFiles(
+            context.arena,
+            context.io,
+            requiredOption(options, "immutable-response"),
+            requiredOption(options, "rulesets-response"),
+            requiredOption(options, "ruleset-detail-response"),
+            requiredOption(options, "repository"),
+            &context.diagnostic,
+        ) catch return error.Invalid;
+    }
+    if (std.mem.eql(u8, name, "verify-draft-assets")) {
+        const mode_text = requiredOption(options, "mode");
+        const mode: support.github_release.DraftAssetTableMode =
+            if (std.mem.eql(u8, mode_text, "repair"))
+                .repair
+            else if (std.mem.eql(u8, mode_text, "asset"))
+                .asset
+            else if (std.mem.eql(u8, mode_text, "subset"))
+                .subset
+            else if (std.mem.eql(u8, mode_text, "exact"))
+                .exact
+            else
+                return error.Usage;
+        return support.github_release.validateDraftAssetTableFiles(
+            context.arena,
+            context.io,
+            requiredOption(options, "release"),
+            requiredOption(options, "notes"),
+            requiredOption(options, "expected"),
+            try integerOption(options, "release-id", 0),
+            .{
+                .tag = requiredOption(options, "release-tag"),
+                .commit = requiredOption(options, "source-commit"),
+                .title = requiredOption(options, "release-title"),
+                .body = "",
+                .prerelease = false,
+            },
+            mode,
+            options.find("asset-name"),
+            out,
+            &context.diagnostic,
+        ) catch return error.Invalid;
+    }
+    if (std.mem.eql(u8, name, "release-stale-assets")) {
+        return publication.writeStaleAssetIds(
+            context,
+            requiredOption(options, "release"),
+            requiredOption(options, "expected"),
             out,
         );
     }

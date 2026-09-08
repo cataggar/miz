@@ -309,7 +309,16 @@ The environment must define these secrets:
 AZURE_CLIENT_ID
 AZURE_TENANT_ID
 AZURE_SUBSCRIPTION_ID
+RELEASE_GITHUB_APP_ID
+RELEASE_GITHUB_APP_PRIVATE_KEY
 ```
+
+The shared release App must have repository **Administration: write**,
+**Contents: write**, and **Workflows: write** permissions. The protected job
+mints separate tokens: Administration-write/Contents-read for the immutable
+release and full ruleset-detail checks, and Contents-write/Workflows-write as
+`GH_TOKEN` for release/tag/asset reads and mutations. Release tag corrections
+always use a new tag.
 
 and these variables:
 

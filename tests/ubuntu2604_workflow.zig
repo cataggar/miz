@@ -77,16 +77,19 @@ test "gallery reissue is explicit, evidence-bound, and independently verified" {
         "\"$RELEASE_TOOL\" verify-gallery-metadata",
         "[[ \"$TOOLING_COMMIT\" =~ ^[0-9a-f]{40}$ ]]",
         "test \"$(wc -l <\"$expected_file\")\" -eq 2",
+        "(.assets[0].state == \"uploaded\")",
         "(.assets[0].digest == $digest)",
         "Final reissue $REISSUE_TAG is immutable",
         "-f \"sha=$TOOLING_COMMIT\"",
         "gh release create \"$REISSUE_TAG\"",
-        "gh release upload \"$REISSUE_TAG\"",
+        "--target \"$TOOLING_COMMIT\"",
+        "https://uploads.github.com/repos/$REPOSITORY/releases/$release_id/assets?name=$name",
+        "github-draft-assets",
         "\"$RELEASE_TOOL\" github-release-assets",
         "\"$RELEASE_TOOL\" github-release-downloaded",
         "--key \"$CANDIDATE_KEY\"",
-        "gh release edit \"$REISSUE_TAG\"",
-        "--draft=false",
+        "gh api --method PATCH \"$release_api\"",
+        "draft=false",
     }) |needle| try publisher.expectContains(needle);
     try publisher.expectCount(
         "gh release view \"$SOURCE_RELEASE_TAG\"",
@@ -94,22 +97,24 @@ test "gallery reissue is explicit, evidence-bound, and independently verified" {
     );
     try source.expectOrder(
         publisher.text,
-        "--stage draft",
+        "check_draft_assets exact",
         "gh release download \"$REISSUE_TAG\"",
         reissue_publisher_path,
     );
     try source.expectOrder(
         publisher.text,
         "\"$RELEASE_TOOL\" github-release-downloaded",
-        "--draft=false",
+        "draft=false",
         reissue_publisher_path,
     );
     try source.expectOrder(
         publisher.text,
-        "--draft=false",
+        "draft=false",
         "--stage final",
         reissue_publisher_path,
     );
+    try publisher.expectOmits("gh release upload");
+    try publisher.expectOmits("--clobber");
     try publisher.expectOmits("gh release edit \"$SOURCE_RELEASE_TAG\"");
     try publisher.expectOmits("gh release upload \"$SOURCE_RELEASE_TAG\"");
     try workflow.expectOmits(source.interpreter);

@@ -1994,8 +1994,8 @@ test "remote, downloaded, and published releases must match the expectation" {
     ));
 
     const release_json = try std.fmt.allocPrint(tree.allocator(),
-        \\{{"draft": true, "assets": [
-        \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "size": {d}}}]}}
+        \\{{"draft": true, "immutable": false, "assets": [
+        \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "state": "uploaded", "size": {d}}}]}}
     , .{ &real_digest, body.len });
     const release_path = try tree.write("release.json", release_json);
     try publication.verifyRemoteRelease(&context, release_path, expected_path);
@@ -2012,6 +2012,7 @@ test "remote, downloaded, and published releases must match the expectation" {
         expected_path,
     ));
     try expectFailure(&context, "release stopped being a draft");
+    try support.mutateDocument(&tree, release_path, "immutable", "true");
     try publication.verifyPublishedRelease(&context, release_path, expected_path);
 
     try support.mutateDocument(&tree, release_path, "draft", "true");
@@ -2184,16 +2185,32 @@ test "the publish script requires a reviewed date and exact assets" {
     try support.expectContains(source, "explicit reviewed RELEASE_DATE");
     try support.expectContains(source, "--release-date \"$RELEASE_DATE\"");
     try support.expectContains(source, "gh release create \"$RELEASE_TAG\"");
-    try support.expectContains(source, "gh release upload \"$RELEASE_TAG\"");
-    try support.expectContains(source, "gh release edit \"$RELEASE_TAG\"");
+    try support.expectContains(source, "--target \"$SOURCE_COMMIT\"");
+    try support.expectContains(source, "if [[ \"$release_exists\" != true ]]");
+    try support.expectContains(
+        source,
+        "https://uploads.github.com/repos/$REPOSITORY/releases/$release_id/assets?name=$asset_name",
+    );
+    try support.expectContains(source, "gh api --method PATCH \"$release_api\"");
+    try support.expectContains(source, "-f \"target_commitish=$SOURCE_COMMIT\"");
     try support.expectContains(source, "gh release download \"$RELEASE_TAG\"");
     try support.expectContains(source, "--draft");
     try support.expectContains(source, "--latest=false");
+    try support.expectAbsent(source, "gh release upload");
+    try support.expectAbsent(source, "--clobber");
+    try support.expectContains(source, "Final release $RELEASE_TAG is immutable");
+    try support.expectContains(source, "\"$release_tool\" verify-release-metadata \\");
+    try support.expectContains(source, "verify-draft-assets");
+    try support.expectContains(source, "verify_draft_assets repair");
+    try support.expectContains(source, "verify_draft_assets exact");
+    try support.expectContains(source, "retaining resumable draft $RELEASE_TAG");
+    try support.expectContains(source, "release_published=true");
+    try support.expectContains(source, "quarantine and inspect immutable release");
+    try support.expectAbsent(source, "--draft >/dev/null 2>&1 || true");
     try support.expectContains(source, "git/matching-refs/tags/$RELEASE_TAG");
     try support.expectAbsent(source, "git/ref/tags/$RELEASE_TAG");
     try support.expectContains(source, "\"$release_tool\" tag-object");
     try support.expectContains(source, "\"$release_tool\" publish-expected \\");
-    try support.expectContains(source, "\"$release_tool\" verify-remote-release \\");
     try support.expectContains(source, "\"$release_tool\" verify-downloaded-release \\");
     try support.expectContains(source, "\"$release_tool\" verify-published-release \\");
     try support.expectAbsent(source, support.interpreter_name);
@@ -2490,7 +2507,7 @@ test "a published release must report leaving the draft state" {
         const release_path = try tree.write("release.json", try std.fmt.allocPrint(
             tree.allocator(),
             \\{{{s}"assets": [
-            \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "size": {d}}}]}}
+            \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "state": "uploaded", "size": {d}}}]}}
         ,
             .{
                 if (draft) |value| try std.fmt.allocPrint(
@@ -2527,20 +2544,36 @@ test "a published release must report leaving the draft state" {
 
     const published = try tree.write("release.json", try std.fmt.allocPrint(
         tree.allocator(),
-        \\{{"draft": false, "assets": [
-        \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "size": {d}}}]}}
+        \\{{"draft": false, "immutable": true, "assets": [
+        \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "state": "uploaded", "size": {d}}}]}}
     ,
         .{ &digest, body.len },
     ));
     try publication.verifyPublishedRelease(&context, published, expected_path);
+    const mutable_published = try tree.write(
+        "release-mutable.json",
+        try std.fmt.allocPrint(
+            tree.allocator(),
+            \\{{"draft": false, "immutable": false, "assets": [
+            \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "state": "uploaded", "size": {d}}}]}}
+        ,
+            .{ &digest, body.len },
+        ),
+    );
+    try std.testing.expectError(error.Invalid, publication.verifyPublishedRelease(
+        &context,
+        mutable_published,
+        expected_path,
+    ));
+    try expectFailure(&context, "published release is not immutable");
 
     // A non-draft release that lost or gained an asset is still refused, and
     // says so precisely.
     const wrong = try tree.write("release-wrong.json", try std.fmt.allocPrint(
         tree.allocator(),
-        \\{{"draft": false, "assets": [
-        \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "size": {d}}},
-        \\  {{"name": "stray.qcow2", "digest": "sha256:{s}", "size": {d}}}]}}
+        \\{{"draft": false, "immutable": true, "assets": [
+        \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "state": "uploaded", "size": {d}}},
+        \\  {{"name": "stray.qcow2", "digest": "sha256:{s}", "state": "uploaded", "size": {d}}}]}}
     ,
         .{ &digest, body.len, &digest, body.len },
     ));
@@ -2552,5 +2585,51 @@ test "a published release must report leaving the draft state" {
     try expectFailure(
         &context,
         "published release did not retain the exact final allowlist",
+    );
+
+    inline for ([_]struct {
+        digest_value: []const u8,
+        state: []const u8,
+    }{
+        .{ .digest_value = "null", .state = "uploaded" },
+        .{
+            .digest_value = "\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+            .state = "uploaded",
+        },
+    }) |invalid| {
+        const invalid_release = try tree.write(
+            "release-invalid.json",
+            try std.fmt.allocPrint(
+                tree.allocator(),
+                "{{\"draft\":false,\"immutable\":true,\"assets\":[{{\"name\":\"asset.qcow2\",\"digest\":{s},\"state\":\"{s}\",\"size\":{d}}}]}}",
+                .{ invalid.digest_value, invalid.state, body.len },
+            ),
+        );
+        try std.testing.expectError(error.Invalid, publication.verifyPublishedRelease(
+            &context,
+            invalid_release,
+            expected_path,
+        ));
+        try expectFailure(
+            &context,
+            "published release did not retain exact uploaded asset digests",
+        );
+    }
+    const starter_release = try tree.write(
+        "release-starter.json",
+        try std.fmt.allocPrint(
+            tree.allocator(),
+            "{{\"draft\":false,\"immutable\":true,\"assets\":[{{\"name\":\"asset.qcow2\",\"digest\":\"sha256:{s}\",\"state\":\"starter\",\"size\":{d}}}]}}",
+            .{ &digest, body.len },
+        ),
+    );
+    try std.testing.expectError(error.Invalid, publication.verifyPublishedRelease(
+        &context,
+        starter_release,
+        expected_path,
+    ));
+    try expectFailure(
+        &context,
+        "published release did not retain exact uploaded asset digests",
     );
 }

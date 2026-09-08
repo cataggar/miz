@@ -1582,12 +1582,12 @@ bypass a publication gate.
 and publishes exactly full/core × x86_64/AArch64. Before dispatch:
 
 1. Create or retarget the required tag `Ubuntu-26.04-20260905` to the exact
-   current `main` commit. Lightweight and annotated tags are accepted; force
-   push the tag when it already exists, then verify the remote resolves to the
-   current `main` commit before dispatch. Mutation is permitted only while the
-   release is being iterated on 2026-09-05; after final publication the tag,
-   assets, URLs, and digests are immutable. Earlier release tags are never
-   retargeted: a new release gets a new date.
+   current `main` commit. Lightweight and annotated tags are accepted. The
+   mandatory global `miz-immutable-release-tags-v1` ruleset prevents every
+   existing tag from being moved or deleted, including by the publishing App,
+   so a wrong or abandoned tag must be replaced by a newly named release tag.
+   Verify the exact remote tag resolves to the current `main` commit before
+   dispatch. Earlier release tags are never retargeted.
 2. Confirm the exact GitHub-hosted `ubuntu-24.04-arm` label is available.
    Publication cannot proceed without both `aarch64-full` and `aarch64-core`
    Secure Boot acceptance jobs using native Arm64
@@ -1601,9 +1601,15 @@ and publishes exactly full/core × x86_64/AArch64. Before dispatch:
    `MIZ_ARTIFACT_SIGNING_PROFILE`.
 4. Configure protected environment `ubuntu2604-release` the same way, with
    secrets `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
-   `AZURE_SUBSCRIPTION_ID` and variables `AZURE_LOCATION_X64`,
+   `AZURE_SUBSCRIPTION_ID`, `RELEASE_GITHUB_APP_ID`, and
+   `RELEASE_GITHUB_APP_PRIVATE_KEY`, and variables `AZURE_LOCATION_X64`,
    `AZURE_LOCATION_ARM64`, `AZURE_VM_SIZE_X64`, and
    `AZURE_VM_SIZE_ARM64`.
+   The shared App needs repository **Administration: write**, **Contents:
+   write**, and **Workflows: write** permissions. Each publishing job mints an
+   Administration-write/Contents-read policy token and a distinct
+   Contents-write/Workflows-write publication token. Only the latter is passed
+   as `GH_TOKEN` to the release publisher.
 5. Configure both Entra federated credentials with issuer
    `https://token.actions.githubusercontent.com` and audience
    `api://AzureADTokenExchange`. Their subjects are respectively

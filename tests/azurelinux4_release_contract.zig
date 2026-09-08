@@ -391,16 +391,32 @@ test "the publisher verifies drafts by release id" {
     const script = try readTracked(allocator, std.testing.io, publish_path);
     defer allocator.free(script);
     try expectContains(script, "--json databaseId");
+    try expectContains(script, "--json isDraft");
+    try expectContains(script, "Final release $RELEASE_TAG is immutable");
+    try expectContains(script, "\"$release_tool\" check-release-metadata \\");
+    try expectContains(script, "publish_attempted=true");
+    try expectContains(script, "release_published=true");
+    try expectContains(script, "--target \"$SOURCE_COMMIT\"");
+    try expectContains(script, "quarantine and inspect immutable release");
+    try expectAbsent(script, "--draft >/dev/null 2>&1 || true");
     try expectContains(script, "release_api=\"repos/$REPOSITORY/releases/$release_id\"");
-    try expectCount(script, "gh api \"$release_api\"", 3);
+    try expectContains(script, "gh api \"$release_api\" >\"$release_file\"");
     try expectAbsent(script, "releases/tags/$RELEASE_TAG");
+    try expectAbsent(script, "gh release upload");
+    try expectAbsent(script, "--clobber");
+    try expectContains(
+        script,
+        "https://uploads.github.com/repos/$REPOSITORY/releases/$release_id/assets?name=$asset_name",
+    );
     // Every remote state check goes through the one tool that parses the
     // expected-asset table, in the order the publication requires.
-    try expectContains(script, "\"$release_tool\" release-stale-assets \\");
-    try expectContains(script, "--state draft");
+    try expectContains(script, "check_draft_assets repair");
+    try expectContains(script, "check_draft_assets asset \"$asset_name\"");
+    try expectContains(script, "check_draft_assets subset");
+    try expectContains(script, "check_draft_assets exact");
     try expectContains(script, "\"$release_tool\" check-downloads \\");
     try expectContains(script, "--state published");
-    const draft = std.mem.indexOf(u8, script, "--state draft").?;
+    const draft = std.mem.indexOf(u8, script, "check_draft_assets exact").?;
     const downloads = std.mem.indexOf(u8, script, "check-downloads").?;
     const published = std.mem.indexOf(u8, script, "--state published").?;
     try std.testing.expect(draft < downloads);

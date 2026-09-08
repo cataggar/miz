@@ -18,51 +18,32 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@3f92e616222f9f5965921619e0ae2804c01ef6c5 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Build release contract tool
+        run: zig build install-miz-release -Doptimize=ReleaseSafe
+
       - name: Match tag and package versions
         id: version
         shell: bash
         run: |
           set -euo pipefail
-
-          version="${GITHUB_REF_NAME#v}"
-          if [[ -z "$version" || "$version" == "$GITHUB_REF_NAME" ]]; then
-            echo "::error::Release tag must start with v and include a version"
-            exit 1
-          fi
-          if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::Release tag '$GITHUB_REF_NAME' is not a supported SemVer tag"
-            exit 1
-          fi
-
-          manifest_version=$(
-            sed -nE 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"([^"]+)",[[:space:]]*$/\1/p' build.zig.zon
-          )
-          manifest_version_count=$(
-            printf '%s\n' "$manifest_version" | awk 'NF { count++ } END { print count + 0 }'
-          )
-          if [[ "$manifest_version_count" != 1 ]]; then
-            echo "::error::Expected exactly one .version entry in build.zig.zon"
-            exit 1
-          fi
-
-          if [[ "$version" != "$manifest_version" ]]; then
-            echo "::error::Tag version '$version' does not match build.zig.zon version '$manifest_version'"
-            exit 1
-          fi
-
-          prerelease=false
-          version_without_build="${version%%+*}"
-          if [[ "$version_without_build" == *-* ]]; then
-            prerelease=true
-          fi
-
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          zig-out/bin/miz_release verify-version \
+            --tag "$GITHUB_REF_NAME" \
+            --manifest build.zig.zon \
+            --github-output "$GITHUB_OUTPUT"
           {
             echo "### Verified release version"
             echo
             echo "- Tag: \`$GITHUB_REF_NAME\`"
-            echo "- Package: \`$manifest_version\`"
+            echo "- Package: \`${GITHUB_REF_NAME#v}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
   build:
@@ -156,63 +137,69 @@ jobs:
     name: Create Release
     needs: [verify, build]
     runs-on: ubuntu-latest
+    environment: miz-release
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@3f92e616222f9f5965921619e0ae2804c01ef6c5 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      - name: Build release publisher
+        run: zig build install-miz-release -Doptimize=ReleaseSafe
 
       - name: Download artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
 
-      - name: Verify release assets
-        shell: bash
-        env:
-          VERSION: ${{ needs.verify.outputs.version }}
-        run: |
-          set -euo pipefail
-
-          platforms=(
-            linux-musl-x64
-            linux-musl-arm64
-            macos-x64
-            macos-arm64
-            windows-x64
-            windows-arm64
-          )
-          for platform in "${platforms[@]}"; do
-            test -f "miz-${VERSION}-${platform}.tar.gz"
-            test -f "miz-${VERSION}-${platform}.sbom.spdx.json"
-          done
-
-          archive_count=$(find . -maxdepth 1 -type f -name 'miz-*.tar.gz' | wc -l | tr -d ' ')
-          sbom_count=$(find . -maxdepth 1 -type f -name 'miz-*.sbom.spdx.json' | wc -l | tr -d ' ')
-          test "$archive_count" = 6
-          test "$sbom_count" = 6
-
       - name: Attest build provenance
         uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
         with:
           subject-path: miz-*.tar.gz
 
-      - name: Create release
-        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+      - name: Mint protected release policy token
+        id: github_policy_token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          name: miz ${{ needs.verify.outputs.version }}
-          tag_name: ${{ github.ref_name }}
-          body: |
-            **Install:**
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: write
+          permission-contents: read
 
-            ```console
-            ghr install cataggar/miz@${{ github.ref_name }}
-            ```
-          files: |
-            miz-*.tar.gz
-            miz-*.sbom.spdx.json
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-          draft: false
-          prerelease: ${{ needs.verify.outputs.prerelease }}
+      - name: Mint isolated release publication token
+        id: github_publication_token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-workflows: write
+
+      - name: Publish verified draft exactly once
+        env:
+          GH_TOKEN: ${{ steps.github_publication_token.outputs.token }}
+          MIZ_RELEASE_POLICY_GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
+        run: |
+          set -euo pipefail
+          zig-out/bin/miz_release publish \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$GITHUB_REF_NAME" \
+            --version "${{ needs.verify.outputs.version }}" \
+            --commit "$GITHUB_SHA" \
+            --assets-directory "$GITHUB_WORKSPACE" \
+            --workspace "$GITHUB_WORKSPACE/.miz-release" \
+            --github-step-summary "$GITHUB_STEP_SUMMARY"

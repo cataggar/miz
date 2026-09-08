@@ -74,6 +74,11 @@ const usage_text =
     \\  publish-expected       print the expected asset table from the publish manifest
     \\  tag-ref                print the object an exact release tag ref points at
     \\  tag-object             print the object a peeled annotated tag points at
+    \\  check-release-metadata require an exact resumable draft identity
+    \\  check-immutable-releases require the protected repository policy
+    \\  select-release-ruleset print the exact immutable tag ruleset ID
+    \\  check-release-policy   require immutable releases and global tag immutability
+    \\  check-draft-assets    plan/validate exact numeric draft asset mutations
     \\  release-stale-assets   print the asset IDs a release holds outside the allowlist
     \\  check-release-assets   require the exact remote allowlist in draft or published state
     \\  check-downloads        re-hash a downloaded release against the expected asset table
@@ -207,6 +212,11 @@ const command_table = [_]Command{
     .{ .name = "publish-expected", .handler = runPublishExpected },
     .{ .name = "tag-ref", .handler = runTagRef },
     .{ .name = "tag-object", .handler = runTagObject },
+    .{ .name = "check-release-metadata", .handler = runCheckReleaseMetadata },
+    .{ .name = "check-immutable-releases", .handler = runCheckImmutableReleases },
+    .{ .name = "select-release-ruleset", .handler = runSelectReleaseRuleset },
+    .{ .name = "check-release-policy", .handler = runCheckReleasePolicy },
+    .{ .name = "check-draft-assets", .handler = runCheckDraftAssets },
     .{ .name = "release-stale-assets", .handler = runReleaseStaleAssets },
     .{ .name = "check-release-assets", .handler = runCheckReleaseAssets },
     .{ .name = "check-downloads", .handler = runCheckDownloads },
@@ -748,6 +758,118 @@ fn runReleaseStaleAssets(context: Context, argv: []const []const u8) !void {
     );
 }
 
+fn runCheckReleaseMetadata(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "release",
+        "notes",
+        "release-tag",
+        "release-title",
+        "source-commit",
+    });
+    return release.github_release.validateDraftMetadataFiles(
+        context.allocator,
+        context.io,
+        try options.require("release"),
+        try options.require("notes"),
+        .{
+            .tag = try options.require("release-tag"),
+            .commit = try options.require("source-commit"),
+            .title = try options.require("release-title"),
+            .body = "",
+            .prerelease = false,
+        },
+        context.diagnostic,
+    );
+}
+
+fn runCheckImmutableReleases(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{"response"});
+    return release.github_release.validateImmutableReleasesFile(
+        context.allocator,
+        context.io,
+        try options.require("response"),
+        context.diagnostic,
+    );
+}
+
+fn runSelectReleaseRuleset(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "repository",
+        "rulesets-response",
+    });
+    const id = try release.github_release.selectImmutableTagRulesetIdFile(
+        context.allocator,
+        context.io,
+        try options.require("rulesets-response"),
+        try options.require("repository"),
+        context.diagnostic,
+    );
+    try context.out.print("{d}\n", .{id});
+}
+
+fn runCheckReleasePolicy(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "repository",
+        "immutable-response",
+        "rulesets-response",
+        "ruleset-detail-response",
+    });
+    return release.github_release.validateRepositoryReleasePolicyFiles(
+        context.allocator,
+        context.io,
+        try options.require("immutable-response"),
+        try options.require("rulesets-response"),
+        try options.require("ruleset-detail-response"),
+        try options.require("repository"),
+        context.diagnostic,
+    );
+}
+
+fn runCheckDraftAssets(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "release",
+        "notes",
+        "expected",
+        "release-id",
+        "release-tag",
+        "release-title",
+        "source-commit",
+        "mode",
+        "asset-name",
+    });
+    const mode_text = try options.require("mode");
+    const mode: release.github_release.DraftAssetTableMode =
+        if (std.mem.eql(u8, mode_text, "repair"))
+            .repair
+        else if (std.mem.eql(u8, mode_text, "asset"))
+            .asset
+        else if (std.mem.eql(u8, mode_text, "subset"))
+            .subset
+        else if (std.mem.eql(u8, mode_text, "exact"))
+            .exact
+        else
+            return error.Usage;
+    return release.github_release.validateDraftAssetTableFiles(
+        context.allocator,
+        context.io,
+        try options.require("release"),
+        try options.require("notes"),
+        try options.require("expected"),
+        try options.requireInteger("release-id"),
+        .{
+            .tag = try options.require("release-tag"),
+            .commit = try options.require("source-commit"),
+            .title = try options.require("release-title"),
+            .body = "",
+            .prerelease = false,
+        },
+        mode,
+        options.get("asset-name"),
+        context.out,
+        context.diagnostic,
+    );
+}
+
 fn runCheckReleaseAssets(context: Context, argv: []const []const u8) !void {
     const options = try parseOptions(argv, &.{ "release", "expected", "state" });
     const state_text = try options.require("state");
@@ -926,6 +1048,11 @@ test "every command the shell and workflow call is dispatched" {
         "publish-expected",
         "tag-ref",
         "tag-object",
+        "check-release-metadata",
+        "check-immutable-releases",
+        "select-release-ruleset",
+        "check-release-policy",
+        "check-draft-assets",
         "release-stale-assets",
         "check-release-assets",
         "check-downloads",

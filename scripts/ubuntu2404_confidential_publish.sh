@@ -11,7 +11,7 @@ if [[ -z ${CANDIDATE:-} || -z ${PROVENANCE:-} ||
   echo "::error::Required Ubuntu 24.04 Confidential VM publication configuration is incomplete"
   exit 1
 fi
-for tool in date gh jq sha256sum stat; do
+for tool in gh git sha256sum stat; do
   command -v "$tool" >/dev/null || {
     echo "::error::Required publication tool $tool is unavailable"
     exit 1
@@ -102,17 +102,60 @@ tag_commit=${peeled_tag:-$direct_tag}
 test "$tag_commit" = "$SOURCE_COMMIT"
 
 release_mutated=false
+publish_attempted=false
+release_published=false
 keep_draft_on_failure() {
   status=$?
   trap - EXIT INT TERM
   if [[ $status -ne 0 && "$release_mutated" == true ]]; then
-    echo "::warning::Publication failed; retaining $RELEASE_TAG as a draft"
-    gh release edit "$RELEASE_TAG" --repo "$REPOSITORY" --draft >/dev/null 2>&1 || true
+    if [[ "$release_published" == true ]]; then
+      echo "::error::Post-publication verification failed; quarantine and inspect immutable release $RELEASE_TAG without mutating it"
+    elif [[ "$publish_attempted" == true ]]; then
+      echo "::error::Publication outcome is unconfirmed; inspect $RELEASE_TAG without attempting release mutation"
+    else
+      echo "::warning::Publication failed; retaining resumable draft $RELEASE_TAG"
+    fi
   fi
   exit "$status"
 }
 trap keep_draft_on_failure EXIT
 trap 'exit 130' INT TERM
+
+policy_token=${RELEASE_POLICY_GH_TOKEN:-}
+unset RELEASE_POLICY_GH_TOKEN
+if [[ -z "$policy_token" ]]; then
+  echo "::error::Protected repository release policy token is missing"
+  exit 1
+fi
+check_repository_release_policy() {
+  local label=$1
+  GH_TOKEN="$policy_token" \
+    scripts/release/check_repository_release_policy.sh \
+    "$STAGING_ROOT/release-policy-$label" "$RELEASE_TOOL" "$REPOSITORY"
+}
+verify_exact_remote_tag() {
+  local tag=$1
+  local expected=$2
+  local -a direct=()
+  local -a peeled=()
+  mapfile -t direct < <(
+    git ls-remote origin "refs/tags/$tag" | awk '{print $1}'
+  )
+  mapfile -t peeled < <(
+    git ls-remote origin "refs/tags/$tag^{}" | awk '{print $1}'
+  )
+  if ((${#direct[@]} != 1 || ${#peeled[@]} > 1)); then
+    echo "::error::Tag $tag did not resolve from one exact remote ref"
+    return 1
+  fi
+  if [[ "${peeled[0]:-${direct[0]}}" != "$expected" ]]; then
+    echo "::error::Tag $tag does not peel to accepted commit $expected"
+    return 1
+  fi
+}
+
+check_repository_release_policy before-mutation
+verify_exact_remote_tag "$RELEASE_TAG" "$SOURCE_COMMIT"
 
 release_exists=false
 if release_is_draft=$(
@@ -122,102 +165,125 @@ if release_is_draft=$(
     --jq .isDraft 2>/dev/null
 ); then
   release_exists=true
-  if [[ "$release_is_draft" != true &&
-        "$(date -u +%Y%m%d)" != "${RELEASE_TAG##*-}" ]]; then
-    echo "::error::Final release $RELEASE_TAG is immutable after its tag date"
+  if [[ "$release_is_draft" != true ]]; then
+    echo "::error::Final release $RELEASE_TAG is immutable"
     exit 1
   fi
+  existing_release_id=$(gh release view "$RELEASE_TAG" \
+    --repo "$REPOSITORY" \
+    --json databaseId \
+    --jq .databaseId)
+  [[ "$existing_release_id" =~ ^[0-9]+$ ]]
+  gh api "repos/$REPOSITORY/releases/$existing_release_id" >"$release_file"
+  "$RELEASE_TOOL" check-release-metadata \
+    --release "$release_file" \
+    --notes "$notes_file" \
+    --release-tag "$RELEASE_TAG" \
+    --release-title "$RELEASE_TITLE" \
+    --source-commit "$SOURCE_COMMIT"
 fi
 
-if [[ "$release_exists" == true ]]; then
-  gh release edit "$RELEASE_TAG" \
-    --repo "$REPOSITORY" \
-    --verify-tag \
-    --draft \
-    --latest=false \
-    --title "$RELEASE_TITLE" \
-    --notes-file "$notes_file" >/dev/null
-else
+if [[ "$release_exists" != true ]]; then
+  release_mutated=true
   gh release create "$RELEASE_TAG" \
     --repo "$REPOSITORY" \
     --verify-tag \
+    --target "$SOURCE_COMMIT" \
     --draft \
     --latest=false \
     --title "$RELEASE_TITLE" \
     --notes-file "$notes_file" >/dev/null
 fi
-release_mutated=true
-release_id=$(gh release view "$RELEASE_TAG" \
+release_id=${existing_release_id:-$(gh release view "$RELEASE_TAG" \
   --repo "$REPOSITORY" \
   --json databaseId \
-  --jq .databaseId)
+  --jq .databaseId)}
 [[ "$release_id" =~ ^[0-9]+$ ]]
 release_api="repos/$REPOSITORY/releases/$release_id"
+gh api "$release_api" >"$release_file"
+"$RELEASE_TOOL" check-release-metadata \
+  --release "$release_file" \
+  --notes "$notes_file" \
+  --release-tag "$RELEASE_TAG" \
+  --release-title "$RELEASE_TITLE" \
+  --source-commit "$SOURCE_COMMIT"
+
+check_release_assets() {
+  local mode=$1
+  local asset_name=${2:-}
+  local -a args=(
+    check-draft-assets
+    --release "$release_file"
+    --notes "$notes_file"
+    --expected "$expected_file"
+    --release-id "$release_id"
+    --release-tag "$RELEASE_TAG"
+    --release-title "$RELEASE_TITLE"
+    --source-commit "$SOURCE_COMMIT"
+    --mode "$mode"
+  )
+  if [[ -n "$asset_name" ]]; then
+    args+=(--asset-name "$asset_name")
+  fi
+  gh api "$release_api" >"$release_file"
+  "$RELEASE_TOOL" "${args[@]}"
+}
+
+repair_file="$STAGING_ROOT/repair-asset-ids"
+while true; do
+  check_release_assets repair >"$repair_file"
+  asset_id=
+  read -r asset_id <"$repair_file" || true
+  [[ -n "$asset_id" ]] || break
+  [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+  release_mutated=true
+  gh api --method DELETE "repos/$REPOSITORY/releases/assets/$asset_id"
+done
+check_release_assets subset >/dev/null
 
 while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
   test "$(sha256sum "$assets_dir/$asset_name" | awk '{print $1}')" = "$expected_sha"
   test "$(stat --format='%s' "$assets_dir/$asset_name")" = "$expected_bytes"
-  gh release upload "$RELEASE_TAG" "$assets_dir/$asset_name" \
-    --clobber \
-    --repo "$REPOSITORY"
+  [[ "$asset_name" =~ ^[A-Za-z0-9._-]+$ ]]
+  upload_status=$(check_release_assets asset "$asset_name")
+  if [[ "$upload_status" == keep ]]; then
+    continue
+  fi
+  [[ "$upload_status" == upload ]]
+  release_mutated=true
+  gh api --method POST \
+    -H 'Content-Type: application/octet-stream' \
+    --input "$assets_dir/$asset_name" \
+    "https://uploads.github.com/repos/$REPOSITORY/releases/$release_id/assets?name=$asset_name" \
+    >/dev/null
+  check_release_assets subset >/dev/null
 done <"$expected_file"
 
-gh api "$release_api" >"$release_file"
-jq -r \
-  --arg candidate "$candidate_name" \
-  --arg provenance "$provenance_name" \
-  --arg acceptance "$acceptance_name" \
-  '.assets[]
-   | select(.name != $candidate and .name != $provenance and .name != $acceptance)
-   | .id' "$release_file" >"$STAGING_ROOT/stale-asset-ids"
-while read -r asset_id; do
-  [[ -z "$asset_id" ]] && continue
-  [[ "$asset_id" =~ ^[0-9]+$ ]]
-  gh api --method DELETE "repos/$REPOSITORY/releases/assets/$asset_id"
-done <"$STAGING_ROOT/stale-asset-ids"
-
-validate_release() {
-  local expected_draft=$1
-  local candidate_bytes provenance_bytes acceptance_bytes
-  candidate_bytes=$(stat --format='%s' "$assets_dir/$candidate_name")
-  provenance_bytes=$(stat --format='%s' "$assets_dir/$provenance_name")
-  acceptance_bytes=$(stat --format='%s' "$assets_dir/$acceptance_name")
-  gh api "$release_api" >"$release_file"
-  jq -e \
-    --argjson expected_draft "$expected_draft" \
-    --arg candidate "$candidate_name" \
-    --arg provenance "$provenance_name" \
-    --arg acceptance "$acceptance_name" \
-    --argjson candidate_bytes "$candidate_bytes" \
-    --argjson provenance_bytes "$provenance_bytes" \
-    --argjson acceptance_bytes "$acceptance_bytes" \
-    '.draft == $expected_draft and
-     ([.assets[] | {name, size}] | sort_by(.name)) ==
-       ([{name:$candidate,size:$candidate_bytes},
-         {name:$provenance,size:$provenance_bytes},
-         {name:$acceptance,size:$acceptance_bytes}] | sort_by(.name))' \
-    "$release_file" >/dev/null
-}
-
-validate_release true
+check_release_assets exact >/dev/null
 mkdir "$verify_dir"
 gh release download "$RELEASE_TAG" \
   --repo "$REPOSITORY" \
-  --dir "$verify_dir" \
-  --clobber
+  --dir "$verify_dir"
 while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
   test "$(sha256sum "$verify_dir/$asset_name" | awk '{print $1}')" = "$expected_sha"
   test "$(stat --format='%s' "$verify_dir/$asset_name")" = "$expected_bytes"
 done <"$expected_file"
 
-gh release edit "$RELEASE_TAG" \
-  --repo "$REPOSITORY" \
-  --verify-tag \
-  --draft=false \
-  --latest=false \
-  --title "$RELEASE_TITLE" \
-  --notes-file "$notes_file" >/dev/null
-validate_release false
+check_release_assets exact >/dev/null
+verify_exact_remote_tag "$RELEASE_TAG" "$SOURCE_COMMIT"
+check_repository_release_policy before-publish
+publish_attempted=true
+gh api --method PATCH "$release_api" \
+  -f "tag_name=$RELEASE_TAG" \
+  -f "target_commitish=$SOURCE_COMMIT" \
+  -f "name=$RELEASE_TITLE" \
+  -F "body=@$notes_file" \
+  -F "draft=false" \
+  -F "prerelease=false" \
+  -f "make_latest=false" >/dev/null
+release_published=true
+verify_exact_remote_tag "$RELEASE_TAG" "$SOURCE_COMMIT"
+check_release_assets published >/dev/null
 
 {
   echo "### Ubuntu 24.04 Confidential VM release published"
@@ -230,4 +296,5 @@ validate_release false
 } >>"$GITHUB_STEP_SUMMARY"
 
 release_mutated=false
+publish_attempted=false
 trap - EXIT INT TERM

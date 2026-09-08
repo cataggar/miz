@@ -61,6 +61,12 @@ const usage_text =
     \\  capture-result         write durable source-to-capture provenance with signed MAA evidence
     \\  verify-capture         independently revalidate protected capture provenance
     \\  verify-capture-publication validate sanitized durable provenance without raw Azure evidence
+    \\  check-release-metadata require an exact resumable draft identity
+    \\  check-immutable-releases require the protected repository policy
+    \\  select-release-ruleset print the exact immutable tag ruleset ID
+    \\  check-release-policy   require immutable releases and global tag immutability
+    \\  check-draft-assets    plan/validate exact numeric draft mutations
+    \\  check-capture-release-assets plan draft repair or require the exact final asset
     \\
     \\verify-capture requires independently supplied workflow identities and every
     \\raw evidence file. Azure ARM, OpenID, and JWKS file authenticity must come
@@ -166,6 +172,12 @@ const command_table = [_]Command{
     .{ .name = "capture-result", .handler = runCaptureResult },
     .{ .name = "verify-capture", .handler = runVerifyCapture },
     .{ .name = "verify-capture-publication", .handler = runVerifyCapturePublication },
+    .{ .name = "check-release-metadata", .handler = runCheckReleaseMetadata },
+    .{ .name = "check-immutable-releases", .handler = runCheckImmutableReleases },
+    .{ .name = "select-release-ruleset", .handler = runSelectReleaseRuleset },
+    .{ .name = "check-release-policy", .handler = runCheckReleasePolicy },
+    .{ .name = "check-draft-assets", .handler = runCheckDraftAssets },
+    .{ .name = "check-capture-release-assets", .handler = runCheckCaptureReleaseAssets },
 };
 
 fn run(context: Context, argv: []const []const u8) !void {
@@ -198,6 +210,165 @@ fn readObject(
         path,
         document_max_bytes,
         diagnostic,
+    );
+}
+
+fn runCheckReleaseMetadata(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "release",
+        "notes",
+        "release-tag",
+        "release-title",
+        "source-commit",
+    });
+    return release.github_release.validateDraftMetadataFiles(
+        context.allocator,
+        context.io,
+        try options.require("release"),
+        try options.require("notes"),
+        .{
+            .tag = try options.require("release-tag"),
+            .commit = try options.require("source-commit"),
+            .title = try options.require("release-title"),
+            .body = "",
+            .prerelease = false,
+        },
+        context.diagnostic,
+    );
+}
+
+fn runCheckImmutableReleases(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{"response"});
+    return release.github_release.validateImmutableReleasesFile(
+        context.allocator,
+        context.io,
+        try options.require("response"),
+        context.diagnostic,
+    );
+}
+
+fn runSelectReleaseRuleset(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "repository",
+        "rulesets-response",
+    });
+    const id = try release.github_release.selectImmutableTagRulesetIdFile(
+        context.allocator,
+        context.io,
+        try options.require("rulesets-response"),
+        try options.require("repository"),
+        context.diagnostic,
+    );
+    try context.out.print("{d}\n", .{id});
+}
+
+fn runCheckReleasePolicy(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "repository",
+        "immutable-response",
+        "rulesets-response",
+        "ruleset-detail-response",
+    });
+    return release.github_release.validateRepositoryReleasePolicyFiles(
+        context.allocator,
+        context.io,
+        try options.require("immutable-response"),
+        try options.require("rulesets-response"),
+        try options.require("ruleset-detail-response"),
+        try options.require("repository"),
+        context.diagnostic,
+    );
+}
+
+fn runCheckDraftAssets(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "release",
+        "notes",
+        "expected",
+        "release-id",
+        "release-tag",
+        "release-title",
+        "source-commit",
+        "mode",
+        "asset-name",
+    });
+    const mode_text = try options.require("mode");
+    const mode: release.github_release.DraftAssetTableMode =
+        if (std.mem.eql(u8, mode_text, "repair"))
+            .repair
+        else if (std.mem.eql(u8, mode_text, "asset"))
+            .asset
+        else if (std.mem.eql(u8, mode_text, "subset"))
+            .subset
+        else if (std.mem.eql(u8, mode_text, "exact"))
+            .exact
+        else if (std.mem.eql(u8, mode_text, "published"))
+            .published
+        else
+            return error.Usage;
+    return release.github_release.validateDraftAssetTableFiles(
+        context.allocator,
+        context.io,
+        try options.require("release"),
+        try options.require("notes"),
+        try options.require("expected"),
+        try options.requireInteger("release-id"),
+        .{
+            .tag = try options.require("release-tag"),
+            .commit = try options.require("source-commit"),
+            .title = try options.require("release-title"),
+            .body = "",
+            .prerelease = false,
+        },
+        mode,
+        options.get("asset-name"),
+        context.out,
+        context.diagnostic,
+    );
+}
+
+fn runCheckCaptureReleaseAssets(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "release",
+        "notes",
+        "release-tag",
+        "release-title",
+        "tool-commit",
+        "asset-name",
+        "asset-sha256",
+        "asset-size",
+        "mode",
+    });
+    const size = try options.requireInteger("asset-size");
+    if (size <= 0) return error.Usage;
+    const mode_text = try options.require("mode");
+    const mode: release.github_release.SingleAssetMode =
+        if (std.mem.eql(u8, mode_text, "repair"))
+            .repair
+        else if (std.mem.eql(u8, mode_text, "final"))
+            .final
+        else if (std.mem.eql(u8, mode_text, "published"))
+            .published
+        else
+            return error.Usage;
+    return release.github_release.validateSingleDraftAssetFiles(
+        context.allocator,
+        context.io,
+        try options.require("release"),
+        try options.require("notes"),
+        .{
+            .tag = try options.require("release-tag"),
+            .commit = try options.require("tool-commit"),
+            .title = try options.require("release-title"),
+            .body = "",
+            .prerelease = false,
+        },
+        try options.require("asset-name"),
+        try options.require("asset-sha256"),
+        @intCast(size),
+        mode,
+        context.out,
+        context.diagnostic,
     );
 }
 
@@ -3309,6 +3480,12 @@ test "command surface is exact and rejects incomplete invocations" {
         "capture-result",
         "verify-capture",
         "verify-capture-publication",
+        "check-release-metadata",
+        "check-immutable-releases",
+        "select-release-ruleset",
+        "check-release-policy",
+        "check-draft-assets",
+        "check-capture-release-assets",
     };
     try std.testing.expectEqual(names.len, command_table.len);
     var discard: Writer.Discarding = .init(&.{});

@@ -401,7 +401,19 @@ The required procedure is:
 Validation-only uploads short-lived evidence and cannot create a tag, draft,
 asset, or release. Publication is possible only from merged `main`; the
 protected `azurelinux4-release` environment remains the credential boundary
-for Azure acceptance.
+for Azure acceptance. The publication job separately requires the protected
+`azurelinux4-release` environment, restricted to `main`, with required
+reviewers, self-review disabled, and the shared `RELEASE_GITHUB_APP_ID` and
+`RELEASE_GITHUB_APP_PRIVATE_KEY` secrets. The shared App has repository
+Administration-write, Contents-write, and Workflows-write permissions. The
+job mints a policy token with Administration write and Contents read and a
+separate publication token with Contents write and Workflows write. Only the
+publication token is passed as `GH_TOKEN` to release/tag/asset operations; the
+policy helper explicitly substitutes the policy token. It requires both
+immutable releases and the global
+`miz-immutable-release-tags-v1` no-bypass update/deletion ruleset before tag or
+draft mutation and again immediately before publication. A tag created before
+a draft failure is retained and quarantined; corrections always use a new tag.
 
 The released QCOW2 files are not directly uploadable to Azure. Derive aligned
 fixed VHDs without changing their partitions:

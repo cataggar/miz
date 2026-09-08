@@ -84,8 +84,8 @@ jobs:
         id: github_policy_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
-          private-key: ${{ secrets.CAPTURE_GITHUB_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-actions: read
@@ -102,7 +102,7 @@ jobs:
       - name: Validate approved dispatch head and protected tag policy
         env:
           GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
-          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
+          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.RELEASE_GITHUB_APP_ID }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -312,9 +312,17 @@ jobs:
           provenance_release_tag="miz-provenance/ubuntu2404-confidential-cvm/v$TARGET_GALLERY_VERSION/origin-$origin_run_id-attempt-$origin_run_attempt/tool-$tool_commit"
           provenance_release_title="Ubuntu 24.04 Confidential VM gallery provenance $TARGET_GALLERY_VERSION"
           provenance_asset_name="Ubuntu-24.04-x86_64.confidential-cvm-$TARGET_GALLERY_VERSION.provenance.json"
-          scripts/ubuntu2404_confidential_provenance_tag.sh \
-            require-absent "$provenance_release_tag" "$tool_commit" \
-            .capture/prepare/provenance-tag
+          provenance_tag_state=$(
+            scripts/ubuntu2404_confidential_provenance_tag.sh \
+              classify "$provenance_release_tag" "$tool_commit" \
+              .capture/prepare/provenance-tag
+          )
+          if [[ "$recovery_mode" == true ]]; then
+            [[ "$provenance_tag_state" == absent ||
+                "$provenance_tag_state" == lightweight ]]
+          else
+            test "$provenance_tag_state" = absent
+          fi
 
           source_release_json=.capture/prepare/source-release.json
           gh api "${api_headers[@]}" \
@@ -468,8 +476,8 @@ jobs:
         id: github_policy_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
-          private-key: ${{ secrets.CAPTURE_GITHUB_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-actions: read
@@ -829,7 +837,7 @@ jobs:
         if: steps.result_discovery.outputs.result_artifact_id == ''
         env:
           GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
-          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
+          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.RELEASE_GITHUB_APP_ID }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -1219,8 +1227,8 @@ jobs:
         id: github_policy_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
-          private-key: ${{ secrets.CAPTURE_GITHUB_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-actions: read
@@ -1231,8 +1239,8 @@ jobs:
         id: github_publication_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
-          private-key: ${{ secrets.CAPTURE_GITHUB_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
@@ -1308,7 +1316,7 @@ jobs:
         env:
           POLICY_GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
           PUBLICATION_GH_TOKEN: ${{ steps.github_publication_token.outputs.token }}
-          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
+          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.RELEASE_GITHUB_APP_ID }}
         run: |
           set -euo pipefail
           umask 077
@@ -1329,19 +1337,28 @@ jobs:
           GH_TOKEN="$POLICY_GH_TOKEN" \
             scripts/ubuntu2404_confidential_github_policy.sh \
             "$VALIDATION_DIR/github-policy-before-release"
-          GH_TOKEN="$POLICY_GH_TOKEN" gh api "${api_headers[@]}" \
-            "repos/$GITHUB_REPOSITORY/immutable-releases" \
-            >"$VALIDATION_DIR/immutable-releases.json"
-          jq -e '.enabled == true' \
-            "$VALIDATION_DIR/immutable-releases.json" >/dev/null ||
-            {
-              echo "::error::Immutable releases are no longer guaranteed"
-              exit 1
-            }
+          GH_TOKEN="$POLICY_GH_TOKEN" \
+            scripts/release/check_repository_release_policy.sh \
+            "$VALIDATION_DIR/release-policy-before-tag" \
+            "$RELEASE_TOOL" "$GITHUB_REPOSITORY"
+          provenance_tag_state=$(
+            GH_TOKEN="$POLICY_GH_TOKEN" \
+              scripts/ubuntu2404_confidential_provenance_tag.sh \
+              classify "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
+              "$VALIDATION_DIR/tag-before-release"
+          )
+          if [[ "$provenance_tag_state" == absent ]]; then
+            GH_TOKEN="$PUBLICATION_GH_TOKEN" gh api --method POST \
+              "${api_headers[@]}" "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$PROVENANCE_RELEASE_TAG" \
+              -f "sha=$TOOL_COMMIT" >/dev/null
+          else
+            test "$provenance_tag_state" = lightweight
+          fi
           GH_TOKEN="$POLICY_GH_TOKEN" \
             scripts/ubuntu2404_confidential_provenance_tag.sh \
-            require-absent "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
-            "$VALIDATION_DIR/tag-before-release"
+            require-lightweight "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
+            "$VALIDATION_DIR/tag-after-create"
           direct_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
           peeled_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
           test "${peeled_source:-$direct_source}" = "$SOURCE_COMMIT"
@@ -1397,6 +1414,10 @@ jobs:
             GH_TOKEN="$POLICY_GH_TOKEN" \
               scripts/ubuntu2404_confidential_github_policy.sh \
               "$VALIDATION_DIR/github-policy-before-create"
+            GH_TOKEN="$POLICY_GH_TOKEN" \
+              scripts/release/check_repository_release_policy.sh \
+              "$VALIDATION_DIR/release-policy-before-create" \
+              "$RELEASE_TOOL" "$GITHUB_REPOSITORY"
             GH_TOKEN="$PUBLICATION_GH_TOKEN" \
               gh api --method POST "${api_headers[@]}" \
               "repos/$GITHUB_REPOSITORY/releases" \
@@ -1407,22 +1428,19 @@ jobs:
 
           validate_release_identity() {
             jq -e \
-              --arg tag "$PROVENANCE_RELEASE_TAG" \
-              --arg title "$PROVENANCE_RELEASE_TITLE" \
-              --arg name "$PROVENANCE_ASSET_NAME" \
-              --arg notes "$expected_notes" \
-              --arg tool_commit "$TOOL_COMMIT" \
-              '
-              .tag_name == $tag and .name == $title and
-              .target_commitish == $tool_commit and
-              .body == $notes and .prerelease == false and
-              .draft == true and .immutable == false and
-              (.assets | length == 0 or length == 1) and
-              all(.assets[];
-                .name == $name and .state == "uploaded" and
-                (.id | type == "number" and . > 0))
-              ' "$1" >/dev/null
+              '(.id | type == "number") and .id > 0 and
+               .draft == true and .immutable == false' "$1" >/dev/null
+            "$RELEASE_TOOL" check-release-metadata \
+              --release "$1" \
+              --notes "$VALIDATION_DIR/release-notes.md" \
+              --release-tag "$PROVENANCE_RELEASE_TAG" \
+              --release-title "$PROVENANCE_RELEASE_TITLE" \
+              --source-commit "$TOOL_COMMIT"
           }
+          printf '%s' "$expected_notes" >"$VALIDATION_DIR/release-notes.md"
+          expected_asset_size=$(stat --format='%s' \
+            "$STAGING_DIR/$PROVENANCE_ASSET_NAME")
+          [[ "$expected_asset_size" =~ ^[1-9][0-9]*$ ]]
           validate_release_identity "$release_json"
 
           release_id=$(jq -er \
@@ -1433,10 +1451,62 @@ jobs:
           validate_release_identity "$release_json"
           GH_TOKEN="$POLICY_GH_TOKEN" \
             scripts/ubuntu2404_confidential_provenance_tag.sh \
-            require-absent "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
+            require-lightweight "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
             "$VALIDATION_DIR/tag-after-draft"
-          if [[ "$(jq -r '.draft' "$release_json")" == true &&
-              "$(jq -r '.assets | length' "$release_json")" == 0 ]]; then
+          repair_plan="$VALIDATION_DIR/asset-repair-plan"
+          "$RELEASE_TOOL" check-capture-release-assets \
+            --release "$release_json" \
+            --notes "$VALIDATION_DIR/release-notes.md" \
+            --release-tag "$PROVENANCE_RELEASE_TAG" \
+            --release-title "$PROVENANCE_RELEASE_TITLE" \
+            --tool-commit "$TOOL_COMMIT" \
+            --asset-name "$PROVENANCE_ASSET_NAME" \
+            --asset-sha256 "$EXPECTED_RESULT_SHA256" \
+            --asset-size "$expected_asset_size" \
+            --mode repair >"$repair_plan"
+          repair_action=$(head -n 1 "$repair_plan")
+          [[ "$repair_action" == keep || "$repair_action" == replace ]]
+          if [[ "$repair_action" == replace ]]; then
+            GH_TOKEN="$POLICY_GH_TOKEN" \
+              scripts/ubuntu2404_confidential_github_policy.sh \
+              "$VALIDATION_DIR/github-policy-before-asset-repair"
+            while read -r asset_id; do
+              [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+              GH_TOKEN="$PUBLICATION_GH_TOKEN" gh api "${api_headers[@]}" \
+                "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+                >"$release_json"
+              validate_release_identity "$release_json"
+              "$RELEASE_TOOL" check-capture-release-assets \
+                --release "$release_json" \
+                --notes "$VALIDATION_DIR/release-notes.md" \
+                --release-tag "$PROVENANCE_RELEASE_TAG" \
+                --release-title "$PROVENANCE_RELEASE_TITLE" \
+                --tool-commit "$TOOL_COMMIT" \
+                --asset-name "$PROVENANCE_ASSET_NAME" \
+                --asset-sha256 "$EXPECTED_RESULT_SHA256" \
+                --asset-size "$expected_asset_size" \
+                --mode repair >"$VALIDATION_DIR/fresh-asset-repair-plan"
+              grep -Fx "$asset_id" \
+                "$VALIDATION_DIR/fresh-asset-repair-plan" >/dev/null
+              GH_TOKEN="$PUBLICATION_GH_TOKEN" \
+                gh api --method DELETE "${api_headers[@]}" \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+            done < <(tail -n +2 "$repair_plan")
+            GH_TOKEN="$PUBLICATION_GH_TOKEN" gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              >"$release_json"
+            validate_release_identity "$release_json"
+            "$RELEASE_TOOL" check-capture-release-assets \
+              --release "$release_json" \
+              --notes "$VALIDATION_DIR/release-notes.md" \
+              --release-tag "$PROVENANCE_RELEASE_TAG" \
+              --release-title "$PROVENANCE_RELEASE_TITLE" \
+              --tool-commit "$TOOL_COMMIT" \
+              --asset-name "$PROVENANCE_ASSET_NAME" \
+              --asset-sha256 "$EXPECTED_RESULT_SHA256" \
+              --asset-size "$expected_asset_size" \
+              --mode repair >"$VALIDATION_DIR/empty-asset-repair-plan"
+            test "$(cat "$VALIDATION_DIR/empty-asset-repair-plan")" = replace
             GH_TOKEN="$POLICY_GH_TOKEN" \
               scripts/ubuntu2404_confidential_github_policy.sh \
               "$VALIDATION_DIR/github-policy-before-upload"
@@ -1451,14 +1521,16 @@ jobs:
               >"$release_json"
             validate_release_identity "$release_json"
           fi
-          jq -e \
-            --arg name "$PROVENANCE_ASSET_NAME" \
-            --arg digest "sha256:$EXPECTED_RESULT_SHA256" \
-            '(.assets | length == 1) and
-             .assets[0].name == $name and
-             .assets[0].state == "uploaded" and
-             .assets[0].digest == $digest' \
-            "$release_json" >/dev/null
+          "$RELEASE_TOOL" check-capture-release-assets \
+            --release "$release_json" \
+            --notes "$VALIDATION_DIR/release-notes.md" \
+            --release-tag "$PROVENANCE_RELEASE_TAG" \
+            --release-title "$PROVENANCE_RELEASE_TITLE" \
+            --tool-commit "$TOOL_COMMIT" \
+            --asset-name "$PROVENANCE_ASSET_NAME" \
+            --asset-sha256 "$EXPECTED_RESULT_SHA256" \
+            --asset-size "$expected_asset_size" \
+            --mode final
           asset_id=$(jq -er '.assets[0].id' "$release_json")
           downloaded="$VALIDATION_DIR/$PROVENANCE_ASSET_NAME"
           GH_TOKEN="$PUBLICATION_GH_TOKEN" gh api "${api_headers[@]}" \
@@ -1479,14 +1551,6 @@ jobs:
             --location "$TARGET_LOCATION" \
             --definition-id "$target_definition_id" \
             --version-id "$target_definition_id/versions/$TARGET_IMAGE_VERSION"
-          GH_TOKEN="$POLICY_GH_TOKEN" \
-            scripts/ubuntu2404_confidential_github_policy.sh \
-            "$VALIDATION_DIR/github-policy-before-publish"
-          GH_TOKEN="$POLICY_GH_TOKEN" gh api "${api_headers[@]}" \
-            "repos/$GITHUB_REPOSITORY/immutable-releases" \
-            >"$VALIDATION_DIR/immutable-releases-before-publish.json"
-          jq -e '.enabled == true' \
-            "$VALIDATION_DIR/immutable-releases-before-publish.json" >/dev/null
           mapfile -t remote_main < <(
             git ls-remote origin refs/heads/main | awk '{print $1}'
           )
@@ -1496,14 +1560,44 @@ jobs:
             "repos/$GITHUB_REPOSITORY/releases/$release_id" \
             >"$release_json"
           validate_release_identity "$release_json"
+          "$RELEASE_TOOL" check-capture-release-assets \
+            --release "$release_json" \
+            --notes "$VALIDATION_DIR/release-notes.md" \
+            --release-tag "$PROVENANCE_RELEASE_TAG" \
+            --release-title "$PROVENANCE_RELEASE_TITLE" \
+            --tool-commit "$TOOL_COMMIT" \
+            --asset-name "$PROVENANCE_ASSET_NAME" \
+            --asset-sha256 "$EXPECTED_RESULT_SHA256" \
+            --asset-size "$expected_asset_size" \
+            --mode final
+          direct_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
+          peeled_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
+          test "${peeled_source:-$direct_source}" = "$SOURCE_COMMIT"
           GH_TOKEN="$POLICY_GH_TOKEN" \
             scripts/ubuntu2404_confidential_provenance_tag.sh \
-            require-absent "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
+            require-lightweight "$PROVENANCE_RELEASE_TAG" "$TOOL_COMMIT" \
             "$VALIDATION_DIR/tag-before-publish"
+          GH_TOKEN="$POLICY_GH_TOKEN" \
+            scripts/ubuntu2404_confidential_github_policy.sh \
+            "$VALIDATION_DIR/github-policy-before-publish"
+          GH_TOKEN="$POLICY_GH_TOKEN" \
+            scripts/release/check_repository_release_policy.sh \
+            "$VALIDATION_DIR/release-policy-before-publish" \
+            "$RELEASE_TOOL" "$GITHUB_REPOSITORY"
           EXPECTED_RELEASE_NOTES="$expected_notes" \
             GH_TOKEN="$PUBLICATION_GH_TOKEN" \
             scripts/ubuntu2404_confidential_publish_release.sh \
             "$release_id" "$VALIDATION_DIR/publish-release.json" "$release_json"
+          "$RELEASE_TOOL" check-capture-release-assets \
+            --release "$release_json" \
+            --notes "$VALIDATION_DIR/release-notes.md" \
+            --release-tag "$PROVENANCE_RELEASE_TAG" \
+            --release-title "$PROVENANCE_RELEASE_TITLE" \
+            --tool-commit "$TOOL_COMMIT" \
+            --asset-name "$PROVENANCE_ASSET_NAME" \
+            --asset-sha256 "$EXPECTED_RESULT_SHA256" \
+            --asset-size "$expected_asset_size" \
+            --mode published
           jq -e \
             --arg tag "$PROVENANCE_RELEASE_TAG" \
             --arg title "$PROVENANCE_RELEASE_TITLE" \
@@ -1511,12 +1605,14 @@ jobs:
             --arg notes "$expected_notes" \
             --arg tool_commit "$TOOL_COMMIT" \
             --arg digest "sha256:$EXPECTED_RESULT_SHA256" \
+            --argjson bytes "$expected_asset_size" \
             '.tag_name == $tag and .name == $title and
              .target_commitish == $tool_commit and
              .body == $notes and .immutable == true and
              .draft == false and .prerelease == false and
              (.assets | length == 1) and
              .assets[0].name == $name and
+             .assets[0].size == $bytes and
              .assets[0].state == "uploaded" and
              .assets[0].digest == $digest' \
             "$release_json" >/dev/null
@@ -1535,12 +1631,14 @@ jobs:
             --arg notes "$expected_notes" \
             --arg tool_commit "$TOOL_COMMIT" \
             --arg digest "sha256:$EXPECTED_RESULT_SHA256" \
+            --argjson bytes "$expected_asset_size" \
             '.tag_name == $tag and .name == $title and
              .target_commitish == $tool_commit and
              .body == $notes and .immutable == true and
              .draft == false and .prerelease == false and
              (.assets | length == 1) and
              .assets[0].name == $name and
+             .assets[0].size == $bytes and
              .assets[0].state == "uploaded" and
              .assets[0].digest == $digest' \
             "$published_release" >/dev/null

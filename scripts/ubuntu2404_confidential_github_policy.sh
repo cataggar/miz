@@ -34,6 +34,7 @@ collaborators="$output_dir/collaborators.json"
 workflow_permissions="$output_dir/workflow-permissions.json"
 ruleset_pages="$output_dir/tag-ruleset-pages.json"
 rulesets="$output_dir/tag-rulesets.json"
+provenance_rulesets="$output_dir/provenance-tag-rulesets.json"
 ruleset="$output_dir/tag-ruleset.json"
 
 gh api "${api_headers[@]}" \
@@ -103,12 +104,14 @@ jq -e \
   'type == "array" and all(.[]; type == "array")' \
   "$ruleset_pages" >/dev/null
 jq '[.[][]]' "$ruleset_pages" >"$rulesets"
+jq --arg name "$PROVENANCE_RULESET_NAME" \
+  '[.[] | select(.name == $name)]' "$rulesets" >"$provenance_rulesets"
 jq -e \
   --arg name "$PROVENANCE_RULESET_NAME" \
   'length == 1 and .[0].name == $name and
    (.[0].id | type == "number" and . > 0)' \
-  "$rulesets" >/dev/null
-ruleset_id=$(jq -er '.[0].id' "$rulesets")
+  "$provenance_rulesets" >/dev/null
+ruleset_id=$(jq -er '.[0].id' "$provenance_rulesets")
 
 gh api "${api_headers[@]}" \
   "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id?includes_parents=true" \
