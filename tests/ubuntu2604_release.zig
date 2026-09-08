@@ -4221,6 +4221,7 @@ test "the publisher is draft-first, allowlisted, and fail-safe" {
     try script.expectOmits("date -u +%Y%m%d");
     try script.expectContains("Final release $RELEASE_TAG is immutable");
     try script.expectContains("\"$RELEASE_TOOL\" github-release-metadata");
+    try script.expectContains("--target \"$SOURCE_COMMIT\"");
     try script.expectContains("publish_attempted=true");
     try script.expectContains("release_published=true");
     try script.expectContains("quarantine and inspect immutable release");

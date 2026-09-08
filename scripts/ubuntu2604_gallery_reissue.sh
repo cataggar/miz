@@ -254,6 +254,7 @@ else
   gh release create "$REISSUE_TAG" \
     --repo "$REPOSITORY" \
     --verify-tag \
+    --target "$TOOLING_COMMIT" \
     --draft \
     --latest=false \
     --title "$RELEASE_TITLE" \
@@ -267,6 +268,13 @@ release_id=${existing_release_id:-$(gh release view "$REISSUE_TAG" \
   --jq .databaseId)}
 [[ "$release_id" =~ ^[1-9][0-9]*$ ]]
 release_api="repos/$REPOSITORY/releases/$release_id"
+gh api "$release_api" >"$release_file"
+"$RELEASE_TOOL" github-release-metadata \
+  --release "$release_file" \
+  --notes "$notes_file" \
+  --release-tag "$REISSUE_TAG" \
+  --release-title "$RELEASE_TITLE" \
+  --source-commit "$TOOLING_COMMIT"
 
 while IFS=$'\t' read -r name expected_sha expected_bytes; do
   test "$(sha256sum "$ASSETS_DIR/$name" | awk '{print $1}')" = "$expected_sha"

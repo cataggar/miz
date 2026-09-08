@@ -8,6 +8,7 @@ const Io = std.Io;
 
 const release_id: i64 = 42;
 const stable_latest_id: i64 = 7;
+const starter_asset_id: i64 = 41;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -179,6 +180,13 @@ fn releaseCommand(
     }
     const source = argv[2];
     const name = std.fs.path.basename(source);
+    if (std.mem.eql(u8, scenario, "starter-first-upload") and
+        !try markerExists(allocator, io, root, "starter-created"))
+    {
+        try writeMarker(io, root, "starter-asset", name);
+        try writeMarker(io, root, "starter-created", "true");
+        return error.MockUploadFailure;
+    }
     if (std.mem.eql(u8, scenario, "missing-remote") and
         std.mem.endsWith(u8, name, "windows-arm64.sbom.spdx.json"))
     {
@@ -247,7 +255,13 @@ fn writeRelease(
     );
     try writeJsonString(out, tag);
     try out.writeAll(",\"target_commitish\":");
-    try writeJsonString(out, commit);
+    if (std.mem.eql(u8, scenario, "missing-target")) {
+        try out.writeAll("null");
+    } else if (std.mem.eql(u8, scenario, "legacy-target")) {
+        try writeJsonString(out, "main");
+    } else {
+        try writeJsonString(out, commit);
+    }
     try out.writeAll(",\"name\":");
     try writeJsonString(out, title);
     try out.writeAll(",\"body\":");
@@ -263,7 +277,7 @@ fn writeRelease(
                 "false",
         },
     );
-    try writeAssets(allocator, io, root, out);
+    try writeAssets(allocator, io, root, scenario, out);
     try out.writeAll("]}");
 }
 
@@ -271,6 +285,7 @@ fn writeAssets(
     allocator: Allocator,
     io: Io,
     root: []const u8,
+    scenario: []const u8,
     out: *std.Io.Writer,
 ) !void {
     const remote = try std.fs.path.join(allocator, &.{ root, "remote" });
@@ -295,8 +310,31 @@ fn writeAssets(
             return std.mem.lessThan(u8, left, right);
         }
     }.less);
-    for (names.items, 0..) |name, index| {
-        if (index != 0) try out.writeByte(',');
+    var wrote_asset = false;
+    const starter_name = readMarker(
+        allocator,
+        io,
+        root,
+        "starter-asset",
+    ) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (starter_name) |name| allocator.free(name);
+    if (starter_name) |name| {
+        try out.print("{{\"id\":{d},\"name\":", .{starter_asset_id});
+        try writeJsonString(out, name);
+        try out.print(
+            ",\"size\":0,\"state\":\"{s}\",\"digest\":null}}",
+            .{if (std.mem.eql(u8, scenario, "unknown-asset-state"))
+                "pending"
+            else
+                "starter"},
+        );
+        wrote_asset = true;
+    }
+    for (names.items) |name| {
+        if (wrote_asset) try out.writeByte(',');
         const path = try std.fs.path.join(allocator, &.{ remote, name });
         defer allocator.free(path);
         const bytes = try Dir.cwd().readFileAlloc(
@@ -315,6 +353,7 @@ fn writeAssets(
             ",\"size\":{d},\"state\":\"uploaded\",\"digest\":\"sha256:{s}\"}}",
             .{ bytes.len, &hex },
         );
+        wrote_asset = true;
     }
 }
 
@@ -405,6 +444,15 @@ fn deleteAssetById(
     root: []const u8,
     id: i64,
 ) !void {
+    if (id == starter_asset_id) {
+        const path = try std.fs.path.join(
+            allocator,
+            &.{ root, "starter-asset" },
+        );
+        defer allocator.free(path);
+        try Dir.cwd().deleteFile(io, path);
+        return;
+    }
     const remote = try std.fs.path.join(allocator, &.{ root, "remote" });
     defer allocator.free(remote);
     var directory = try Dir.cwd().openDir(io, remote, .{ .iterate = true });
@@ -417,6 +465,49 @@ fn deleteAssetById(
         }
     }
     return error.AssetNotFound;
+}
+
+fn markerExists(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    name: []const u8,
+) !bool {
+    const path = try std.fs.path.join(allocator, &.{ root, name });
+    defer allocator.free(path);
+    var file = Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    file.close(io);
+    return true;
+}
+
+fn writeMarker(
+    io: Io,
+    root: []const u8,
+    name: []const u8,
+    contents: []const u8,
+) !void {
+    var buffer: [1024]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buffer, "{s}/{s}", .{ root, name });
+    try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
+}
+
+fn readMarker(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    name: []const u8,
+) ![]u8 {
+    const path = try std.fs.path.join(allocator, &.{ root, name });
+    defer allocator.free(path);
+    return Dir.cwd().readFileAlloc(
+        io,
+        path,
+        allocator,
+        .limited(1024),
+    );
 }
 
 fn readAssetById(

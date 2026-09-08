@@ -159,6 +159,7 @@ else
   gh release create "$RELEASE_TAG" \
     --repo "$REPOSITORY" \
     --verify-tag \
+    --target "$SOURCE_COMMIT" \
     --draft \
     --latest=false \
     --title "$RELEASE_TITLE" \
@@ -171,6 +172,13 @@ release_id=${existing_release_id:-$(gh release view "$RELEASE_TAG" \
   --jq .databaseId)}
 [[ "$release_id" =~ ^[0-9]+$ ]]
 release_api="repos/$REPOSITORY/releases/$release_id"
+gh api "$release_api" >"$release_file"
+"$RELEASE_TOOL" check-release-metadata \
+  --release "$release_file" \
+  --notes "$notes_file" \
+  --release-tag "$RELEASE_TAG" \
+  --release-title "$RELEASE_TITLE" \
+  --source-commit "$SOURCE_COMMIT"
 
 while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
   test "$(sha256sum "$assets_dir/$asset_name" | awk '{print $1}')" = "$expected_sha"

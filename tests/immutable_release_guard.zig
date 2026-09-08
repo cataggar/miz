@@ -1,4 +1,6 @@
-//! Repository-wide structural guard for GitHub release producers.
+//! Repository-wide structural guard for ordinary reviewable GitHub release
+//! capabilities. It deliberately does not claim to decode encrypted or
+//! arbitrarily obfuscated producer code.
 
 const std = @import("std");
 
@@ -7,10 +9,16 @@ const Dir = std.Io.Dir;
 const Io = std.Io;
 
 const max_source_bytes = 8 * 1024 * 1024;
+const max_git_output_bytes = 32 * 1024 * 1024;
 
 const producers = [_][]const u8{
+    ".github/workflows/azurelinux4-release.yml",
+    ".github/workflows/freebsd15-release.yml",
     ".github/workflows/release.yml",
     ".github/workflows/ubuntu2404-confidential-capture.yml",
+    ".github/workflows/ubuntu2404-confidential-release.yml",
+    ".github/workflows/ubuntu2604-gallery-reissue.yml",
+    ".github/workflows/ubuntu2604-release.yml",
     "scripts/azurelinux4_publish.sh",
     "scripts/freebsd15_publish.sh",
     "scripts/miz_release.zig",
@@ -19,6 +27,28 @@ const producers = [_][]const u8{
     "scripts/ubuntu2404_confidential_publish_release.sh",
     "scripts/ubuntu2604_gallery_reissue.sh",
     "scripts/ubuntu2604_publish.sh",
+};
+
+const write_workflows = [_][]const u8{
+    ".github/workflows/azurelinux4-release.yml",
+    ".github/workflows/freebsd15-release.yml",
+    ".github/workflows/release.yml",
+    ".github/workflows/ubuntu2404-confidential-capture.yml",
+    ".github/workflows/ubuntu2404-confidential-release.yml",
+    ".github/workflows/ubuntu2604-gallery-reissue.yml",
+    ".github/workflows/ubuntu2604-release.yml",
+};
+
+const pattern_fixtures = [_][]const u8{
+    "tests/azurelinux4_release_contract.zig",
+    "tests/freebsd15_release.zig",
+    "tests/immutable_release_guard.zig",
+    "tests/immutable_releases.zig",
+    "tests/ubuntu2404_confidential_capture_workflow.zig",
+    "tests/ubuntu2404_confidential_workflow.zig",
+    "tests/ubuntu2604_core_workflow.zig",
+    "tests/ubuntu2604_release.zig",
+    "tests/ubuntu2604_workflow.zig",
 };
 
 const asset_publishers = [_][]const u8{
@@ -55,6 +85,303 @@ fn readSource(
     );
 }
 
+fn lowerNormalized(
+    allocator: Allocator,
+    source: []const u8,
+) ![]u8 {
+    var normalized = try allocator.alloc(u8, source.len);
+    var write: usize = 0;
+    var index: usize = 0;
+    while (index < source.len) : (index += 1) {
+        const byte = source[index];
+        if (byte == '\\' and index + 1 < source.len and
+            source[index + 1] == '\n')
+        {
+            index += 1;
+            continue;
+        }
+        if (byte == '\'' or byte == '"' or byte == '`') continue;
+        normalized[write] = switch (byte) {
+            'A'...'Z' => byte + ('a' - 'A'),
+            '\n' => '\n',
+            '\r', '\t', ';', '|', '&', '(', ')', '[', ']', '{', '}', ',' => ' ',
+            else => byte,
+        };
+        write += 1;
+    }
+    return allocator.realloc(normalized, write);
+}
+
+fn isWorkflow(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, ".github/workflows/") and
+        (std.mem.endsWith(u8, path, ".yml") or
+            std.mem.endsWith(u8, path, ".yaml"));
+}
+
+fn isListed(path: []const u8, list: []const []const u8) bool {
+    for (list) |entry| {
+        if (std.mem.eql(u8, entry, path)) return true;
+    }
+    return false;
+}
+
+fn hasYamlValue(
+    source: []const u8,
+    key: []const u8,
+    expected: []const u8,
+) bool {
+    var search_at: usize = 0;
+    while (std.mem.indexOfPos(u8, source, search_at, key)) |at| {
+        if (at != 0 and source[at - 1] != ' ' and source[at - 1] != '\t' and
+            source[at - 1] != '\r' and source[at - 1] != '\n')
+        {
+            search_at = at + 1;
+            continue;
+        }
+        var index = at + key.len;
+        while (index < source.len and
+            (source[index] == ' ' or source[index] == '\t')) : (index += 1)
+        {}
+        if (index >= source.len or source[index] != ':') {
+            search_at = at + 1;
+            continue;
+        }
+        index += 1;
+        while (index < source.len and
+            (source[index] == ' ' or source[index] == '\t')) : (index += 1)
+        {}
+        if (std.mem.startsWith(u8, source[index..], expected)) {
+            const end = index + expected.len;
+            if (end == source.len or source[end] == ' ' or
+                source[end] == '\r' or source[end] == '\n')
+            {
+                return true;
+            }
+        }
+        search_at = at + 1;
+    }
+    return false;
+}
+
+fn workflowCanWrite(normalized: []const u8) bool {
+    return hasYamlValue(normalized, "contents", "write") or
+        (std.mem.indexOf(u8, normalized, "create-github-app-token") != null and
+            hasYamlValue(normalized, "permission-contents", "write"));
+}
+
+fn tokenHasReleaseEndpoint(token: []const u8) bool {
+    if (std.mem.indexOf(u8, token, "immutable-releases") != null) return false;
+    return std.mem.indexOf(u8, token, "/releases") != null or
+        std.mem.indexOf(u8, token, "releases/") != null or
+        std.mem.indexOf(u8, token, "releases?") != null;
+}
+
+fn tokenIsWriteMethod(token: []const u8) bool {
+    return std.mem.eql(u8, token, "post") or
+        std.mem.eql(u8, token, "patch") or
+        std.mem.eql(u8, token, "delete") or
+        std.mem.eql(u8, token, "-xpost") or
+        std.mem.eql(u8, token, "-xpatch") or
+        std.mem.eql(u8, token, "-xdelete") or
+        std.mem.eql(u8, token, "--method=post") or
+        std.mem.eql(u8, token, "--method=patch") or
+        std.mem.eql(u8, token, "--method=delete") or
+        std.mem.eql(u8, token, "--request=post") or
+        std.mem.eql(u8, token, "--request=patch") or
+        std.mem.eql(u8, token, "--request=delete");
+}
+
+fn commandWindowIsReleaseWrite(tokens: []const []const u8, start: usize) bool {
+    const end = @min(tokens.len, start + 48);
+    var release_index: ?usize = null;
+    var api_index: ?usize = null;
+    var write_method = false;
+    var release_endpoint = false;
+    var upload_endpoint = false;
+    var pending_method = false;
+    for (tokens[start..end], start..) |token, index| {
+        if (std.mem.eql(u8, token, "release") and release_index == null) {
+            release_index = index;
+        }
+        if (std.mem.eql(u8, token, "api") and api_index == null) api_index = index;
+        if (std.mem.eql(u8, token, "-x") or
+            std.mem.eql(u8, token, "--method") or
+            std.mem.eql(u8, token, "--request"))
+        {
+            pending_method = true;
+            continue;
+        }
+        if (pending_method) {
+            write_method = write_method or tokenIsWriteMethod(token);
+            pending_method = false;
+        }
+        write_method = write_method or tokenIsWriteMethod(token);
+        release_endpoint = release_endpoint or tokenHasReleaseEndpoint(token);
+        upload_endpoint = upload_endpoint or
+            std.mem.indexOf(u8, token, "uploads.github.com") != null;
+    }
+    if (release_index) |at| {
+        const command_end = @min(tokens.len, at + 16);
+        for (tokens[at + 1 .. command_end]) |token| {
+            if (std.mem.eql(u8, token, "create") or
+                std.mem.eql(u8, token, "edit") or
+                std.mem.eql(u8, token, "upload") or
+                std.mem.startsWith(u8, token, "delete"))
+            {
+                return true;
+            }
+        }
+    }
+    return api_index != null and release_endpoint and
+        (write_method or upload_endpoint);
+}
+
+fn looksLikeReleaseAction(normalized: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, normalized, '\n');
+    while (lines.next()) |line| {
+        const uses = std.mem.indexOf(u8, line, "uses:") orelse continue;
+        const action = std.mem.trim(u8, line[uses + "uses:".len ..], " ");
+        const reference = if (std.mem.indexOfScalar(u8, action, '@')) |at|
+            action[0..at]
+        else
+            action;
+        if (std.mem.indexOf(u8, reference, "release") != null or
+            std.mem.indexOf(u8, reference, "publish") != null or
+            std.mem.indexOf(u8, reference, "publication") != null or
+            (std.mem.indexOf(u8, reference, "upload") != null and
+                std.mem.indexOf(u8, reference, "asset") != null))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn looksLikeProducer(
+    allocator: Allocator,
+    path: []const u8,
+    source: []const u8,
+) !bool {
+    const normalized = try lowerNormalized(allocator, source);
+    defer allocator.free(normalized);
+    if (isWorkflow(path) and workflowCanWrite(normalized)) return true;
+    if (looksLikeReleaseAction(normalized)) return true;
+    if (std.mem.indexOf(u8, normalized, "github_release.publish") != null or
+        std.mem.indexOf(u8, normalized, "miz_release publish") != null)
+    {
+        return true;
+    }
+    if (std.mem.indexOf(u8, normalized, "self.gh") != null and
+        std.mem.indexOf(u8, normalized, "/releases") != null and
+        std.mem.indexOf(u8, normalized, "--method") != null and
+        (std.mem.indexOf(u8, normalized, "post") != null or
+            std.mem.indexOf(u8, normalized, "patch") != null or
+            std.mem.indexOf(u8, normalized, "delete") != null))
+    {
+        return true;
+    }
+    for ([_][]const u8{
+        "createrelease",
+        "updaterelease",
+        "deleterelease",
+        "uploadreleaseasset",
+        "deletereleaseasset",
+        "create_release",
+        "update_release",
+        "delete_release",
+        "upload_release_asset",
+        "delete_release_asset",
+    }) |surface| {
+        if (std.mem.indexOf(u8, normalized, surface) != null) return true;
+    }
+    var tokens_list: std.ArrayList([]const u8) = .empty;
+    defer tokens_list.deinit(allocator);
+    var tokens = std.mem.tokenizeAny(u8, normalized, " \t\r\n");
+    while (tokens.next()) |token| try tokens_list.append(allocator, token);
+    for (tokens_list.items, 0..) |token, index| {
+        if (std.mem.eql(u8, token, "gh") and
+            commandWindowIsReleaseWrite(tokens_list.items, index))
+        {
+            return true;
+        }
+        if (std.mem.eql(u8, token, "curl") or std.mem.eql(u8, token, "wget")) {
+            const end = @min(tokens_list.items.len, index + 48);
+            var release_url = false;
+            var upload_url = false;
+            var write_method = false;
+            var pending_method = false;
+            for (tokens_list.items[index..end]) |argument| {
+                release_url = release_url or
+                    ((std.mem.indexOf(u8, argument, "api.github.com") != null or
+                        std.mem.indexOf(u8, argument, "github.com/api/") != null) and
+                        tokenHasReleaseEndpoint(argument));
+                upload_url = upload_url or
+                    (std.mem.indexOf(u8, argument, "uploads.github.com") != null and
+                        tokenHasReleaseEndpoint(argument));
+                if (std.mem.eql(u8, argument, "-x") or
+                    std.mem.eql(u8, argument, "--request"))
+                {
+                    pending_method = true;
+                    continue;
+                }
+                if (pending_method) {
+                    write_method = write_method or tokenIsWriteMethod(argument);
+                    pending_method = false;
+                }
+                write_method = write_method or tokenIsWriteMethod(argument);
+                write_method = write_method or
+                    std.mem.eql(u8, argument, "-d") or
+                    std.mem.startsWith(u8, argument, "-d=") or
+                    std.mem.eql(u8, argument, "--data") or
+                    std.mem.startsWith(u8, argument, "--data=") or
+                    std.mem.eql(u8, argument, "--data-binary") or
+                    std.mem.startsWith(u8, argument, "--data-binary=");
+            }
+            if (upload_url or (release_url and write_method)) return true;
+        }
+    }
+    return false;
+}
+
+fn isBinary(source: []const u8) bool {
+    return std.mem.indexOfScalar(u8, source, 0) != null;
+}
+
+fn isExecutableContext(path: []const u8, mode: []const u8) bool {
+    if (std.mem.eql(u8, mode, "100755") or isWorkflow(path)) return true;
+    for ([_][]const u8{
+        ".c",   ".cc", ".cpp", ".go", ".java", ".js",  ".jsx",
+        ".mjs", ".rs", ".sh",  ".ts", ".tsx",  ".zig",
+    }) |extension| {
+        if (std.mem.endsWith(u8, path, extension)) return true;
+    }
+    return false;
+}
+
+fn validateTrackedSource(
+    allocator: Allocator,
+    path: []const u8,
+    mode: []const u8,
+    source: []const u8,
+    report_unreviewed: bool,
+) !bool {
+    if (isBinary(source) or !isExecutableContext(path, mode)) return false;
+    const producer = try looksLikeProducer(allocator, path, source);
+    if (!producer) return false;
+    if (isListed(path, &pattern_fixtures) and
+        std.mem.eql(u8, mode, "100644"))
+    {
+        return false;
+    }
+    if (!isListed(path, &producers)) {
+        if (report_unreviewed) {
+            std.debug.print("unreviewed GitHub release producer: {s}\n", .{path});
+        }
+        return error.UnreviewedReleaseProducer;
+    }
+    return true;
+}
+
 fn expectContains(path: []const u8, source: []const u8, needle: []const u8) !void {
     if (std.mem.indexOf(u8, source, needle) != null) return;
     std.debug.print("{s}: missing required release guard text:\n{s}\n", .{
@@ -88,31 +415,6 @@ fn expectOrder(
     return error.ReleaseOperationsOutOfOrder;
 }
 
-fn isKnownProducer(path: []const u8) bool {
-    for (producers) |known| {
-        if (std.mem.eql(u8, known, path)) return true;
-    }
-    return false;
-}
-
-fn looksLikeProducer(path: []const u8, source: []const u8) bool {
-    if (std.mem.indexOf(u8, source, "softprops/action-gh-release") != null or
-        std.mem.indexOf(u8, source, "gh release create") != null or
-        std.mem.indexOf(u8, source, "gh release edit") != null or
-        std.mem.indexOf(u8, source, "gh release upload") != null or
-        std.mem.indexOf(u8, source, "uploads.github.com/repos/") != null or
-        std.mem.indexOf(u8, source, "miz_release publish") != null or
-        (std.mem.indexOf(u8, source, "gh api --method PATCH") != null and
-            std.mem.indexOf(u8, source, "/releases/$release_id") != null))
-    {
-        return true;
-    }
-    return std.mem.indexOf(u8, source, "github_release.publish") != null or
-        (std.mem.endsWith(u8, path, ".zig") and
-            std.mem.indexOf(u8, source, "\"upload\",") != null and
-            std.mem.indexOf(u8, source, "releases/assets/") != null);
-}
-
 test "producer discovery is exact and catches unreviewed publication surfaces" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -124,14 +426,10 @@ test "producer discovery is exact and catches unreviewed publication surfaces" {
             "-C",
             root,
             "ls-files",
-            "--cached",
-            "--others",
-            "--exclude-standard",
+            "--stage",
             "-z",
-            ".github",
-            "scripts",
         },
-        .stdout_limit = .limited(max_source_bytes),
+        .stdout_limit = .limited(max_git_output_bytes),
         .stderr_limit = .limited(1024 * 1024),
     });
     defer allocator.free(result.stdout);
@@ -143,19 +441,39 @@ test "producer discovery is exact and catches unreviewed publication surfaces" {
 
     var found: std.ArrayList([]const u8) = .empty;
     defer found.deinit(allocator);
-    var paths = std.mem.splitScalar(u8, result.stdout, 0);
-    while (paths.next()) |path| {
-        if (path.len == 0) continue;
+    var entries = std.mem.splitScalar(u8, result.stdout, 0);
+    while (entries.next()) |entry| {
+        if (entry.len == 0) continue;
+        const tab = std.mem.indexOfScalar(u8, entry, '\t') orelse
+            return error.InvalidGitIndexEntry;
+        const metadata = entry[0..tab];
+        const path = entry[tab + 1 ..];
+        const space = std.mem.indexOfScalar(u8, metadata, ' ') orelse
+            return error.InvalidGitIndexEntry;
+        const mode = metadata[0..space];
+        if (!std.mem.eql(u8, mode, "100644") and
+            !std.mem.eql(u8, mode, "100755"))
+        {
+            continue;
+        }
         const source = try readSource(allocator, io, root, path);
         defer allocator.free(source);
-        if (!looksLikeProducer(path, source)) continue;
-        try found.append(allocator, path);
-        if (!isKnownProducer(path)) {
-            std.debug.print("unreviewed GitHub release producer: {s}\n", .{path});
-            return error.UnreviewedReleaseProducer;
+        if (try validateTrackedSource(allocator, path, mode, source, true)) {
+            try found.append(allocator, path);
+        }
+        if (isWorkflow(path)) {
+            const normalized = try lowerNormalized(allocator, source);
+            defer allocator.free(normalized);
+            const capable = workflowCanWrite(normalized);
+            if (capable != isListed(path, &write_workflows)) {
+                std.debug.print(
+                    "workflow Contents:write allowlist mismatch: {s}\n",
+                    .{path},
+                );
+                return error.WriteWorkflowAllowlistMismatch;
+            }
         }
     }
-    try std.testing.expectEqual(producers.len, found.items.len);
     for (producers) |expected| {
         var present = false;
         for (found.items) |actual| {
@@ -168,6 +486,96 @@ test "producer discovery is exact and catches unreviewed publication surfaces" {
             return error.StaleReleaseProducerAllowlist;
         }
     }
+    try std.testing.expectEqual(producers.len, found.items.len);
+}
+
+test "producer capability detection resists ordinary spelling variants" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        path: []const u8,
+        source: []const u8,
+    }{
+        .{
+            .path = "tools/publish.sh",
+            .source = "gh api -X POST repos/acme/project/releases",
+        },
+        .{
+            .path = "tools/publish.sh",
+            .source = "gh api repos/acme/project/releases --method=PATCH",
+        },
+        .{
+            .path = "tools/publish.sh",
+            .source = "command g\"\"h api \\\n -X DELETE \\\n repos/acme/project/releases/7",
+        },
+        .{
+            .path = "tools/publish.sh",
+            .source = "curl --request POST https://api.github.com/repos/acme/project/releases",
+        },
+        .{
+            .path = "tools/publish.sh",
+            .source = "wget https://uploads.github.com/repos/acme/project/releases/7/assets?name=x",
+        },
+        .{
+            .path = "src/publish.ts",
+            .source = "await octokit.rest.repos.uploadReleaseAsset(options);",
+        },
+        .{
+            .path = "src/publish.go",
+            .source = "client.Repositories.CreateRelease(ctx, owner, repo, release)",
+        },
+        .{
+            .path = "src/publish.ts",
+            .source = "graphql(`mutation { createRelease(input: $input) { id } }`)",
+        },
+        .{
+            .path = ".github/workflows/other.yml",
+            .source = "steps:\n  - uses: ncipollo/release-action@v1\n",
+        },
+        .{
+            .path = ".github/workflows/other.yml",
+            .source = "permissions:\n  contents:    write\n",
+        },
+        .{
+            .path = "tools/publish.sh",
+            .source = "gh --repo acme/project release --verify-tag create v1",
+        },
+    };
+    for (cases) |case| {
+        try std.testing.expect(
+            try looksLikeProducer(allocator, case.path, case.source),
+        );
+        try std.testing.expectError(
+            error.UnreviewedReleaseProducer,
+            validateTrackedSource(
+                allocator,
+                case.path,
+                if (std.mem.endsWith(u8, case.path, ".sh")) "100755" else "100644",
+                case.source,
+                false,
+            ),
+        );
+    }
+}
+
+test "non-executable exact pattern fixtures do not become producers" {
+    const allocator = std.testing.allocator;
+    try std.testing.expect(!try validateTrackedSource(
+        allocator,
+        "tests/immutable_release_guard.zig",
+        "100644",
+        "const fixture = \"gh api -X POST repos/x/y/releases\";",
+        false,
+    ));
+    try std.testing.expectError(
+        error.UnreviewedReleaseProducer,
+        validateTrackedSource(
+            allocator,
+            "tests/new_release_fixture.zig",
+            "100644",
+            "const fixture = \"gh api -X POST repos/x/y/releases\";",
+            false,
+        ),
+    );
 }
 
 test "main release workflow delegates the complete draft transaction to Zig" {
@@ -262,6 +670,92 @@ test "retained drafts are identity-checked by native release tools" {
             requirement[0],
             source,
             requirement[1],
+            "gh release upload",
+        );
+    }
+}
+
+test "shell-created drafts bind and refetch the exact target before upload" {
+    const allocator = std.testing.allocator;
+    const root = try rootAlloc(allocator);
+    defer allocator.free(root);
+    const requirements = [_]struct {
+        path: []const u8,
+        tag: []const u8,
+        target: []const u8,
+        validator: []const u8,
+    }{
+        .{
+            .path = "scripts/azurelinux4_publish.sh",
+            .tag = "$RELEASE_TAG",
+            .target = "$SOURCE_COMMIT",
+            .validator = "check-release-metadata",
+        },
+        .{
+            .path = "scripts/freebsd15_publish.sh",
+            .tag = "$RELEASE_TAG",
+            .target = "$SOURCE_COMMIT",
+            .validator = "verify-release-metadata",
+        },
+        .{
+            .path = "scripts/ubuntu2404_confidential_publish.sh",
+            .tag = "$RELEASE_TAG",
+            .target = "$SOURCE_COMMIT",
+            .validator = "check-release-metadata",
+        },
+        .{
+            .path = "scripts/ubuntu2604_publish.sh",
+            .tag = "$RELEASE_TAG",
+            .target = "$SOURCE_COMMIT",
+            .validator = "github-release-metadata",
+        },
+        .{
+            .path = "scripts/ubuntu2604_gallery_reissue.sh",
+            .tag = "$REISSUE_TAG",
+            .target = "$TOOLING_COMMIT",
+            .validator = "github-release-metadata",
+        },
+    };
+    for (requirements) |requirement| {
+        const source = try readSource(
+            allocator,
+            std.testing.io,
+            root,
+            requirement.path,
+        );
+        defer allocator.free(source);
+        const create_marker = try std.fmt.allocPrint(
+            allocator,
+            "gh release create \"{s}\"",
+            .{requirement.tag},
+        );
+        defer allocator.free(create_marker);
+        const create_at = std.mem.indexOf(u8, source, create_marker) orelse
+            return error.RequiredTextMissing;
+        const transaction = source[create_at..];
+        const target_marker = try std.fmt.allocPrint(
+            allocator,
+            "--target \"{s}\"",
+            .{requirement.target},
+        );
+        defer allocator.free(target_marker);
+        try expectContains(requirement.path, transaction, target_marker);
+        try expectOrder(
+            requirement.path,
+            transaction,
+            target_marker,
+            "gh api \"$release_api\"",
+        );
+        try expectOrder(
+            requirement.path,
+            transaction,
+            "gh api \"$release_api\"",
+            requirement.validator,
+        );
+        try expectOrder(
+            requirement.path,
+            transaction,
+            requirement.validator,
             "gh release upload",
         );
     }

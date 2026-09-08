@@ -310,8 +310,8 @@ test "policy and publication GitHub App tokens stay separated" {
         publication,
         "github-token: ${{ steps.github_policy_token.outputs.token }}",
     );
-    try expectCount(publication, "GH_TOKEN=\"$POLICY_GH_TOKEN\"", 12);
-    try expectCount(publication, "GH_TOKEN=\"$PUBLICATION_GH_TOKEN\"", 8);
+    try expectCount(publication, "GH_TOKEN=\"$POLICY_GH_TOKEN\"", 13);
+    try expectCount(publication, "GH_TOKEN=\"$PUBLICATION_GH_TOKEN\"", 11);
     try expectAbsent(prepare, "gh api --method POST");
     try expectAbsent(prepare, "gh api --method PATCH");
     try expectAbsent(capture, "gh api --method POST");
@@ -329,7 +329,7 @@ test "repository writer boundary and ruleset policy fail closed" {
     try expectCount(
         workflow,
         "scripts/ubuntu2404_confidential_github_policy.sh",
-        7,
+        8,
     );
     for ([_][]const u8{
         "repos/$GITHUB_REPOSITORY",
@@ -814,8 +814,8 @@ test "publication boundary uploads one sanitized result and never deletes target
         ".immutable == true",
         ".target_commitish == $tool_commit",
         ".assets[0].digest == $digest",
+        ".assets[0].size == $bytes",
         ".body == $notes",
-        ".assets | length == 0 or length == 1",
         "release_count=$(jq -er 'length' \"$exact_releases_json\")",
         "(( release_count <= 1 ))",
         "gh api --method POST \"${api_headers[@]}\"",
@@ -823,6 +823,7 @@ test "publication boundary uploads one sanitized result and never deletes target
         "uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets",
         "github-policy-before-draft-discovery",
         "github-policy-before-create",
+        "github-policy-before-asset-repair",
         "github-policy-before-upload",
         "github-policy-before-publish",
         "immutable-releases-before-publish.json",
@@ -833,6 +834,13 @@ test "publication boundary uploads one sanitized result and never deletes target
         "ubuntu2404_confidential_publish_release.sh",
         "publish-release.json",
         ".assets[0].digest == $digest",
+        "check-capture-release-assets",
+        "--mode repair",
+        "--mode final",
+        "gh api --method DELETE \"${api_headers[@]}\"",
+        "fresh-asset-repair-plan",
+        "empty-asset-repair-plan",
+        "validate_release_identity \"$release_json\"",
     }) |needle| try expectContains(workflow, needle);
     try expectAbsent(publication, "gh release create");
     try expectAbsent(publication, "gh release upload");
@@ -852,6 +860,18 @@ test "publication boundary uploads one sanitized result and never deletes target
         "publication_az \"${AZURE_CONFIDENTIAL_VM_ARGS[@]}\" \\\n      >\"$target_response\"",
         2,
     );
+    const repair = try indexOf(publication, "--mode repair");
+    const deletion = try indexOf(publication, "gh api --method DELETE");
+    const upload = try indexOf(publication, "https://uploads.github.com/");
+    const final_assets = try indexOf(publication, "--mode final");
+    const publish = try indexOf(
+        publication,
+        "ubuntu2404_confidential_publish_release.sh",
+    );
+    try std.testing.expect(repair < deletion);
+    try std.testing.expect(deletion < upload);
+    try std.testing.expect(upload < final_assets);
+    try std.testing.expect(final_assets < publish);
 }
 
 test "durable recovery preserves origin and gates PUT cleanup and publication" {

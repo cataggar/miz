@@ -396,10 +396,11 @@ test "the publisher verifies drafts by release id" {
     try expectContains(script, "\"$release_tool\" check-release-metadata \\");
     try expectContains(script, "publish_attempted=true");
     try expectContains(script, "release_published=true");
+    try expectContains(script, "--target \"$SOURCE_COMMIT\"");
     try expectContains(script, "quarantine and inspect immutable release");
     try expectAbsent(script, "--draft >/dev/null 2>&1 || true");
     try expectContains(script, "release_api=\"repos/$REPOSITORY/releases/$release_id\"");
-    try expectCount(script, "gh api \"$release_api\"", 4);
+    try expectCount(script, "gh api \"$release_api\"", 5);
     try expectAbsent(script, "releases/tags/$RELEASE_TAG");
     // Every remote state check goes through the one tool that parses the
     // expected-asset table, in the order the publication requires.

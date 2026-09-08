@@ -213,6 +213,7 @@ test "publication revalidates both artifacts before a three-asset release" {
         "--json isDraft",
         "Final release $RELEASE_TAG is immutable",
         "\"$RELEASE_TOOL\" check-release-metadata",
+        "--target \"$SOURCE_COMMIT\"",
         "gh release upload",
         "validate_release true",
         "gh release download",

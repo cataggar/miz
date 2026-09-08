@@ -2184,6 +2184,7 @@ test "the publish script requires a reviewed date and exact assets" {
     try support.expectContains(source, "explicit reviewed RELEASE_DATE");
     try support.expectContains(source, "--release-date \"$RELEASE_DATE\"");
     try support.expectContains(source, "gh release create \"$RELEASE_TAG\"");
+    try support.expectContains(source, "--target \"$SOURCE_COMMIT\"");
     try support.expectContains(source, "if [[ \"$release_exists\" == true ]]");
     try support.expectContains(source, "gh release upload \"$RELEASE_TAG\"");
     try support.expectContains(source, "gh release edit \"$RELEASE_TAG\"");

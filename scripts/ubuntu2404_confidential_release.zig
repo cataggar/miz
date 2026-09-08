@@ -62,6 +62,7 @@ const usage_text =
     \\  verify-capture         independently revalidate protected capture provenance
     \\  verify-capture-publication validate sanitized durable provenance without raw Azure evidence
     \\  check-release-metadata require an exact resumable draft identity
+    \\  check-capture-release-assets plan draft repair or require the exact final asset
     \\
     \\verify-capture requires independently supplied workflow identities and every
     \\raw evidence file. Azure ARM, OpenID, and JWKS file authenticity must come
@@ -168,6 +169,7 @@ const command_table = [_]Command{
     .{ .name = "verify-capture", .handler = runVerifyCapture },
     .{ .name = "verify-capture-publication", .handler = runVerifyCapturePublication },
     .{ .name = "check-release-metadata", .handler = runCheckReleaseMetadata },
+    .{ .name = "check-capture-release-assets", .handler = runCheckCaptureReleaseAssets },
 };
 
 fn run(context: Context, argv: []const []const u8) !void {
@@ -223,6 +225,49 @@ fn runCheckReleaseMetadata(context: Context, argv: []const []const u8) !void {
             .body = "",
             .prerelease = false,
         },
+        context.diagnostic,
+    );
+}
+
+fn runCheckCaptureReleaseAssets(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "release",
+        "notes",
+        "release-tag",
+        "release-title",
+        "tool-commit",
+        "asset-name",
+        "asset-sha256",
+        "asset-size",
+        "mode",
+    });
+    const size = try options.requireInteger("asset-size");
+    if (size <= 0) return error.Usage;
+    const mode_text = try options.require("mode");
+    const mode: release.github_release.SingleAssetMode =
+        if (std.mem.eql(u8, mode_text, "repair"))
+            .repair
+        else if (std.mem.eql(u8, mode_text, "final"))
+            .final
+        else
+            return error.Usage;
+    return release.github_release.validateSingleDraftAssetFiles(
+        context.allocator,
+        context.io,
+        try options.require("release"),
+        try options.require("notes"),
+        .{
+            .tag = try options.require("release-tag"),
+            .commit = try options.require("tool-commit"),
+            .title = try options.require("release-title"),
+            .body = "",
+            .prerelease = false,
+        },
+        try options.require("asset-name"),
+        try options.require("asset-sha256"),
+        @intCast(size),
+        mode,
+        context.out,
         context.diagnostic,
     );
 }
@@ -3336,6 +3381,7 @@ test "command surface is exact and rejects incomplete invocations" {
         "verify-capture",
         "verify-capture-publication",
         "check-release-metadata",
+        "check-capture-release-assets",
     };
     try std.testing.expectEqual(names.len, command_table.len);
     var discard: Writer.Discarding = .init(&.{});

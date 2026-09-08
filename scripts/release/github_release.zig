@@ -69,6 +69,17 @@ const RemoteAsset = struct {
     name: []const u8,
     size: u64,
     digest_text: ?[]const u8,
+    state: AssetState,
+};
+
+const AssetState = enum {
+    starter,
+    uploaded,
+};
+
+const AssetPolicy = enum {
+    allow_incomplete,
+    require_uploaded,
 };
 
 pub const PublishOptions = struct {
@@ -279,7 +290,11 @@ const Publisher = struct {
                         .{self.metadata.tag},
                     );
                 }
-                exact = try self.parseRelease(candidate, true);
+                exact = try self.parseRelease(
+                    candidate,
+                    true,
+                    .allow_incomplete,
+                );
             }
         }
         if (exact) |release| {
@@ -339,7 +354,11 @@ const Publisher = struct {
             latest_field,
         });
         defer result.deinit();
-        const release = try self.parseRelease(result.value, true);
+        const release = try self.parseRelease(
+            result.value,
+            true,
+            .require_uploaded,
+        );
         if (!release.draft) return self.fail(
             "GitHub did not create release {s} as a draft",
             .{self.metadata.tag},
@@ -347,7 +366,11 @@ const Publisher = struct {
         return release;
     }
 
-    fn fetch(self: *Publisher, expected_draft: bool) Error!Release {
+    fn fetch(
+        self: *Publisher,
+        expected_draft: bool,
+        asset_policy: AssetPolicy,
+    ) Error!Release {
         var endpoint_buffer: [512]u8 = undefined;
         const endpoint = std.fmt.bufPrint(
             &endpoint_buffer,
@@ -356,7 +379,11 @@ const Publisher = struct {
         ) catch return self.fail("release endpoint is too long", .{});
         var result = try self.ghJson(&.{ "api", endpoint });
         defer result.deinit();
-        const release = try self.parseRelease(result.value, true);
+        const release = try self.parseRelease(
+            result.value,
+            true,
+            asset_policy,
+        );
         if (release.id != self.release_id) return self.fail(
             "GitHub returned release {d}, expected {d}",
             .{ release.id, self.release_id },
@@ -372,6 +399,7 @@ const Publisher = struct {
         self: *Publisher,
         value: Value,
         require_metadata: bool,
+        asset_policy: AssetPolicy,
     ) Error!Release {
         if (value != .object) return self.fail(
             "release response is not an object",
@@ -446,10 +474,21 @@ const Publisher = struct {
                 "state",
                 "release asset state",
             ) catch return error.Failed;
-            if (!std.mem.eql(u8, state, "uploaded")) return self.fail(
-                "release asset {s} is not fully uploaded",
-                .{name},
-            );
+            const parsed_state: AssetState = if (std.mem.eql(u8, state, "uploaded"))
+                .uploaded
+            else if (std.mem.eql(u8, state, "starter"))
+                .starter
+            else
+                return self.fail(
+                    "release asset {s} has unknown state {s}",
+                    .{ name, state },
+                );
+            if (asset_policy == .require_uploaded and parsed_state != .uploaded) {
+                return self.fail(
+                    "release asset {s} is not fully uploaded",
+                    .{name},
+                );
+            }
             asset.* = .{
                 .id = integerField(
                     self,
@@ -463,6 +502,7 @@ const Publisher = struct {
                     self.allocator.dupe(u8, text) catch return error.OutOfMemory
                 else
                     null,
+                .state = parsed_state,
             };
             initialized += 1;
             if (asset.id <= 0) return self.fail(
@@ -493,7 +533,7 @@ const Publisher = struct {
     }
 
     fn upload(self: *Publisher, asset: *const Asset) Error!void {
-        var draft = try self.fetch(true);
+        var draft = try self.fetch(true, .require_uploaded);
         defer draft.deinit(self.allocator);
         try self.revalidateLocal(asset);
         const result = try self.gh(&.{
@@ -508,21 +548,50 @@ const Publisher = struct {
         result.deinit(self.allocator);
     }
 
+    fn deleteRemoteAsset(self: *Publisher, asset_id: i64) Error!void {
+        var checked = try self.fetch(true, .allow_incomplete);
+        defer checked.deinit(self.allocator);
+        var present = false;
+        for (checked.assets) |asset| {
+            if (asset.id == asset_id) present = true;
+        }
+        if (!present) return self.fail(
+            "draft asset {d} changed before deletion",
+            .{asset_id},
+        );
+        var endpoint_buffer: [512]u8 = undefined;
+        const endpoint = std.fmt.bufPrint(
+            &endpoint_buffer,
+            "repos/{s}/releases/assets/{d}",
+            .{ self.options.repository_name, asset_id },
+        ) catch return self.fail("asset endpoint is too long", .{});
+        const result = try self.gh(&.{ "api", "--method", "DELETE", endpoint });
+        result.deinit(self.allocator);
+    }
+
+    fn repairDraftAssets(self: *Publisher) Error!void {
+        var release = try self.fetch(true, .allow_incomplete);
+        defer release.deinit(self.allocator);
+        for (release.assets) |remote| {
+            var same_name_count: usize = 0;
+            for (release.assets) |candidate| {
+                if (std.mem.eql(u8, candidate.name, remote.name)) {
+                    same_name_count += 1;
+                }
+            }
+            const remove = remote.state != .uploaded or
+                findAsset(self.assets, remote.name) == null or
+                same_name_count != 1;
+            if (remove) try self.deleteRemoteAsset(remote.id);
+        }
+    }
+
     fn deleteStale(self: *Publisher) Error!void {
-        var release = try self.fetch(true);
+        var release = try self.fetch(true, .require_uploaded);
         defer release.deinit(self.allocator);
         for (release.assets) |remote| {
             if (findAsset(self.assets, remote.name) != null) continue;
-            var checked = try self.fetch(true);
-            defer checked.deinit(self.allocator);
-            var endpoint_buffer: [512]u8 = undefined;
-            const endpoint = std.fmt.bufPrint(
-                &endpoint_buffer,
-                "repos/{s}/releases/assets/{d}",
-                .{ self.options.repository_name, remote.id },
-            ) catch return self.fail("asset endpoint is too long", .{});
-            const result = try self.gh(&.{ "api", "--method", "DELETE", endpoint });
-            result.deinit(self.allocator);
+            try self.deleteRemoteAsset(remote.id);
         }
     }
 
@@ -677,8 +746,8 @@ const Publisher = struct {
 
     fn publish(self: *Publisher) Error!void {
         try self.verifyTag();
-        var draft = try self.fetch(true);
-        defer self.allocator.free(draft.assets);
+        var draft = try self.fetch(true, .require_uploaded);
+        defer draft.deinit(self.allocator);
         try self.validateRemoteAssets(&draft);
         for (self.assets) |*asset| try self.revalidateLocal(asset);
 
@@ -727,7 +796,11 @@ const Publisher = struct {
             latest_field,
         });
         defer result.deinit();
-        var published_response = try self.parseRelease(result.value, true);
+        var published_response = try self.parseRelease(
+            result.value,
+            true,
+            .require_uploaded,
+        );
         defer published_response.deinit(self.allocator);
         if (published_response.draft) return self.fail(
             "GitHub did not publish release {s}",
@@ -737,7 +810,7 @@ const Publisher = struct {
 
     fn validateFinal(self: *Publisher) Error!void {
         try self.verifyTag();
-        var release = try self.fetch(false);
+        var release = try self.fetch(false, .require_uploaded);
         defer release.deinit(self.allocator);
         try self.validateRemoteAssets(&release);
         if (self.immutable_was_true and !release.immutable) return self.fail(
@@ -890,9 +963,12 @@ pub fn publish(
         "release {s} is not a draft",
         .{options.tag},
     );
+    var fresh_draft = try publisher.fetch(true, .allow_incomplete);
+    fresh_draft.deinit(allocator);
+    try publisher.repairDraftAssets();
     for (assets) |*asset| try publisher.upload(asset);
     try publisher.deleteStale();
-    var uploaded = try publisher.fetch(true);
+    var uploaded = try publisher.fetch(true, .require_uploaded);
     defer uploaded.deinit(allocator);
     try publisher.validateRemoteAssets(&uploaded);
     for (assets) |*asset| try publisher.downloadAndVerify(asset);
@@ -1029,6 +1105,233 @@ pub fn validateDraftMetadataFiles(
         "existing release is not a resumable draft",
         .{},
     );
+}
+
+pub const SingleAssetMode = enum {
+    repair,
+    final,
+};
+
+pub fn validateSingleDraftAssetFiles(
+    allocator: Allocator,
+    io: Io,
+    release_path: []const u8,
+    notes_path: []const u8,
+    expected_without_body: ExpectedMetadata,
+    expected_name: []const u8,
+    expected_digest_hex: []const u8,
+    expected_size: u64,
+    mode: SingleAssetMode,
+    out: *std.Io.Writer,
+    diagnostic: *Diagnostic,
+) Error!void {
+    if (expected_digest_hex.len != 64) return diagnostic.fail(
+        error.Failed,
+        "expected release asset digest is not lowercase SHA-256",
+        .{},
+    );
+    for (expected_digest_hex) |character| switch (character) {
+        '0'...'9', 'a'...'f' => {},
+        else => return diagnostic.fail(
+            error.Failed,
+            "expected release asset digest is not lowercase SHA-256",
+            .{},
+        ),
+    };
+    if (expected_size == 0) return diagnostic.fail(
+        error.Failed,
+        "expected release asset is empty",
+        .{},
+    );
+    const release_bytes = file_support.readBounded(
+        allocator,
+        io,
+        release_path,
+        4 * 1024 * 1024,
+    ) catch |err| return diagnostic.fail(
+        error.Failed,
+        "cannot read release metadata: {t}",
+        .{err},
+    );
+    defer allocator.free(release_bytes);
+    var parsed = std.json.parseFromSlice(
+        Value,
+        allocator,
+        release_bytes,
+        .{},
+    ) catch |err| return diagnostic.fail(
+        error.Failed,
+        "cannot parse release metadata: {t}",
+        .{err},
+    );
+    defer parsed.deinit();
+    if (parsed.value != .object) return diagnostic.fail(
+        error.Failed,
+        "release metadata is not an object",
+        .{},
+    );
+    const notes = file_support.readBounded(
+        allocator,
+        io,
+        notes_path,
+        4 * 1024 * 1024,
+    ) catch |err| return diagnostic.fail(
+        error.Failed,
+        "cannot read release notes: {t}",
+        .{err},
+    );
+    defer allocator.free(notes);
+    var expected = expected_without_body;
+    expected.body = notes;
+    const object = &parsed.value.object;
+    try validateMetadataObject(object, expected, diagnostic);
+    const draft = object.get("draft") orelse return diagnostic.fail(
+        error.Failed,
+        "release draft state is missing",
+        .{},
+    );
+    if (draft != .bool or !draft.bool) return diagnostic.fail(
+        error.Failed,
+        "release is published and must not be repaired",
+        .{},
+    );
+    const immutable = object.get("immutable") orelse return diagnostic.fail(
+        error.Failed,
+        "release immutable state is missing",
+        .{},
+    );
+    if (immutable != .bool or immutable.bool) return diagnostic.fail(
+        error.Failed,
+        "draft release immutable state is invalid",
+        .{},
+    );
+    const assets_value = object.get("assets") orelse return diagnostic.fail(
+        error.Failed,
+        "release assets are missing",
+        .{},
+    );
+    if (assets_value != .array) return diagnostic.fail(
+        error.Failed,
+        "release assets are not an array",
+        .{},
+    );
+
+    const expected_digest = std.fmt.allocPrint(
+        allocator,
+        "sha256:{s}",
+        .{expected_digest_hex},
+    ) catch return error.OutOfMemory;
+    defer allocator.free(expected_digest);
+    var exact = assets_value.array.items.len == 1;
+    for (assets_value.array.items, 0..) |asset_value, index| {
+        if (asset_value != .object) return diagnostic.fail(
+            error.Failed,
+            "release asset is not an object",
+            .{},
+        );
+        const asset = &asset_value.object;
+        const id_value = asset.get("id") orelse return diagnostic.fail(
+            error.Failed,
+            "release asset id is missing",
+            .{},
+        );
+        if (id_value != .integer or id_value.integer <= 0) return diagnostic.fail(
+            error.Failed,
+            "release asset id is invalid",
+            .{},
+        );
+        for (assets_value.array.items[0..index]) |previous_value| {
+            if (previous_value.object.get("id").?.integer == id_value.integer) {
+                return diagnostic.fail(
+                    error.Failed,
+                    "release asset id is duplicated",
+                    .{},
+                );
+            }
+        }
+        const name = asset.get("name") orelse return diagnostic.fail(
+            error.Failed,
+            "release asset name is missing",
+            .{},
+        );
+        if (name != .string) return diagnostic.fail(
+            error.Failed,
+            "release asset name is invalid",
+            .{},
+        );
+        const state = asset.get("state") orelse return diagnostic.fail(
+            error.Failed,
+            "release asset state is missing",
+            .{},
+        );
+        if (state != .string) return diagnostic.fail(
+            error.Failed,
+            "release asset state is invalid",
+            .{},
+        );
+        if (!std.mem.eql(u8, state.string, "uploaded") and
+            !std.mem.eql(u8, state.string, "starter"))
+        {
+            return diagnostic.fail(
+                error.Failed,
+                "release asset {s} has unknown state {s}",
+                .{ name.string, state.string },
+            );
+        }
+        const size = asset.get("size") orelse return diagnostic.fail(
+            error.Failed,
+            "release asset size is missing",
+            .{},
+        );
+        if (size != .integer or size.integer < 0) return diagnostic.fail(
+            error.Failed,
+            "release asset size is invalid",
+            .{},
+        );
+        const digest_value = asset.get("digest");
+        const digest_matches = if (digest_value) |value|
+            value == .string and std.mem.eql(
+                u8,
+                value.string,
+                expected_digest,
+            )
+        else
+            false;
+        exact = exact and
+            std.mem.eql(u8, name.string, expected_name) and
+            std.mem.eql(u8, state.string, "uploaded") and
+            @as(u64, @intCast(size.integer)) == expected_size and
+            digest_matches;
+    }
+    if (mode == .final) {
+        if (!exact) return diagnostic.fail(
+            error.Failed,
+            "release asset set is not the exact uploaded publication asset",
+            .{},
+        );
+        return;
+    }
+    if (exact) {
+        out.writeAll("keep\n") catch return diagnostic.fail(
+            error.Failed,
+            "cannot write release asset repair plan",
+            .{},
+        );
+        return;
+    }
+    out.writeAll("replace\n") catch return diagnostic.fail(
+        error.Failed,
+        "cannot write release asset repair plan",
+        .{},
+    );
+    for (assets_value.array.items) |asset_value| {
+        out.print("{d}\n", .{asset_value.object.get("id").?.integer}) catch
+            return diagnostic.fail(
+                error.Failed,
+                "cannot write release asset repair plan",
+                .{},
+            );
+    }
 }
 
 pub fn validateVersionTag(
@@ -1313,5 +1616,175 @@ test "version and tag contract distinguishes prerelease SemVer" {
     try std.testing.expectError(
         error.Failed,
         validateVersionTag("01.2.3", "v01.2.3", &diagnostic),
+    );
+}
+
+test "single draft asset repair plans fail closed and replace invalid sets" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const notes_path = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/tmp/{s}/notes.md",
+        .{&tmp.sub_path},
+    );
+    defer allocator.free(notes_path);
+    const release_path = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/tmp/{s}/release.json",
+        .{&tmp.sub_path},
+    );
+    defer allocator.free(release_path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = notes_path,
+        .data = "exact notes",
+    });
+    const prefix =
+        \\{"id":42,"tag_name":"capture-v1","target_commitish":"0123456789abcdef0123456789abcdef01234567","name":"capture","body":"exact notes","draft":
+    ;
+    const suffix = ",\"prerelease\":false,\"immutable\":false,\"assets\":";
+    const cases = [_]struct {
+        draft: []const u8,
+        assets: []const u8,
+        expected: ?[]const u8,
+        error_needle: ?[]const u8 = null,
+    }{
+        .{
+            .draft = "true",
+            .assets =
+            \\[{"id":1,"name":"result.json","size":0,"state":"starter","digest":null}]}
+            ,
+            .expected = "replace\n1\n",
+        },
+        .{
+            .draft = "true",
+            .assets =
+            \\[{"id":2,"name":"result.json","size":7,"state":"uploaded","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}
+            ,
+            .expected = "replace\n2\n",
+        },
+        .{
+            .draft = "true",
+            .assets =
+            \\[{"id":3,"name":"result.json","size":7,"state":"uploaded","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"id":4,"name":"unexpected.bin","size":1,"state":"uploaded","digest":null}]}
+            ,
+            .expected = "replace\n3\n4\n",
+        },
+        .{
+            .draft = "true",
+            .assets =
+            \\[{"id":5,"name":"result.json","size":7,"state":"uploaded","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"id":6,"name":"result.json","size":0,"state":"starter","digest":null}]}
+            ,
+            .expected = "replace\n5\n6\n",
+        },
+        .{
+            .draft = "true",
+            .assets =
+            \\[{"id":7,"name":"result.json","size":0,"state":"pending","digest":null}]}
+            ,
+            .expected = null,
+            .error_needle = "unknown state",
+        },
+        .{
+            .draft = "false",
+            .assets = "[]}",
+            .expected = null,
+            .error_needle = "published",
+        },
+    };
+    for (cases) |case| {
+        const document = try std.mem.concat(
+            allocator,
+            u8,
+            &.{ prefix, case.draft, suffix, case.assets },
+        );
+        defer allocator.free(document);
+        try Dir.cwd().writeFile(io, .{
+            .sub_path = release_path,
+            .data = document,
+        });
+        var output: std.Io.Writer.Allocating = .init(allocator);
+        defer output.deinit();
+        var diagnostic: Diagnostic = .{};
+        const result = validateSingleDraftAssetFiles(
+            allocator,
+            io,
+            release_path,
+            notes_path,
+            .{
+                .tag = "capture-v1",
+                .commit = "0123456789abcdef0123456789abcdef01234567",
+                .title = "capture",
+                .body = "",
+                .prerelease = false,
+            },
+            "result.json",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            7,
+            .repair,
+            &output.writer,
+            &diagnostic,
+        );
+        if (case.expected) |expected| {
+            try result;
+            try std.testing.expectEqualStrings(expected, output.written());
+        } else {
+            try std.testing.expectError(error.Failed, result);
+            try std.testing.expect(
+                std.mem.indexOf(
+                    u8,
+                    diagnostic.message(),
+                    case.error_needle.?,
+                ) != null,
+            );
+        }
+    }
+}
+
+test "single draft asset final validation requires one uploaded exact asset" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const notes_path = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/tmp/{s}/notes.md",
+        .{&tmp.sub_path},
+    );
+    defer allocator.free(notes_path);
+    const release_path = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/tmp/{s}/release.json",
+        .{&tmp.sub_path},
+    );
+    defer allocator.free(release_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = notes_path, .data = "notes" });
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = release_path,
+        .data =
+        \\{"id":42,"tag_name":"capture-v1","target_commitish":"0123456789abcdef0123456789abcdef01234567","name":"capture","body":"notes","draft":true,"prerelease":false,"immutable":false,"assets":[{"id":1,"name":"result.json","size":7,"state":"uploaded","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}
+        ,
+    });
+    var output: std.Io.Writer.Discarding = .init(&.{});
+    var diagnostic: Diagnostic = .{};
+    try validateSingleDraftAssetFiles(
+        allocator,
+        io,
+        release_path,
+        notes_path,
+        .{
+            .tag = "capture-v1",
+            .commit = "0123456789abcdef0123456789abcdef01234567",
+            .title = "capture",
+            .body = "",
+            .prerelease = false,
+        },
+        "result.json",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        7,
+        .final,
+        &output.writer,
+        &diagnostic,
     );
 }

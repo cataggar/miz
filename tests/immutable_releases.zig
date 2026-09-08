@@ -144,6 +144,29 @@ const Fixture = struct {
         );
     }
 
+    fn addStarter(self: *Fixture, name: []const u8) !void {
+        const remote = try std.fs.path.join(
+            self.allocator,
+            &.{ self.root, "remote" },
+        );
+        defer self.allocator.free(remote);
+        try Dir.cwd().createDirPath(std.testing.io, remote);
+        for ([_][2][]const u8{
+            .{ "starter-asset", name },
+            .{ "starter-created", "true" },
+        }) |marker| {
+            const path = try std.fs.path.join(
+                self.allocator,
+                &.{ self.root, marker[0] },
+            );
+            defer self.allocator.free(path);
+            try Dir.cwd().writeFile(
+                std.testing.io,
+                .{ .sub_path = path, .data = marker[1] },
+            );
+        }
+    }
+
     fn run(
         self: *Fixture,
         scenario: []const u8,
@@ -271,11 +294,98 @@ test "fresh draft uploads verifies downloads and publishes once in order" {
     );
     try expectContains(log, "11:draft=false");
     try expectContains(log, "16:make_latest=true");
+    try expectContains(
+        log,
+        "target_commitish=0123456789abcdef0123456789abcdef01234567",
+    );
     try expectContains(log, "assets; argv remains literal");
     try expectAbsent(log, "sh -c");
     const stage = try fixture.stage();
     defer std.testing.allocator.free(stage);
     try std.testing.expectEqualStrings("published", stage);
+}
+
+test "a missing or legacy draft target is refused before upload" {
+    inline for ([_][]const u8{ "missing-target", "legacy-target" }) |scenario| {
+        var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+        defer fixture.deinit();
+        const result = try fixture.run(scenario, "1.2.3");
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(!result.succeeded());
+        try expectContains(result.stderr, "release target");
+        const log = try fixture.log();
+        defer std.testing.allocator.free(log);
+        try expectAbsent(log, "7:release\x1f6:upload");
+        try expectAbsent(log, "8:--method\x1f5:PATCH");
+    }
+}
+
+test "a starter asset left by a failed upload is repaired on the next run" {
+    var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+    defer fixture.deinit();
+    const first = try fixture.run("starter-first-upload", "1.2.3");
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expect(!first.succeeded());
+    const draft = try fixture.stage();
+    defer std.testing.allocator.free(draft);
+    try std.testing.expectEqualStrings("draft", draft);
+
+    const second = try fixture.run("starter-first-upload", "1.2.3");
+    defer second.deinit(std.testing.allocator);
+    try expectSucceeded(second);
+    const log = try fixture.log();
+    defer std.testing.allocator.free(log);
+    try expectOrder(log, "8:--method\x1f6:DELETE", "7:release\x1f6:upload");
+    const stage = try fixture.stage();
+    defer std.testing.allocator.free(stage);
+    try std.testing.expectEqualStrings("published", stage);
+}
+
+test "unknown draft asset states fail closed before repair" {
+    var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+    defer fixture.deinit();
+    try fixture.setStage("draft");
+    try fixture.addStarter("miz-1.2.3-linux-musl-x64.tar.gz");
+    const result = try fixture.run("unknown-asset-state", "1.2.3");
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(!result.succeeded());
+    try expectContains(result.stderr, "unknown state");
+    const log = try fixture.log();
+    defer std.testing.allocator.free(log);
+    try expectAbsent(log, "8:--method\x1f6:DELETE");
+    try expectAbsent(log, "7:release\x1f6:upload");
+}
+
+test "duplicate uploaded and incomplete entries are replaced safely" {
+    var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+    defer fixture.deinit();
+    try fixture.setStage("draft");
+    const name = "miz-1.2.3-linux-musl-x64.tar.gz";
+    try fixture.addRemote(name, "old uploaded asset");
+    try fixture.addStarter(name);
+    const result = try fixture.run("resume", "1.2.3");
+    defer result.deinit(std.testing.allocator);
+    try expectSucceeded(result);
+    const log = try fixture.log();
+    defer std.testing.allocator.free(log);
+    const first_delete = std.mem.indexOf(
+        u8,
+        log,
+        "8:--method\x1f6:DELETE",
+    ) orelse return error.MissingText;
+    const second_delete = std.mem.indexOfPos(
+        u8,
+        log,
+        first_delete + 1,
+        "8:--method\x1f6:DELETE",
+    ) orelse return error.MissingText;
+    const upload = std.mem.indexOfPos(
+        u8,
+        log,
+        second_delete + 1,
+        "7:release\x1f6:upload",
+    ) orelse return error.MissingText;
+    try std.testing.expect(second_delete < upload);
 }
 
 test "an exact retained draft resumes without creating another release" {

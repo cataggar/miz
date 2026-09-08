@@ -81,6 +81,7 @@ test "gallery reissue is explicit, evidence-bound, and independently verified" {
         "Final reissue $REISSUE_TAG is immutable",
         "-f \"sha=$TOOLING_COMMIT\"",
         "gh release create \"$REISSUE_TAG\"",
+        "--target \"$TOOLING_COMMIT\"",
         "gh release upload \"$REISSUE_TAG\"",
         "\"$RELEASE_TOOL\" github-release-assets",
         "\"$RELEASE_TOOL\" github-release-downloaded",
