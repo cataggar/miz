@@ -39,6 +39,15 @@ const write_workflows = [_][]const u8{
     ".github/workflows/ubuntu2604-release.yml",
 };
 
+const app_release_workflows = [_][]const u8{
+    ".github/workflows/azurelinux4-release.yml",
+    ".github/workflows/freebsd15-release.yml",
+    ".github/workflows/release.yml",
+    ".github/workflows/ubuntu2404-confidential-release.yml",
+    ".github/workflows/ubuntu2604-gallery-reissue.yml",
+    ".github/workflows/ubuntu2604-release.yml",
+};
+
 const pattern_fixtures = [_][]const u8{
     "tests/azurelinux4_release_contract.zig",
     "tests/freebsd15_release.zig",
@@ -936,6 +945,73 @@ test "every publishing workflow mints the shared protected policy token" {
     );
 }
 
+test "every release publisher uses separate least-privilege App tokens" {
+    const allocator = std.testing.allocator;
+    const root = try rootAlloc(allocator);
+    defer allocator.free(root);
+    const pinned =
+        "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349";
+    for (app_release_workflows) |path| {
+        const source = try readSource(allocator, std.testing.io, root, path);
+        defer allocator.free(source);
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, pinned));
+        try expectContains(path, source, "id: github_policy_token");
+        try expectContains(path, source, "id: github_publication_token");
+        try expectContains(path, source, "permission-administration: write");
+        try expectContains(path, source, "permission-contents: write");
+        try expectContains(path, source, "permission-workflows: write");
+
+        const policy_start = std.mem.indexOf(
+            u8,
+            source,
+            "- name: Mint protected release policy token",
+        ) orelse return error.MissingText;
+        const publication_start = std.mem.indexOfPos(
+            u8,
+            source,
+            policy_start,
+            "- name: Mint isolated release publication token",
+        ) orelse return error.MissingText;
+        const publisher_start = std.mem.indexOfPos(
+            u8,
+            source,
+            publication_start,
+            "\n      - name:",
+        ) orelse return error.MissingText;
+        const policy_step = source[policy_start..publication_start];
+        const publication_step = source[publication_start..publisher_start];
+        const publisher_end = std.mem.indexOfPos(
+            u8,
+            source,
+            publisher_start + 1,
+            "\n      - name:",
+        ) orelse source.len;
+        const publisher_step = source[publisher_start..publisher_end];
+
+        try expectContains(path, policy_step, "permission-administration: write");
+        try expectContains(path, policy_step, "permission-contents: read");
+        try expectAbsent(path, policy_step, "permission-actions:");
+        try expectAbsent(path, policy_step, "permission-contents: write");
+        try expectAbsent(path, policy_step, "permission-workflows: write");
+        try expectContains(path, publication_step, "permission-contents: write");
+        try expectContains(path, publication_step, "permission-workflows: write");
+        try expectAbsent(path, publication_step, "permission-actions:");
+        try expectAbsent(path, publication_step, "permission-administration:");
+        try expectContains(
+            path,
+            publisher_step,
+            "GH_TOKEN: ${{ steps.github_publication_token.outputs.token }}",
+        );
+        try expectContains(
+            path,
+            publisher_step,
+            "steps.github_policy_token.outputs.token",
+        );
+        try expectAbsent(path, publisher_step, "GH_TOKEN: ${{ github.token }}");
+        try expectAbsent(path, publisher_step, "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}");
+    }
+}
+
 test "every shell asset publisher is draft-only until one-way publication" {
     const allocator = std.testing.allocator;
     const root = try rootAlloc(allocator);
@@ -1038,9 +1114,12 @@ test "shared repository policy fetch is read-only paginated and Zig-validated" {
         "repos/$repository/immutable-releases",
         "--paginate --slurp",
         "rulesets?includes_parents=true&targets=tag&per_page=100",
+        "\"$release_tool\" select-release-ruleset",
+        "rulesets/$ruleset_id?includes_parents=true",
         "\"$release_tool\" check-release-policy",
         "--immutable-response",
         "--rulesets-response",
+        "--ruleset-detail-response",
     }) |needle| try expectContains(path, source, needle);
     try expectAbsent(path, source, "--method POST");
     try expectAbsent(path, source, "--method PATCH");

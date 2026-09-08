@@ -1605,9 +1605,11 @@ and publishes exactly full/core × x86_64/AArch64. Before dispatch:
    `RELEASE_GITHUB_APP_PRIVATE_KEY`, and variables `AZURE_LOCATION_X64`,
    `AZURE_LOCATION_ARM64`, `AZURE_VM_SIZE_X64`, and
    `AZURE_VM_SIZE_ARM64`.
-   The shared App needs repository **Administration: write** permission; policy
-   tokens request Administration write and Contents read to validate immutable
-   releases and the global tag ruleset before mutation and publication.
+   The shared App needs repository **Administration: write**, **Contents:
+   write**, and **Workflows: write** permissions. Each publishing job mints an
+   Administration-write/Contents-read policy token and a distinct
+   Contents-write/Workflows-write publication token. Only the latter is passed
+   as `GH_TOKEN` to the release publisher.
 5. Configure both Entra federated credentials with issuer
    `https://token.actions.githubusercontent.com` and audience
    `api://AzureADTokenExchange`. Their subjects are respectively

@@ -107,22 +107,53 @@ fn apiCommand(
             try out.writeAll("[[]]\n");
             return;
         }
+        const id: i64 = if (std.mem.eql(u8, scenario, "ruleset-bad-id")) 0 else 665;
         const enforcement = if (std.mem.eql(u8, scenario, "ruleset-inactive"))
             "disabled"
         else
             "active";
+        try out.print(
+            "[[{{\"id\":{d},\"name\":\"miz-immutable-release-tags-v1\"," ++
+                "\"target\":\"tag\",\"source_type\":\"Repository\"," ++
+                "\"source\":\"cataggar/miz\",\"enforcement\":\"{s}\"}}",
+            .{ id, enforcement },
+        );
+        if (std.mem.eql(u8, scenario, "ruleset-duplicate")) {
+            try out.writeAll(
+                ",{\"id\":666,\"name\":\"miz-immutable-release-tags-v1\"," ++
+                    "\"target\":\"tag\",\"source_type\":\"Repository\"," ++
+                    "\"source\":\"cataggar/miz\",\"enforcement\":\"active\"}",
+            );
+        }
+        try out.writeAll("]]\n");
+        return;
+    }
+    if (std.mem.indexOf(
+        u8,
+        endpoint,
+        "/rulesets/665?includes_parents=true",
+    ) != null) {
+        if (!std.mem.eql(u8, gh_token, "policy-token") or
+            std.mem.eql(u8, scenario, "policy-unauthorized"))
+        {
+            return error.MockPolicyUnauthorized;
+        }
+        const id: i64 = if (std.mem.eql(u8, scenario, "ruleset-detail-mismatch"))
+            666
+        else
+            665;
         const bypass = if (std.mem.eql(u8, scenario, "ruleset-bypass"))
             "[{\"actor_id\":123,\"actor_type\":\"Integration\",\"bypass_mode\":\"always\"}]"
         else
             "[]";
         try out.print(
-            "[[{{\"id\":665,\"name\":\"miz-immutable-release-tags-v1\"," ++
+            "{{\"id\":{d},\"name\":\"miz-immutable-release-tags-v1\"," ++
                 "\"target\":\"tag\",\"source_type\":\"Repository\"," ++
-                "\"source\":\"cataggar/miz\",\"enforcement\":\"{s}\"," ++
+                "\"source\":\"cataggar/miz\",\"enforcement\":\"active\"," ++
                 "\"bypass_actors\":{s},\"conditions\":{{\"ref_name\":{{" ++
                 "\"include\":[\"~ALL\"],\"exclude\":[]}}}},\"rules\":[" ++
-                "{{\"type\":\"update\"}},{{\"type\":\"deletion\"}}]}}]]\n",
-            .{ enforcement, bypass },
+                "{{\"type\":\"update\"}},{{\"type\":\"deletion\"}}]}}\n",
+            .{ id, bypass },
         );
         return;
     }
@@ -140,11 +171,11 @@ fn apiCommand(
     if (std.mem.endsWith(u8, endpoint, "/releases?per_page=100")) {
         const stage = try readStage(allocator, io, root);
         defer allocator.free(stage);
-        if (std.mem.eql(u8, stage, "absent")) {
-            try out.writeAll("[[{\"tag_name\":\"v1.2.2\"}]]\n");
-        } else {
-            try out.writeAll("[[");
+        try out.writeAll("[[");
+        var has_entry = false;
+        if (!std.mem.eql(u8, stage, "absent")) {
             try writeRelease(allocator, io, root, scenario, tag, version, commit, out);
+            has_entry = true;
             if (std.mem.eql(u8, scenario, "duplicate-release")) {
                 try out.writeByte(',');
                 try writeRelease(
@@ -158,8 +189,35 @@ fn apiCommand(
                     out,
                 );
             }
-            try out.writeAll(",{\"tag_name\":\"v1.2.2\"}]]\n");
         }
+        if (std.mem.eql(u8, scenario, "abandoned-higher-draft")) {
+            if (has_entry) try out.writeByte(',');
+            try out.writeAll(
+                "{\"tag_name\":\"v1.2.9\",\"draft\":true," ++
+                    "\"prerelease\":false}",
+            );
+            has_entry = true;
+        }
+        if (std.mem.eql(u8, scenario, "no-ref-draft")) {
+            if (has_entry) try out.writeByte(',');
+            try out.writeAll(
+                "{\"tag_name\":null,\"draft\":true,\"prerelease\":false}",
+            );
+            has_entry = true;
+        }
+        if (std.mem.eql(u8, scenario, "published-prerelease")) {
+            if (has_entry) try out.writeByte(',');
+            try out.writeAll(
+                "{\"tag_name\":\"v1.2.3-rc.1\",\"draft\":false," ++
+                    "\"prerelease\":true}",
+            );
+            has_entry = true;
+        }
+        if (has_entry) try out.writeByte(',');
+        try out.writeAll(
+            "{\"tag_name\":\"v1.2.2\",\"draft\":false," ++
+                "\"prerelease\":false}]]\n",
+        );
         return;
     }
     if (std.mem.endsWith(u8, endpoint, "/releases/latest")) {
@@ -173,6 +231,12 @@ fn apiCommand(
     if (std.mem.endsWith(u8, endpoint, "/releases/generate-notes") and
         std.mem.eql(u8, method, "POST"))
     {
+        const expected_previous =
+            if (std.mem.eql(u8, scenario, "published-prerelease") and
+            std.mem.indexOfScalar(u8, version, '-') != null)
+                "v1.2.3-rc.1"
+            else
+                "v1.2.2";
         if (!std.mem.eql(u8, fieldValue(argv, "tag_name") orelse "", tag) or
             !std.mem.eql(
                 u8,
@@ -182,7 +246,7 @@ fn apiCommand(
             !std.mem.eql(
                 u8,
                 fieldValue(argv, "previous_tag_name") orelse "",
-                "v1.2.2",
+                expected_previous,
             ))
         {
             return error.MockInvalidGeneratedNotesIdentity;
@@ -243,6 +307,9 @@ fn apiCommand(
     if (std.mem.endsWith(u8, endpoint, "/releases/42") and
         std.mem.eql(u8, method, "PATCH"))
     {
+        if (std.mem.eql(u8, scenario, "publication-token-expired")) {
+            return error.MockPublicationTokenExpired;
+        }
         const expected_body = try expectedReleaseBody(allocator, tag, "fresh");
         defer allocator.free(expected_body);
         if (!std.mem.eql(

@@ -246,9 +246,24 @@ pub const release_commands = [_]Command{
         .required = &.{"response"},
     },
     .{
+        .name = "select-release-ruleset",
+        .options = &.{ "repository", "rulesets-response" },
+        .required = &.{ "repository", "rulesets-response" },
+    },
+    .{
         .name = "check-release-policy",
-        .options = &.{ "repository", "immutable-response", "rulesets-response" },
-        .required = &.{ "repository", "immutable-response", "rulesets-response" },
+        .options = &.{
+            "repository",
+            "immutable-response",
+            "rulesets-response",
+            "ruleset-detail-response",
+        },
+        .required = &.{
+            "repository",
+            "immutable-response",
+            "rulesets-response",
+            "ruleset-detail-response",
+        },
     },
     .{
         .name = "verify-draft-assets",
@@ -411,7 +426,7 @@ const release_usage_text =
     \\  matrix, azure-matrix, describe, include-count, candidate, azure-result,
     \\  candidate-binding, stage, compare, stage-expected, stage-evidence,
     \\  publish-expected, tag-object, verify-release-metadata,
-    \\  check-immutable-releases, check-release-policy,
+    \\  check-immutable-releases, select-release-ruleset, check-release-policy,
     \\  verify-draft-assets,
     \\  release-stale-assets, verify-remote-release,
     \\  verify-downloaded-release, verify-published-release
@@ -613,12 +628,23 @@ fn dispatchRelease(
             &context.diagnostic,
         ) catch return error.Invalid;
     }
+    if (std.mem.eql(u8, name, "select-release-ruleset")) {
+        const id = support.github_release.selectImmutableTagRulesetIdFile(
+            context.arena,
+            context.io,
+            requiredOption(options, "rulesets-response"),
+            requiredOption(options, "repository"),
+            &context.diagnostic,
+        ) catch return error.Invalid;
+        return out.print("{d}\n", .{id});
+    }
     if (std.mem.eql(u8, name, "check-release-policy")) {
         return support.github_release.validateRepositoryReleasePolicyFiles(
             context.arena,
             context.io,
             requiredOption(options, "immutable-response"),
             requiredOption(options, "rulesets-response"),
+            requiredOption(options, "ruleset-detail-response"),
             requiredOption(options, "repository"),
             &context.diagnostic,
         ) catch return error.Invalid;

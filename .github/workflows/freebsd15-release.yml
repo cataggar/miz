@@ -539,7 +539,7 @@ jobs:
     environment: azurelinux4-release
     permissions:
       actions: read
-      contents: write
+      contents: read
     env:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       RELEASE_SET: ${{ inputs.release_set }}
@@ -597,8 +597,8 @@ jobs:
           scripts/freebsd15_stage_release.sh
           diff --recursive --brief "$PLAN_DIR" "$STAGING_ROOT/evidence"
 
-      - name: Mint immutable-release policy token
-        id: release_policy_token
+      - name: Mint protected release policy token
+        id: github_policy_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
           app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
@@ -608,7 +608,19 @@ jobs:
           permission-administration: write
           permission-contents: read
 
+      - name: Mint isolated release publication token
+        id: github_publication_token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-workflows: write
+
       - name: Mutate the GitHub release from the verified plan
         env:
-          RELEASE_POLICY_GH_TOKEN: ${{ steps.release_policy_token.outputs.token }}
+          GH_TOKEN: ${{ steps.github_publication_token.outputs.token }}
+          RELEASE_POLICY_GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
         run: scripts/freebsd15_publish.sh

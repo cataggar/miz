@@ -9,8 +9,11 @@ const Io = std.Io;
 const usage =
     \\usage:
     \\  miz_release verify-version --tag TAG --manifest PATH [--github-output PATH]
+    \\  miz_release select-release-ruleset --repository OWNER/REPO
+    \\      --rulesets-response PATH
     \\  miz_release check-release-policy --repository OWNER/REPO
     \\      --immutable-response PATH --rulesets-response PATH
+    \\      --ruleset-detail-response PATH
     \\  miz_release publish --repository OWNER/REPO --tag TAG --version VERSION
     \\      --commit SHA --assets-directory PATH --workspace PATH
     \\      [--github-step-summary PATH]
@@ -68,6 +71,9 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_file: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    const stdout = &stdout_file.interface;
     var stderr_buffer: [4096]u8 = undefined;
     var stderr_file: std.Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
     const stderr = &stderr_file.interface;
@@ -79,6 +85,7 @@ pub fn main(init: std.process.Init) !void {
         init.environ_map.get("MIZ_GH") orelse "gh",
         init.minimal.environ,
         init.environ_map.get("MIZ_RELEASE_POLICY_GH_TOKEN"),
+        stdout,
         argv[1..],
         &diagnostic,
     ) catch |err| switch (err) {
@@ -94,6 +101,7 @@ pub fn main(init: std.process.Init) !void {
         },
         else => return err,
     };
+    try stdout.flush();
 }
 
 fn run(
@@ -102,6 +110,7 @@ fn run(
     gh_executable: []const u8,
     environment: std.process.Environ,
     policy_token: ?[]const u8,
+    out: *std.Io.Writer,
     argv: []const []const u8,
     diagnostic: *release.Diagnostic,
 ) !void {
@@ -139,17 +148,31 @@ fn run(
         }
         return;
     }
+    if (std.mem.eql(u8, argv[0], "select-release-ruleset")) {
+        try options.only(&.{ "--repository", "--rulesets-response" });
+        const id = try release.github_release.selectImmutableTagRulesetIdFile(
+            allocator,
+            io,
+            try options.require("--rulesets-response"),
+            try options.require("--repository"),
+            diagnostic,
+        );
+        try out.print("{d}\n", .{id});
+        return;
+    }
     if (std.mem.eql(u8, argv[0], "check-release-policy")) {
         try options.only(&.{
             "--repository",
             "--immutable-response",
             "--rulesets-response",
+            "--ruleset-detail-response",
         });
         return release.github_release.validateRepositoryReleasePolicyFiles(
             allocator,
             io,
             try options.require("--immutable-response"),
             try options.require("--rulesets-response"),
+            try options.require("--ruleset-detail-response"),
             try options.require("--repository"),
             diagnostic,
         );

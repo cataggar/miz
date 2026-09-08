@@ -17,15 +17,26 @@ api_headers=(
   -H "X-GitHub-Api-Version: $GH_API_VERSION"
 )
 immutable_response="$output_dir/immutable-releases.json"
-rulesets_response="$output_dir/tag-ruleset-pages.json"
+ruleset_list_response="$output_dir/tag-ruleset-pages.json"
+ruleset_detail_response="$output_dir/tag-ruleset-detail.json"
 
 gh api --method GET "${api_headers[@]}" \
   "repos/$repository/immutable-releases" >"$immutable_response"
 gh api --method GET --paginate --slurp "${api_headers[@]}" \
   "repos/$repository/rulesets?includes_parents=true&targets=tag&per_page=100" \
-  >"$rulesets_response"
+  >"$ruleset_list_response"
+ruleset_id=$(
+  "$release_tool" select-release-ruleset \
+    --repository "$repository" \
+    --rulesets-response "$ruleset_list_response"
+)
+[[ "$ruleset_id" =~ ^[1-9][0-9]*$ ]]
+gh api --method GET "${api_headers[@]}" \
+  "repos/$repository/rulesets/$ruleset_id?includes_parents=true" \
+  >"$ruleset_detail_response"
 
 "$release_tool" check-release-policy \
   --repository "$repository" \
   --immutable-response "$immutable_response" \
-  --rulesets-response "$rulesets_response"
+  --rulesets-response "$ruleset_list_response" \
+  --ruleset-detail-response "$ruleset_detail_response"

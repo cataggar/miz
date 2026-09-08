@@ -854,11 +854,27 @@ pub fn dispatch(
             diagnostic,
         );
     }
+    if (std.mem.eql(u8, command, "select-release-ruleset")) {
+        var options = try parse(allocator, argv, &.{
+            "--repository",
+            "--rulesets-response",
+        });
+        defer options.deinit();
+        const id = try support.github_release.selectImmutableTagRulesetIdFile(
+            allocator,
+            io,
+            try options.require("--rulesets-response"),
+            try options.require("--repository"),
+            diagnostic,
+        );
+        return out.print("{d}\n", .{id});
+    }
     if (std.mem.eql(u8, command, "check-release-policy")) {
         var options = try parse(allocator, argv, &.{
             "--repository",
             "--immutable-response",
             "--rulesets-response",
+            "--ruleset-detail-response",
         });
         defer options.deinit();
         return support.github_release.validateRepositoryReleasePolicyFiles(
@@ -866,6 +882,7 @@ pub fn dispatch(
             io,
             try options.require("--immutable-response"),
             try options.require("--rulesets-response"),
+            try options.require("--ruleset-detail-response"),
             try options.require("--repository"),
             diagnostic,
         );

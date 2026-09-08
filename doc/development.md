@@ -19,10 +19,20 @@ asset digests, independently download and hash every asset, revalidate the
 draft, and publish exactly once. Stable releases explicitly become latest;
 prereleases and image/provenance releases explicitly do not.
 
-Before publishing any release, enable the repository **Immutable releases**
-setting at **Settings → General → Releases** and create the mandatory global
-tag ruleset below at **Settings → Rules → Rulesets → New ruleset → New tag
-ruleset**. Keep both controls enabled:
+The repository controls are deliberately provisioned as a post-merge
+deployment, not by this code. Use this exact order:
+
+1. Install the shared release App, create the protected environments and their
+   App secrets, and create the required tag rulesets while **Immutable
+   releases** remains disabled.
+2. Merge the immutable-release migration.
+3. Exercise every protected gate, then enable **Immutable releases** at
+   **Settings → General → Releases** only when all producers can pass.
+
+Until that deployment is complete, publication fails closed. Do not weaken a
+gate to accommodate an absent environment, secret, App installation, ruleset,
+or immutable-release setting. Create the mandatory global tag ruleset at
+**Settings → Rules → Rulesets → New ruleset → New tag ruleset**:
 
 - name: `miz-immutable-release-tags-v1`;
 - enforcement: **Active**;
@@ -55,35 +65,40 @@ The equivalent rulesets API request body is:
 Submit that body manually to `POST /repos/cataggar/miz/rulesets`; release
 workflows never create, edit, disable, or delete repository settings or
 rulesets. Omitting the `creation` rule deliberately leaves tag creation
-available to the existing `GITHUB_TOKEN` and publishing App paths. Once any
-tag exists, however, no bypass actor—including the publishing App—can move or
-delete it while the ruleset is active. Repository administrators remain the
-trusted root because they can disable repository policy.
+available to the publishing App. Once any tag exists, however, no bypass
+actor—including the publishing App—can move or delete it while the ruleset is
+active. Repository administrators remain the trusted root because they can
+disable repository policy.
 
-Every producer uses a freshly minted protected GitHub App token with
-**Administration: write** and **Contents: read** to query both
+Every producer mints a fresh protected policy token with
+**Administration: write** and **Contents: read** to query
 `GET /repos/cataggar/miz/immutable-releases` and the paginated
 `GET /repos/cataggar/miz/rulesets?includes_parents=true&targets=tag&per_page=100`
-before tag/release mutation and again immediately before its `draft=false`
-transition. GitHub's current rulesets REST response omits `bypass_actors`
-unless the caller can write the ruleset, so a missing field fails closed even
-though the token performs reads only. The shared Zig validator requires the
-named repository ruleset to be unambiguous, active, global, exclusion-free,
-limited to the reviewed update/deletion rules, and to have exactly zero bypass
-actors. `GITHUB_TOKEN` cannot perform these Administration queries. A missing,
-expired, unauthorized, disabled, or changed prerequisite fails before
-publication; the final numeric release response must report `immutable=true`.
+to select exactly one active named repository ruleset and its positive numeric
+ID. List summaries are not treated as detail: the policy path then fetches
+`GET /repos/cataggar/miz/rulesets/{id}?includes_parents=true` and validates the
+full target, source, enforcement, `~ALL`/no-exclusion conditions, exact update
+and deletion rules, and empty bypass list. GitHub omits `bypass_actors` from
+detail for callers that cannot write the ruleset, so a missing field fails
+closed even though the policy token performs reads only. `GITHUB_TOKEN` cannot
+perform these Administration queries.
 
 Install one release GitHub App on only `cataggar/miz` with repository
-**Administration: write** permission so every producer can inspect ruleset
-bypass actors. Store its App ID and PEM key as
+permissions **Administration: write**, **Contents: write**, and
+**Workflows: write**. The capture workflow additionally needs **Actions:
+read**. Store its App ID and PEM key as
 `RELEASE_GITHUB_APP_ID` and `RELEASE_GITHUB_APP_PRIVATE_KEY` in every protected
 publishing environment: `miz-release`, `azurelinux4-release`,
 `ubuntu2404-confidential-release`, `ubuntu2404-confidential-capture`, and
-`ubuntu2604-release`. Publication jobs mint an Administration-write,
-Contents-read policy token; capture separately
-mints its restricted content-publication token. The gallery reissue shares
-`ubuntu2604-release`.
+`ubuntu2604-release`. Every publication job separately mints:
+
+- a policy token with **Administration: write** and **Contents: read**; and
+- a publication token with only **Contents: write** and **Workflows: write**.
+
+Only the publication token is passed as `GH_TOKEN` to the publisher's
+release/tag/asset reads and mutations. The policy checker explicitly replaces
+`GH_TOKEN` with the policy token. Neither token is logged or uploaded. The
+gallery reissue shares `ubuntu2604-release`.
 
 The normal `.github/workflows/release.yml` tag job requires the protected
 `miz-release` environment. Restrict it to the repository's `v*` release tags,
@@ -95,11 +110,18 @@ A failure before publication leaves a resumable draft. Retrying is allowed
 only when the tag, target commit, title, install preamble, stored non-empty
 generated notes, and prerelease state still match the original transaction.
 Generated notes are created only for a new draft and retained byte-for-byte on
-retry. A published release is never reopened, edited, clobbered, or corrected. A tag
-created before a failed draft is retained and quarantined rather than deleted.
-If post-publication verification fails, investigate without mutation. Every
-release tag correction, including a wrong target or abandoned draft tag,
-requires a new tag and a new release.
+retry. Draft releases never become the generated-notes predecessor. Stable
+main SemVer releases use the greatest lower published stable `v*` release;
+prereleases use the greatest lower published main SemVer release, including a
+published prerelease when it orders last. Image tags, malformed SemVer tags,
+and no-ref drafts are ignored. If the publication App token expires before the
+one-way transition, the exact draft remains
+unpublished and a fresh-token rerun resumes it. A published release is never
+reopened, edited, clobbered, or corrected. A tag created before a failed draft
+is retained and quarantined rather than deleted. If post-publication
+verification fails, investigate without mutation. Every release tag
+correction, including a wrong target or abandoned draft tag, requires a new
+tag and a new release.
 
 Run `zig build test-immutable-releases` when changing a release workflow,
 publisher, or GitHub release API call. The repository-wide guard intentionally

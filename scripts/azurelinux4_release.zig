@@ -76,6 +76,7 @@ const usage_text =
     \\  tag-object             print the object a peeled annotated tag points at
     \\  check-release-metadata require an exact resumable draft identity
     \\  check-immutable-releases require the protected repository policy
+    \\  select-release-ruleset print the exact immutable tag ruleset ID
     \\  check-release-policy   require immutable releases and global tag immutability
     \\  check-draft-assets    plan/validate exact numeric draft asset mutations
     \\  release-stale-assets   print the asset IDs a release holds outside the allowlist
@@ -213,6 +214,7 @@ const command_table = [_]Command{
     .{ .name = "tag-object", .handler = runTagObject },
     .{ .name = "check-release-metadata", .handler = runCheckReleaseMetadata },
     .{ .name = "check-immutable-releases", .handler = runCheckImmutableReleases },
+    .{ .name = "select-release-ruleset", .handler = runSelectReleaseRuleset },
     .{ .name = "check-release-policy", .handler = runCheckReleasePolicy },
     .{ .name = "check-draft-assets", .handler = runCheckDraftAssets },
     .{ .name = "release-stale-assets", .handler = runReleaseStaleAssets },
@@ -790,17 +792,34 @@ fn runCheckImmutableReleases(context: Context, argv: []const []const u8) !void {
     );
 }
 
+fn runSelectReleaseRuleset(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "repository",
+        "rulesets-response",
+    });
+    const id = try release.github_release.selectImmutableTagRulesetIdFile(
+        context.allocator,
+        context.io,
+        try options.require("rulesets-response"),
+        try options.require("repository"),
+        context.diagnostic,
+    );
+    try context.out.print("{d}\n", .{id});
+}
+
 fn runCheckReleasePolicy(context: Context, argv: []const []const u8) !void {
     const options = try parseOptions(argv, &.{
         "repository",
         "immutable-response",
         "rulesets-response",
+        "ruleset-detail-response",
     });
     return release.github_release.validateRepositoryReleasePolicyFiles(
         context.allocator,
         context.io,
         try options.require("immutable-response"),
         try options.require("rulesets-response"),
+        try options.require("ruleset-detail-response"),
         try options.require("repository"),
         context.diagnostic,
     );
@@ -1031,6 +1050,7 @@ test "every command the shell and workflow call is dispatched" {
         "tag-object",
         "check-release-metadata",
         "check-immutable-releases",
+        "select-release-ruleset",
         "check-release-policy",
         "check-draft-assets",
         "release-stale-assets",

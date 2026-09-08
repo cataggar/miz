@@ -381,8 +381,15 @@ test "fresh draft uploads verifies downloads and publishes once in order" {
         log,
         "rulesets?includes_parents=true&targets=tag&per_page=100",
     ) orelse return error.MissingText;
+    const first_ruleset_detail = std.mem.indexOfPos(
+        u8,
+        log,
+        first_ruleset,
+        "repos/cataggar/miz/rulesets/665?includes_parents=true",
+    ) orelse return error.MissingText;
     try std.testing.expect(first_immutable < first_ruleset);
-    try std.testing.expect(first_ruleset < create_at);
+    try std.testing.expect(first_ruleset < first_ruleset_detail);
+    try std.testing.expect(first_ruleset_detail < create_at);
     const publish_at = std.mem.indexOf(
         u8,
         log,
@@ -406,8 +413,15 @@ test "fresh draft uploads verifies downloads and publishes once in order" {
         final_immutable,
         "rulesets?includes_parents=true&targets=tag&per_page=100",
     ) orelse return error.MissingText;
+    const final_ruleset_detail = std.mem.indexOfPos(
+        u8,
+        before_publish,
+        final_ruleset,
+        "repos/cataggar/miz/rulesets/665?includes_parents=true",
+    ) orelse return error.MissingText;
     try std.testing.expect(final_tag < final_immutable);
     try std.testing.expect(final_immutable < final_ruleset);
+    try std.testing.expect(final_ruleset < final_ruleset_detail);
     const tag_after_publish = std.mem.indexOfPos(
         u8,
         log,
@@ -453,6 +467,52 @@ test "fresh release body preserves the byte-exact generated-notes separator" {
         "body=**Install:**\\n\\n```console\\nghr install cataggar/miz@v1.2.3" ++
             "\\n```\\n\\n\\n## What's Changed\\n\\n* Generated fixture changelog\\n",
     );
+}
+
+test "generated notes ignore an abandoned higher draft release" {
+    var fixture = try Fixture.create(std.testing.allocator, "1.3.0");
+    defer fixture.deinit();
+    const result = try fixture.run("abandoned-higher-draft", "1.3.0");
+    defer result.deinit(std.testing.allocator);
+    try expectSucceeded(result);
+    const log = try fixture.log();
+    defer std.testing.allocator.free(log);
+    try expectContains(log, "previous_tag_name=v1.2.2");
+    try expectAbsent(log, "previous_tag_name=v1.2.9");
+}
+
+test "stable generated notes exclude published prereleases" {
+    var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+    defer fixture.deinit();
+    const result = try fixture.run("published-prerelease", "1.2.3");
+    defer result.deinit(std.testing.allocator);
+    try expectSucceeded(result);
+    const log = try fixture.log();
+    defer std.testing.allocator.free(log);
+    try expectContains(log, "previous_tag_name=v1.2.2");
+    try expectAbsent(log, "previous_tag_name=v1.2.3-rc.1");
+}
+
+test "prerelease generated notes may follow a published prerelease" {
+    var fixture = try Fixture.create(std.testing.allocator, "1.2.3-rc.2");
+    defer fixture.deinit();
+    const result = try fixture.run("published-prerelease", "1.2.3-rc.2");
+    defer result.deinit(std.testing.allocator);
+    try expectSucceeded(result);
+    const log = try fixture.log();
+    defer std.testing.allocator.free(log);
+    try expectContains(log, "previous_tag_name=v1.2.3-rc.1");
+}
+
+test "generated notes ignore a draft without a tag ref" {
+    var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+    defer fixture.deinit();
+    const result = try fixture.run("no-ref-draft", "1.2.3");
+    defer result.deinit(std.testing.allocator);
+    try expectSucceeded(result);
+    const log = try fixture.log();
+    defer std.testing.allocator.free(log);
+    try expectContains(log, "previous_tag_name=v1.2.2");
 }
 
 test "a missing or legacy draft target is refused before upload" {
@@ -693,9 +753,24 @@ test "repository release policy failures occur before draft mutation" {
             .diagnostic = "tag ruleset is missing",
         },
         .{
+            .scenario = "ruleset-duplicate",
+            .policy_token = "policy-token",
+            .diagnostic = "tag ruleset is ambiguous",
+        },
+        .{
+            .scenario = "ruleset-bad-id",
+            .policy_token = "policy-token",
+            .diagnostic = "listing id is invalid",
+        },
+        .{
             .scenario = "ruleset-inactive",
             .policy_token = "policy-token",
             .diagnostic = "enforcement is not active",
+        },
+        .{
+            .scenario = "ruleset-detail-mismatch",
+            .policy_token = "policy-token",
+            .diagnostic = "detail id does not match the listing",
         },
         .{
             .scenario = "ruleset-bypass",
@@ -719,6 +794,28 @@ test "repository release policy failures occur before draft mutation" {
         try expectAbsent(log, upload_endpoint);
         try expectAbsent(log, "8:--method\x1f5:PATCH");
     }
+}
+
+test "expired publication token retains one exact draft and rerun resumes" {
+    var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+    defer fixture.deinit();
+    const first = try fixture.run("publication-token-expired", "1.2.3");
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expect(!first.succeeded());
+    try expectContains(first.stderr, "MockPublicationTokenExpired");
+    const draft = try fixture.stage();
+    defer std.testing.allocator.free(draft);
+    try std.testing.expectEqualStrings("draft", draft);
+
+    const second = try fixture.run("resume", "1.2.3");
+    defer second.deinit(std.testing.allocator);
+    try expectSucceeded(second);
+    const log = try fixture.log();
+    defer std.testing.allocator.free(log);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log, create_endpoint));
+    const published = try fixture.stage();
+    defer std.testing.allocator.free(published);
+    try std.testing.expectEqualStrings("published", published);
 }
 
 test "stale assets are deleted only after a draft check and before publish" {

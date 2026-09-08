@@ -30,7 +30,7 @@ jobs:
     environment: ubuntu2604-release
     permissions:
       actions: read
-      contents: write
+      contents: read
     env:
       SOURCE_RELEASE_TAG: ${{ inputs.source_release_tag }}
       CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
@@ -175,8 +175,8 @@ jobs:
             --key "$CANDIDATE_KEY" \
             --source-commit "$SOURCE_COMMIT"
 
-      - name: Mint immutable-release policy token
-        id: release_policy_token
+      - name: Mint protected release policy token
+        id: github_policy_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
           app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
@@ -186,6 +186,17 @@ jobs:
           permission-administration: write
           permission-contents: read
 
+      - name: Mint isolated release publication token
+        id: github_publication_token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-workflows: write
+
       - name: Publish explicit metadata-capable reissue
         env:
           SOURCE_COMMIT: ${{ steps.resolve.outputs.source_commit }}
@@ -193,7 +204,8 @@ jobs:
           REISSUE_TAG: ${{ steps.resolve.outputs.reissue_tag }}
           RELEASE_TITLE: Ubuntu 26.04 AArch64 core gallery metadata reissue
           UBUNTU2604_RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2604_release
-          RELEASE_POLICY_GH_TOKEN: ${{ steps.release_policy_token.outputs.token }}
+          GH_TOKEN: ${{ steps.github_publication_token.outputs.token }}
+          RELEASE_POLICY_GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
         run: scripts/ubuntu2604_gallery_reissue.sh
 
       - name: Remove reissue staging and downloaded evidence

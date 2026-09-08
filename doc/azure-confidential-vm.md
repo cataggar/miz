@@ -165,6 +165,13 @@ it to the `main` branch, and configure:
 | Variable | `AZURE_LOCATION` | `westeurope` |
 | Variable | `AZURE_VM_SIZE` | `Standard_DC2as_v5` |
 
+The shared release App needs repository **Administration: write**,
+**Contents: write**, and **Workflows: write** permissions. The protected
+publication job mints an Administration-write/Contents-read policy token and a
+distinct Contents-write/Workflows-write publication token. The publisher
+receives only the latter as `GH_TOKEN`; policy checks explicitly substitute
+the former.
+
 The Entra application needs a federated credential with subject
 `repo:cataggar/miz:environment:ubuntu2404-confidential-release`. Grant only
 the Azure permissions needed to create and delete the temporary resource group
@@ -273,7 +280,10 @@ publication; it never changes repository settings.
 Specifically, `GET /repos/cataggar/miz/immutable-releases` must report
 `enabled=true`, and the paginated
 `GET /repos/cataggar/miz/rulesets?includes_parents=true&targets=tag&per_page=100`
-response must contain the exact active global ruleset with a visible empty
+response must identify exactly one active named global ruleset and its positive
+numeric ID. The workflow then retrieves
+`GET /repos/cataggar/miz/rulesets/{id}?includes_parents=true`; only this full
+detail response is used to validate conditions, rules, and the visible empty
 `bypass_actors` array.
 `GITHUB_TOKEN` cannot receive the required repository Administration access.
 Install the shared release GitHub App on only `cataggar/miz` with repository
