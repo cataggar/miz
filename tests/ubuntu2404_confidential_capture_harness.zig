@@ -253,7 +253,7 @@ test "persistent version is immutable fully replicated and final VM inherits sec
     try std.testing.expect(created < put);
 }
 
-test "conditional container creates prove ownership before cleanup state" {
+test "conditional container creates persist pending before PUT and confirm after GET" {
     const allocator = std.testing.allocator;
     const script = try readTracked(allocator, script_path);
     defer allocator.free(script);
@@ -289,41 +289,70 @@ test "conditional container creates prove ownership before cleanup state" {
 
     const group_create = try section(
         script,
-        "group_exists=$(az group exists",
-        "\njq -n \\\n  --arg location \"$TARGET_LOCATION\"",
+        "create_temporary_group_conditionally() {",
+        "\ncreate_target_definition_conditionally() {",
+    );
+    const group_pending = try indexOf(
+        group_create,
+        "persist_temporary_group_create",
     );
     const group_put = try indexOf(
         group_create,
         "azure_confidential_vm_resource_group_conditional_create_args",
     );
-    const group_response = try indexOf(
+    const group_dispatch = try indexOf(
         group_create,
+        "run_conditional_create",
+    );
+    const group_confirm_call = try indexOf(
+        group_create,
+        "confirm_temporary_group_create",
+    );
+    try std.testing.expect(group_pending < group_put);
+    try std.testing.expect(group_put < group_dispatch);
+    try std.testing.expect(group_dispatch < group_confirm_call);
+
+    const group_confirm = try section(
+        script,
+        "confirm_temporary_group_create() {",
+        "\nconfirm_target_definition_create() {",
+    );
+    const group_response = try indexOf(
+        group_confirm,
         "validate_temporary_group_document \"$temporary_group_response\"",
     );
     const group_get = try indexOf(
-        group_create,
+        group_confirm,
         "az group show --name \"$resource_group\"",
     );
     const group_fresh = try indexOf(
-        group_create,
+        group_confirm,
         "validate_temporary_group_document \"$temporary_group_json\"",
     );
     const group_owned = try indexOf(
-        group_create,
-        "state_replace '.temporary_group_created = true'",
+        group_confirm,
+        "state_replace '.temporary_group_create.status = \"confirmed\"'",
     );
-    try std.testing.expect(group_put < group_response);
     try std.testing.expect(group_response < group_get);
     try std.testing.expect(group_get < group_fresh);
     try std.testing.expect(group_fresh < group_owned);
 
     const definition_create = try section(
         script,
+        "create_target_definition_conditionally() {",
+        "\nvalidate_target_definition_document() {",
+    );
+    const definition_pending = try indexOf(
+        definition_create,
+        "persist_target_definition_create",
+    );
+    const definition_top_level = try section(
+        script,
         "definition_was_created=false",
         "\ntarget_request=\"$RESULT_DIR/target-gallery-request.json\"",
     );
     const definition_revalidate = try indexOf(
-        definition_create,
+        definition_top_level,
         "validate_target_containers",
     );
     const definition_put = try indexOf(
@@ -332,23 +361,38 @@ test "conditional container creates prove ownership before cleanup state" {
     );
     const definition_response = try indexOf(
         definition_create,
+        "run_conditional_create",
+    );
+    const definition_confirm_call = try indexOf(
+        definition_create,
+        "confirm_target_definition_create",
+    );
+    try std.testing.expect(definition_pending < definition_put);
+    try std.testing.expect(definition_put < definition_response);
+    try std.testing.expect(definition_response < definition_confirm_call);
+
+    const definition_confirm = try section(
+        script,
+        "confirm_target_definition_create() {",
+        "\ncreate_temporary_group_conditionally() {",
+    );
+    const definition_response_validation = try indexOf(
+        definition_confirm,
         "validate_created_target_definition_response",
     );
     const definition_get = try indexOf(
-        definition_create,
+        definition_confirm,
         "az sig image-definition show --ids \"$target_definition_id\"",
     );
     const definition_fresh = try indexOf(
-        definition_create,
+        definition_confirm,
         "validate_target_definition_document \"$target_definition_json\" exact",
     );
     const definition_owned = try indexOf(
-        definition_create,
-        "state_replace '.target.definition_created = true'",
+        definition_confirm,
+        "state_replace '.target.definition_create.status = \"confirmed\"'",
     );
-    try std.testing.expect(definition_revalidate < definition_put);
-    try std.testing.expect(definition_put < definition_response);
-    try std.testing.expect(definition_response < definition_get);
+    try std.testing.expect(definition_response_validation < definition_get);
     try std.testing.expect(definition_get < definition_fresh);
     try std.testing.expect(definition_fresh < definition_owned);
 
@@ -369,18 +413,53 @@ test "conditional container creates prove ownership before cleanup state" {
         version_mutation,
         "azure_confidential_vm_capture_gallery_version_put_args",
     );
+    const target_creation = try indexOf(
+        definition_top_level,
+        "create_target_definition_conditionally",
+    );
+    try std.testing.expect(definition_revalidate < target_creation);
     try std.testing.expect(version_revalidate < version_definition);
     try std.testing.expect(version_definition < version_put);
 }
 
-test "conditional create collisions never claim cleanup ownership" {
+test "foreign conditional-create collisions clear pending without deletion" {
     const allocator = std.testing.allocator;
     const script = try readTracked(allocator, script_path);
     defer allocator.free(script);
+    const state_replace_source = try section(
+        script,
+        "state_replace() {",
+        "\nstate_file_is_safe() {",
+    );
+    const exact_tags_source = try section(
+        script,
+        "exact_owned_tags_match() {",
+        "\nvalidate_write_access_identity() {",
+    );
     const conditional_source = try section(
         script,
         "run_conditional_create() {",
+        "\npersist_temporary_group_create() {",
+    );
+    const persist_source = try section(
+        script,
+        "persist_temporary_group_create() {",
         "\nvalidate_temporary_group_document() {",
+    );
+    const identity_source = try section(
+        script,
+        "validate_temporary_group_identity() {",
+        "\nvalidate_write_access_identity() {",
+    );
+    const collision_source = try section(
+        script,
+        "resolve_temporary_group_collision() {",
+        "\nconfirm_temporary_group_create() {",
+    );
+    const create_source = try section(
+        script,
+        "create_temporary_group_conditionally() {",
+        "\nvalidate_target_definition_document() {",
     );
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -392,74 +471,413 @@ test "conditional create collisions never claim cleanup ownership" {
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
+    const fixture = try writeCleanupFixture(
+        allocator,
+        root,
+        false,
+        null,
+        null,
+        null,
+        false,
+    );
+    defer allocator.free(fixture.state);
+    defer allocator.free(fixture.log);
     const fixture_source = try std.fmt.allocPrint(
         allocator,
         \\#!/usr/bin/env bash
         \\set -Eeuo pipefail
-        \\MOCK_LOG='{s}/collision.log'
+        \\STATE_FILE='{s}'
+        \\MOCK_LOG='{s}'
+        \\OWNER=ubuntu2404-confidential-capture
+        \\TARGET_OWNER_TAG=durable-owner
+        \\GITHUB_REPOSITORY=cataggar/miz
+        \\GITHUB_RUN_ID=123
+        \\GITHUB_RUN_ATTEMPT=4
+        \\SOURCE_COMMIT=0123456789abcdef0123456789abcdef01234567
+        \\resource_group=miz-u2404-cvm-capture-123-4
+        \\temporary_group_id=/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4
+        \\TARGET_IMAGE_DEFINITION=ubuntu
+        \\target_definition_id=/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/gallery/providers/Microsoft.Compute/galleries/release/images/ubuntu
+        \\temporary_group_json='{s}/collision-group.json'
+        \\target_definition_json='{s}/collision-definition.json'
+        \\temporary_group_request='{s}/group-request.json'
+        \\temporary_group_response='{s}/group-response.json'
+        \\target_definition_request='{s}/definition-request.json'
+        \\target_definition_response='{s}/definition-response.json'
+        \\AZURE_CONFIDENTIAL_VM_ARGS=()
         \\fail() {{ printf '%s\n' "$*" >&2; return 1; }}
-        \\az() {{ printf 'HTTP %s collision\n' "${{!#}}" >>"$MOCK_LOG"; return 42; }}
-        \\{s}
-        \\for kind in "temporary resource group" "target image definition"; do
-        \\  status=409
-        \\  [[ "$kind" == "target image definition" ]] && status=412
-        \\  if (
-        \\    set -Eeuo pipefail
-        \\    owned=false
-        \\    cleanup() {{
-        \\      if [[ "$owned" == true ]]; then
-        \\        printf 'DELETE %s\n' "$kind" >>"$MOCK_LOG"
+        \\azure_confidential_vm_resource_group_conditional_create_args() {{
+        \\  AZURE_CONFIDENTIAL_VM_ARGS=(rest --method put --url "$1")
+        \\}}
+        \\azure_confidential_vm_capture_image_definition_conditional_create_args() {{
+        \\  AZURE_CONFIDENTIAL_VM_ARGS=(rest --method put --url "$1")
+        \\}}
+        \\az() {{
+        \\  printf '%s\n' "$*" >>"$MOCK_LOG"
+        \\  case "$1 $2" in
+        \\    "rest --method")
+        \\      if [[ "${{MOCK_MODE:-collision}}" == ambiguous ]]; then
+        \\        echo 'connection reset' >&2
+        \\        return 10
         \\      fi
-        \\    }}
-        \\    trap cleanup EXIT
-        \\    if run_conditional_create "{s}/response.json" "$kind" rest --method put "$status"; then
-        \\      owned=true
-        \\      printf 'CLAIM %s\n' "$kind" >>"$MOCK_LOG"
-        \\      exit 0
-        \\    fi
-        \\    exit 1
-        \\  ); then
-        \\    exit 91
-        \\  fi
-        \\done
+        \\      echo 'HTTP 412 PreconditionFailed' >&2
+        \\      return 42
+        \\      ;;
+        \\    "group show")
+        \\      printf '{{"id":"%s","name":"%s","type":"Microsoft.Resources/resourceGroups","tags":{{"miz-owner":"foreign"}}}}\n' "$temporary_group_id" "$resource_group"
+        \\      ;;
+        \\    "sig image-definition")
+        \\      printf '{{"id":"%s","name":"ubuntu","type":"Microsoft.Compute/galleries/images","tags":{{"miz-owner":"foreign"}}}}\n' "$target_definition_id"
+        \\      ;;
+        \\    *delete*) printf 'DELETE\n' >>"$MOCK_LOG"; exit 92 ;;
+        \\    *) exit 73 ;;
+        \\  esac
+        \\}}
+        \\{s}
+        \\{s}
+        \\{s}
+        \\{s}
+        \\{s}
+        \\{s}
+        \\{s}
+        \\if create_temporary_group_conditionally; then exit 91; fi
+        \\jq -e '.temporary_group_create == null' "$STATE_FILE" >/dev/null
+        \\if create_target_definition_conditionally; then exit 91; fi
+        \\jq -e '.target.definition_create == null' "$STATE_FILE" >/dev/null
+        \\MOCK_MODE=ambiguous
+        \\persist_temporary_group_create
+        \\azure_confidential_vm_resource_group_conditional_create_args \
+        \\  "$temporary_group_id" "$temporary_group_request"
+        \\if run_conditional_create "$temporary_group_response" \
+        \\    "temporary resource group" "${{AZURE_CONFIDENTIAL_VM_ARGS[@]}}"; then
+        \\  exit 91
+        \\fi
+        \\[[ "$CONDITIONAL_CREATE_COLLISION" == false ]]
+        \\jq -e '.temporary_group_create.status == "pending"' "$STATE_FILE" >/dev/null
         \\
     ,
-        .{ root, conditional_source, root },
+        .{
+            fixture.state,
+            fixture.log,
+            root,
+            root,
+            root,
+            root,
+            root,
+            root,
+            state_replace_source,
+            exact_tags_source,
+            conditional_source,
+            persist_source,
+            identity_source,
+            collision_source,
+            create_source,
+        },
     );
     defer allocator.free(fixture_source);
     const result = try runShellSource(
         allocator,
         root,
-        "conditional-collision-fixture.sh",
+        "foreign-collision-fixture.sh",
         fixture_source,
     );
     defer result.deinit(allocator);
     try std.testing.expect(result.succeeded());
     try expectContains(
         result.stderr,
-        "Conditional temporary resource group create failed",
+        "Conditional temporary resource-group create collided with a pre-existing non-owned resource",
     );
     try expectContains(
         result.stderr,
-        "Conditional target image definition create failed",
+        "Conditional target image-definition create collided with a pre-existing non-owned resource",
     );
-    const log_path = try std.fmt.allocPrint(
-        allocator,
-        "{s}/collision.log",
-        .{root},
-    );
-    defer allocator.free(log_path);
     const log = try Dir.cwd().readFileAlloc(
         std.testing.io,
-        log_path,
+        fixture.log,
         allocator,
         .limited(max_output_bytes),
     );
     defer allocator.free(log);
-    try expectContains(log, "HTTP 409 collision");
-    try expectContains(log, "HTTP 412 collision");
-    try expectAbsent(log, "CLAIM");
+    try expectContains(log, "group show");
+    try expectContains(log, "sig image-definition show");
     try expectAbsent(log, "DELETE");
+}
+
+test "interruption after conditional PUT leaves exact pending create records" {
+    const allocator = std.testing.allocator;
+    const script = try readTracked(allocator, script_path);
+    defer allocator.free(script);
+    const state_replace_source = try section(
+        script,
+        "state_replace() {",
+        "\nstate_file_is_safe() {",
+    );
+    const persist_source = try section(
+        script,
+        "persist_temporary_group_create() {",
+        "\nvalidate_temporary_group_document() {",
+    );
+    const create_source = try section(
+        script,
+        "create_temporary_group_conditionally() {",
+        "\nvalidate_target_definition_document() {",
+    );
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository = try rootAlloc(allocator);
+    defer allocator.free(repository);
+    const root = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}",
+        .{ repository, tmp.sub_path },
+    );
+    defer allocator.free(root);
+    const fixture = try writeCleanupFixture(
+        allocator,
+        root,
+        false,
+        null,
+        null,
+        null,
+        false,
+    );
+    defer allocator.free(fixture.state);
+    defer allocator.free(fixture.log);
+    const fixture_source = try std.fmt.allocPrint(
+        allocator,
+        \\#!/usr/bin/env bash
+        \\set -Eeuo pipefail
+        \\STATE_FILE='{s}'
+        \\MOCK_LOG='{s}'
+        \\OWNER=ubuntu2404-confidential-capture
+        \\TARGET_OWNER_TAG=durable-owner
+        \\GITHUB_REPOSITORY=cataggar/miz
+        \\GITHUB_RUN_ID=123
+        \\GITHUB_RUN_ATTEMPT=4
+        \\SOURCE_COMMIT=0123456789abcdef0123456789abcdef01234567
+        \\resource_group=miz-u2404-cvm-capture-123-4
+        \\temporary_group_id=/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4
+        \\TARGET_IMAGE_DEFINITION=ubuntu
+        \\target_definition_id=/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/gallery/providers/Microsoft.Compute/galleries/release/images/ubuntu
+        \\temporary_group_request='{s}/group-request.json'
+        \\temporary_group_response='{s}/group-response.json'
+        \\target_definition_request='{s}/definition-request.json'
+        \\target_definition_response='{s}/definition-response.json'
+        \\AZURE_CONFIDENTIAL_VM_ARGS=()
+        \\fail() {{ printf '%s\n' "$*" >&2; return 1; }}
+        \\azure_confidential_vm_resource_group_conditional_create_args() {{
+        \\  AZURE_CONFIDENTIAL_VM_ARGS=(rest --method put --url "$1")
+        \\}}
+        \\azure_confidential_vm_capture_image_definition_conditional_create_args() {{
+        \\  AZURE_CONFIDENTIAL_VM_ARGS=(rest --method put --url "$1")
+        \\}}
+        \\run_conditional_create() {{
+        \\  local response=$1 kind=$2
+        \\  if [[ "$kind" == "temporary resource group" ]]; then
+        \\    jq -e '.temporary_group_create.status == "pending"' "$STATE_FILE" >/dev/null
+        \\  else
+        \\    jq -e '.target.definition_create.status == "pending"' "$STATE_FILE" >/dev/null
+        \\  fi
+        \\  printf 'PUT %s\n' "$kind" >>"$MOCK_LOG"
+        \\  printf '{{}}\n' >"$response"
+        \\}}
+        \\{s}
+        \\{s}
+        \\{s}
+        \\confirm_temporary_group_create() {{ return 97; }}
+        \\if create_temporary_group_conditionally; then exit 91; fi
+        \\jq -e '
+        \\  .temporary_group_create.status == "pending" and
+        \\  .temporary_group_create.resource_id == $id and
+        \\  .temporary_group_create.resource_name == "miz-u2404-cvm-capture-123-4"
+        \\' --arg id "$temporary_group_id" "$STATE_FILE" >/dev/null
+        \\state_replace '.temporary_group_create = null'
+        \\confirm_target_definition_create() {{ return 97; }}
+        \\if create_target_definition_conditionally; then exit 91; fi
+        \\jq -e '
+        \\  .target.definition_create.status == "pending" and
+        \\  .target.definition_create.resource_id == $id and
+        \\  .target.definition_create.resource_name == "ubuntu"
+        \\' --arg id "$target_definition_id" "$STATE_FILE" >/dev/null
+        \\
+    ,
+        .{
+            fixture.state,
+            fixture.log,
+            root,
+            root,
+            root,
+            root,
+            state_replace_source,
+            persist_source,
+            create_source,
+        },
+    );
+    defer allocator.free(fixture_source);
+    const result = try runShellSource(
+        allocator,
+        root,
+        "interrupted-create-fixture.sh",
+        fixture_source,
+    );
+    defer result.deinit(allocator);
+    if (!result.succeeded()) {
+        std.debug.print(
+            "interrupted create fixture failed:\n{s}\n{s}\n",
+            .{ result.stdout, result.stderr },
+        );
+        return error.InterruptionFixtureFailed;
+    }
+    const log = try Dir.cwd().readFileAlloc(
+        std.testing.io,
+        fixture.log,
+        allocator,
+        .limited(max_output_bytes),
+    );
+    defer allocator.free(log);
+    try expectContains(log, "PUT temporary resource group");
+    try expectContains(log, "PUT target image definition");
+    try expectAbsent(log, "GET");
+}
+
+test "fresh GET failure after successful PUT retains pending create records" {
+    const allocator = std.testing.allocator;
+    const script = try readTracked(allocator, script_path);
+    defer allocator.free(script);
+    const state_replace_source = try section(
+        script,
+        "state_replace() {",
+        "\nstate_file_is_safe() {",
+    );
+    const exact_tags_source = try section(
+        script,
+        "exact_owned_tags_match() {",
+        "\nvalidate_write_access_identity() {",
+    );
+    const persist_source = try section(
+        script,
+        "persist_temporary_group_create() {",
+        "\nvalidate_temporary_group_document() {",
+    );
+    const identity_source = try section(
+        script,
+        "validate_temporary_group_identity() {",
+        "\nvalidate_write_access_identity() {",
+    );
+    const temporary_validation_source = try section(
+        script,
+        "validate_temporary_group_document() {",
+        "\nvalidate_target_containers() {",
+    );
+    const definition_validation_source = try section(
+        script,
+        "validate_created_target_definition_response() {",
+        "\nresolve_temporary_group_collision() {",
+    );
+    const confirm_source = try section(
+        script,
+        "confirm_temporary_group_create() {",
+        "\ncreate_temporary_group_conditionally() {",
+    );
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository = try rootAlloc(allocator);
+    defer allocator.free(repository);
+    const root = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}",
+        .{ repository, tmp.sub_path },
+    );
+    defer allocator.free(root);
+    const fixture = try writeCleanupFixture(
+        allocator,
+        root,
+        false,
+        null,
+        null,
+        null,
+        false,
+    );
+    defer allocator.free(fixture.state);
+    defer allocator.free(fixture.log);
+    const fixture_source = try std.fmt.allocPrint(
+        allocator,
+        \\#!/usr/bin/env bash
+        \\set -Eeuo pipefail
+        \\STATE_FILE='{s}'
+        \\OWNER=ubuntu2404-confidential-capture
+        \\TARGET_OWNER_TAG=durable-owner
+        \\GITHUB_REPOSITORY=cataggar/miz
+        \\GITHUB_RUN_ID=123
+        \\GITHUB_RUN_ATTEMPT=4
+        \\SOURCE_COMMIT=0123456789abcdef0123456789abcdef01234567
+        \\AZURE_LOCATION=eastus2
+        \\TARGET_LOCATION=eastus2
+        \\resource_group=miz-u2404-cvm-capture-123-4
+        \\temporary_group_id=/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4
+        \\TARGET_IMAGE_DEFINITION=ubuntu
+        \\target_definition_id=/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/gallery/providers/Microsoft.Compute/galleries/release/images/ubuntu
+        \\temporary_group_response='{s}/group-response.json'
+        \\temporary_group_json='{s}/group-fresh.json'
+        \\target_definition_response='{s}/definition-response.json'
+        \\target_definition_json='{s}/definition-fresh.json'
+        \\fail() {{ printf '%s\n' "$*" >&2; return 1; }}
+        \\az() {{ return 52; }}
+        \\{s}
+        \\{s}
+        \\{s}
+        \\{s}
+        \\{s}
+        \\{s}
+        \\{s}
+        \\persist_temporary_group_create
+        \\printf '%s\n' '{{"id":"'"$temporary_group_id"'","name":"'"$resource_group"'","type":"Microsoft.Resources/resourceGroups","location":"eastus2","tags":{{"miz-owner":"ubuntu2404-confidential-capture","miz-repository":"cataggar/miz","miz-run-id":"123","miz-run-attempt":"4","miz-source-commit":"0123456789abcdef0123456789abcdef01234567"}}}}' >"$temporary_group_response"
+        \\if confirm_temporary_group_create; then exit 91; fi
+        \\jq -e '.temporary_group_create.status == "pending"' "$STATE_FILE" >/dev/null
+        \\persist_target_definition_create
+        \\printf '%s\n' '{{"id":"'"$target_definition_id"'","name":"ubuntu","type":"Microsoft.Compute/galleries/images","location":"eastus2","tags":{{"miz-owner":"durable-owner","miz-repository":"cataggar/miz","miz-run-id":"123","miz-run-attempt":"4","miz-source-commit":"0123456789abcdef0123456789abcdef01234567"}},"properties":{{"identifier":{{"publisher":"miz","offer":"ubuntu2404","sku":"confidential-x64"}},"osType":"Linux","osState":"Generalized","hyperVGeneration":"V2","architecture":"x64","features":[{{"name":"SecurityType","value":"ConfidentialVM"}}]}}}}' >"$target_definition_response"
+        \\if confirm_target_definition_create; then exit 91; fi
+        \\jq -e '.target.definition_create.status == "pending"' "$STATE_FILE" >/dev/null
+        \\
+    ,
+        .{
+            fixture.state,
+            root,
+            root,
+            root,
+            root,
+            state_replace_source,
+            exact_tags_source,
+            persist_source,
+            identity_source,
+            temporary_validation_source,
+            definition_validation_source,
+            confirm_source,
+        },
+    );
+    defer allocator.free(fixture_source);
+    const result = try runShellSource(
+        allocator,
+        root,
+        "failed-create-get-fixture.sh",
+        fixture_source,
+    );
+    defer result.deinit(allocator);
+    if (!result.succeeded()) {
+        std.debug.print(
+            "failed GET fixture failed:\n{s}\n{s}\n",
+            .{ result.stdout, result.stderr },
+        );
+        return error.GetFailureFixtureFailed;
+    }
+    try expectContains(
+        result.stderr,
+        "Could not freshly inspect the created temporary resource group",
+    );
+    try expectContains(
+        result.stderr,
+        "Could not freshly inspect the created target image definition",
+    );
 }
 
 test "target resource group and gallery drift block target mutation" {
@@ -865,6 +1283,9 @@ fn writeCleanupFixture(
     root: []const u8,
     succeeded: bool,
     write_access_status: ?[]const u8,
+    group_create_status: ?[]const u8,
+    definition_create_status: ?[]const u8,
+    version_created: bool,
 ) !struct { state: []u8, log: []u8 } {
     const bin = try std.fmt.allocPrint(allocator, "{s}/bin", .{root});
     defer allocator.free(bin);
@@ -879,9 +1300,13 @@ fn writeCleanupFixture(
         \\printf '%s\n' "$*" >>"$MOCK_LOG"
         \\case "$1 $2" in
         \\  "account show") echo 00000000-0000-0000-0000-000000000000 ;;
-        \\  "group exists") echo true ;;
         \\  "group show")
-        \\    printf '{"tags":{"miz-owner":"%s","miz-repository":"cataggar/miz","miz-run-id":"123","miz-run-attempt":"4","miz-source-commit":"0123456789abcdef0123456789abcdef01234567"}}\n' "$MOCK_GROUP_OWNER"
+        \\    if [[ "$MOCK_GROUP_OWNER" == absent ]]; then
+        \\      echo ResourceNotFound >&2
+        \\      exit 3
+        \\    fi
+        \\    if [[ "$MOCK_GROUP_OWNER" == failure ]]; then exit 52; fi
+        \\    printf '{"id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4","name":"miz-u2404-cvm-capture-123-4","type":"Microsoft.Resources/resourceGroups","location":"eastus2","tags":{"miz-owner":"%s","miz-repository":"cataggar/miz","miz-run-id":"123","miz-run-attempt":"4","miz-source-commit":"0123456789abcdef0123456789abcdef01234567"}}\n' "$MOCK_GROUP_OWNER"
         \\    ;;
         \\  "group delete") exit 0 ;;
         \\  "disk show")
@@ -901,7 +1326,12 @@ fn writeCleanupFixture(
         \\  "sig image-definition")
         \\    case "$3" in
         \\      show)
-        \\        printf '{"tags":{"miz-owner":"durable-owner","miz-repository":"cataggar/miz","miz-run-id":"123","miz-run-attempt":"4","miz-source-commit":"0123456789abcdef0123456789abcdef01234567"}}\n'
+        \\        if [[ "$MOCK_DEFINITION_OWNER" == absent ]]; then
+        \\          echo ResourceNotFound >&2
+        \\          exit 3
+        \\        fi
+        \\        if [[ "$MOCK_DEFINITION_OWNER" == failure ]]; then exit 52; fi
+        \\        printf '{"id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/gallery/providers/Microsoft.Compute/galleries/release/images/ubuntu","name":"ubuntu","type":"Microsoft.Compute/galleries/images","location":"eastus2","tags":{"miz-owner":"%s","miz-repository":"cataggar/miz","miz-run-id":"123","miz-run-attempt":"4","miz-source-commit":"0123456789abcdef0123456789abcdef01234567"}}\n' "$MOCK_DEFINITION_OWNER"
         \\        ;;
         \\      delete) exit 0 ;;
         \\      *) exit 72 ;;
@@ -928,23 +1358,55 @@ fn writeCleanupFixture(
     else
         try allocator.dupe(u8, "null");
     defer allocator.free(write_access_json);
+    const group_create_json = if (group_create_status) |status|
+        try std.fmt.allocPrint(
+            allocator,
+            \\{{"status":"{s}",
+            \\"resource_id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4",
+            \\"resource_name":"miz-u2404-cvm-capture-123-4",
+            \\"owner_tag":"ubuntu2404-confidential-capture",
+            \\"repository":"cataggar/miz","run_id":"123","run_attempt":"4",
+            \\"source_commit":"0123456789abcdef0123456789abcdef01234567"}}
+        ,
+            .{status},
+        )
+    else
+        try allocator.dupe(u8, "null");
+    defer allocator.free(group_create_json);
+    const definition_create_json = if (definition_create_status) |status|
+        try std.fmt.allocPrint(
+            allocator,
+            \\{{"status":"{s}",
+            \\"resource_id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/gallery/providers/Microsoft.Compute/galleries/release/images/ubuntu",
+            \\"resource_name":"ubuntu","owner_tag":"durable-owner",
+            \\"repository":"cataggar/miz","run_id":"123","run_attempt":"4",
+            \\"source_commit":"0123456789abcdef0123456789abcdef01234567"}}
+        ,
+            .{status},
+        )
+    else
+        try allocator.dupe(u8, "null");
+    defer allocator.free(definition_create_json);
     const state_json = try std.fmt.allocPrint(
         allocator,
-        \\{{"schema":1,"repository":"cataggar/miz","run_id":"123","run_attempt":"4",
+        \\{{"schema":2,"repository":"cataggar/miz","run_id":"123","run_attempt":"4",
         \\"source_commit":"0123456789abcdef0123456789abcdef01234567",
         \\"subscription_id":"00000000-0000-0000-0000-000000000000",
         \\"temporary_resource_group":"miz-u2404-cvm-capture-123-4",
-        \\"temporary_group_created":true,
+        \\"temporary_group_create":{s},
         \\"run_succeeded":{s},"outstanding_write_access":{s},
         \\"target":{{"owner_tag":"durable-owner",
         \\"resource_group":"gallery","gallery":"release","image_definition":"ubuntu",
         \\"definition_id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/gallery/providers/Microsoft.Compute/galleries/release/images/ubuntu",
         \\"version_id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/gallery/providers/Microsoft.Compute/galleries/release/images/ubuntu/versions/1.2.3",
-        \\"definition_created":true,"version_created":true}}}}
+        \\"definition_create":{s},"version_created":{s}}}}}
     ,
         .{
+            group_create_json,
             if (succeeded) "true" else "false",
             write_access_json,
+            definition_create_json,
+            if (version_created) "true" else "false",
         },
     );
     defer allocator.free(state_json);
@@ -966,6 +1428,7 @@ fn runCleanup(
     log: []const u8,
     version_owner: []const u8,
     group_owner: []const u8,
+    definition_owner: []const u8,
     version_list: []const u8,
     disk_id: []const u8,
     disk_owner: []const u8,
@@ -1004,6 +1467,7 @@ fn runCleanup(
     try environment.put("MOCK_LOG", log);
     try environment.put("MOCK_VERSION_OWNER", version_owner);
     try environment.put("MOCK_GROUP_OWNER", group_owner);
+    try environment.put("MOCK_DEFINITION_OWNER", definition_owner);
     try environment.put("MOCK_VERSION_LIST", version_list);
     try environment.put("MOCK_DISK_ID", disk_id);
     try environment.put("MOCK_DISK_OWNER", disk_owner);
@@ -1063,7 +1527,15 @@ test "interrupted beginGetAccess leaves pending exact disk for cleanup revoke" {
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const fixture = try writeCleanupFixture(allocator, root, true, null);
+    const fixture = try writeCleanupFixture(
+        allocator,
+        root,
+        true,
+        null,
+        "confirmed",
+        "confirmed",
+        true,
+    );
     defer allocator.free(fixture.state);
     defer allocator.free(fixture.log);
     const request_log = try std.fmt.allocPrint(
@@ -1159,6 +1631,7 @@ test "interrupted beginGetAccess leaves pending exact disk for cleanup revoke" {
         fixture.log,
         "different-owner",
         "ubuntu2404-confidential-capture",
+        "durable-owner",
         "[]",
         disk_id,
         "ubuntu2404-confidential-capture",
@@ -1199,7 +1672,15 @@ test "mocked cleanup deletes only exact-owned resources in dependency order" {
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const fixture = try writeCleanupFixture(allocator, root, false, null);
+    const fixture = try writeCleanupFixture(
+        allocator,
+        root,
+        false,
+        null,
+        "confirmed",
+        "confirmed",
+        true,
+    );
     defer allocator.free(fixture.state);
     defer allocator.free(fixture.log);
     const result = try runCleanup(
@@ -1209,6 +1690,7 @@ test "mocked cleanup deletes only exact-owned resources in dependency order" {
         fixture.log,
         "ubuntu2404-confidential-capture",
         "ubuntu2404-confidential-capture",
+        "durable-owner",
         "[]",
         "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4/providers/Microsoft.Compute/disks/miz-u2404-capture-upload-123-4",
         "ubuntu2404-confidential-capture",
@@ -1233,6 +1715,134 @@ test "mocked cleanup deletes only exact-owned resources in dependency order" {
     try std.testing.expect(definition_delete < group_delete);
 }
 
+test "pending cleanup clears conclusively absent group and definition" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository = try rootAlloc(allocator);
+    defer allocator.free(repository);
+    const root = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}",
+        .{ repository, tmp.sub_path },
+    );
+    defer allocator.free(root);
+    const fixture = try writeCleanupFixture(
+        allocator,
+        root,
+        false,
+        null,
+        "pending",
+        "pending",
+        false,
+    );
+    defer allocator.free(fixture.state);
+    defer allocator.free(fixture.log);
+    const result = try runCleanup(
+        allocator,
+        root,
+        fixture.state,
+        fixture.log,
+        "different-owner",
+        "absent",
+        "absent",
+        "[]",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4/providers/Microsoft.Compute/disks/miz-u2404-capture-upload-123-4",
+        "different-owner",
+        "0",
+    );
+    defer result.deinit(allocator);
+    if (!result.succeeded()) {
+        std.debug.print(
+            "absent pending cleanup failed:\n{s}\n{s}\n",
+            .{ result.stdout, result.stderr },
+        );
+        return error.CleanupFailed;
+    }
+    const state = try Dir.cwd().readFileAlloc(
+        std.testing.io,
+        fixture.state,
+        allocator,
+        .limited(max_output_bytes),
+    );
+    defer allocator.free(state);
+    try expectContains(state, "\"temporary_group_create\":null");
+    try expectContains(state, "\"definition_create\":null");
+    const log = try Dir.cwd().readFileAlloc(
+        std.testing.io,
+        fixture.log,
+        allocator,
+        .limited(max_output_bytes),
+    );
+    defer allocator.free(log);
+    try expectContains(log, "sig image-definition show");
+    try expectContains(log, "group show");
+    try expectAbsent(log, "sig image-definition delete");
+    try expectAbsent(log, "group delete");
+}
+
+test "pending cleanup deletes exact-owned empty definition then temporary group" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository = try rootAlloc(allocator);
+    defer allocator.free(repository);
+    const root = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}",
+        .{ repository, tmp.sub_path },
+    );
+    defer allocator.free(root);
+    const fixture = try writeCleanupFixture(
+        allocator,
+        root,
+        false,
+        null,
+        "pending",
+        "pending",
+        false,
+    );
+    defer allocator.free(fixture.state);
+    defer allocator.free(fixture.log);
+    const result = try runCleanup(
+        allocator,
+        root,
+        fixture.state,
+        fixture.log,
+        "different-owner",
+        "ubuntu2404-confidential-capture",
+        "durable-owner",
+        "[]",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4/providers/Microsoft.Compute/disks/miz-u2404-capture-upload-123-4",
+        "different-owner",
+        "0",
+    );
+    defer result.deinit(allocator);
+    if (!result.succeeded()) {
+        std.debug.print(
+            "owned pending cleanup failed:\n{s}\n{s}\n",
+            .{ result.stdout, result.stderr },
+        );
+        return error.CleanupFailed;
+    }
+    const log = try Dir.cwd().readFileAlloc(
+        std.testing.io,
+        fixture.log,
+        allocator,
+        .limited(max_output_bytes),
+    );
+    defer allocator.free(log);
+    const definition_get = try indexOf(log, "sig image-definition show");
+    const definition_list = try indexOf(log, "sig image-version list");
+    const definition_delete = try indexOf(log, "sig image-definition delete");
+    const group_get = try indexOf(log, "group show");
+    const group_delete = try indexOf(log, "group delete");
+    try std.testing.expect(definition_get < definition_list);
+    try std.testing.expect(definition_list < definition_delete);
+    try std.testing.expect(definition_delete < group_get);
+    try std.testing.expect(group_get < group_delete);
+}
+
 test "mocked cleanup refuses mismatched target and group ownership" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1245,7 +1855,15 @@ test "mocked cleanup refuses mismatched target and group ownership" {
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const fixture = try writeCleanupFixture(allocator, root, false, null);
+    const fixture = try writeCleanupFixture(
+        allocator,
+        root,
+        false,
+        null,
+        "confirmed",
+        "confirmed",
+        true,
+    );
     defer allocator.free(fixture.state);
     defer allocator.free(fixture.log);
     const result = try runCleanup(
@@ -1253,6 +1871,7 @@ test "mocked cleanup refuses mismatched target and group ownership" {
         root,
         fixture.state,
         fixture.log,
+        "different-owner",
         "different-owner",
         "different-owner",
         "[{}]",
@@ -1286,7 +1905,15 @@ test "successful-run cleanup retains persistent target and deletes exact temp gr
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const fixture = try writeCleanupFixture(allocator, root, true, null);
+    const fixture = try writeCleanupFixture(
+        allocator,
+        root,
+        true,
+        null,
+        "confirmed",
+        "confirmed",
+        true,
+    );
     defer allocator.free(fixture.state);
     defer allocator.free(fixture.log);
     const result = try runCleanup(
@@ -1296,6 +1923,7 @@ test "successful-run cleanup retains persistent target and deletes exact temp gr
         fixture.log,
         "different-owner",
         "ubuntu2404-confidential-capture",
+        "different-owner",
         "[{}]",
         "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4/providers/Microsoft.Compute/disks/miz-u2404-capture-upload-123-4",
         "ubuntu2404-confidential-capture",
@@ -1327,7 +1955,15 @@ test "interrupted upload cleanup revokes exact disk before resource-group deleti
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const fixture = try writeCleanupFixture(allocator, root, false, "active");
+    const fixture = try writeCleanupFixture(
+        allocator,
+        root,
+        false,
+        "active",
+        "confirmed",
+        "confirmed",
+        true,
+    );
     defer allocator.free(fixture.state);
     defer allocator.free(fixture.log);
     const disk_id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4/providers/Microsoft.Compute/disks/miz-u2404-capture-upload-123-4";
@@ -1338,6 +1974,7 @@ test "interrupted upload cleanup revokes exact disk before resource-group deleti
         fixture.log,
         "ubuntu2404-confidential-capture",
         "ubuntu2404-confidential-capture",
+        "durable-owner",
         "[]",
         disk_id,
         "ubuntu2404-confidential-capture",
@@ -1380,7 +2017,15 @@ test "failed normal revoke remains active and surfaces cleanup failure" {
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const fixture = try writeCleanupFixture(allocator, root, true, "active");
+    const fixture = try writeCleanupFixture(
+        allocator,
+        root,
+        true,
+        "active",
+        "confirmed",
+        "confirmed",
+        true,
+    );
     defer allocator.free(fixture.state);
     defer allocator.free(fixture.log);
     const disk_id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4/providers/Microsoft.Compute/disks/miz-u2404-capture-upload-123-4";
@@ -1391,6 +2036,7 @@ test "failed normal revoke remains active and surfaces cleanup failure" {
         fixture.log,
         "ubuntu2404-confidential-capture",
         "ubuntu2404-confidential-capture",
+        "durable-owner",
         "[]",
         disk_id,
         "ubuntu2404-confidential-capture",
@@ -1431,7 +2077,15 @@ test "cleanup never revokes an unrelated disk from active state" {
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const fixture = try writeCleanupFixture(allocator, root, true, "active");
+    const fixture = try writeCleanupFixture(
+        allocator,
+        root,
+        true,
+        "active",
+        "confirmed",
+        "confirmed",
+        true,
+    );
     defer allocator.free(fixture.state);
     defer allocator.free(fixture.log);
     const unrelated_id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/other/providers/Microsoft.Compute/disks/unrelated";
@@ -1442,6 +2096,7 @@ test "cleanup never revokes an unrelated disk from active state" {
         fixture.log,
         "ubuntu2404-confidential-capture",
         "ubuntu2404-confidential-capture",
+        "durable-owner",
         "[]",
         unrelated_id,
         "different-owner",

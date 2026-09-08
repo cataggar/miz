@@ -71,12 +71,13 @@ state_matches_identity() {
     --arg run_id "$GITHUB_RUN_ID" \
     --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
     --arg source_commit "$SOURCE_COMMIT" \
-    'keys == [
+    '. as $state |
+     keys == [
        "outstanding_write_access", "repository", "run_attempt", "run_id",
        "run_succeeded", "schema", "source_commit", "subscription_id", "target",
-       "temporary_group_created", "temporary_resource_group"
+       "temporary_group_create", "temporary_resource_group"
      ] and
-     .schema == 1 and
+     .schema == 2 and
      .repository == $repository and
      .run_id == $run_id and
      .run_attempt == $run_attempt and
@@ -85,13 +86,75 @@ state_matches_identity() {
      (.subscription_id | test("^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")) and
      (.temporary_resource_group | type == "string") and
      (.temporary_resource_group | test("^miz-u2404-cvm-capture-[1-9][0-9]{0,19}-[1-9][0-9]{0,9}$")) and
-     (.temporary_group_created | type == "boolean") and
+     (
+       .temporary_group_create == null or
+       (
+         (.temporary_group_create | type == "object") and
+         (.temporary_group_create | keys == [
+           "owner_tag", "repository", "resource_id", "resource_name",
+           "run_attempt", "run_id", "source_commit", "status"
+         ]) and
+         (.temporary_group_create.status == "pending" or
+          .temporary_group_create.status == "confirmed") and
+         (.temporary_group_create.resource_id | ascii_downcase) ==
+           ("/subscriptions/" + $state.subscription_id + "/resourceGroups/" +
+            $state.temporary_resource_group | ascii_downcase) and
+         .temporary_group_create.resource_name ==
+           $state.temporary_resource_group and
+         .temporary_group_create.owner_tag ==
+           "ubuntu2404-confidential-capture" and
+         .temporary_group_create.repository == $repository and
+         .temporary_group_create.run_id == $run_id and
+         .temporary_group_create.run_attempt == $run_attempt and
+         .temporary_group_create.source_commit == $source_commit
+       )
+     ) and
      (.run_succeeded | type == "boolean") and
      (.target | type == "object") and
      (.target | keys == [
-       "definition_created", "definition_id", "gallery", "image_definition",
+       "definition_create", "definition_id", "gallery", "image_definition",
        "owner_tag", "resource_group", "version_created", "version_id"
      ]) and
+     (.target.owner_tag | type == "string") and
+     (.target.owner_tag | test("^[A-Za-z0-9._:/-]{1,128}$")) and
+     (.target.resource_group | type == "string") and
+     (.target.resource_group | test("^[A-Za-z0-9._()-]{1,90}$")) and
+     (.target.gallery | type == "string") and
+     (.target.gallery | test("^[A-Za-z0-9_]{1,80}$")) and
+     (.target.image_definition | type == "string") and
+     (.target.image_definition | test("^[A-Za-z0-9._()-]{1,80}$")) and
+     (.target.definition_id | ascii_downcase) ==
+       ("/subscriptions/" + $state.subscription_id + "/resourceGroups/" +
+        $state.target.resource_group +
+        "/providers/Microsoft.Compute/galleries/" + $state.target.gallery +
+        "/images/" + $state.target.image_definition | ascii_downcase) and
+     (.target.version_id | ascii_downcase | startswith(
+       ($state.target.definition_id + "/versions/" | ascii_downcase)
+     )) and
+     (.target.version_id | split("/") | last |
+       test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
+     (.target.version_created | type == "boolean") and
+     (
+       .target.definition_create == null or
+       (
+         (.target.definition_create | type == "object") and
+         (.target.definition_create | keys == [
+           "owner_tag", "repository", "resource_id", "resource_name",
+           "run_attempt", "run_id", "source_commit", "status"
+         ]) and
+         (.target.definition_create.status == "pending" or
+          .target.definition_create.status == "confirmed") and
+         (.target.definition_create.resource_id | ascii_downcase) ==
+           ($state.target.definition_id | ascii_downcase) and
+         .target.definition_create.resource_name ==
+           $state.target.image_definition and
+         .target.definition_create.owner_tag == $state.target.owner_tag and
+         .target.definition_create.repository == $repository and
+         .target.definition_create.run_id == $run_id and
+         .target.definition_create.run_attempt == $run_attempt and
+         .target.definition_create.source_commit == $source_commit
+       )
+     ) and
      (
        .outstanding_write_access == null or
        (
@@ -140,6 +203,36 @@ exact_owned_tags_match() {
       "miz-run-attempt": $run_attempt,
       "miz-source-commit": $source_commit
     }' \
+    "$metadata" >/dev/null
+}
+
+validate_temporary_group_identity() {
+  local metadata=$1 expected_id=$2 expected_name=$3
+  jq -e \
+    --arg expected_id "$expected_id" \
+    --arg name "$expected_name" \
+    '(.id | ascii_downcase) == ($expected_id | ascii_downcase) and
+     (.name | ascii_downcase) == ($name | ascii_downcase) and
+     (.type | ascii_downcase) == "microsoft.resources/resourcegroups"' \
+    "$metadata" >/dev/null
+}
+
+validate_target_definition_identity() {
+  local metadata=$1 expected_id=${2:-} expected_name=${3:-}
+  if [[ -z "$expected_id" ]]; then
+    expected_id=$(jq -er '.target.definition_create.resource_id' "$STATE_FILE") ||
+      return
+  fi
+  if [[ -z "$expected_name" ]]; then
+    expected_name=$(jq -er '.target.definition_create.resource_name' "$STATE_FILE") ||
+      return
+  fi
+  jq -e \
+    --arg expected_id "$expected_id" \
+    --arg name "$expected_name" \
+    '(.id | ascii_downcase) == ($expected_id | ascii_downcase) and
+     .name == $name and
+     (.type | ascii_downcase) == "microsoft.compute/galleries/images"' \
     "$metadata" >/dev/null
 }
 
@@ -245,13 +338,19 @@ delete_created_version() {
 }
 
 delete_created_definition() {
-  local created definition_id image_name gallery_name metadata owner_tag resource_group versions
-  created=$(jq -r '.target.definition_created' "$STATE_FILE")
-  [[ "$created" == true ]] || return 0
-  definition_id=$(jq -r '.target.definition_id' "$STATE_FILE")
+  local status definition_id image_name gallery_name metadata owner_tag resource_group versions
+  status=$(jq -r '.target.definition_create.status // "none"' "$STATE_FILE")
+  case "$status" in
+    none) return 0 ;;
+    pending|confirmed) ;;
+    *) fail "Capture cleanup state has an invalid target definition create"; return ;;
+  esac
+  definition_id=$(jq -er '.target.definition_create.resource_id' "$STATE_FILE") ||
+    return
   resource_group=$(jq -r '.target.resource_group' "$STATE_FILE")
   gallery_name=$(jq -r '.target.gallery' "$STATE_FILE")
-  image_name=$(jq -r '.target.image_definition' "$STATE_FILE")
+  image_name=$(jq -er '.target.definition_create.resource_name' "$STATE_FILE") ||
+    return
   [[ "$definition_id" == /subscriptions/*/resourceGroups/*/providers/Microsoft.Compute/galleries/*/images/* ]] ||
     return 1
   [[ "$resource_group" =~ ^[A-Za-z0-9._()-]{1,90}$ &&
@@ -262,14 +361,20 @@ delete_created_definition() {
   if ! az sig image-definition show --ids "$definition_id" --output json >"$metadata" 2>"${metadata}.stderr"; then
     if grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' "${metadata}.stderr"; then
       rm -f -- "$metadata" "${metadata}.stderr"
+      state_replace '.target.definition_create = null'
       return 0
     fi
     fail "Could not inspect the target image definition during cleanup"
     return
   fi
   rm -f -- "${metadata}.stderr"
+  validate_target_definition_identity "$metadata" ||
+    {
+      fail "Refusing to delete target definition without exact resource identity"
+      return
+    }
   owner_tag=$(jq -r '.target.owner_tag' "$STATE_FILE")
-  if ! owned_tags_match "$metadata" "$owner_tag" "$GITHUB_REPOSITORY" \
+  if ! exact_owned_tags_match "$metadata" "$owner_tag" "$GITHUB_REPOSITORY" \
       "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"; then
     fail "Refusing to delete target definition without exact run ownership tags"
     return
@@ -290,37 +395,53 @@ delete_created_definition() {
       return
     }
   az sig image-definition delete --ids "$definition_id" ||
-    fail "Failed to delete exact-owned empty target image definition"
+    {
+      fail "Failed to delete exact-owned empty target image definition"
+      return
+    }
+  state_replace '.target.definition_create = null'
 }
 
 delete_temporary_group() {
-  local created group exists metadata
-  created=$(jq -r '.temporary_group_created' "$STATE_FILE")
-  [[ "$created" == true ]] || return 0
-  group=$(jq -r '.temporary_resource_group' "$STATE_FILE")
-  exists=$(az group exists --name "$group" --output tsv) ||
-    {
-      fail "Could not determine whether the temporary resource group exists"
-      return
-    }
-  case "$exists" in
-    false) return 0 ;;
-    true) ;;
-    *) fail "Azure returned an invalid resource-group existence result"; return ;;
+  local status group resource_id metadata stderr_file
+  status=$(jq -r '.temporary_group_create.status // "none"' "$STATE_FILE")
+  case "$status" in
+    none) return 0 ;;
+    pending|confirmed) ;;
+    *) fail "Capture cleanup state has an invalid temporary group create"; return ;;
   esac
+  group=$(jq -er '.temporary_group_create.resource_name' "$STATE_FILE") || return
+  resource_id=$(jq -er '.temporary_group_create.resource_id' "$STATE_FILE") ||
+    return
   metadata="${STATE_FILE}.group.json"
-  az group show --name "$group" --output json >"$metadata" ||
+  stderr_file="${metadata}.stderr"
+  if ! az group show --name "$group" --output json >"$metadata" 2>"$stderr_file"; then
+    if grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' \
+        "$stderr_file"; then
+      rm -f -- "$metadata" "$stderr_file"
+      state_replace '.temporary_group_create = null'
+      return
+    fi
+    fail "Could not inspect temporary resource-group ownership"
+    return
+  fi
+  rm -f -- "$stderr_file"
+  validate_temporary_group_identity "$metadata" "$resource_id" "$group" ||
     {
-      fail "Could not inspect temporary resource-group ownership"
+      fail "Refusing to delete temporary resource group without exact resource identity"
       return
     }
-  if ! owned_tags_match "$metadata" "$OWNER" "$GITHUB_REPOSITORY" \
+  if ! exact_owned_tags_match "$metadata" "$OWNER" "$GITHUB_REPOSITORY" \
       "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"; then
     fail "Refusing to delete temporary resource group without exact ownership tags"
     return
   fi
   az group delete --name "$group" --yes ||
-    fail "Failed to delete exact-owned temporary resource group"
+    {
+      fail "Failed to delete exact-owned temporary resource group"
+      return
+    }
+  state_replace '.temporary_group_create = null'
 }
 
 cleanup_resources() {
@@ -489,14 +610,14 @@ jq -n \
   --arg definition_id "$target_definition_id" \
   --arg version_id "$target_version_id" \
   -c '{
-    schema: 1,
+    schema: 2,
     repository: $repository,
     run_id: $run_id,
     run_attempt: $run_attempt,
     source_commit: $source_commit,
     subscription_id: $subscription_id,
     temporary_resource_group: $temporary_resource_group,
-    temporary_group_created: false,
+    temporary_group_create: null,
     run_succeeded: false,
     outstanding_write_access: null,
     target: {
@@ -506,7 +627,7 @@ jq -n \
       image_definition: $target_image_definition,
       definition_id: $definition_id,
       version_id: $version_id,
-      definition_created: false,
+      definition_create: null,
       version_created: false
     }
   }' >"$STATE_FILE"
@@ -686,26 +807,80 @@ resource_absent() {
 }
 
 run_conditional_create() {
-  local response=$1 resource_kind=$2
+  local response=$1 resource_kind=$2 stderr_file status
   shift 2
+  CONDITIONAL_CREATE_COLLISION=false
+  stderr_file="${response}.stderr"
   rm -f -- "$response"
-  if ! az "$@" >"$response"; then
-    rm -f -- "$response"
-    fail "Conditional $resource_kind create failed; refusing update or ownership claim"
-    return
+  rm -f -- "$stderr_file"
+  if az "$@" >"$response" 2>"$stderr_file"; then
+    rm -f -- "$stderr_file"
+    return 0
+  else
+    status=$?
   fi
+  rm -f -- "$response"
+  if grep -Eqi \
+      '(^|[^0-9])(409|412)([^0-9]|$)|Conflict|PreconditionFailed|ResourceAlreadyExists' \
+      "$stderr_file"; then
+    rm -f -- "$stderr_file"
+    CONDITIONAL_CREATE_COLLISION=true
+    return 1
+  fi
+  rm -f -- "$stderr_file"
+  fail "Conditional $resource_kind create failed ambiguously; retaining pending cleanup state"
+  return "$status"
+}
+
+persist_temporary_group_create() {
+  state_replace \
+    '.temporary_group_create = {
+      status: "pending",
+      resource_id: $resource_id,
+      resource_name: $resource_name,
+      owner_tag: $owner_tag,
+      repository: $repository,
+      run_id: $run_id,
+      run_attempt: $run_attempt,
+      source_commit: $source_commit
+    }' \
+    --arg resource_id "$temporary_group_id" \
+    --arg resource_name "$resource_group" \
+    --arg owner_tag "$OWNER" \
+    --arg repository "$GITHUB_REPOSITORY" \
+    --arg run_id "$GITHUB_RUN_ID" \
+    --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+    --arg source_commit "$SOURCE_COMMIT"
+}
+
+persist_target_definition_create() {
+  state_replace \
+    '.target.definition_create = {
+      status: "pending",
+      resource_id: $resource_id,
+      resource_name: $resource_name,
+      owner_tag: $owner_tag,
+      repository: $repository,
+      run_id: $run_id,
+      run_attempt: $run_attempt,
+      source_commit: $source_commit
+    }' \
+    --arg resource_id "$target_definition_id" \
+    --arg resource_name "$TARGET_IMAGE_DEFINITION" \
+    --arg owner_tag "$TARGET_OWNER_TAG" \
+    --arg repository "$GITHUB_REPOSITORY" \
+    --arg run_id "$GITHUB_RUN_ID" \
+    --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
+    --arg source_commit "$SOURCE_COMMIT"
 }
 
 validate_temporary_group_document() {
   local metadata=$1
-  jq -e \
-    --arg expected_id "$temporary_group_id" \
-    --arg name "$resource_group" \
+  validate_temporary_group_identity \
+    "$metadata" "$temporary_group_id" "$resource_group" &&
+    jq -e \
     --arg location "$AZURE_LOCATION" \
-    '(.id | ascii_downcase) == ($expected_id | ascii_downcase) and
-     (.name | ascii_downcase) == ($name | ascii_downcase) and
-     (.type | ascii_downcase) == "microsoft.resources/resourcegroups" and
-     (.location | ascii_downcase) == ($location | ascii_downcase)' \
+    '(.location | ascii_downcase) == ($location | ascii_downcase)' \
     "$metadata" >/dev/null &&
     exact_owned_tags_match "$metadata" "$OWNER" "$GITHUB_REPOSITORY" \
       "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"
@@ -756,17 +931,16 @@ validate_target_containers() {
 
 validate_created_target_definition_response() {
   local metadata=$1
-  jq -e \
-    --arg expected_id "$target_definition_id" \
+  validate_target_definition_identity \
+    "$metadata" "$target_definition_id" "$TARGET_IMAGE_DEFINITION" &&
+    jq -e \
     --arg location "$TARGET_LOCATION" \
     --arg owner "$TARGET_OWNER_TAG" \
     --arg repository "$GITHUB_REPOSITORY" \
     --arg run_id "$GITHUB_RUN_ID" \
     --arg run_attempt "$GITHUB_RUN_ATTEMPT" \
     --arg source_commit "$SOURCE_COMMIT" \
-    '(.id | ascii_downcase) == ($expected_id | ascii_downcase) and
-     (.type | ascii_downcase) == "microsoft.compute/galleries/images" and
-     (.location | ascii_downcase) == ($location | ascii_downcase) and
+    '(.location | ascii_downcase) == ($location | ascii_downcase) and
      .tags == {
        "miz-owner": $owner,
        "miz-repository": $repository,
@@ -787,6 +961,152 @@ validate_created_target_definition_response() {
        name: "SecurityType", value: "ConfidentialVM"
      }])' \
     "$metadata" >/dev/null
+}
+
+resolve_temporary_group_collision() {
+  local metadata=$temporary_group_json stderr_file="${temporary_group_json}.stderr"
+  if ! az group show --name "$resource_group" --output json \
+      >"$metadata" 2>"$stderr_file"; then
+    rm -f -- "$metadata" "$stderr_file"
+    fail "Could not prove the conditional temporary resource-group collision was pre-existing"
+    return
+  fi
+  rm -f -- "$stderr_file"
+  validate_temporary_group_identity \
+    "$metadata" "$temporary_group_id" "$resource_group" ||
+    {
+      fail "Conditional temporary resource-group collision has mismatched identity"
+      return
+    }
+  if exact_owned_tags_match "$metadata" "$OWNER" "$GITHUB_REPOSITORY" \
+      "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$SOURCE_COMMIT"; then
+    fail "Conditional temporary resource-group collision is run-owned; retaining pending cleanup state"
+    return
+  fi
+  state_replace '.temporary_group_create = null' ||
+    {
+      fail "Could not clear the proven non-owned temporary resource-group collision"
+      return
+    }
+  fail "Conditional temporary resource-group create collided with a pre-existing non-owned resource"
+}
+
+resolve_target_definition_collision() {
+  local metadata=$target_definition_json stderr_file="${target_definition_json}.stderr"
+  if ! az sig image-definition show --ids "$target_definition_id" --output json \
+      >"$metadata" 2>"$stderr_file"; then
+    rm -f -- "$metadata" "$stderr_file"
+    fail "Could not prove the conditional target image-definition collision was pre-existing"
+    return
+  fi
+  rm -f -- "$stderr_file"
+  validate_target_definition_identity \
+    "$metadata" "$target_definition_id" "$TARGET_IMAGE_DEFINITION" ||
+    {
+      fail "Conditional target image-definition collision has mismatched identity"
+      return
+    }
+  if exact_owned_tags_match "$metadata" "$TARGET_OWNER_TAG" \
+      "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" \
+      "$SOURCE_COMMIT"; then
+    fail "Conditional target image-definition collision is run-owned; retaining pending cleanup state"
+    return
+  fi
+  state_replace '.target.definition_create = null' ||
+    {
+      fail "Could not clear the proven non-owned target image-definition collision"
+      return
+    }
+  fail "Conditional target image-definition create collided with a pre-existing non-owned resource"
+}
+
+confirm_temporary_group_create() {
+  validate_temporary_group_document "$temporary_group_response" ||
+    {
+      fail "Conditional temporary resource-group response is invalid"
+      return
+    }
+  az group show --name "$resource_group" --output json >"$temporary_group_json" ||
+    {
+      fail "Could not freshly inspect the created temporary resource group"
+      return
+    }
+  validate_temporary_group_document "$temporary_group_json" ||
+    {
+      fail "Created temporary resource group failed fresh ownership validation"
+      return
+    }
+  state_replace '.temporary_group_create.status = "confirmed"' ||
+    fail "Could not confirm temporary resource-group cleanup ownership"
+}
+
+confirm_target_definition_create() {
+  validate_created_target_definition_response "$target_definition_response" ||
+    {
+      fail "Conditional target image-definition response is invalid"
+      return
+    }
+  az sig image-definition show --ids "$target_definition_id" --output json \
+    >"$target_definition_json" ||
+    {
+      fail "Could not freshly inspect the created target image definition"
+      return
+    }
+  validate_target_definition_document "$target_definition_json" exact ||
+    {
+      fail "Created target image definition failed fresh security validation"
+      return
+    }
+  state_replace '.target.definition_create.status = "confirmed"' ||
+    fail "Could not confirm target image-definition cleanup ownership"
+}
+
+create_temporary_group_conditionally() {
+  local create_status
+  persist_temporary_group_create ||
+    {
+      fail "Could not persist pending temporary resource-group creation"
+      return
+    }
+  azure_confidential_vm_resource_group_conditional_create_args \
+    "$temporary_group_id" "$temporary_group_request"
+  if run_conditional_create \
+      "$temporary_group_response" "temporary resource group" \
+      "${AZURE_CONFIDENTIAL_VM_ARGS[@]}"; then
+    confirm_temporary_group_create
+    return
+  else
+    create_status=$?
+  fi
+  if [[ "$CONDITIONAL_CREATE_COLLISION" == true ]]; then
+    resolve_temporary_group_collision
+    return
+  fi
+  return "$create_status"
+}
+
+create_target_definition_conditionally() {
+  local create_status
+  persist_target_definition_create ||
+    {
+      fail "Could not persist pending target image-definition creation"
+      return
+    }
+  azure_confidential_vm_capture_image_definition_conditional_create_args \
+    "$target_definition_id" "$target_definition_request"
+  if run_conditional_create \
+      "$target_definition_response" "target image definition" \
+      "${AZURE_CONFIDENTIAL_VM_ARGS[@]}"; then
+    confirm_target_definition_create
+    return
+  else
+    create_status=$?
+  fi
+  if [[ "$CONDITIONAL_CREATE_COLLISION" == true ]]; then
+    resolve_target_definition_collision
+    return
+  fi
+  return "$create_status"
 }
 
 validate_target_definition_document() {
@@ -986,17 +1306,7 @@ jq -n \
       "miz-source-commit": $source_commit
     }
   }' >"$temporary_group_request"
-azure_confidential_vm_resource_group_conditional_create_args \
-  "$temporary_group_id" "$temporary_group_request"
-run_conditional_create \
-  "$temporary_group_response" "temporary resource group" \
-  "${AZURE_CONFIDENTIAL_VM_ARGS[@]}"
-validate_temporary_group_document "$temporary_group_response" ||
-  fail "Conditional temporary resource-group response is invalid"
-az group show --name "$resource_group" --output json >"$temporary_group_json"
-validate_temporary_group_document "$temporary_group_json" ||
-  fail "Created temporary resource group failed fresh ownership validation"
-state_replace '.temporary_group_created = true'
+create_temporary_group_conditionally
 
 jq -n \
   --arg location "$TARGET_LOCATION" \
@@ -1380,17 +1690,7 @@ owned_tags_match "$snapshot_json" "$OWNER" "$GITHUB_REPOSITORY" \
 definition_was_created=false
 if [[ "$definition_existed_initially" == false ]]; then
   validate_target_containers
-  azure_confidential_vm_capture_image_definition_conditional_create_args \
-    "$target_definition_id" "$target_definition_request"
-  run_conditional_create \
-    "$target_definition_response" "target image definition" \
-    "${AZURE_CONFIDENTIAL_VM_ARGS[@]}"
-  validate_created_target_definition_response "$target_definition_response" ||
-    fail "Conditional target image-definition response is invalid"
-  az sig image-definition show --ids "$target_definition_id" --output json \
-    >"$target_definition_json"
-  validate_target_definition_document "$target_definition_json" exact
-  state_replace '.target.definition_created = true'
+  create_target_definition_conditionally
   definition_was_created=true
 else
   validate_target_containers
