@@ -207,6 +207,151 @@ and the enforced SEV-SNP, Secure Boot, vTPM, compliance, and non-debug state.
 The temporary Azure resources are deleted; the result is the durable evidence
 that those exact candidate bytes passed the protected deployment.
 
+## Protected ConfidentialVM capture workflow
+
+`.github/workflows/ubuntu2404-confidential-capture.yml` promotes one already
+accepted three-asset source release into a full ConfidentialVM gallery image.
+It is manual-dispatch only, accepts only `cataggar/miz` `main`, and serializes
+every target version through the stable, non-canceling concurrency group
+`ubuntu2404-confidential-cvm-target-version`. Before dispatch, an operator must
+create the deterministically derived provenance tag
+`Ubuntu-24.04-confidential-cvm-MAJOR.MINOR.PATCH` at the exact current `main`
+tool commit. A release must not already exist for that tag.
+
+Create the GitHub environment `ubuntu2404-confidential-capture`, restrict it to
+the `main` branch, require at least one designated release reviewer, and
+disable self-review so the dispatcher cannot approve the deployment.
+Configure:
+
+| Kind | Name | Meaning |
+|---|---|---|
+| Secret | `AZURE_CAPTURE_CLIENT_ID` | narrow scratch/capture Entra application |
+| Secret | `AZURE_PUBLICATION_CLIENT_ID` | distinct exclusive version publisher |
+| Secret | `AZURE_TENANT_ID` | common Entra tenant |
+| Secret | `AZURE_SUBSCRIPTION_ID` | common capture/target subscription |
+| Variable | `AZURE_LOCATION` | previously live-qualified region |
+| Variable | `AZURE_VM_SIZE` | previously live-qualified AMD SEV-SNP SKU |
+| Variable | `TARGET_RESOURCE_GROUP` | pre-provisioned durable resource group |
+| Variable | `TARGET_GALLERY` | pre-provisioned private gallery |
+| Variable | `TARGET_IMAGE_DEFINITION` | pre-provisioned full ConfidentialVM definition |
+| Variable | `TARGET_OWNER_TAG` | durable `miz-owner` tag on every target parent |
+
+Both applications need a federated credential with subject
+`repo:cataggar/miz:environment:ubuntu2404-confidential-capture`. They must not
+share a client ID. The workflow logs them into separate owner-only absolute
+Azure CLI configuration directories, verifies tenant, subscription, principal
+type, and signed-in client ID, and obtains the publisher token only after the
+capture state is exactly prepared. It refreshes the capture token immediately
+before publication validation and again on the unconditional cleanup path.
+No access token, OIDC request token, JWT, SAS, SSH key, Azure CLI configuration,
+or raw attestation bundle is serialized into recovery state or uploaded.
+
+Use custom roles with no wildcard control-plane permissions. The capture
+principal needs these actions only:
+
+- at subscription scope, limited operationally to the randomized tagged
+  scratch group prefix:
+  `Microsoft.Resources/subscriptions/resourceGroups/read`,
+  `Microsoft.Resources/subscriptions/resourceGroups/write`, and
+`Microsoft.Resources/subscriptions/resourceGroups/delete`, plus
+`Microsoft.Compute/skus/read` for the configured region/SKU check;
+- in its one randomized scratch resource group:
+  `Microsoft.Resources/subscriptions/resourceGroups/resources/read`,
+  `Microsoft.Resources/tags/write`,
+  `Microsoft.Compute/disks/read`,
+  `Microsoft.Compute/disks/write`,
+  `Microsoft.Compute/disks/beginGetAccess/action`,
+  `Microsoft.Compute/disks/endGetAccess/action`,
+  `Microsoft.Compute/images/read`,
+  `Microsoft.Compute/images/write`,
+  `Microsoft.Compute/snapshots/read`,
+  `Microsoft.Compute/snapshots/write`,
+  `Microsoft.Compute/virtualMachines/read`,
+  `Microsoft.Compute/virtualMachines/write`,
+  `Microsoft.Compute/virtualMachines/start/action`,
+  `Microsoft.Compute/virtualMachines/deallocate/action`,
+  `Microsoft.Compute/virtualMachines/generalize/action`,
+  `Microsoft.Compute/virtualMachines/instanceView/read`,
+  `Microsoft.Compute/galleries/read`,
+  `Microsoft.Compute/galleries/write`,
+  `Microsoft.Compute/galleries/images/read`,
+  `Microsoft.Compute/galleries/images/write`,
+  `Microsoft.Compute/galleries/images/versions/read`,
+  `Microsoft.Compute/galleries/images/versions/write`,
+  `Microsoft.Network/virtualNetworks/read`,
+  `Microsoft.Network/virtualNetworks/write`,
+  `Microsoft.Network/virtualNetworks/subnets/read`,
+  `Microsoft.Network/virtualNetworks/subnets/write`,
+  `Microsoft.Network/virtualNetworks/subnets/join/action`,
+  `Microsoft.Network/networkSecurityGroups/read`,
+  `Microsoft.Network/networkSecurityGroups/write`,
+  `Microsoft.Network/networkSecurityGroups/join/action`,
+  `Microsoft.Network/networkSecurityGroups/securityRules/read`,
+  `Microsoft.Network/networkSecurityGroups/securityRules/write`,
+  `Microsoft.Network/publicIPAddresses/read`,
+  `Microsoft.Network/publicIPAddresses/write`,
+  `Microsoft.Network/publicIPAddresses/join/action`,
+  `Microsoft.Network/networkInterfaces/read`,
+  `Microsoft.Network/networkInterfaces/write`,
+  `Microsoft.Network/networkInterfaces/join/action`; and
+- on the exact durable target version resource ID,
+  `Microsoft.Compute/galleries/images/versions/read` only.
+
+The publisher principal needs only
+`Microsoft.Resources/subscriptions/resourceGroups/read` on the exact target
+resource group, `Microsoft.Compute/galleries/read` on the exact gallery,
+`Microsoft.Compute/galleries/images/read` on the exact definition, and
+`Microsoft.Compute/galleries/images/versions/read` plus
+`Microsoft.Compute/galleries/images/versions/write` on the exact new version
+resource ID. It must have no version delete permission and no target
+resource-group, gallery, or definition write/delete permission. The version
+scope and role assignments are pre-provisioned as part of the operator change
+for that target version; the workflow never grants RBAC. Azure RBAC and a
+malicious subscription Owner are outside what the workflow or harness can
+prove, so operators must independently review effective assignments before
+dispatch.
+
+The durable target resource group, private gallery, and image definition must
+already exist in the same subscription and region as the accepted source. They
+carry exact `miz-owner` and `miz-repository=cataggar/miz` tags. The definition
+is Ubuntu 24.04 x64 AMD SEV-SNP, generalized Gen2, with
+`SecurityType=ConfidentialVM`; it is never created, updated, or deleted by the
+workflow. Azure creates the captured VM Guest State. The resulting full image
+creates Confidential VMs only: deployed VMs use `VMGuestStateOnly`, while the
+gallery version records `EncryptedVMGuestStateOnlyWithPmk`. Replication is
+`Full`, and source recreation, capture, snapshot, target, and final acceptance
+remain in the same region and subscription.
+
+The source release must be published, non-draft, non-prerelease, and contain
+exactly the QCOW2, build provenance JSON, and Azure acceptance JSON documented
+above. The workflow downloads those three assets by exact asset ID, validates
+their hashes and shape with the accepted-source tooling, and derives the
+source commit, source run/attempt, location, and VM size from the validated
+release evidence. It never adds an asset to that source release.
+
+The capture harness has explicit same-job `prepare`, `publish`, and `cleanup`
+stages. Recovery state and prepared evidence are owner-only, schema-validated,
+identity-bound, and hash-checked. `publish` revalidates the prepared snapshot,
+all target parents, and target-version absence before its sole non-retried PUT.
+Any ambiguous publication is quarantined: the target is never deleted, the
+scratch group is retained, and an operator must compare Azure activity logs,
+the exact version ID, tags, and state before break-glass cleanup. Do not rerun
+or retarget the provenance tag to bypass quarantine.
+
+Only the sanitized `capture-result.json` crosses jobs. The publication job
+re-hashes it, validates protected source/tool/run/target identities with
+`verify-capture-publication`, uploads one deterministically named provenance
+JSON to a new draft GitHub release, downloads and revalidates that exact asset,
+then publishes the release. Full raw Azure and MAA verification has already
+succeeded inside the protected Azure job; the durable verifier does not claim
+to reauthenticate discarded transport evidence.
+
+This workflow is not a substitute for qualification. A new region, SKU,
+definition contract, Azure API behavior, role design, or harness change
+requires a supervised live Azure qualification run before production use.
+Repository CI and this implementation intentionally perform no live Azure
+execution.
+
 ## Attestation and operational limitations
 
 The guest attestation client and `azguestattestation1` package are pinned by
