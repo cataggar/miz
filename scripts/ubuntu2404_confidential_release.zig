@@ -1864,14 +1864,22 @@ fn runCheckCaptureSnapshot(context: Context, argv: []const []const u8) !void {
 
 fn captureGalleryContract(
     options: *const Options,
+    diagnostic: *Diagnostic,
 ) !release.azure_confidential_vm.CaptureGalleryContract {
-    return .{
+    const contract: release.azure_confidential_vm.CaptureGalleryContract = .{
         .subscription_id = try options.require("subscription-id"),
         .location = try options.require("location"),
         .source_id = try options.require("snapshot-id"),
         .image_definition_id = try options.require("definition-id"),
         .image_version_id = try options.require("version-id"),
     };
+    try capture.validateCaptureGalleryIds(
+        contract.image_definition_id,
+        contract.image_version_id,
+        contract.subscription_id,
+        diagnostic,
+    );
+    return contract;
 }
 
 fn runCheckCaptureDefinition(context: Context, argv: []const []const u8) !void {
@@ -1892,7 +1900,7 @@ fn runCheckCaptureDefinition(context: Context, argv: []const []const u8) !void {
     defer document.deinit();
     const id = try release.azure_confidential_vm.validateCapturedImageDefinition(
         document.object(),
-        try captureGalleryContract(&options),
+        try captureGalleryContract(&options, context.diagnostic),
         context.diagnostic,
     );
     try context.out.print("{s}\n", .{id});
@@ -1907,6 +1915,7 @@ fn runCaptureGalleryRequest(context: Context, argv: []const []const u8) !void {
         "definition-id",
         "version-id",
     });
+    const contract = try captureGalleryContract(&options, context.diagnostic);
     const request = try release.azure_confidential_vm.captureGalleryVersionRequest(
         context.allocator,
         try options.require("location"),
@@ -1914,7 +1923,7 @@ fn runCaptureGalleryRequest(context: Context, argv: []const []const u8) !void {
     );
     try release.azure_confidential_vm.validateCaptureGalleryRequest(
         &request.object,
-        try captureGalleryContract(&options),
+        contract,
         context.diagnostic,
     );
     try release.json_document.writeDocument(
@@ -1976,7 +1985,7 @@ fn runCheckCaptureGallery(context: Context, argv: []const []const u8) !void {
         context.diagnostic,
     );
     defer response.deinit();
-    const contract = try captureGalleryContract(&options);
+    const contract = try captureGalleryContract(&options, context.diagnostic);
     try release.azure_confidential_vm.validateCaptureGalleryRequest(
         request.object(),
         contract,
@@ -2045,12 +2054,14 @@ const capture_result_options = [_][]const u8{
     "final-vm-id",
     "final-disk-id",
     "capture-vm",
+    "capture-vm-instance",
     "capture-disk",
     "snapshot",
     "definition",
     "gallery-request",
     "gallery-response",
     "final-vm",
+    "final-vm-instance",
     "token",
     "openid",
     "jwks",
@@ -2083,6 +2094,21 @@ const capture_verify_options = [_][]const u8{
     "version-id",
     "final-vm-id",
     "final-disk-id",
+    "capture-vm",
+    "capture-vm-instance",
+    "capture-disk",
+    "snapshot",
+    "definition",
+    "gallery-request",
+    "gallery-response",
+    "final-vm",
+    "final-vm-instance",
+    "token",
+    "openid",
+    "jwks",
+    "endpoint",
+    "nonce",
+    "now",
     "result",
 };
 
@@ -2217,6 +2243,8 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
     );
     var capture_vm = try readObject(context.allocator, context.io, try options.require("capture-vm"), context.diagnostic);
     defer capture_vm.deinit();
+    var capture_vm_instance = try readObject(context.allocator, context.io, try options.require("capture-vm-instance"), context.diagnostic);
+    defer capture_vm_instance.deinit();
     var capture_disk = try readObject(context.allocator, context.io, try options.require("capture-disk"), context.diagnostic);
     defer capture_disk.deinit();
     var snapshot = try readObject(context.allocator, context.io, try options.require("snapshot"), context.diagnostic);
@@ -2229,6 +2257,8 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
     defer gallery_response.deinit();
     var final_vm = try readObject(context.allocator, context.io, try options.require("final-vm"), context.diagnostic);
     defer final_vm.deinit();
+    var final_vm_instance = try readObject(context.allocator, context.io, try options.require("final-vm-instance"), context.diagnostic);
+    defer final_vm_instance.deinit();
     const guest_vm_id = try options.require("guest-vm-id");
     const attestation = try verifyAttestation(
         context.allocator,
@@ -2247,12 +2277,14 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
         .{
             .source_acceptance = source_acceptance.object(),
             .capture_vm = capture_vm.object(),
+            .capture_vm_instance = capture_vm_instance.object(),
             .capture_disk = capture_disk.object(),
             .snapshot = snapshot.object(),
             .image_definition = definition.object(),
             .gallery_request = gallery_request.object(),
             .gallery_response = gallery_response.object(),
             .final_vm = final_vm.object(),
+            .final_vm_instance = final_vm_instance.object(),
         },
         expected,
         .{
@@ -2295,11 +2327,64 @@ fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
         context.diagnostic,
     );
     defer result_document.deinit();
+    var capture_vm = try readObject(context.allocator, context.io, try options.require("capture-vm"), context.diagnostic);
+    defer capture_vm.deinit();
+    var capture_vm_instance = try readObject(context.allocator, context.io, try options.require("capture-vm-instance"), context.diagnostic);
+    defer capture_vm_instance.deinit();
+    var capture_disk = try readObject(context.allocator, context.io, try options.require("capture-disk"), context.diagnostic);
+    defer capture_disk.deinit();
+    var snapshot = try readObject(context.allocator, context.io, try options.require("snapshot"), context.diagnostic);
+    defer snapshot.deinit();
+    var definition = try readObject(context.allocator, context.io, try options.require("definition"), context.diagnostic);
+    defer definition.deinit();
+    var gallery_request = try readObject(context.allocator, context.io, try options.require("gallery-request"), context.diagnostic);
+    defer gallery_request.deinit();
+    var gallery_response = try readObject(context.allocator, context.io, try options.require("gallery-response"), context.diagnostic);
+    defer gallery_response.deinit();
+    var final_vm = try readObject(context.allocator, context.io, try options.require("final-vm"), context.diagnostic);
+    defer final_vm.deinit();
+    var final_vm_instance = try readObject(context.allocator, context.io, try options.require("final-vm-instance"), context.diagnostic);
+    defer final_vm_instance.deinit();
+    const final_guest_vm_id = try capture.validateFinalVmEvidence(
+        final_vm.object(),
+        final_vm_instance.object(),
+        expected,
+        context.diagnostic,
+    );
+    const attestation = try verifyAttestation(
+        context.allocator,
+        context.io,
+        try options.require("token"),
+        try options.require("openid"),
+        try options.require("jwks"),
+        try options.require("endpoint"),
+        try options.require("nonce"),
+        final_guest_vm_id,
+        try options.requireInteger("now"),
+        context.diagnostic,
+    );
     try capture.validateResult(
         context.allocator,
         result_document.object(),
-        source_acceptance.object(),
+        .{
+            .source_acceptance = source_acceptance.object(),
+            .capture_vm = capture_vm.object(),
+            .capture_vm_instance = capture_vm_instance.object(),
+            .capture_disk = capture_disk.object(),
+            .snapshot = snapshot.object(),
+            .image_definition = definition.object(),
+            .gallery_request = gallery_request.object(),
+            .gallery_response = gallery_response.object(),
+            .final_vm = final_vm.object(),
+            .final_vm_instance = final_vm_instance.object(),
+        },
         expected,
+        .{
+            .vm_id = final_guest_vm_id,
+            .issuer = attestation.issuer,
+            .nonce_sha256 = &attestation.nonce_sha256,
+            .token_sha256 = &attestation.token_sha256,
+        },
         context.diagnostic,
     );
     try context.out.print("{s}\n{s}\n", .{
@@ -2619,6 +2704,42 @@ test "valid RS256 JWT and JWKS verify cryptographically" {
     try std.testing.expectEqualStrings(
         test_attestation_endpoint,
         evidence.issuer,
+    );
+
+    diagnostic = .{};
+    try std.testing.expectError(error.InvalidDocument, verifyAttestation(
+        allocator,
+        std.testing.io,
+        token_path,
+        openid_path,
+        jwks_path,
+        test_attestation_endpoint,
+        "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        test_attestation_vm_id,
+        2_000_000_000,
+        &diagnostic,
+    ));
+    try std.testing.expectEqualStrings(
+        "MAA JWT nonce mismatch",
+        diagnostic.message(),
+    );
+
+    diagnostic = .{};
+    try std.testing.expectError(error.InvalidDocument, verifyAttestation(
+        allocator,
+        std.testing.io,
+        token_path,
+        openid_path,
+        jwks_path,
+        "https://other.attest.azure.net",
+        test_attestation_nonce,
+        test_attestation_vm_id,
+        2_000_000_000,
+        &diagnostic,
+    ));
+    try std.testing.expectEqualStrings(
+        "OpenID issuer mismatch",
+        diagnostic.message(),
     );
 
     var bad_signature = try allocator.dupe(u8, test_jwt_signature);

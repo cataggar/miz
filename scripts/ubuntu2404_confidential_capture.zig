@@ -51,12 +51,14 @@ pub const Expected = struct {
 pub const Documents = struct {
     source_acceptance: *const ObjectMap,
     capture_vm: *const ObjectMap,
+    capture_vm_instance: *const ObjectMap,
     capture_disk: *const ObjectMap,
     snapshot: *const ObjectMap,
     image_definition: *const ObjectMap,
     gallery_request: *const ObjectMap,
     gallery_response: *const ObjectMap,
     final_vm: *const ObjectMap,
+    final_vm_instance: *const ObjectMap,
 };
 
 pub const Attestation = struct {
@@ -190,6 +192,35 @@ const ResourceKind = enum {
     image_version,
 };
 
+fn validResourceName(name: []const u8) bool {
+    if (name.len == 0 or
+        std.mem.eql(u8, name, ".") or
+        std.mem.eql(u8, name, ".."))
+    {
+        return false;
+    }
+    for (name) |character| switch (character) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.', '(', ')' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn validVersionName(name: []const u8) bool {
+    var components = std.mem.splitScalar(u8, name, '.');
+    var count: usize = 0;
+    while (components.next()) |component| {
+        count += 1;
+        if (count > 3 or component.len == 0) return false;
+        for (component) |character| {
+            if (character < '0' or character > '9') return false;
+        }
+        const number = std.fmt.parseInt(u32, component, 10) catch return false;
+        if (number > std.math.maxInt(i32)) return false;
+    }
+    return count == 3;
+}
+
 fn azureResourceId(
     id: []const u8,
     subscription_id: []const u8,
@@ -205,12 +236,13 @@ fn azureResourceId(
     }
     const nested = kind == .image_definition or kind == .image_version;
     const expected_count: usize = if (kind == .image_version) 13 else if (nested) 11 else 9;
-    if (count != expected_count or
+    if (!validGuid(subscription_id) or
+        count != expected_count or
         segments[0].len != 0 or
         !std.ascii.eqlIgnoreCase(segments[1], "subscriptions") or
         !std.ascii.eqlIgnoreCase(segments[2], subscription_id) or
         !std.ascii.eqlIgnoreCase(segments[3], "resourceGroups") or
-        segments[4].len == 0 or
+        !validResourceName(segments[4]) or
         !std.ascii.eqlIgnoreCase(segments[5], "providers") or
         !std.ascii.eqlIgnoreCase(segments[6], "Microsoft.Compute"))
     {
@@ -223,19 +255,19 @@ fn azureResourceId(
         .image_definition, .image_version => "galleries",
     };
     if (!std.ascii.eqlIgnoreCase(segments[7], first_type) or
-        segments[8].len == 0)
+        !validResourceName(segments[8]))
     {
         return false;
     }
     if (nested and
         (!std.ascii.eqlIgnoreCase(segments[9], "images") or
-            segments[10].len == 0))
+            !validResourceName(segments[10])))
     {
         return false;
     }
     return kind != .image_version or
         (std.ascii.eqlIgnoreCase(segments[11], "versions") and
-            segments[12].len != 0);
+            validVersionName(segments[12]));
 }
 
 pub fn validateSourceVersionId(
@@ -270,14 +302,44 @@ fn resourceGroup(id: []const u8) ?[]const u8 {
 
 fn versionBelongsToDefinition(version_id: []const u8, definition_id: []const u8) bool {
     if (version_id.len <= definition_id.len or
-        !std.ascii.eqlIgnoreCase(version_id[0..definition_id.len], definition_id))
+        !std.mem.eql(u8, version_id[0..definition_id.len], definition_id))
     {
         return false;
     }
     const suffix = version_id[definition_id.len..];
-    if (!std.ascii.startsWithIgnoreCase(suffix, "/versions/")) return false;
+    if (!std.mem.startsWith(u8, suffix, "/versions/")) return false;
     const name = suffix["/versions/".len..];
-    return name.len != 0 and std.mem.indexOfScalar(u8, name, '/') == null;
+    return validVersionName(name);
+}
+
+pub fn validateCaptureGalleryIds(
+    definition_id: []const u8,
+    version_id: []const u8,
+    subscription_id: []const u8,
+    diagnostic: *Diagnostic,
+) !void {
+    if (!azureResourceId(
+        definition_id,
+        subscription_id,
+        .image_definition,
+    ) or !azureResourceId(
+        version_id,
+        subscription_id,
+        .image_version,
+    )) {
+        return invalid(
+            diagnostic,
+            "capture gallery definition or version ID is malformed or cross-subscription",
+            .{},
+        );
+    }
+    if (!versionBelongsToDefinition(version_id, definition_id)) {
+        return invalid(
+            diagnostic,
+            "capture gallery version is outside the exact image definition",
+            .{},
+        );
+    }
 }
 
 fn captureResourceGroup(
@@ -332,13 +394,11 @@ fn validateExpected(
             return invalid(diagnostic, "capture Azure resource ID is malformed", .{});
         }
     }
-    if (!versionBelongsToDefinition(
-        expected.image_version_id,
+    try validateCaptureGalleryIds(
         expected.image_definition_id,
-    )) return invalid(
+        expected.image_version_id,
+        expected.subscription_id,
         diagnostic,
-        "capture gallery version is outside the exact image definition",
-        .{},
     );
     const group = try captureResourceGroup(
         allocator,
@@ -467,7 +527,7 @@ pub fn validateSourceAcceptance(
     return .{ .gallery_image_version_id = version_id };
 }
 
-fn vmUniqueId(vm: *const ObjectMap, diagnostic: *Diagnostic) ![]const u8 {
+pub fn vmUniqueId(vm: *const ObjectMap, diagnostic: *Diagnostic) ![]const u8 {
     const id = try string(vm, "vmId", "Azure VM unique identity", diagnostic);
     if (!validGuid(id)) return invalid(
         diagnostic,
@@ -475,6 +535,40 @@ fn vmUniqueId(vm: *const ObjectMap, diagnostic: *Diagnostic) ![]const u8 {
         .{},
     );
     return id;
+}
+
+fn validateVmInstance(
+    instance: *const ObjectMap,
+    label: []const u8,
+    diagnostic: *Diagnostic,
+) !void {
+    release.azure_confidential_vm.validateVmSecurityProfile(
+        instance,
+        label,
+        diagnostic,
+    ) catch return error.InvalidDocument;
+}
+
+pub fn validateFinalVmEvidence(
+    vm: *const ObjectMap,
+    instance: *const ObjectMap,
+    expected: Expected,
+    diagnostic: *Diagnostic,
+) ![]const u8 {
+    const final_contract: release.azure_confidential_vm.CaptureContract = .{
+        .subscription_id = expected.subscription_id,
+        .location = expected.location,
+        .source_image_version_id = expected.image_version_id,
+        .vm_id = expected.final_vm_id,
+        .disk_id = expected.final_disk_id,
+    };
+    release.azure_confidential_vm.validateCapturedVm(
+        vm,
+        final_contract,
+        diagnostic,
+    ) catch return error.InvalidDocument;
+    try validateVmInstance(instance, "Azure final VM instance view", diagnostic);
+    return vmUniqueId(vm, diagnostic);
 }
 
 fn cloneValue(allocator: Allocator, value: Value) !Value {
@@ -554,6 +648,11 @@ pub fn result(
         capture_contract,
         diagnostic,
     );
+    try validateVmInstance(
+        documents.capture_vm_instance,
+        "Azure capture VM instance view",
+        diagnostic,
+    );
     _ = try release.azure_confidential_vm.validateCaptureManagedDisk(
         documents.capture_disk,
         capture_contract,
@@ -587,20 +686,13 @@ pub fn result(
         gallery_contract,
         diagnostic,
     );
-    const final_contract: release.azure_confidential_vm.CaptureContract = .{
-        .subscription_id = expected.subscription_id,
-        .location = expected.location,
-        .source_image_version_id = expected.image_version_id,
-        .vm_id = expected.final_vm_id,
-        .disk_id = expected.final_disk_id,
-    };
-    try release.azure_confidential_vm.validateCapturedVm(
+    const final_vm_id = try validateFinalVmEvidence(
         documents.final_vm,
-        final_contract,
+        documents.final_vm_instance,
+        expected,
         diagnostic,
     );
     const capture_vm_id = try vmUniqueId(documents.capture_vm, diagnostic);
-    const final_vm_id = try vmUniqueId(documents.final_vm, diagnostic);
     if (!std.ascii.eqlIgnoreCase(attestation.vm_id, final_vm_id) or
         !validEndpoint(attestation.issuer))
     {
@@ -718,260 +810,54 @@ pub fn result(
     });
 }
 
-fn validateWorkflow(
-    value: ObjectMap,
-    run_id: []const u8,
-    run_attempt: []const u8,
-    label: []const u8,
-    diagnostic: *Diagnostic,
-) !void {
-    if (!exact(value, &.{ "repository", "run_attempt", "run_id" })) {
-        return invalid(diagnostic, "{s} shape is invalid", .{label});
-    }
-    try equal(
-        try string(&value, "repository", label, diagnostic),
-        repository,
-        label,
-        diagnostic,
-    );
-    try equal(try string(&value, "run_id", label, diagnostic), run_id, label, diagnostic);
-    try equal(
-        try string(&value, "run_attempt", label, diagnostic),
-        run_attempt,
-        label,
-        diagnostic,
-    );
-}
-
-fn validateAttestation(
-    value: ObjectMap,
-    vm_id: []const u8,
-    diagnostic: *Diagnostic,
-) !void {
-    if (!exact(value, &.{
-        "compliance",
-        "debuggable",
-        "issuer",
-        "nonce_sha256",
-        "secure_boot",
-        "tee",
-        "token_sha256",
-        "vm_id",
-        "vtpm",
-    })) return invalid(diagnostic, "final attestation shape is invalid", .{});
-    try equal(
-        try string(&value, "compliance", "final attestation compliance", diagnostic),
-        "azure-compliant-cvm",
-        "final attestation compliance",
-        diagnostic,
-    );
-    if (value.get("debuggable") == null or value.get("debuggable").? != .bool or
-        value.get("debuggable").?.bool or
-        !release.azure_compute.isTrue(value.get("secure_boot")) or
-        !release.azure_compute.isTrue(value.get("vtpm")))
-    {
-        return invalid(diagnostic, "final attestation security claims are invalid", .{});
-    }
-    try equal(
-        try string(&value, "tee", "final attestation TEE", diagnostic),
-        "AMD SEV-SNP",
-        "final attestation TEE",
-        diagnostic,
-    );
-    try equalIgnoreCase(
-        try string(&value, "vm_id", "final attestation VM ID", diagnostic),
-        vm_id,
-        "final attestation VM ID",
-        diagnostic,
-    );
-    if (!validEndpoint(try string(&value, "issuer", "final attestation issuer", diagnostic))) {
-        return invalid(diagnostic, "final attestation issuer is invalid", .{});
-    }
-    _ = release.digest.parseHex(try string(
-        &value,
-        "nonce_sha256",
-        "final attestation nonce SHA-256",
-        diagnostic,
-    )) catch return invalid(diagnostic, "final attestation nonce SHA-256 is invalid", .{});
-    _ = release.digest.parseHex(try string(
-        &value,
-        "token_sha256",
-        "final attestation token SHA-256",
-        diagnostic,
-    )) catch return invalid(diagnostic, "final attestation token SHA-256 is invalid", .{});
+fn jsonEqual(left: Value, right: Value) bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    return switch (left) {
+        .null => true,
+        .bool => |value| value == right.bool,
+        .integer => |value| value == right.integer,
+        .float => |value| value == right.float,
+        .number_string => |value| std.mem.eql(u8, value, right.number_string),
+        .string => |value| std.mem.eql(u8, value, right.string),
+        .array => |items| blk: {
+            if (items.items.len != right.array.items.len) break :blk false;
+            for (items.items, right.array.items) |left_item, right_item| {
+                if (!jsonEqual(left_item, right_item)) break :blk false;
+            }
+            break :blk true;
+        },
+        .object => |map| blk: {
+            if (map.count() != right.object.count()) break :blk false;
+            var iterator = map.iterator();
+            while (iterator.next()) |entry| {
+                const right_value = right.object.get(entry.key_ptr.*) orelse
+                    break :blk false;
+                if (!jsonEqual(entry.value_ptr.*, right_value)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
 }
 
 pub fn validateResult(
     allocator: Allocator,
     root: *const ObjectMap,
-    source_acceptance: *const ObjectMap,
+    documents: Documents,
     expected: Expected,
+    attestation: Attestation,
     diagnostic: *Diagnostic,
 ) !void {
-    try validateExpected(allocator, expected, diagnostic);
-    const accepted_source = try validateSourceAcceptance(
-        source_acceptance,
+    const independently_derived = try result(
+        allocator,
+        documents,
         expected,
+        attestation,
         diagnostic,
     );
-    if (!exact(root.*, &.{
-        "architecture",
-        "capture",
-        "final_acceptance",
-        "gallery",
-        "location",
-        "release",
-        "schema",
-        "source",
-        "subscription_id",
-        "type",
-        "workflow",
-    }) or try integer(root, "schema", "capture schema", diagnostic) != schema) {
-        return invalid(diagnostic, "capture result shape is invalid", .{});
-    }
-    try equal(try string(root, "type", "capture type", diagnostic), result_type, "capture type", diagnostic);
-    try equal(try string(root, "release", "capture release", diagnostic), "24.04", "capture release", diagnostic);
-    try equal(try string(root, "architecture", "capture architecture", diagnostic), "x64", "capture architecture", diagnostic);
-    try equalIgnoreCase(try string(root, "location", "capture location", diagnostic), expected.location, "capture location", diagnostic);
-    try equalIgnoreCase(try string(root, "subscription_id", "capture subscription", diagnostic), expected.subscription_id, "capture subscription", diagnostic);
-    try validateWorkflow(
-        try object(root, "workflow", "capture workflow", diagnostic),
-        expected.run_id,
-        expected.run_attempt,
-        "capture workflow",
+    if (!jsonEqual(.{ .object = root.* }, independently_derived)) return invalid(
         diagnostic,
-    );
-
-    const source = try object(root, "source", "capture source", diagnostic);
-    if (!exact(source, &.{ "acceptance", "artifact", "commit", "gallery_image_version_id", "release" })) {
-        return invalid(diagnostic, "capture source shape is invalid", .{});
-    }
-    try equal(try string(&source, "commit", "capture source commit", diagnostic), expected.source.commit, "capture source commit", diagnostic);
-    try equal(try string(&source, "release", "capture source release", diagnostic), "24.04", "capture source release", diagnostic);
-    try equalIgnoreCase(
-        try string(&source, "gallery_image_version_id", "capture source version", diagnostic),
-        accepted_source.gallery_image_version_id,
-        "capture source version",
-        diagnostic,
-    );
-    const acceptance = try object(&source, "acceptance", "capture source acceptance", diagnostic);
-    if (!exact(acceptance, &.{ "schema", "sha256", "type", "workflow" }) or
-        try integer(&acceptance, "schema", "source acceptance schema", diagnostic) != 1)
-    {
-        return invalid(diagnostic, "capture source acceptance shape is invalid", .{});
-    }
-    try equal(try string(&acceptance, "type", "source acceptance type", diagnostic), source_acceptance_type, "source acceptance type", diagnostic);
-    try equal(try string(&acceptance, "sha256", "source acceptance SHA-256", diagnostic), expected.source.acceptance_sha256, "source acceptance SHA-256", diagnostic);
-    try validateWorkflow(
-        try object(&acceptance, "workflow", "source acceptance workflow", diagnostic),
-        expected.source.run_id,
-        expected.source.run_attempt,
-        "source acceptance workflow",
-        diagnostic,
-    );
-    const artifact = try object(&source, "artifact", "capture source artifact", diagnostic);
-    if (!exact(artifact, &.{ "qcow_sha256", "qcow_size", "vhd_sha256", "vhd_size", "virtual_size" })) {
-        return invalid(diagnostic, "capture source artifact shape is invalid", .{});
-    }
-    try equal(try string(&artifact, "qcow_sha256", "capture QCOW2 SHA-256", diagnostic), expected.source.artifact.qcow_sha256, "capture QCOW2 SHA-256", diagnostic);
-    try equal(try string(&artifact, "vhd_sha256", "capture VHD SHA-256", diagnostic), expected.source.artifact.vhd_sha256, "capture VHD SHA-256", diagnostic);
-    const result_sizes = [_]struct { []const u8, u64 }{
-        .{ "qcow_size", expected.source.artifact.qcow_size },
-        .{ "vhd_size", expected.source.artifact.vhd_size },
-        .{ "virtual_size", expected.source.artifact.virtual_size },
-    };
-    for (result_sizes) |entry| if (try positive(
-        try integer(&artifact, entry[0], entry[0], diagnostic),
-        entry[0],
-        diagnostic,
-    ) != entry[1]) return invalid(diagnostic, "capture source artifact size mismatch", .{});
-
-    const capture = try object(root, "capture", "capture evidence", diagnostic);
-    if (!exact(capture, &.{ "encryption_translation", "managed_os_disk", "snapshot", "vm" })) {
-        return invalid(diagnostic, "capture evidence shape is invalid", .{});
-    }
-    const vm = try object(&capture, "vm", "capture VM", diagnostic);
-    if (!exact(vm, &.{ "image_reference_id", "managed_os_disk_id", "os_disk_encryption_type", "resource_id", "security_type", "vm_id" })) {
-        return invalid(diagnostic, "capture VM evidence shape is invalid", .{});
-    }
-    try equalIgnoreCase(try string(&vm, "resource_id", "capture VM resource ID", diagnostic), expected.capture_vm_id, "capture VM resource ID", diagnostic);
-    try equalIgnoreCase(try string(&vm, "image_reference_id", "capture VM image reference", diagnostic), accepted_source.gallery_image_version_id, "capture VM image reference", diagnostic);
-    try equalIgnoreCase(try string(&vm, "managed_os_disk_id", "capture VM disk", diagnostic), expected.capture_disk_id, "capture VM disk", diagnostic);
-    try equal(try string(&vm, "security_type", "capture VM security type", diagnostic), release.azure_confidential_vm.vm_security_type, "capture VM security type", diagnostic);
-    try equal(try string(&vm, "os_disk_encryption_type", "capture VM encryption", diagnostic), release.azure_confidential_vm.os_disk_security_encryption_type, "capture VM encryption", diagnostic);
-    if (!validGuid(try string(&vm, "vm_id", "capture VM ID", diagnostic))) return invalid(diagnostic, "capture VM ID is invalid", .{});
-
-    const disk = try object(&capture, "managed_os_disk", "capture disk", diagnostic);
-    if (!exact(disk, &.{ "encryption_type", "id", "location", "managed_by", "provisioning_state", "security_type" })) {
-        return invalid(diagnostic, "capture disk evidence shape is invalid", .{});
-    }
-    try equalIgnoreCase(try string(&disk, "id", "capture disk ID", diagnostic), expected.capture_disk_id, "capture disk ID", diagnostic);
-    try equalIgnoreCase(try string(&disk, "managed_by", "capture disk VM", diagnostic), expected.capture_vm_id, "capture disk VM", diagnostic);
-    try equalIgnoreCase(try string(&disk, "location", "capture disk location", diagnostic), expected.location, "capture disk location", diagnostic);
-    try equal(try string(&disk, "provisioning_state", "capture disk state", diagnostic), "Succeeded", "capture disk state", diagnostic);
-    try equal(try string(&disk, "security_type", "capture disk security", diagnostic), release.azure_confidential_vm.managed_disk_security_type, "capture disk security", diagnostic);
-    try equal(try string(&disk, "encryption_type", "capture disk encryption", diagnostic), release.azure_confidential_vm.platform_disk_encryption_type, "capture disk encryption", diagnostic);
-
-    const snapshot = try object(&capture, "snapshot", "capture snapshot", diagnostic);
-    if (!exact(snapshot, &.{ "create_option", "encryption_type", "id", "location", "provisioning_state", "security_type", "source_disk_id" })) {
-        return invalid(diagnostic, "capture snapshot evidence shape is invalid", .{});
-    }
-    try equalIgnoreCase(try string(&snapshot, "id", "snapshot ID", diagnostic), expected.snapshot_id, "snapshot ID", diagnostic);
-    try equalIgnoreCase(try string(&snapshot, "source_disk_id", "snapshot source disk", diagnostic), expected.capture_disk_id, "snapshot source disk", diagnostic);
-    try equalIgnoreCase(try string(&snapshot, "location", "snapshot location", diagnostic), expected.location, "snapshot location", diagnostic);
-    try equal(try string(&snapshot, "create_option", "snapshot create option", diagnostic), "Copy", "snapshot create option", diagnostic);
-    try equal(try string(&snapshot, "provisioning_state", "snapshot state", diagnostic), "Succeeded", "snapshot state", diagnostic);
-    try equal(try string(&snapshot, "security_type", "snapshot security", diagnostic), release.azure_confidential_vm.managed_disk_security_type, "snapshot security", diagnostic);
-    try equal(try string(&snapshot, "encryption_type", "snapshot encryption", diagnostic), release.azure_confidential_vm.platform_disk_encryption_type, "snapshot encryption", diagnostic);
-    const translation = try object(&capture, "encryption_translation", "encryption translation", diagnostic);
-    if (!exact(translation, &.{ "gallery", "resource", "vm" })) return invalid(diagnostic, "encryption translation shape is invalid", .{});
-    try equal(try string(&translation, "vm", "VM encryption translation", diagnostic), release.azure_confidential_vm.os_disk_security_encryption_type, "VM encryption translation", diagnostic);
-    try equal(try string(&translation, "resource", "resource encryption translation", diagnostic), release.azure_confidential_vm.managed_disk_security_type, "resource encryption translation", diagnostic);
-    try equal(try string(&translation, "gallery", "gallery encryption translation", diagnostic), release.azure_confidential_vm.gallery_os_disk_encryption_type, "gallery encryption translation", diagnostic);
-
-    const gallery = try object(root, "gallery", "capture gallery", diagnostic);
-    if (!exact(gallery, &.{ "definition", "version" })) return invalid(diagnostic, "capture gallery shape is invalid", .{});
-    const definition = try object(&gallery, "definition", "capture definition", diagnostic);
-    if (!exact(definition, &.{ "id", "security_type" })) return invalid(diagnostic, "capture definition shape is invalid", .{});
-    try equalIgnoreCase(try string(&definition, "id", "capture definition ID", diagnostic), expected.image_definition_id, "capture definition ID", diagnostic);
-    try equal(try string(&definition, "security_type", "capture definition security", diagnostic), release.azure_confidential_vm.captured_image_security_type, "capture definition security", diagnostic);
-    const version = try object(&gallery, "version", "capture version", diagnostic);
-    if (!exact(version, &.{ "encryption_type", "id", "replication_mode", "request", "response", "source_snapshot_id" })) {
-        return invalid(diagnostic, "capture version shape is invalid", .{});
-    }
-    try equalIgnoreCase(try string(&version, "id", "capture version ID", diagnostic), expected.image_version_id, "capture version ID", diagnostic);
-    try equalIgnoreCase(try string(&version, "source_snapshot_id", "capture version source", diagnostic), expected.snapshot_id, "capture version source", diagnostic);
-    try equal(try string(&version, "replication_mode", "capture replication mode", diagnostic), "Full", "capture replication mode", diagnostic);
-    try equal(try string(&version, "encryption_type", "capture gallery encryption", diagnostic), release.azure_confidential_vm.gallery_os_disk_encryption_type, "capture gallery encryption", diagnostic);
-    const gallery_contract: release.azure_confidential_vm.CaptureGalleryContract = .{
-        .subscription_id = expected.subscription_id,
-        .location = expected.location,
-        .source_id = expected.snapshot_id,
-        .image_definition_id = expected.image_definition_id,
-        .image_version_id = expected.image_version_id,
-    };
-    const request = try object(&version, "request", "capture gallery request", diagnostic);
-    const response = try object(&version, "response", "capture gallery response", diagnostic);
-    try release.azure_confidential_vm.validateCaptureGalleryRequest(&request, gallery_contract, diagnostic);
-    try release.azure_confidential_vm.validateCapturedGalleryVersion(&response, gallery_contract, diagnostic);
-
-    const final = try object(root, "final_acceptance", "final acceptance", diagnostic);
-    if (!exact(final, &.{ "attestation", "vm" })) return invalid(diagnostic, "final acceptance shape is invalid", .{});
-    const final_vm = try object(&final, "vm", "final VM", diagnostic);
-    if (!exact(final_vm, &.{ "image_reference_id", "managed_os_disk_id", "os_disk_encryption_type", "resource_id", "security_type", "vm_id" })) {
-        return invalid(diagnostic, "final VM shape is invalid", .{});
-    }
-    try equalIgnoreCase(try string(&final_vm, "resource_id", "final VM resource ID", diagnostic), expected.final_vm_id, "final VM resource ID", diagnostic);
-    try equalIgnoreCase(try string(&final_vm, "managed_os_disk_id", "final VM disk", diagnostic), expected.final_disk_id, "final VM disk", diagnostic);
-    try equalIgnoreCase(try string(&final_vm, "image_reference_id", "final VM image reference", diagnostic), expected.image_version_id, "final VM image reference", diagnostic);
-    try equal(try string(&final_vm, "security_type", "final VM security", diagnostic), release.azure_confidential_vm.vm_security_type, "final VM security", diagnostic);
-    try equal(try string(&final_vm, "os_disk_encryption_type", "final VM encryption", diagnostic), release.azure_confidential_vm.os_disk_security_encryption_type, "final VM encryption", diagnostic);
-    const final_vm_unique_id = try string(&final_vm, "vm_id", "final VM ID", diagnostic);
-    if (!validGuid(final_vm_unique_id)) return invalid(diagnostic, "final VM ID is invalid", .{});
-    try validateAttestation(
-        try object(&final, "attestation", "final attestation", diagnostic),
-        final_vm_unique_id,
-        diagnostic,
+        "capture result does not match independently validated external evidence",
+        .{},
     );
 }
 
@@ -998,6 +884,34 @@ test "Azure capture resource IDs are structural and exact" {
         subscription,
         .image_version,
     ));
+
+    var diagnostic: Diagnostic = .{};
+    const invalid_pairs = [_][2][]const u8{
+        .{
+            definition,
+            "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/gallery/providers/Microsoft.Compute/galleries/other/images/ubuntu/versions/1.0.0",
+        },
+        .{
+            definition,
+            "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/gallery/providers/Microsoft.Compute/galleries/g/images/ubuntu/versions/1.0.0",
+        },
+        .{ definition, definition ++ "/versions/1.0" },
+        .{ definition, definition ++ "/versions/1.0.0/extra" },
+        .{ definition, definition ++ "-evil/versions/1.0.0" },
+        .{
+            definition,
+            "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/gallery/providers/Microsoft.Compute/galleries/g/images/Ubuntu/versions/1.0.0",
+        },
+    };
+    for (invalid_pairs) |pair| {
+        diagnostic = .{};
+        try std.testing.expectError(error.InvalidDocument, validateCaptureGalleryIds(
+            pair[0],
+            pair[1],
+            subscription,
+            &diagnostic,
+        ));
+    }
 }
 
 const test_subscription = "00000000-0000-0000-0000-000000000000";
@@ -1156,12 +1070,17 @@ const test_final_vm_document =
     "\",\"diskEncryptionSet\":null,\"securityProfile\":" ++
     "{\"securityEncryptionType\":\"VMGuestStateOnly\",\"diskEncryptionSet\":null}}}}}";
 
+const test_vm_instance_document =
+    "{\"securityType\":\"ConfidentialVM\",\"uefiSettings\":" ++
+    "{\"secureBootEnabled\":true,\"vTpmEnabled\":true}}";
+
 fn expectTamper(
     allocator: Allocator,
     valid: []const u8,
     needle: []const u8,
     replacement: []const u8,
-    source_acceptance: *const ObjectMap,
+    documents: Documents,
+    attestation: Attestation,
 ) !void {
     const occurrences = std.mem.count(u8, valid, needle);
     if (occurrences != 1) {
@@ -1183,8 +1102,9 @@ fn expectTamper(
     try std.testing.expectError(error.InvalidDocument, validateResult(
         allocator,
         &parsed.value.object,
-        source_acceptance,
+        documents,
         testExpected(),
+        attestation,
         &diagnostic,
     ));
 }
@@ -1203,6 +1123,12 @@ test "capture result independently rejects provenance substitutions" {
         Value,
         allocator,
         test_capture_vm_document,
+        .{},
+    );
+    var capture_vm_instance = try std.json.parseFromSlice(
+        Value,
+        allocator,
+        test_vm_instance_document,
         .{},
     );
     var capture_disk = try std.json.parseFromSlice(
@@ -1240,33 +1166,44 @@ test "capture result independently rejects provenance substitutions" {
         test_final_vm_document,
         .{},
     );
+    var final_vm_instance = try std.json.parseFromSlice(
+        Value,
+        allocator,
+        test_vm_instance_document,
+        .{},
+    );
+    const documents: Documents = .{
+        .source_acceptance = &source.value.object,
+        .capture_vm = &capture_vm.value.object,
+        .capture_vm_instance = &capture_vm_instance.value.object,
+        .capture_disk = &capture_disk.value.object,
+        .snapshot = &snapshot.value.object,
+        .image_definition = &definition.value.object,
+        .gallery_request = &request.object,
+        .gallery_response = &response.value.object,
+        .final_vm = &final_vm.value.object,
+        .final_vm_instance = &final_vm_instance.value.object,
+    };
+    const attestation: Attestation = .{
+        .vm_id = test_final_vm_id,
+        .issuer = "https://test.attest.azure.net",
+        .nonce_sha256 = "3" ** 64,
+        .token_sha256 = "4" ** 64,
+    };
     var diagnostic: Diagnostic = .{};
     const valid_value = try result(
         allocator,
-        .{
-            .source_acceptance = &source.value.object,
-            .capture_vm = &capture_vm.value.object,
-            .capture_disk = &capture_disk.value.object,
-            .snapshot = &snapshot.value.object,
-            .image_definition = &definition.value.object,
-            .gallery_request = &request.object,
-            .gallery_response = &response.value.object,
-            .final_vm = &final_vm.value.object,
-        },
+        documents,
         testExpected(),
-        .{
-            .vm_id = test_final_vm_id,
-            .issuer = "https://test.attest.azure.net",
-            .nonce_sha256 = "3" ** 64,
-            .token_sha256 = "4" ** 64,
-        },
+        attestation,
         &diagnostic,
     );
     try validateResult(
         allocator,
         &valid_value.object,
-        &source.value.object,
+        documents,
         testExpected(),
+        attestation,
         &diagnostic,
     );
     const valid = try std.json.Stringify.valueAlloc(allocator, valid_value, .{});
@@ -1334,6 +1271,68 @@ test "capture result independently rejects provenance substitutions" {
         valid,
         substitution[0],
         substitution[1],
-        &source.value.object,
+        documents,
+        attestation,
+    );
+
+    const coordinated_final = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        valid,
+        test_final_vm_id,
+        "33333333-3333-3333-3333-333333333333",
+    );
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        std.mem.count(u8, valid, test_final_vm_id),
+    );
+    var coordinated = try std.json.parseFromSlice(
+        Value,
+        allocator,
+        coordinated_final,
+        .{},
+    );
+    diagnostic = .{};
+    try std.testing.expectError(error.InvalidDocument, validateResult(
+        allocator,
+        &coordinated.value.object,
+        documents,
+        testExpected(),
+        attestation,
+        &diagnostic,
+    ));
+
+    const replaced_final_document = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        test_final_vm_document,
+        test_final_vm_id,
+        "33333333-3333-3333-3333-333333333333",
+    );
+    var replaced_final_vm = try std.json.parseFromSlice(
+        Value,
+        allocator,
+        replaced_final_document,
+        .{},
+    );
+    var replaced_documents = documents;
+    replaced_documents.final_vm = &replaced_final_vm.value.object;
+    diagnostic = .{};
+    try std.testing.expectError(error.InvalidDocument, validateResult(
+        allocator,
+        &coordinated.value.object,
+        replaced_documents,
+        testExpected(),
+        attestation,
+        &diagnostic,
+    ));
+
+    try expectTamper(
+        allocator,
+        valid,
+        test_capture_vm_id,
+        "44444444-4444-4444-4444-444444444444",
+        documents,
+        attestation,
     );
 }
