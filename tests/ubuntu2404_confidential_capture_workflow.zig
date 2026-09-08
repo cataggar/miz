@@ -253,8 +253,8 @@ test "policy and publication GitHub App tokens stay separated" {
         "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349",
         4,
     );
-    try expectCount(workflow, "secrets.CAPTURE_GITHUB_APP_ID", 7);
-    try expectCount(workflow, "secrets.CAPTURE_GITHUB_APP_PRIVATE_KEY", 4);
+    try expectCount(workflow, "secrets.RELEASE_GITHUB_APP_ID", 7);
+    try expectCount(workflow, "secrets.RELEASE_GITHUB_APP_PRIVATE_KEY", 4);
     try expectAbsent(workflow, "permission-administration: read");
     try expectCount(workflow, "permission-administration: write", 3);
     try expectCount(workflow, "permission-actions: read", 3);
@@ -316,7 +316,15 @@ test "policy and publication GitHub App tokens stay separated" {
     try expectAbsent(prepare, "gh api --method PATCH");
     try expectAbsent(capture, "gh api --method POST");
     try expectAbsent(capture, "gh api --method PATCH");
-    try expectAbsent(publication, "GH_TOKEN=\"$POLICY_GH_TOKEN\" gh api --method");
+    for ([_][]const u8{ "POST", "PATCH", "DELETE" }) |method| {
+        const mutation = try std.fmt.allocPrint(
+            allocator,
+            "GH_TOKEN=\"$POLICY_GH_TOKEN\" gh api --method {s}",
+            .{method},
+        );
+        defer allocator.free(mutation);
+        try expectAbsent(publication, mutation);
+    }
 }
 
 test "repository writer boundary and ruleset policy fail closed" {
@@ -827,6 +835,7 @@ test "publication boundary uploads one sanitized result and never deletes target
         "github-policy-before-upload",
         "github-policy-before-publish",
         "immutable-releases-before-publish.json",
+        "check-immutable-releases",
         "tag-before-publish",
         "require-lightweight \"$PROVENANCE_RELEASE_TAG\" \"$TOOL_COMMIT\"",
         "origin-run-id: $ORIGIN_RUN_ID",
@@ -837,6 +846,7 @@ test "publication boundary uploads one sanitized result and never deletes target
         "check-capture-release-assets",
         "--mode repair",
         "--mode final",
+        "--mode published",
         "gh api --method DELETE \"${api_headers[@]}\"",
         "fresh-asset-repair-plan",
         "empty-asset-repair-plan",
@@ -868,10 +878,18 @@ test "publication boundary uploads one sanitized result and never deletes target
         publication,
         "ubuntu2404_confidential_publish_release.sh",
     );
+    const immutable_policy = try indexOf(
+        publication,
+        "immutable-releases-before-publish.json",
+    );
+    const published_assets = try indexOf(publication, "--mode published");
     try std.testing.expect(repair < deletion);
     try std.testing.expect(deletion < upload);
     try std.testing.expect(upload < final_assets);
+    try std.testing.expect(final_assets < immutable_policy);
+    try std.testing.expect(immutable_policy < publish);
     try std.testing.expect(final_assets < publish);
+    try std.testing.expect(publish < published_assets);
 }
 
 test "durable recovery preserves origin and gates PUT cleanup and publication" {
@@ -1226,8 +1244,8 @@ test "operator guide fixes prerequisites RBAC and quarantine boundary" {
         "`PUBLICATION_VERSION_WRITE_SCOPE`",
         "`CAPTURE_TARGET_READ_SCOPE`",
         "`SCRATCH_RESERVATION_TAG`",
-        "`CAPTURE_GITHUB_APP_ID`",
-        "`CAPTURE_GITHUB_APP_PRIVATE_KEY`",
+        "`RELEASE_GITHUB_APP_ID`",
+        "`RELEASE_GITHUB_APP_PRIVATE_KEY`",
         "**Administration: write**",
         "**Actions: read**",
         "**Contents: read**",

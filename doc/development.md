@@ -19,12 +19,40 @@ asset digests, independently download and hash every asset, revalidate the
 draft, and publish exactly once. Stable releases explicitly become latest;
 prereleases and image/provenance releases explicitly do not.
 
+Enable the repository **Immutable releases** setting before publishing any
+release and keep it enabled. Every producer uses a freshly minted protected
+GitHub App token to query
+`GET /repos/cataggar/miz/immutable-releases` immediately before its
+`draft=false` transition. `GITHUB_TOKEN` cannot perform that Administration
+query. A missing, expired, unauthorized, or disabled policy token/setting
+fails while the release is still a draft; the final numeric release response
+must report `immutable=true`.
+
+Install one release GitHub App on only `cataggar/miz` with repository
+**Administration: write** permission (capture needs write access to inspect
+ruleset bypass actors). Store its App ID and PEM key as
+`RELEASE_GITHUB_APP_ID` and `RELEASE_GITHUB_APP_PRIVATE_KEY` in every protected
+publishing environment: `miz-release`, `azurelinux4-release`,
+`ubuntu2404-confidential-release`, `ubuntu2404-confidential-capture`, and
+`ubuntu2604-release`. Ordinary publication jobs mint an Administration-read
+policy token; capture separately
+mints its restricted content-publication token. The gallery reissue shares
+`ubuntu2604-release`.
+
+The normal `.github/workflows/release.yml` tag job requires the protected
+`miz-release` environment. Restrict it to the repository's `v*` release tags,
+require designated reviewers, disable self-review, and configure the two
+shared App secrets above. Disabling immutable releases is an intentional
+repository-wide publication stop; workflows never enable the setting.
+
 A failure before publication leaves a resumable draft. Retrying is allowed
-only when the tag, target commit, title, notes, and prerelease state still
-match the original transaction. A published release is never reopened,
-edited, clobbered, or corrected. If post-publication verification fails, the
-result must be quarantined and investigated without mutation. If any
-published artifact is wrong, issue a new tag and a new release.
+only when the tag, target commit, title, install preamble, stored non-empty
+generated notes, and prerelease state still match the original transaction.
+Generated notes are created only for a new draft and retained byte-for-byte on
+retry. A published release is never reopened, edited, clobbered, or corrected.
+If post-publication verification fails, the result must be quarantined and
+investigated without mutation. If any published artifact is wrong, issue a new
+tag and a new release.
 
 Run `zig build test-immutable-releases` when changing a release workflow,
 publisher, or GitHub release API call. The repository-wide guard intentionally

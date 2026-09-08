@@ -1601,7 +1601,8 @@ and publishes exactly full/core × x86_64/AArch64. Before dispatch:
    `MIZ_ARTIFACT_SIGNING_PROFILE`.
 4. Configure protected environment `ubuntu2604-release` the same way, with
    secrets `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
-   `AZURE_SUBSCRIPTION_ID` and variables `AZURE_LOCATION_X64`,
+   `AZURE_SUBSCRIPTION_ID`, `RELEASE_GITHUB_APP_ID`, and
+   `RELEASE_GITHUB_APP_PRIVATE_KEY`, and variables `AZURE_LOCATION_X64`,
    `AZURE_LOCATION_ARM64`, `AZURE_VM_SIZE_X64`, and
    `AZURE_VM_SIZE_ARM64`.
 5. Configure both Entra federated credentials with issuer

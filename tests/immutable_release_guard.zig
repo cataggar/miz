@@ -119,6 +119,12 @@ fn isWorkflow(path: []const u8) bool {
             std.mem.endsWith(u8, path, ".yaml"));
 }
 
+fn isAction(path: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, ".github/actions/")) return false;
+    return std.mem.endsWith(u8, path, "/action.yml") or
+        std.mem.endsWith(u8, path, "/action.yaml");
+}
+
 fn isListed(path: []const u8, list: []const []const u8) bool {
     for (list) |entry| {
         if (std.mem.eql(u8, entry, path)) return true;
@@ -211,6 +217,24 @@ fn tokenContainsWriteMethod(token: []const u8) bool {
     return false;
 }
 
+fn tokenIsGetMethod(token: []const u8) bool {
+    return std.mem.eql(u8, token, "get") or
+        std.mem.eql(u8, token, "-xget") or
+        std.mem.eql(u8, token, "--method=get") or
+        std.mem.eql(u8, token, "--request=get");
+}
+
+fn tokenIsGhBodyFlag(token: []const u8) bool {
+    return std.mem.eql(u8, token, "-f") or
+        std.mem.startsWith(u8, token, "-f=") or
+        std.mem.eql(u8, token, "--raw-field") or
+        std.mem.startsWith(u8, token, "--raw-field=") or
+        std.mem.eql(u8, token, "--field") or
+        std.mem.startsWith(u8, token, "--field=") or
+        std.mem.eql(u8, token, "--input") or
+        std.mem.startsWith(u8, token, "--input=");
+}
+
 fn endpointWindowIsReleaseWrite(tokens: []const []const u8, index: usize) bool {
     const token = tokens[index];
     const release_endpoint = tokenHasReleaseEndpoint(token);
@@ -223,10 +247,27 @@ fn endpointWindowIsReleaseWrite(tokens: []const []const u8, index: usize) bool {
     const start = index -| 24;
     const end = @min(tokens.len, index + 25);
     var write_method = false;
+    var explicit_get = false;
+    var body = false;
+    var pending_method = false;
     for (tokens[start..end]) |nearby| {
+        if (std.mem.eql(u8, nearby, "-x") or
+            std.mem.eql(u8, nearby, "--method") or
+            std.mem.eql(u8, nearby, "--request"))
+        {
+            pending_method = true;
+            continue;
+        }
+        if (pending_method) {
+            write_method = write_method or tokenContainsWriteMethod(nearby);
+            explicit_get = explicit_get or tokenIsGetMethod(nearby);
+            pending_method = false;
+        }
         write_method = write_method or tokenContainsWriteMethod(nearby);
+        explicit_get = explicit_get or tokenIsGetMethod(nearby);
+        body = body or tokenIsGhBodyFlag(nearby);
     }
-    return upload_endpoint or write_method;
+    return upload_endpoint or write_method or (body and !explicit_get);
 }
 
 fn commandWindowIsReleaseWrite(tokens: []const []const u8, start: usize) bool {
@@ -237,6 +278,8 @@ fn commandWindowIsReleaseWrite(tokens: []const []const u8, start: usize) bool {
     var release_endpoint = false;
     var upload_endpoint = false;
     var pending_method = false;
+    var explicit_get = false;
+    var body = false;
     for (tokens[start..end], start..) |token, index| {
         if (std.mem.eql(u8, token, "release") and release_index == null) {
             release_index = index;
@@ -251,9 +294,12 @@ fn commandWindowIsReleaseWrite(tokens: []const []const u8, start: usize) bool {
         }
         if (pending_method) {
             write_method = write_method or tokenContainsWriteMethod(token);
+            explicit_get = explicit_get or tokenIsGetMethod(token);
             pending_method = false;
         }
         write_method = write_method or tokenIsWriteMethod(token);
+        explicit_get = explicit_get or tokenIsGetMethod(token);
+        body = body or tokenIsGhBodyFlag(token);
         release_endpoint = release_endpoint or tokenHasReleaseEndpoint(token);
         upload_endpoint = upload_endpoint or
             std.mem.indexOf(u8, token, "uploads.github.com") != null;
@@ -271,7 +317,7 @@ fn commandWindowIsReleaseWrite(tokens: []const []const u8, start: usize) bool {
         }
     }
     return api_index != null and release_endpoint and
-        (write_method or upload_endpoint);
+        (write_method or upload_endpoint or (body and !explicit_get));
 }
 
 fn looksLikeReleaseAction(normalized: []const u8) bool {
@@ -387,7 +433,7 @@ fn isBinary(source: []const u8) bool {
 }
 
 fn isExecutableContext(path: []const u8, mode: []const u8, source: []const u8) bool {
-    if (std.mem.eql(u8, mode, "100755") or isWorkflow(path) or
+    if (std.mem.eql(u8, mode, "100755") or isWorkflow(path) or isAction(path) or
         std.mem.startsWith(u8, source, "#!"))
     {
         return true;
@@ -556,6 +602,26 @@ test "producer capability detection resists ordinary spelling variants" {
         },
         .{
             .path = "tools/publish.sh",
+            .source = "gh api repos/acme/project/releases -f tag_name=v1",
+        },
+        .{
+            .path = "tools/publish.sh",
+            .source = "gh api repos/acme/project/releases --raw-field tag_name=v1",
+        },
+        .{
+            .path = "tools/publish.sh",
+            .source = "gh api repos/acme/project/releases -F draft=true",
+        },
+        .{
+            .path = "tools/publish.sh",
+            .source = "gh api repos/acme/project/releases --field draft=true",
+        },
+        .{
+            .path = "tools/publish.sh",
+            .source = "gh api repos/acme/project/releases --input request.json",
+        },
+        .{
+            .path = "tools/publish.sh",
             .source = "curl --request POST https://api.github.com/repos/acme/project/releases",
         },
         .{
@@ -628,6 +694,48 @@ test "producer capability detection resists ordinary spelling variants" {
     }
 }
 
+test "explicit GET keeps gh API body fields read-only" {
+    const allocator = std.testing.allocator;
+    inline for ([_][]const u8{
+        "gh api --method GET repos/acme/project/releases -f per_page=100",
+        "gh api -X GET repos/acme/project/releases --field per_page=100",
+        "gh api repos/acme/project/releases --method=GET --input query.json",
+    }) |source| {
+        try std.testing.expect(!try looksLikeProducer(
+            allocator,
+            "tools/query.sh",
+            source,
+        ));
+    }
+}
+
+test "composite actions are executable release producer contexts" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\name: hidden publisher
+        \\runs:
+        \\  using: composite
+        \\  steps:
+        \\    - shell: bash
+        \\      run: gh api repos/acme/project/releases -f tag_name=v1
+    ;
+    try std.testing.expect(try looksLikeProducer(
+        allocator,
+        ".github/actions/publish/action.yml",
+        source,
+    ));
+    try std.testing.expectError(
+        error.UnreviewedReleaseProducer,
+        validateTrackedSource(
+            allocator,
+            ".github/actions/publish/action.yml",
+            "100644",
+            source,
+            false,
+        ),
+    );
+}
+
 test "non-executable exact pattern fixtures do not become producers" {
     const allocator = std.testing.allocator;
     try std.testing.expect(!try validateTrackedSource(
@@ -665,6 +773,52 @@ test "main release workflow delegates the complete draft transaction to Zig" {
     try expectContains(path, source, "--workspace \"$GITHUB_WORKSPACE/.miz-release\"");
 }
 
+test "every publishing workflow mints the shared protected policy token" {
+    const allocator = std.testing.allocator;
+    const root = try rootAlloc(allocator);
+    defer allocator.free(root);
+    const pinned =
+        "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349";
+    for (write_workflows) |path| {
+        const source = try readSource(allocator, std.testing.io, root, path);
+        defer allocator.free(source);
+        try expectContains(path, source, pinned);
+        try expectContains(path, source, "secrets.RELEASE_GITHUB_APP_ID");
+        try expectContains(
+            path,
+            source,
+            "secrets.RELEASE_GITHUB_APP_PRIVATE_KEY",
+        );
+        if (std.mem.endsWith(u8, path, "ubuntu2404-confidential-capture.yml")) {
+            try expectContains(path, source, "permission-administration: write");
+            try expectContains(path, source, "POLICY_GH_TOKEN");
+        } else {
+            try expectContains(path, source, "permission-administration: read");
+            try expectContains(
+                path,
+                source,
+                if (std.mem.endsWith(u8, path, "/release.yml"))
+                    "MIZ_RELEASE_POLICY_GH_TOKEN"
+                else
+                    "RELEASE_POLICY_GH_TOKEN",
+            );
+        }
+    }
+    const main = try readSource(
+        allocator,
+        std.testing.io,
+        root,
+        ".github/workflows/release.yml",
+    );
+    defer allocator.free(main);
+    try expectContains(".github/workflows/release.yml", main, "environment: miz-release");
+    try expectContains(
+        ".github/workflows/release.yml",
+        main,
+        "MIZ_RELEASE_POLICY_GH_TOKEN",
+    );
+}
+
 test "every shell asset publisher is draft-only until one-way publication" {
     const allocator = std.testing.allocator;
     const root = try rootAlloc(allocator);
@@ -694,6 +848,14 @@ test "every shell asset publisher is draft-only until one-way publication" {
         try expectOrder(path, source, "--draft", "uploads.github.com/repos/");
         try expectOrder(path, source, "uploads.github.com/repos/", "gh release download");
         try expectOrder(path, source, "gh release download", "publish_attempted=true");
+        try expectOrder(
+            path,
+            source,
+            "repos/$REPOSITORY/immutable-releases",
+            "publish_attempted=true",
+        );
+        try expectContains(path, source, "RELEASE_POLICY_GH_TOKEN");
+        try expectContains(path, source, "GH_TOKEN=\"$policy_token\" gh api");
         if (std.mem.indexOf(u8, source, "--method DELETE") != null) {
             try expectOrder(
                 path,

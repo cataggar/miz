@@ -195,6 +195,15 @@ const Fixture = struct {
         scenario: []const u8,
         version: []const u8,
     ) !Run {
+        return self.runWithPolicy(scenario, version, "policy-token");
+    }
+
+    fn runWithPolicy(
+        self: *Fixture,
+        scenario: []const u8,
+        version: []const u8,
+        policy_token: ?[]const u8,
+    ) !Run {
         const tag = try std.fmt.allocPrint(self.allocator, "v{s}", .{version});
         defer self.allocator.free(tag);
         var environment = try std.process.Environ.createMap(
@@ -208,6 +217,10 @@ const Fixture = struct {
         try environment.put("MIZ_MOCK_GH_TAG", tag);
         try environment.put("MIZ_MOCK_GH_VERSION", version);
         try environment.put("MIZ_MOCK_GH_COMMIT", commit);
+        try environment.put("GH_TOKEN", "content-token");
+        if (policy_token) |token| {
+            try environment.put("MIZ_RELEASE_POLICY_GH_TOKEN", token);
+        }
         const result = try std.process.run(self.allocator, std.testing.io, .{
             .argv = &.{
                 self.publisher,
@@ -351,6 +364,11 @@ test "fresh draft uploads verifies downloads and publishes once in order" {
     try expectOrder(
         log,
         "32:Accept: application/octet-stream",
+        "repos/cataggar/miz/immutable-releases",
+    );
+    try expectOrder(
+        log,
+        "repos/cataggar/miz/immutable-releases",
         "8:--method\x1f5:PATCH",
     );
     try expectContains(log, "11:draft=false");
@@ -358,6 +376,11 @@ test "fresh draft uploads verifies downloads and publishes once in order" {
     try expectContains(log, "17:make_latest=false");
     try expectContains(log, "16:make_latest=true");
     try expectContains(log, "Generated fixture changelog");
+    try expectContains(log, "previous_tag_name=v1.2.2");
+    try expectContains(
+        log,
+        "``\\n\\n\\n## What's Changed",
+    );
     try expectContains(
         log,
         "target_commitish=0123456789abcdef0123456789abcdef01234567",
@@ -371,6 +394,21 @@ test "fresh draft uploads verifies downloads and publishes once in order" {
     const stage = try fixture.stage();
     defer std.testing.allocator.free(stage);
     try std.testing.expectEqualStrings("published", stage);
+}
+
+test "fresh release body preserves the byte-exact generated-notes separator" {
+    var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+    defer fixture.deinit();
+    const result = try fixture.run("fresh", "1.2.3");
+    defer result.deinit(std.testing.allocator);
+    try expectSucceeded(result);
+    const log = try fixture.log();
+    defer std.testing.allocator.free(log);
+    try expectContains(
+        log,
+        "body=**Install:**\\n\\n```console\\nghr install cataggar/miz@v1.2.3" ++
+            "\\n```\\n\\n\\n## What's Changed\\n\\n* Generated fixture changelog\\n",
+    );
 }
 
 test "a missing or legacy draft target is refused before upload" {
@@ -467,6 +505,7 @@ test "an exact retained draft resumes without creating another release" {
     const log = try fixture.log();
     defer std.testing.allocator.free(log);
     try expectAbsent(log, create_endpoint);
+    try expectAbsent(log, "repos/cataggar/miz/releases/generate-notes");
     try expectContains(log, "8:--method\x1f5:PATCH");
 }
 
@@ -485,25 +524,49 @@ test "an exact retained draft asset set is not reuploaded" {
     try expectContains(log, "8:--method\x1f5:PATCH");
 }
 
-test "regenerated release notes must exactly match a resumable draft" {
+test "retained draft notes survive changed generated-note inputs" {
     var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
     defer fixture.deinit();
     try fixture.setStage("draft");
     const result = try fixture.run("notes-mismatch", "1.2.3");
     defer result.deinit(std.testing.allocator);
-    try std.testing.expect(!result.succeeded());
-    try expectContains(result.stderr, "release body");
+    try expectSucceeded(result);
     const log = try fixture.log();
     defer std.testing.allocator.free(log);
-    try expectOrder(
-        log,
-        "repos/cataggar/miz/releases/generate-notes",
-        "releases?per_page=100",
-    );
+    try expectAbsent(log, "repos/cataggar/miz/releases/generate-notes");
     try expectAbsent(log, create_endpoint);
-    try expectAbsent(log, upload_endpoint);
-    try expectAbsent(log, "8:--method\x1f6:DELETE");
-    try expectAbsent(log, "8:--method\x1f5:PATCH");
+    try expectContains(log, "Generated fixture changelog");
+    try expectAbsent(log, "Regenerated fixture changelog changed");
+}
+
+test "malformed or foreign retained draft bodies are refused" {
+    inline for ([_]struct {
+        scenario: []const u8,
+        diagnostic: []const u8,
+    }{
+        .{
+            .scenario = "malformed-body",
+            .diagnostic = "generated-notes separator",
+        },
+        .{
+            .scenario = "foreign-body",
+            .diagnostic = "exact install preamble",
+        },
+    }) |case| {
+        var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+        defer fixture.deinit();
+        try fixture.setStage("draft");
+        const result = try fixture.run(case.scenario, "1.2.3");
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(!result.succeeded());
+        try expectContains(result.stderr, case.diagnostic);
+        const log = try fixture.log();
+        defer std.testing.allocator.free(log);
+        try expectAbsent(log, "repos/cataggar/miz/releases/generate-notes");
+        try expectAbsent(log, upload_endpoint);
+        try expectAbsent(log, "8:--method\x1f6:DELETE");
+        try expectAbsent(log, "8:--method\x1f5:PATCH");
+    }
 }
 
 test "a published release is refused before every mutation" {
@@ -552,6 +615,52 @@ test "upload failure leaves a resumable draft and never publishes" {
     const log = try fixture.log();
     defer std.testing.allocator.free(log);
     try expectAbsent(log, "8:--method\x1f5:PATCH");
+}
+
+test "immutable release policy failures leave the release as a draft" {
+    inline for ([_]struct {
+        scenario: []const u8,
+        policy_token: ?[]const u8,
+        diagnostic: []const u8,
+    }{
+        .{
+            .scenario = "immutable-disabled",
+            .policy_token = "policy-token",
+            .diagnostic = "immutable releases are disabled",
+        },
+        .{
+            .scenario = "immutable-missing",
+            .policy_token = "policy-token",
+            .diagnostic = "enabled state is missing",
+        },
+        .{
+            .scenario = "policy-unauthorized",
+            .policy_token = "expired-policy-token",
+            .diagnostic = "GitHub CLI command failed",
+        },
+        .{
+            .scenario = "fresh",
+            .policy_token = null,
+            .diagnostic = "policy token is missing",
+        },
+    }) |case| {
+        var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+        defer fixture.deinit();
+        const result = try fixture.runWithPolicy(
+            case.scenario,
+            "1.2.3",
+            case.policy_token,
+        );
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(!result.succeeded());
+        try expectContains(result.stderr, case.diagnostic);
+        const stage = try fixture.stage();
+        defer std.testing.allocator.free(stage);
+        try std.testing.expectEqualStrings("draft", stage);
+        const log = try fixture.log();
+        defer std.testing.allocator.free(log);
+        try expectAbsent(log, "8:--method\x1f5:PATCH");
+    }
 }
 
 test "stale assets are deleted only after a draft check and before publish" {
@@ -674,16 +783,51 @@ test "post-publication verification failure performs no later mutation" {
     try expectAbsent(after, "draft=true");
 }
 
-test "an immutable response must remain immutable on the final read" {
+test "the final numeric release response must be immutable" {
     var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
     defer fixture.deinit();
-    const result = try fixture.run("immutable-regression", "1.2.3");
+    const result = try fixture.run("final-immutable-false", "1.2.3");
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(!result.succeeded());
-    try expectContains(result.stderr, "immutable state regressed");
+    try expectContains(result.stderr, "published release is not immutable");
     const stage = try fixture.stage();
     defer std.testing.allocator.free(stage);
     try std.testing.expectEqualStrings("published", stage);
+}
+
+test "asset deletion aborts when the fresh predicate no longer matches" {
+    inline for ([_]struct {
+        scenario: []const u8,
+        setup: enum { starter, stale, duplicate },
+    }{
+        .{ .scenario = "race-starter-valid", .setup = .starter },
+        .{ .scenario = "race-stale-changed", .setup = .stale },
+        .{ .scenario = "race-duplicate-resolved", .setup = .duplicate },
+    }) |case| {
+        var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+        defer fixture.deinit();
+        try fixture.setStage("draft");
+        const name = "miz-1.2.3-linux-musl-x64.tar.gz";
+        switch (case.setup) {
+            .starter => try fixture.addStarter(name),
+            .stale => try fixture.addRemote("stale.bin", "stale"),
+            .duplicate => {
+                try fixture.addStarter(name);
+                try fixture.addRemote(name, "fixture:miz-1.2.3-linux-musl-x64.tar.gz\n");
+            },
+        }
+        const result = try fixture.run(case.scenario, "1.2.3");
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expect(!result.succeeded());
+        try expectContains(result.stderr, "changed");
+        const log = try fixture.log();
+        defer std.testing.allocator.free(log);
+        try expectAbsent(log, "8:--method\x1f6:DELETE");
+        try expectAbsent(log, "8:--method\x1f5:PATCH");
+        const stage = try fixture.stage();
+        defer std.testing.allocator.free(stage);
+        try std.testing.expectEqualStrings("draft", stage);
+    }
 }
 
 test "missing unexpected and changed local assets fail closed" {

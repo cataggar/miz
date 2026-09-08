@@ -4361,8 +4361,11 @@ fn remoteReleaseForExpected(
     errdefer output.deinit(allocator);
     try output.print(
         allocator,
-        "{{\"draft\": {s}, \"assets\": [",
-        .{if (draft) "true" else "false"},
+        "{{\"draft\": {s}, \"immutable\": {s}, \"assets\": [",
+        .{
+            if (draft) "true" else "false",
+            if (draft) "false" else "true",
+        },
     );
     var first = true;
     var lines = std.mem.splitScalar(u8, expected, '\n');
@@ -4521,6 +4524,20 @@ test "github-release-assets holds the final stage to the same one-to-one set" {
     const exact = try remoteReleaseForExpected(publication_allowlist, false);
     defer allocator.free(exact);
     try expectAssetsAccepted(&subject, exact, "final");
+    const mutable = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        exact,
+        "\"immutable\": true",
+        "\"immutable\": false",
+    );
+    defer allocator.free(mutable);
+    try expectAssetsRejected(
+        &subject,
+        mutable,
+        "final",
+        "published release is not immutable",
+    );
 
     const duplicated =
         \\{"draft": false, "assets": [

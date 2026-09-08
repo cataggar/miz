@@ -365,7 +365,19 @@ jobs:
           zig build -Doptimize=ReleaseSafe install-ubuntu2404-confidential-release
           test -x "$RELEASE_TOOL"
 
+      - name: Mint immutable-release policy token
+        id: release_policy_token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: read
+
       - name: Revalidate the exact protected result and publish
+        env:
+          RELEASE_POLICY_GH_TOKEN: ${{ steps.release_policy_token.outputs.token }}
         run: scripts/ubuntu2404_confidential_publish.sh
 
       - name: Remove publication staging

@@ -137,6 +137,7 @@ jobs:
     name: Create Release
     needs: [verify, build]
     runs-on: ubuntu-latest
+    environment: miz-release
     permissions:
       contents: write
       id-token: write
@@ -166,9 +167,20 @@ jobs:
         with:
           subject-path: miz-*.tar.gz
 
+      - name: Mint immutable-release policy token
+        id: release_policy_token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: read
+
       - name: Publish verified draft exactly once
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MIZ_RELEASE_POLICY_GH_TOKEN: ${{ steps.release_policy_token.outputs.token }}
         run: |
           set -euo pipefail
           zig-out/bin/miz_release publish \

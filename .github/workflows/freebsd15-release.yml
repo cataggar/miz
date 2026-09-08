@@ -536,6 +536,7 @@ jobs:
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    environment: azurelinux4-release
     permissions:
       actions: read
       contents: write
@@ -596,5 +597,17 @@ jobs:
           scripts/freebsd15_stage_release.sh
           diff --recursive --brief "$PLAN_DIR" "$STAGING_ROOT/evidence"
 
+      - name: Mint immutable-release policy token
+        id: release_policy_token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: read
+
       - name: Mutate the GitHub release from the verified plan
+        env:
+          RELEASE_POLICY_GH_TOKEN: ${{ steps.release_policy_token.outputs.token }}
         run: scripts/freebsd15_publish.sh

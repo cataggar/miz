@@ -160,6 +160,8 @@ it to the `main` branch, and configure:
 | Secret | `AZURE_CLIENT_ID` | Entra application client ID |
 | Secret | `AZURE_TENANT_ID` | Entra tenant ID |
 | Secret | `AZURE_SUBSCRIPTION_ID` | Acceptance subscription ID |
+| Secret | `RELEASE_GITHUB_APP_ID` | shared repository-installed release App ID |
+| Secret | `RELEASE_GITHUB_APP_PRIVATE_KEY` | PEM key for the shared release App |
 | Variable | `AZURE_LOCATION` | `westeurope` |
 | Variable | `AZURE_VM_SIZE` | `Standard_DC2as_v5` |
 
@@ -237,8 +239,8 @@ Configure:
 | Secret | `AZURE_PUBLICATION_CLIENT_ID` | distinct exclusive version publisher |
 | Secret | `AZURE_TENANT_ID` | common Entra tenant |
 | Secret | `AZURE_SUBSCRIPTION_ID` | common capture/target subscription |
-| Secret | `CAPTURE_GITHUB_APP_ID` | repository-installed protected capture GitHub App ID |
-| Secret | `CAPTURE_GITHUB_APP_PRIVATE_KEY` | PEM private key for that GitHub App |
+| Secret | `RELEASE_GITHUB_APP_ID` | shared repository-installed release GitHub App ID |
+| Secret | `RELEASE_GITHUB_APP_PRIVATE_KEY` | PEM private key for that GitHub App |
 | Variable | `CAPTURE_RELEASE_WRITER_POLICY` | exact `owner-and-publisher-app-only-v1` acknowledgement after the manual installed-App audit |
 | Variable | `AZURE_LOCATION` | previously live-qualified region |
 | Variable | `AZURE_VM_SIZE` | previously live-qualified AMD SEV-SNP SKU |
@@ -265,9 +267,10 @@ Enable **immutable releases** in the repository settings before creating the
 accepted source release or dispatching capture. The workflow queries
 `GET /repos/cataggar/miz/immutable-releases` with the pinned official GitHub
 REST API version in a protected preflight before any Azure login or mutation
-and requires `enabled=true`; it never changes the repository setting.
+and again immediately before provenance publication, requiring
+`enabled=true`; it never changes the repository setting.
 `GITHUB_TOKEN` cannot receive the required repository Administration access.
-Install a dedicated GitHub App on only `cataggar/miz` with repository
+Install the shared release GitHub App on only `cataggar/miz` with repository
 permissions **Administration: write**, **Actions: read**, **Contents: write**,
 and **Workflows: write**. The pinned official
 `actions/create-github-app-token` action mints a fresh installation token in
@@ -280,7 +283,7 @@ publication job separately mints a token with only **Contents: write** and
 reads and artifact download; the content token performs the draft
 create/read/upload/publish operations and never performs an Administration
 query. Every token is revoked at job completion. Never expose or upload the
-App private key or an installation token. `CAPTURE_GITHUB_APP_ID` is the
+App private key or an installation token. `RELEASE_GITHUB_APP_ID` is the
 GitHub App/integration ID used by the sole ruleset `Integration` bypass actor
 and identifies the intended publisher in the protected configuration.
 It is not the App installation ID. The accepted source release itself must

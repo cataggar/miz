@@ -75,6 +75,8 @@ pub fn main(init: std.process.Init) !void {
         allocator,
         io,
         init.environ_map.get("MIZ_GH") orelse "gh",
+        init.minimal.environ,
+        init.environ_map.get("MIZ_RELEASE_POLICY_GH_TOKEN"),
         argv[1..],
         &diagnostic,
     ) catch |err| switch (err) {
@@ -96,6 +98,8 @@ fn run(
     allocator: Allocator,
     io: Io,
     gh_executable: []const u8,
+    environment: std.process.Environ,
+    policy_token: ?[]const u8,
     argv: []const []const u8,
     diagnostic: *release.Diagnostic,
 ) !void {
@@ -152,6 +156,8 @@ fn run(
             .workspace = try options.require("--workspace"),
             .gh_executable = gh_executable,
             .summary_path = options.get("--github-step-summary"),
+            .environment = environment,
+            .policy_token = policy_token,
         }, diagnostic);
     }
     return error.Usage;

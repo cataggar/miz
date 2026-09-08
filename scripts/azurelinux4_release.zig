@@ -75,6 +75,7 @@ const usage_text =
     \\  tag-ref                print the object an exact release tag ref points at
     \\  tag-object             print the object a peeled annotated tag points at
     \\  check-release-metadata require an exact resumable draft identity
+    \\  check-immutable-releases require the protected repository policy
     \\  check-draft-assets    plan/validate exact numeric draft asset mutations
     \\  release-stale-assets   print the asset IDs a release holds outside the allowlist
     \\  check-release-assets   require the exact remote allowlist in draft or published state
@@ -210,6 +211,7 @@ const command_table = [_]Command{
     .{ .name = "tag-ref", .handler = runTagRef },
     .{ .name = "tag-object", .handler = runTagObject },
     .{ .name = "check-release-metadata", .handler = runCheckReleaseMetadata },
+    .{ .name = "check-immutable-releases", .handler = runCheckImmutableReleases },
     .{ .name = "check-draft-assets", .handler = runCheckDraftAssets },
     .{ .name = "release-stale-assets", .handler = runReleaseStaleAssets },
     .{ .name = "check-release-assets", .handler = runCheckReleaseAssets },
@@ -776,6 +778,16 @@ fn runCheckReleaseMetadata(context: Context, argv: []const []const u8) !void {
     );
 }
 
+fn runCheckImmutableReleases(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{"response"});
+    return release.github_release.validateImmutableReleasesFile(
+        context.allocator,
+        context.io,
+        try options.require("response"),
+        context.diagnostic,
+    );
+}
+
 fn runCheckDraftAssets(context: Context, argv: []const []const u8) !void {
     const options = try parseOptions(argv, &.{
         "release",
@@ -1000,6 +1012,7 @@ test "every command the shell and workflow call is dispatched" {
         "tag-ref",
         "tag-object",
         "check-release-metadata",
+        "check-immutable-releases",
         "check-draft-assets",
         "release-stale-assets",
         "check-release-assets",

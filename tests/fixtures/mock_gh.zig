@@ -21,6 +21,7 @@ pub fn main(init: std.process.Init) !void {
     const version = init.environ_map.get("MIZ_MOCK_GH_VERSION") orelse "1.2.3";
     const commit = init.environ_map.get("MIZ_MOCK_GH_COMMIT") orelse
         "0123456789abcdef0123456789abcdef01234567";
+    const gh_token = init.environ_map.get("GH_TOKEN") orelse "";
     try appendLog(allocator, io, root, argv[1..]);
     if (argv.len < 2) return error.MissingCommand;
 
@@ -38,6 +39,7 @@ pub fn main(init: std.process.Init) !void {
             tag,
             version,
             commit,
+            gh_token,
             argv[2..],
             out,
         );
@@ -55,6 +57,7 @@ fn apiCommand(
     tag: []const u8,
     version: []const u8,
     commit: []const u8,
+    gh_token: []const u8,
     argv: []const []const u8,
     out: *std.Io.Writer,
 ) !void {
@@ -71,6 +74,25 @@ fn apiCommand(
     } else return error.MissingApiEndpoint;
     const method = optionValue(argv, "--method") orelse "GET";
 
+    if (std.mem.endsWith(u8, endpoint, "/immutable-releases")) {
+        if (!std.mem.eql(u8, gh_token, "policy-token") or
+            std.mem.eql(u8, scenario, "policy-unauthorized"))
+        {
+            return error.MockPolicyUnauthorized;
+        }
+        if (std.mem.eql(u8, scenario, "immutable-missing")) {
+            try out.writeAll("{}\n");
+        } else {
+            try out.print(
+                "{{\"enabled\":{s}}}\n",
+                .{if (std.mem.eql(u8, scenario, "immutable-disabled"))
+                    "false"
+                else
+                    "true"},
+            );
+        }
+        return;
+    }
     if (std.mem.indexOf(u8, endpoint, "/git/ref/tags/") != null) {
         const sha = if (std.mem.eql(u8, scenario, "tag-mismatch"))
             "ffffffffffffffffffffffffffffffffffffffff"
@@ -86,7 +108,7 @@ fn apiCommand(
         const stage = try readStage(allocator, io, root);
         defer allocator.free(stage);
         if (std.mem.eql(u8, stage, "absent")) {
-            try out.writeAll("[[]]\n");
+            try out.writeAll("[[{\"tag_name\":\"v1.2.2\"}]]\n");
         } else {
             try out.writeAll("[[");
             try writeRelease(allocator, io, root, scenario, tag, version, commit, out);
@@ -103,7 +125,7 @@ fn apiCommand(
                     out,
                 );
             }
-            try out.writeAll("]]\n");
+            try out.writeAll(",{\"tag_name\":\"v1.2.2\"}]]\n");
         }
         return;
     }
@@ -123,6 +145,11 @@ fn apiCommand(
                 u8,
                 fieldValue(argv, "target_commitish") orelse "",
                 commit,
+            ) or
+            !std.mem.eql(
+                u8,
+                fieldValue(argv, "previous_tag_name") orelse "",
+                "v1.2.2",
             ))
         {
             return error.MockInvalidGeneratedNotesIdentity;
@@ -183,6 +210,13 @@ fn apiCommand(
     if (std.mem.endsWith(u8, endpoint, "/releases/42") and
         std.mem.eql(u8, method, "PATCH"))
     {
+        const expected_body = try expectedReleaseBody(allocator, tag, "fresh");
+        defer allocator.free(expected_body);
+        if (!std.mem.eql(
+            u8,
+            fieldValue(argv, "body") orelse "",
+            expected_body,
+        )) return error.MockChangedStoredBody;
         try writeStage(io, root, "published");
         const response_scenario = if (std.mem.eql(
             u8,
@@ -190,8 +224,6 @@ fn apiCommand(
             "post-publish-failure",
         ))
             "fresh"
-        else if (std.mem.eql(u8, scenario, "immutable-regression"))
-            "immutable-enabled"
         else
             scenario;
         try writeRelease(
@@ -207,6 +239,11 @@ fn apiCommand(
         return;
     }
     if (std.mem.endsWith(u8, endpoint, "/releases/42")) {
+        if (std.mem.eql(u8, method, "GET") and
+            (std.mem.startsWith(u8, scenario, "race-")))
+        {
+            _ = try incrementMarker(allocator, io, root, "numeric-fetch-count");
+        }
         try writeRelease(allocator, io, root, scenario, tag, version, commit, out);
         return;
     }
@@ -323,7 +360,16 @@ fn writeRelease(
     else
         try std.fmt.allocPrint(allocator, "miz {s}", .{version});
     defer if (!std.mem.eql(u8, title, "foreign title")) allocator.free(title);
-    const body = try expectedReleaseBody(allocator, tag, "fresh");
+    const body = if (std.mem.eql(u8, scenario, "malformed-body"))
+        try std.fmt.allocPrint(
+            allocator,
+            "**Install:**\n\n```console\nghr install cataggar/miz@{s}\n```\n",
+            .{tag},
+        )
+    else if (std.mem.eql(u8, scenario, "foreign-body"))
+        try allocator.dupe(u8, "foreign release body")
+    else
+        try expectedReleaseBody(allocator, tag, "fresh");
     defer allocator.free(body);
     try out.print(
         "{{\"id\":{d},\"tag_name\":",
@@ -347,13 +393,14 @@ fn writeRelease(
         .{
             if (draft) "true" else "false",
             if (std.mem.indexOfScalar(u8, version, '-') != null) "true" else "false",
-            if (published and std.mem.eql(u8, scenario, "immutable-enabled"))
+            if (published and
+                !std.mem.eql(u8, scenario, "final-immutable-false"))
                 "true"
             else
                 "false",
         },
     );
-    try writeAssets(allocator, io, root, scenario, out);
+    try writeAssets(allocator, io, root, scenario, version, out);
     try out.writeAll("]}");
 }
 
@@ -362,6 +409,7 @@ fn writeAssets(
     io: Io,
     root: []const u8,
     scenario: []const u8,
+    version: []const u8,
     out: *std.Io.Writer,
 ) !void {
     const remote = try std.fs.path.join(allocator, &.{ root, "remote" });
@@ -398,16 +446,45 @@ fn writeAssets(
     };
     defer if (starter_name) |name| allocator.free(name);
     if (starter_name) |name| {
-        try out.print("{{\"id\":{d},\"name\":", .{starter_asset_id});
-        try writeJsonString(out, name);
-        try out.print(
-            ",\"size\":0,\"state\":\"{s}\",\"digest\":null}}",
-            .{if (std.mem.eql(u8, scenario, "unknown-asset-state"))
-                "pending"
-            else
-                "starter"},
-        );
-        wrote_asset = true;
+        const fetch_count = readMarkerInt(
+            allocator,
+            io,
+            root,
+            "numeric-fetch-count",
+        ) catch 0;
+        if ((std.mem.eql(u8, scenario, "race-starter-valid") and
+            fetch_count >= 3) or
+            (std.mem.eql(u8, scenario, "race-duplicate-resolved") and
+                fetch_count < 3))
+        {
+            const local_path = try std.fs.path.join(
+                allocator,
+                &.{ root, "assets; argv remains literal", name },
+            );
+            defer allocator.free(local_path);
+            const bytes = try Dir.cwd().readFileAlloc(
+                io,
+                local_path,
+                allocator,
+                .limited(1024 * 1024),
+            );
+            defer allocator.free(bytes);
+            try writeAssetRecord(out, starter_asset_id, name, bytes);
+            wrote_asset = true;
+        } else if (!(std.mem.eql(u8, scenario, "race-duplicate-resolved") and
+            fetch_count >= 3))
+        {
+            try out.print("{{\"id\":{d},\"name\":", .{starter_asset_id});
+            try writeJsonString(out, name);
+            try out.print(
+                ",\"size\":0,\"state\":\"{s}\",\"digest\":null}}",
+                .{if (std.mem.eql(u8, scenario, "unknown-asset-state"))
+                    "pending"
+                else
+                    "starter"},
+            );
+            wrote_asset = true;
+        }
     }
     const corrupt_final_gate =
         (std.mem.eql(u8, scenario, "final-null-digest") or
@@ -419,6 +496,42 @@ fn writeAssets(
         if (wrote_asset) try out.writeByte(',');
         const path = try std.fs.path.join(allocator, &.{ remote, name });
         defer allocator.free(path);
+        const fetch_count = readMarkerInt(
+            allocator,
+            io,
+            root,
+            "numeric-fetch-count",
+        ) catch 0;
+        if (std.mem.eql(u8, scenario, "race-stale-changed") and
+            fetch_count >= 3 and std.mem.eql(u8, name, "stale.bin"))
+        {
+            const expected_name = try std.fmt.allocPrint(
+                allocator,
+                "miz-{s}-linux-musl-x64.tar.gz",
+                .{version},
+            );
+            defer allocator.free(expected_name);
+            const local_path = try std.fs.path.join(
+                allocator,
+                &.{ root, "assets; argv remains literal", expected_name },
+            );
+            defer allocator.free(local_path);
+            const local_bytes = try Dir.cwd().readFileAlloc(
+                io,
+                local_path,
+                allocator,
+                .limited(1024 * 1024),
+            );
+            defer allocator.free(local_bytes);
+            try writeAssetRecord(
+                out,
+                assetId("stale.bin"),
+                expected_name,
+                local_bytes,
+            );
+            wrote_asset = true;
+            continue;
+        }
         const bytes = try Dir.cwd().readFileAlloc(
             io,
             path,
@@ -459,6 +572,23 @@ fn writeAssets(
         }
         wrote_asset = true;
     }
+}
+
+fn writeAssetRecord(
+    out: *std.Io.Writer,
+    id: i64,
+    name: []const u8,
+    bytes: []const u8,
+) !void {
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
+    const hex = std.fmt.bytesToHex(hash, .lower);
+    try out.print("{{\"id\":{d},\"name\":", .{id});
+    try writeJsonString(out, name);
+    try out.print(
+        ",\"size\":{d},\"state\":\"uploaded\",\"digest\":\"sha256:{s}\"}}",
+        .{ bytes.len, &hex },
+    );
 }
 
 fn appendLog(
@@ -560,7 +690,7 @@ fn expectedReleaseBody(
 ) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
-        "**Install:**\n\n```console\nghr install cataggar/miz@{s}\n```\n{s}",
+        "**Install:**\n\n```console\nghr install cataggar/miz@{s}\n```\n\n\n{s}",
         .{ tag, generatedNotes(scenario) },
     );
 }
@@ -620,6 +750,31 @@ fn markerExists(
     };
     file.close(io);
     return true;
+}
+
+fn incrementMarker(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    name: []const u8,
+) !u64 {
+    const current = readMarkerInt(allocator, io, root, name) catch 0;
+    const next = current + 1;
+    var buffer: [32]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buffer, "{d}", .{next});
+    try writeMarker(io, root, name, text);
+    return next;
+}
+
+fn readMarkerInt(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    name: []const u8,
+) !u64 {
+    const text = try readMarker(allocator, io, root, name);
+    defer allocator.free(text);
+    return std.fmt.parseInt(u64, text, 10);
 }
 
 fn writeMarker(

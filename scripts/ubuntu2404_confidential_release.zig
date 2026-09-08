@@ -62,6 +62,7 @@ const usage_text =
     \\  verify-capture         independently revalidate protected capture provenance
     \\  verify-capture-publication validate sanitized durable provenance without raw Azure evidence
     \\  check-release-metadata require an exact resumable draft identity
+    \\  check-immutable-releases require the protected repository policy
     \\  check-draft-assets    plan/validate exact numeric draft mutations
     \\  check-capture-release-assets plan draft repair or require the exact final asset
     \\
@@ -170,6 +171,7 @@ const command_table = [_]Command{
     .{ .name = "verify-capture", .handler = runVerifyCapture },
     .{ .name = "verify-capture-publication", .handler = runVerifyCapturePublication },
     .{ .name = "check-release-metadata", .handler = runCheckReleaseMetadata },
+    .{ .name = "check-immutable-releases", .handler = runCheckImmutableReleases },
     .{ .name = "check-draft-assets", .handler = runCheckDraftAssets },
     .{ .name = "check-capture-release-assets", .handler = runCheckCaptureReleaseAssets },
 };
@@ -227,6 +229,16 @@ fn runCheckReleaseMetadata(context: Context, argv: []const []const u8) !void {
             .body = "",
             .prerelease = false,
         },
+        context.diagnostic,
+    );
+}
+
+fn runCheckImmutableReleases(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{"response"});
+    return release.github_release.validateImmutableReleasesFile(
+        context.allocator,
+        context.io,
+        try options.require("response"),
         context.diagnostic,
     );
 }
@@ -298,6 +310,8 @@ fn runCheckCaptureReleaseAssets(context: Context, argv: []const []const u8) !voi
             .repair
         else if (std.mem.eql(u8, mode_text, "final"))
             .final
+        else if (std.mem.eql(u8, mode_text, "published"))
+            .published
         else
             return error.Usage;
     return release.github_release.validateSingleDraftAssetFiles(
@@ -3430,6 +3444,7 @@ test "command surface is exact and rejects incomplete invocations" {
         "verify-capture",
         "verify-capture-publication",
         "check-release-metadata",
+        "check-immutable-releases",
         "check-draft-assets",
         "check-capture-release-assets",
     };

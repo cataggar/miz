@@ -84,8 +84,8 @@ jobs:
         id: github_policy_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
-          private-key: ${{ secrets.CAPTURE_GITHUB_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-actions: read
@@ -102,7 +102,7 @@ jobs:
       - name: Validate approved dispatch head and protected tag policy
         env:
           GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
-          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
+          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.RELEASE_GITHUB_APP_ID }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -468,8 +468,8 @@ jobs:
         id: github_policy_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
-          private-key: ${{ secrets.CAPTURE_GITHUB_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-actions: read
@@ -829,7 +829,7 @@ jobs:
         if: steps.result_discovery.outputs.result_artifact_id == ''
         env:
           GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
-          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
+          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.RELEASE_GITHUB_APP_ID }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -1219,8 +1219,8 @@ jobs:
         id: github_policy_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
-          private-key: ${{ secrets.CAPTURE_GITHUB_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-actions: read
@@ -1231,8 +1231,8 @@ jobs:
         id: github_publication_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
-          app-id: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
-          private-key: ${{ secrets.CAPTURE_GITHUB_APP_PRIVATE_KEY }}
+          app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
+          private-key: ${{ secrets.RELEASE_GITHUB_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
           permission-contents: write
@@ -1308,7 +1308,7 @@ jobs:
         env:
           POLICY_GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
           PUBLICATION_GH_TOKEN: ${{ steps.github_publication_token.outputs.token }}
-          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.CAPTURE_GITHUB_APP_ID }}
+          EXPECTED_PUBLISHER_APP_ID: ${{ secrets.RELEASE_GITHUB_APP_ID }}
         run: |
           set -euo pipefail
           umask 077
@@ -1329,7 +1329,7 @@ jobs:
           GH_TOKEN="$POLICY_GH_TOKEN" \
             scripts/ubuntu2404_confidential_github_policy.sh \
             "$VALIDATION_DIR/github-policy-before-release"
-          GH_TOKEN="$POLICY_GH_TOKEN" gh api "${api_headers[@]}" \
+          GH_TOKEN="$POLICY_GH_TOKEN" gh api --method GET "${api_headers[@]}" \
             "repos/$GITHUB_REPOSITORY/immutable-releases" \
             >"$VALIDATION_DIR/immutable-releases.json"
           jq -e '.enabled == true' \
@@ -1533,11 +1533,6 @@ jobs:
           GH_TOKEN="$POLICY_GH_TOKEN" \
             scripts/ubuntu2404_confidential_github_policy.sh \
             "$VALIDATION_DIR/github-policy-before-publish"
-          GH_TOKEN="$POLICY_GH_TOKEN" gh api "${api_headers[@]}" \
-            "repos/$GITHUB_REPOSITORY/immutable-releases" \
-            >"$VALIDATION_DIR/immutable-releases-before-publish.json"
-          jq -e '.enabled == true' \
-            "$VALIDATION_DIR/immutable-releases-before-publish.json" >/dev/null
           mapfile -t remote_main < <(
             git ls-remote origin refs/heads/main | awk '{print $1}'
           )
@@ -1561,10 +1556,25 @@ jobs:
             --asset-sha256 "$EXPECTED_RESULT_SHA256" \
             --asset-size "$expected_asset_size" \
             --mode final
+          GH_TOKEN="$POLICY_GH_TOKEN" gh api --method GET "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            >"$VALIDATION_DIR/immutable-releases-before-publish.json"
+          "$RELEASE_TOOL" check-immutable-releases \
+            --response "$VALIDATION_DIR/immutable-releases-before-publish.json"
           EXPECTED_RELEASE_NOTES="$expected_notes" \
             GH_TOKEN="$PUBLICATION_GH_TOKEN" \
             scripts/ubuntu2404_confidential_publish_release.sh \
             "$release_id" "$VALIDATION_DIR/publish-release.json" "$release_json"
+          "$RELEASE_TOOL" check-capture-release-assets \
+            --release "$release_json" \
+            --notes "$VALIDATION_DIR/release-notes.md" \
+            --release-tag "$PROVENANCE_RELEASE_TAG" \
+            --release-title "$PROVENANCE_RELEASE_TITLE" \
+            --tool-commit "$TOOL_COMMIT" \
+            --asset-name "$PROVENANCE_ASSET_NAME" \
+            --asset-sha256 "$EXPECTED_RESULT_SHA256" \
+            --asset-size "$expected_asset_size" \
+            --mode published
           jq -e \
             --arg tag "$PROVENANCE_RELEASE_TAG" \
             --arg title "$PROVENANCE_RELEASE_TITLE" \

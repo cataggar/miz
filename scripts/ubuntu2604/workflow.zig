@@ -844,6 +844,16 @@ pub fn dispatch(
         }
         return;
     }
+    if (std.mem.eql(u8, command, "github-immutable-releases")) {
+        var options = try parse(allocator, argv, &.{"--response"});
+        defer options.deinit();
+        return support.github_release.validateImmutableReleasesFile(
+            allocator,
+            io,
+            try options.require("--response"),
+            diagnostic,
+        );
+    }
     if (std.mem.eql(u8, command, "github-release-assets")) {
         var options = try parse(allocator, argv, &.{
             "--release",
@@ -4242,6 +4252,11 @@ pub fn releaseAssets(
     for (claimed) |taken| {
         if (!taken) return mismatch(final, assets.len, diagnostic);
     }
+    if (final and !support.isTrue(document.get("immutable"))) return fail(
+        diagnostic,
+        "published release is not immutable",
+        .{},
+    );
 }
 
 /// The downloaded copy of the release must be byte-identical to the staged

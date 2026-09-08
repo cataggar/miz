@@ -241,6 +241,11 @@ pub const release_commands = [_]Command{
         },
     },
     .{
+        .name = "check-immutable-releases",
+        .options = &.{"response"},
+        .required = &.{"response"},
+    },
+    .{
         .name = "verify-draft-assets",
         .options = &.{
             "release",
@@ -401,6 +406,7 @@ const release_usage_text =
     \\  matrix, azure-matrix, describe, include-count, candidate, azure-result,
     \\  candidate-binding, stage, compare, stage-expected, stage-evidence,
     \\  publish-expected, tag-object, verify-release-metadata,
+    \\  check-immutable-releases,
     \\  verify-draft-assets,
     \\  release-stale-assets, verify-remote-release,
     \\  verify-downloaded-release, verify-published-release
@@ -593,6 +599,14 @@ fn dispatchRelease(
             requiredOption(options, "release-title"),
             requiredOption(options, "source-commit"),
         );
+    }
+    if (std.mem.eql(u8, name, "check-immutable-releases")) {
+        return support.github_release.validateImmutableReleasesFile(
+            context.arena,
+            context.io,
+            requiredOption(options, "response"),
+            &context.diagnostic,
+        ) catch return error.Invalid;
     }
     if (std.mem.eql(u8, name, "verify-draft-assets")) {
         const mode_text = requiredOption(options, "mode");

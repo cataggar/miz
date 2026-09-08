@@ -61,6 +61,7 @@ assets_dir="$STAGING_ROOT/assets"
 notes_file="$STAGING_ROOT/release-notes.md"
 expected_file="$STAGING_ROOT/expected.tsv"
 release_file="$STAGING_ROOT/release.json"
+immutable_policy_file="$STAGING_ROOT/immutable-releases.json"
 verify_dir="$STAGING_ROOT/remote"
 rm -rf -- "$assets_dir" "$verify_dir"
 mkdir "$assets_dir"
@@ -234,6 +235,23 @@ while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
 done <"$expected_file"
 
 check_release_assets exact >/dev/null
+policy_token=${RELEASE_POLICY_GH_TOKEN:-}
+unset RELEASE_POLICY_GH_TOKEN
+if [[ -z "$policy_token" ]]; then
+  echo "::error::Protected immutable-release policy token is missing"
+  exit 1
+fi
+if ! GH_TOKEN="$policy_token" gh api --method GET \
+    -H 'Accept: application/vnd.github+json' \
+    -H 'X-GitHub-Api-Version: 2026-03-10' \
+    "repos/$REPOSITORY/immutable-releases" >"$immutable_policy_file"; then
+  unset policy_token
+  echo "::error::Cannot read the protected immutable-release policy"
+  exit 1
+fi
+unset policy_token
+"$RELEASE_TOOL" check-immutable-releases \
+  --response "$immutable_policy_file"
 publish_attempted=true
 gh api --method PATCH "$release_api" \
   -f "tag_name=$RELEASE_TAG" \

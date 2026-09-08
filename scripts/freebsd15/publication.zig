@@ -665,6 +665,10 @@ pub fn verifyPublishedRelease(
     if (draft == null or draft.? != .bool or draft.?.bool) {
         return context.fail("published release did not leave the draft state", .{});
     }
+    const immutable = release.object.get("immutable");
+    if (immutable == null or immutable.? != .bool or !immutable.?.bool) {
+        return context.fail("published release is not immutable", .{});
+    }
     const assets = document.arrayOf(release.object.get("assets")) orelse
         return context.fail(
             "published release did not retain the exact final allowlist",

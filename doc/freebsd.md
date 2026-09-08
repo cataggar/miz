@@ -401,7 +401,11 @@ The required procedure is:
 Validation-only uploads short-lived evidence and cannot create a tag, draft,
 asset, or release. Publication is possible only from merged `main`; the
 protected `azurelinux4-release` environment remains the credential boundary
-for Azure acceptance.
+for Azure acceptance. The publication job separately requires the protected
+`azurelinux4-release` environment, restricted to `main`, with required
+reviewers, self-review disabled, and the shared `RELEASE_GITHUB_APP_ID` and
+`RELEASE_GITHUB_APP_PRIVATE_KEY` secrets. That App token performs only the
+fresh immutable-release policy read immediately before publication.
 
 The released QCOW2 files are not directly uploadable to Azure. Derive aligned
 fixed VHDs without changing their partitions:

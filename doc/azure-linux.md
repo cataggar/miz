@@ -309,6 +309,8 @@ The environment must define these secrets:
 AZURE_CLIENT_ID
 AZURE_TENANT_ID
 AZURE_SUBSCRIPTION_ID
+RELEASE_GITHUB_APP_ID
+RELEASE_GITHUB_APP_PRIVATE_KEY
 ```
 
 and these variables:

@@ -332,6 +332,16 @@ pub fn checkReleaseAssets(
         .published => !draft.?.bool,
     };
     var matches = draft_matches and assets.len == expected.len;
+    if (state == .published) {
+        const immutable = release_document.get("immutable");
+        if (immutable == null or immutable.? != .bool or !immutable.?.bool) {
+            return diagnostic.fail(
+                error.ReleaseAllowlistMismatch,
+                "published release is not immutable",
+                .{},
+            );
+        }
+    }
     if (matches) {
         for (expected) |row| {
             var found: ?ObjectMap = null;
@@ -796,7 +806,7 @@ test "the remote release must hold exactly the expected four" {
     ));
 
     var published = try parse(
-        \\{"draft": false, "assets": [
+        \\{"draft": false, "immutable": true, "assets": [
         \\ {"id": 1, "name": "AzureLinux-4.0-x86_64.qcow2", "size": 11, "state": "uploaded", "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"},
         \\ {"id": 2, "name": "AzureLinux-4.0-aarch64.qcow2", "size": 22, "state": "uploaded", "digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"},
         \\ {"id": 3, "name": "AzureLinux-4.0-x86_64.core.qcow2", "size": 33, "state": "uploaded", "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"},
@@ -819,6 +829,24 @@ test "the remote release must hold exactly the expected four" {
     ));
     try std.testing.expectEqualStrings(
         "release stopped being a draft before verification",
+        diagnostic.message(),
+    );
+    var mutable_published = try parse(
+        \\{"draft": false, "immutable": false, "assets": []}
+    );
+    defer mutable_published.deinit();
+    try std.testing.expectError(
+        error.ReleaseAllowlistMismatch,
+        checkReleaseAssets(
+            allocator,
+            &mutable_published.value.object,
+            expected,
+            .published,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqualStrings(
+        "published release is not immutable",
         diagnostic.message(),
     );
 
