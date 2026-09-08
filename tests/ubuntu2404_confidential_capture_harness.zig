@@ -201,9 +201,9 @@ fn writeState(
     errdefer allocator.free(state);
     const text = try std.fmt.allocPrint(
         allocator,
-        \\{{"schema":4,"stage":"prepared",
-        \\"repository":"cataggar/miz","run_id":"123",
-        \\"run_attempt":"4","source_commit":"{s}",
+        \\{{"schema":5,"stage":"prepared",
+        \\"repository":"cataggar/miz","origin_run_id":"123",
+        \\"origin_run_attempt":"4","source_commit":"{s}",
         \\"source_release_tag":"{s}","tool_commit":"{s}",
         \\"subscription_id":"{s}",
         \\"temporary_resource_group":"{s}",
@@ -211,16 +211,23 @@ fn writeState(
         \\"resource_id":"/subscriptions/{s}/resourceGroups/{s}",
         \\"resource_name":"{s}",
         \\"owner_tag":"ubuntu2404-confidential-capture",
-        \\"repository":"cataggar/miz","run_id":"123","run_attempt":"4",
+        \\"repository":"cataggar/miz","origin_run_id":"123",
+        \\"origin_run_attempt":"4",
         \\"source_commit":"{s}"}},
         \\"temporary_resources":{s},"run_succeeded":{s},
         \\"outstanding_write_access":null,
+        \\"recovery":{{"artifact_name":"ubuntu2404-confidential-capture-recovery-123-4-1.2.3",
+        \\"artifact_digest":null,"intent_sha256":null,"status":"pending"}},
+        \\"result":{{"artifact_name":"ubuntu2404-confidential-capture-result-123-4-1.2.3",
+        \\"sha256":null,"status":"pending"}},
         \\"target":{{"owner_tag":"durable-owner","resource_group":"target-rg",
         \\"gallery":"release","image_definition":"ubuntu-confidential",
         \\"definition_id":"/subscriptions/{s}/resourceGroups/target-rg/providers/Microsoft.Compute/galleries/release/images/ubuntu-confidential",
         \\"version_id":"/subscriptions/{s}/resourceGroups/target-rg/providers/Microsoft.Compute/galleries/release/images/ubuntu-confidential/versions/1.2.3",
         \\"publication":{{"lock_id":"{s}",
-        \\"principal_client_id":"{s}","status":"{s}"}}}}}}
+        \\"principal_client_id":"{s}",
+        \\"dispatch_artifact_name":"ubuntu2404-confidential-capture-dispatch-123-4-1.2.3",
+        \\"dispatch_artifact_digest":null,"status":"{s}"}}}}}}
     ,
         .{
             commit,
@@ -255,11 +262,14 @@ fn shellIdentityPreamble(allocator: Allocator, state: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
         \\STATE_FILE='{s}'
+        \\command_name=prepare
         \\EXPECTED_PUBLICATION_LOCK={s}
         \\OWNER=ubuntu2404-confidential-capture
         \\GITHUB_REPOSITORY=cataggar/miz
         \\GITHUB_RUN_ID=123
         \\GITHUB_RUN_ATTEMPT=4
+        \\ORIGIN_RUN_ID=123
+        \\ORIGIN_RUN_ATTEMPT=4
         \\SOURCE_COMMIT={s}
         \\SOURCE_RELEASE_TAG={s}
         \\TOOL_COMMIT={s}
@@ -273,7 +283,17 @@ fn shellIdentityPreamble(allocator: Allocator, state: []const u8) ![]u8 {
         \\TARGET_GALLERY=release
         \\TARGET_IMAGE_DEFINITION=ubuntu-confidential
         \\TARGET_IMAGE_VERSION=1.2.3
+        \\SCRATCH_RESOURCE_GROUP={s}
+        \\SCRATCH_RESERVATION_TAG=fixture-reservation-0001
         \\PUBLICATION_PRINCIPAL_CLIENT_ID={s}
+        \\CAPTURE_TARGET_READ_SCOPE=/subscriptions/{s}/resourceGroups/target-rg
+        \\PUBLICATION_SNAPSHOT_READ_SCOPE=/subscriptions/{s}/resourceGroups/{s}
+        \\PUBLICATION_VERSION_WRITE_SCOPE=/subscriptions/{s}/resourceGroups/target-rg/providers/Microsoft.Compute/galleries/release/images/ubuntu-confidential
+        \\RECOVERY_ARTIFACT_NAME=ubuntu2404-confidential-capture-recovery-123-4-1.2.3
+        \\DISPATCH_ARTIFACT_NAME=ubuntu2404-confidential-capture-dispatch-123-4-1.2.3
+        \\RESULT_ARTIFACT_NAME=ubuntu2404-confidential-capture-result-123-4-1.2.3
+        \\RECOVERY_DIR='{s}/recovery'
+        \\DISPATCH_DIR='{s}/dispatch'
         \\fail() {{ printf '%s\n' "$*" >&2; return 1; }}
         \\
     ,
@@ -287,7 +307,14 @@ fn shellIdentityPreamble(allocator: Allocator, state: []const u8) ![]u8 {
             tenant,
             capture_principal,
             std.fs.path.dirname(state).?,
+            group_name,
             principal,
+            subscription,
+            subscription,
+            group_name,
+            subscription,
+            std.fs.path.dirname(state).?,
+            std.fs.path.dirname(state).?,
         },
     );
 }
@@ -303,17 +330,27 @@ test "harness encodes durable parent and serialized publication trust boundaries
         "CAPTURE_PRINCIPAL_CLIENT_ID",
         "PUBLICATION_PRINCIPAL_CLIENT_ID",
         "Capture and publication principals must be distinct",
-        "usage: $0 prepare|publish|cleanup|run",
+        "usage: $0 prepare|inspect-recovery|export-recovery",
+        "ORIGIN_RUN_ID",
+        "ORIGIN_RUN_ATTEMPT",
+        "RECOVERY_ARTIFACT_NAME",
+        "DISPATCH_ARTIFACT_NAME",
+        "RESULT_ARTIFACT_NAME",
+        "PUBLICATION_SNAPSHOT_READ_SCOPE",
+        "PUBLICATION_VERSION_WRITE_SCOPE",
+        "CAPTURE_TARGET_READ_SCOPE",
         ".stage = \"prepared\"",
         ".stage = \"publishing\"",
-        ".stage = \"completed\"",
+        ".stage = \"result_ready\"",
         "Prepared capture evidence changed after the prepare transition",
         "MIZ_CAPTURE_STAGE=prepared",
         "MIZ_CAPTURE_STAGE=publishing",
-        "MIZ_CAPTURE_STAGE=completed",
+        "MIZ_CAPTURE_STAGE=result_ready",
         "stable,\n# non-canceling concurrency group",
-        "no version delete or parent",
-        "cannot prove RBAC or defend against a\n# malicious subscription Owner",
+        "no version\n# delete or resource-group/gallery/image-definition",
+        "snapshot read only at the configured",
+        "preexisting image-definition scope",
+        "cannot prove\n# RBAC or defend against a malicious subscription Owner",
         "validate_target_parents",
         "Pre-provisioned target resource group is missing or unavailable",
         "Pre-provisioned target gallery is missing or unavailable",
@@ -333,8 +370,16 @@ test "harness encodes durable parent and serialized publication trust boundaries
         "require_target_version_absent_capture prepare",
     );
     const temporary_create = try indexOf(script, "create_temporary_group\n");
-    const prepared = try indexOf(script, "persist_prepared_state\n");
-    const publication_identity = try indexOf(script, "require_publication_account\n");
+    const prepared = std.mem.lastIndexOf(
+        u8,
+        script,
+        "persist_prepared_state\n",
+    ) orelse return error.RequiredTextMissing;
+    const publication_identity = std.mem.lastIndexOf(
+        u8,
+        script,
+        "require_publication_account\n",
+    ) orelse return error.RequiredTextMissing;
     const final_validation = std.mem.lastIndexOf(
         u8,
         script,
@@ -518,7 +563,7 @@ test "unsupported conditional headers and target parent mutations are absent" {
     try expectContains(library, "api-version=2025-03-03");
 }
 
-test "temporary resources use random group names explicit networking and allowlists" {
+test "temporary resources use preprovisioned reservation explicit networking and allowlists" {
     const allocator = std.testing.allocator;
     const script = try readTracked(allocator, script_path);
     defer allocator.free(script);
@@ -528,12 +573,13 @@ test "temporary resources use random group names explicit networking and allowli
     defer allocator.free(guest);
 
     for ([_][]const u8{
-        "random_group_suffix=$(openssl rand -hex 16)",
-        "[[ \"$random_group_suffix\" =~ ^[0-9a-f]{32}$ ]]",
-        "resource_group=\"miz-u2404-cvm-capture-${name_seed}-${random_group_suffix}\"",
+        "resource_group=$SCRATCH_RESOURCE_GROUP",
+        "validate_reserved_temporary_group_document",
+        "\"miz-reservation\": $reservation",
+        "Pre-provisioned scratch reservation is not empty",
+        "--operation Replace",
         "temporary_group_create: {\n        status: \"expected\"",
         "group_exists=$(az group exists",
-        "azure_confidential_vm_resource_group_create_args",
         "confirmed_created",
         "create_common_network",
         "az network vnet create",
@@ -587,7 +633,7 @@ test "publication dispatch is one upsert and ambiguity is quarantined" {
     );
     try expectContains(
         publication_source,
-        ".target.publication.status = \"pending\"",
+        ".target.publication.status = \"put_dispatched\"",
     );
     try expectContains(
         publication_source,
@@ -656,10 +702,18 @@ test "publication dispatch is one upsert and ambiguity is quarantined" {
         \\{s}
         \\{s}
         \\{s}
+        \\jq '.recovery.status = "durable" |
+        \\    .recovery.intent_sha256 = ("a" * 64) |
+        \\    .recovery.artifact_digest = ("sha256:" + ("b" * 64)) |
+        \\    .target.publication.status = "put_authorized" |
+        \\    .target.publication.dispatch_artifact_digest = ("sha256:" + ("c" * 64))' \
+        \\  "$STATE_FILE" >"$STATE_FILE.ready"
+        \\mv "$STATE_FILE.ready" "$STATE_FILE"
+        \\chmod 0600 "$STATE_FILE"
         \\if publish_target_version_once; then exit 90; fi
         \\jq -e '.target.publication.status == "quarantined"' "$STATE_FILE" >/dev/null
         \\[[ "$PUT_COUNT" == 1 ]]
-        \\jq '.target.publication.status = "not_dispatched"' "$STATE_FILE" >"$STATE_FILE.reset"
+        \\jq '.target.publication.status = "put_authorized"' "$STATE_FILE" >"$STATE_FILE.reset"
         \\mv "$STATE_FILE.reset" "$STATE_FILE"
         \\chmod 0600 "$STATE_FILE"
         \\MOCK_MODE=success
@@ -775,6 +829,7 @@ test "parent missing and drift fail before any mutation" {
         \\    *) return 46 ;;
         \\  esac
         \\}}
+        \\az() {{ publication_az "$@"; }}
         \\{s}
         \\{s}
         \\validate_target_parents
@@ -892,7 +947,7 @@ test "preexisting target version and second-check race are hard conflicts" {
     );
 }
 
-test "ambiguous temporary group creation is quarantined and never deleted" {
+test "failed scratch reservation claim is quarantined and never deleted" {
     const allocator = std.testing.allocator;
     const script = try readTracked(allocator, script_path);
     defer allocator.free(script);
@@ -942,10 +997,6 @@ test "ambiguous temporary group creation is quarantined and never deleted" {
         \\temporary_group_request='{s}/group-request.json'
         \\temporary_group_response='{s}/group-response.json'
         \\temporary_group_json='{s}/group.json'
-        \\AZURE_CONFIDENTIAL_VM_ARGS=()
-        \\azure_confidential_vm_resource_group_create_args() {{
-        \\  AZURE_CONFIDENTIAL_VM_ARGS=(rest --method put --uri "$1")
-        \\}}
         \\az() {{
         \\  printf '%s\n' "$*" >>'{s}/az.log'
         \\  return 52
@@ -986,7 +1037,7 @@ test "ambiguous temporary group creation is quarantined and never deleted" {
     );
     defer result.deinit(allocator);
     try std.testing.expect(result.succeeded());
-    try expectContains(result.stderr, "create failed ambiguously");
+    try expectContains(result.stderr, "Pre-provisioned scratch resource group is missing");
     try expectContains(result.stderr, "requires manual review");
 }
 
@@ -1276,6 +1327,8 @@ test "invalid stable publication lock is rejected before Azure or artifact work"
         .{ "GITHUB_REPOSITORY", "cataggar/miz" },
         .{ "GITHUB_RUN_ID", "123" },
         .{ "GITHUB_RUN_ATTEMPT", "4" },
+        .{ "ORIGIN_RUN_ID", "123" },
+        .{ "ORIGIN_RUN_ATTEMPT", "4" },
         .{ "GITHUB_REF", "refs/heads/main" },
         .{ "PROTECTED_ENVIRONMENT", "ubuntu2404-confidential-capture" },
         .{ "SOURCE_COMMIT", commit },
@@ -1300,9 +1353,19 @@ test "invalid stable publication lock is rejected before Azure or artifact work"
         .{ "TARGET_IMAGE_VERSION", "1.2.3" },
         .{ "TARGET_LOCATION", "eastus2" },
         .{ "TARGET_OWNER_TAG", "durable-owner" },
+        .{ "SCRATCH_RESOURCE_GROUP", group_name },
+        .{ "SCRATCH_RESERVATION_TAG", "fixture-reservation-0001" },
         .{ "PUBLICATION_LOCK_ID", "run-specific-lock" },
         .{ "CAPTURE_PRINCIPAL_CLIENT_ID", capture_principal },
         .{ "PUBLICATION_PRINCIPAL_CLIENT_ID", principal },
+        .{ "CAPTURE_TARGET_READ_SCOPE", "/subscriptions/" ++ subscription ++ "/resourceGroups/target-rg" },
+        .{ "PUBLICATION_SNAPSHOT_READ_SCOPE", "/subscriptions/" ++ subscription ++ "/resourceGroups/" ++ group_name },
+        .{ "PUBLICATION_VERSION_WRITE_SCOPE", "/subscriptions/" ++ subscription ++ "/resourceGroups/target-rg/providers/Microsoft.Compute/galleries/release/images/ubuntu-confidential" },
+        .{ "RECOVERY_ARTIFACT_NAME", "ubuntu2404-confidential-capture-recovery-123-4-1.2.3" },
+        .{ "DISPATCH_ARTIFACT_NAME", "ubuntu2404-confidential-capture-dispatch-123-4-1.2.3" },
+        .{ "RESULT_ARTIFACT_NAME", "ubuntu2404-confidential-capture-result-123-4-1.2.3" },
+        .{ "RECOVERY_DIR", root },
+        .{ "DISPATCH_DIR", root },
         .{ "PUBLICATION_AZURE_CONFIG_DIR", root },
         .{ "RESULT_DIR", "result" },
         .{ "MIZ", "miz" },

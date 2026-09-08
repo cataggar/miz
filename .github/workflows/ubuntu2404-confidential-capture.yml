@@ -15,6 +15,20 @@ on:
         description: New semantic Azure Compute Gallery version (major.minor.patch)
         required: true
         type: string
+      scratch_resource_group:
+        description: Pre-provisioned empty scratch RG with both principal assignments
+        required: true
+        type: string
+      origin_run_id:
+        description: Recovery only - original workflow run ID (set with origin_run_attempt)
+        required: false
+        default: ''
+        type: string
+      origin_run_attempt:
+        description: Recovery only - original workflow run attempt (set with origin_run_id)
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -28,6 +42,7 @@ env:
   SOURCE_PROVENANCE_NAME: Ubuntu-24.04-x86_64.confidential.qcow2.provenance.json
   SOURCE_ACCEPTANCE_NAME: Ubuntu-24.04-x86_64.confidential.azure-acceptance.json
   PUBLICATION_LOCK_ID: ubuntu2404-confidential-cvm-target-version
+  GH_API_VERSION: 2026-03-10
 
 jobs:
   prepare:
@@ -35,6 +50,9 @@ jobs:
     if: github.repository == 'cataggar/miz' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
     outputs:
       tool_commit: ${{ steps.resolve.outputs.tool_commit }}
       source_commit: ${{ steps.resolve.outputs.source_commit }}
@@ -46,6 +64,18 @@ jobs:
       provenance_release_title: ${{ steps.resolve.outputs.provenance_release_title }}
       provenance_asset_name: ${{ steps.resolve.outputs.provenance_asset_name }}
       target_gallery_version: ${{ steps.resolve.outputs.target_gallery_version }}
+      recovery_mode: ${{ steps.resolve.outputs.recovery_mode }}
+      origin_run_id: ${{ steps.resolve.outputs.origin_run_id }}
+      origin_run_attempt: ${{ steps.resolve.outputs.origin_run_attempt }}
+      recovery_artifact_name: ${{ steps.resolve.outputs.recovery_artifact_name }}
+      recovery_artifact_id: ${{ steps.resolve.outputs.recovery_artifact_id }}
+      recovery_artifact_digest: ${{ steps.resolve.outputs.recovery_artifact_digest }}
+      dispatch_artifact_name: ${{ steps.resolve.outputs.dispatch_artifact_name }}
+      dispatch_artifact_id: ${{ steps.resolve.outputs.dispatch_artifact_id }}
+      dispatch_artifact_digest: ${{ steps.resolve.outputs.dispatch_artifact_digest }}
+      result_artifact_name: ${{ steps.resolve.outputs.result_artifact_name }}
+      result_artifact_id: ${{ steps.resolve.outputs.result_artifact_id }}
+      result_artifact_digest: ${{ steps.resolve.outputs.result_artifact_digest }}
     steps:
       - name: Check out current main
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -54,12 +84,15 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Resolve exact source release and unused provenance release
+      - name: Require immutable releases and resolve exact origin identities
         id: resolve
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RELEASE_TAG: ${{ inputs.source_release_tag }}
           TARGET_GALLERY_VERSION: ${{ inputs.target_gallery_version }}
+          SCRATCH_RESOURCE_GROUP: ${{ inputs.scratch_resource_group }}
+          REQUESTED_ORIGIN_RUN_ID: ${{ inputs.origin_run_id }}
+          REQUESTED_ORIGIN_RUN_ATTEMPT: ${{ inputs.origin_run_attempt }}
         run: |
           set -euo pipefail
           umask 077
@@ -73,17 +106,187 @@ jobs:
           test "$(date -u -d "$source_release_iso" +%Y%m%d)" = "$source_release_date"
           source_release_title="Ubuntu 24.04 Confidential VM - $source_release_date"
           [[ "$TARGET_GALLERY_VERSION" =~ ^(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})$ ]]
+          [[ "$SCRATCH_RESOURCE_GROUP" =~ ^miz-u2404-cvm-capture-[a-z0-9-]{8,48}$ ]]
           IFS=. read -r target_major target_minor target_patch <<<"$TARGET_GALLERY_VERSION"
           (( 10#$target_major <= 2147483647 ))
           (( 10#$target_minor <= 2147483647 ))
           (( 10#$target_patch <= 2147483647 ))
           (( 10#$target_major != 0 || 10#$target_minor != 0 || 10#$target_patch != 0 ))
 
+          if [[ -n "$REQUESTED_ORIGIN_RUN_ID" ||
+              -n "$REQUESTED_ORIGIN_RUN_ATTEMPT" ]]; then
+            [[ "$REQUESTED_ORIGIN_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+            [[ "$REQUESTED_ORIGIN_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ]]
+            recovery_mode=true
+            origin_run_id=$REQUESTED_ORIGIN_RUN_ID
+            origin_run_attempt=$REQUESTED_ORIGIN_RUN_ATTEMPT
+          else
+            test -z "$REQUESTED_ORIGIN_RUN_ID"
+            test -z "$REQUESTED_ORIGIN_RUN_ATTEMPT"
+            recovery_mode=false
+            origin_run_id=$GITHUB_RUN_ID
+            origin_run_attempt=$GITHUB_RUN_ATTEMPT
+          fi
+          recovery_artifact_name="ubuntu2404-confidential-capture-recovery-$origin_run_id-$origin_run_attempt-$TARGET_GALLERY_VERSION"
+          dispatch_artifact_name="ubuntu2404-confidential-capture-dispatch-$origin_run_id-$origin_run_attempt-$TARGET_GALLERY_VERSION"
+          result_artifact_name="ubuntu2404-confidential-capture-result-$origin_run_id-$origin_run_attempt-$TARGET_GALLERY_VERSION"
+
+          mkdir -p .capture/prepare
+          api_headers=(
+            -H 'Accept: application/vnd.github+json'
+            -H "X-GitHub-Api-Version: $GH_API_VERSION"
+          )
+          gh api "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            >.capture/prepare/immutable-releases.json
+          jq -e '.enabled == true' \
+            .capture/prepare/immutable-releases.json >/dev/null ||
+            {
+              echo "::error::Repository immutable releases must already be enabled"
+              exit 1
+            }
+
+          recovery_artifact_id=
+          recovery_artifact_digest=
+          dispatch_artifact_id=
+          dispatch_artifact_digest=
+          result_artifact_id=
+          result_artifact_digest=
           tool_commit=$(git rev-parse HEAD)
+          if [[ "$recovery_mode" == true ]]; then
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$origin_run_id" \
+              >.capture/prepare/origin-run.json
+            jq -e \
+              --argjson run_id "$origin_run_id" \
+              --argjson run_attempt "$origin_run_attempt" \
+              '.id == $run_id and .run_attempt == $run_attempt and
+               .event == "workflow_dispatch" and
+               .head_repository.full_name == env.GITHUB_REPOSITORY and
+               .path == ".github/workflows/ubuntu2404-confidential-capture.yml"' \
+              .capture/prepare/origin-run.json >/dev/null
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$origin_run_id/artifacts?name=$recovery_artifact_name&per_page=100" \
+              >.capture/prepare/recovery-artifacts.json
+            jq -e \
+              --arg name "$recovery_artifact_name" \
+              '.total_count == 1 and (.artifacts | length == 1) and
+               .artifacts[0].name == $name and
+               .artifacts[0].expired == false and
+               (.artifacts[0].digest |
+                 test("^sha256:[0-9a-f]{64}$"))' \
+              .capture/prepare/recovery-artifacts.json >/dev/null
+            recovery_artifact_id=$(jq -er \
+              '.artifacts[0].id' .capture/prepare/recovery-artifacts.json)
+            recovery_artifact_digest=$(jq -er \
+              '.artifacts[0].digest' .capture/prepare/recovery-artifacts.json)
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts/$recovery_artifact_id/zip" \
+              >.capture/prepare/recovery.zip
+            test "sha256:$(sha256sum .capture/prepare/recovery.zip | awk '{print $1}')" \
+              = "$recovery_artifact_digest"
+            mkdir -m 0700 .capture/prepare/recovery
+            unzip -q .capture/prepare/recovery.zip \
+              -d .capture/prepare/recovery
+            test "$(find .capture/prepare/recovery -maxdepth 1 -type f | wc -l)" -eq 2
+            test -f .capture/prepare/recovery/capture-state.json
+            test -f .capture/prepare/recovery/recovery-intent.json
+            chmod 0600 .capture/prepare/recovery/*.json
+            jq -e \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg origin_run_id "$origin_run_id" \
+              --arg origin_run_attempt "$origin_run_attempt" \
+              --arg source_release_tag "$SOURCE_RELEASE_TAG" \
+              --arg target_version "$TARGET_GALLERY_VERSION" \
+              --arg recovery_name "$recovery_artifact_name" \
+              --arg dispatch_name "$dispatch_artifact_name" \
+              --arg result_name "$result_artifact_name" \
+              '.schema == 5 and .stage == "prepared" and
+               .repository == $repository and
+               .origin_run_id == $origin_run_id and
+               .origin_run_attempt == $origin_run_attempt and
+               .source_release_tag == $source_release_tag and
+               .temporary_resource_group == env.SCRATCH_RESOURCE_GROUP and
+               (.target.version_id | split("/") | last) == $target_version and
+               .recovery.artifact_name == $recovery_name and
+               .recovery.status == "pending" and
+               .target.publication.dispatch_artifact_name == $dispatch_name and
+               .target.publication.status == "not_dispatched" and
+               .result.artifact_name == $result_name and
+               .result.status == "pending"' \
+              .capture/prepare/recovery/capture-state.json >/dev/null
+            recovery_state_sha256=$(
+              sha256sum .capture/prepare/recovery/capture-state.json |
+                awk '{print $1}'
+            )
+            jq -e \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg origin_run_id "$origin_run_id" \
+              --arg origin_run_attempt "$origin_run_attempt" \
+              --arg source_release_tag "$SOURCE_RELEASE_TAG" \
+              --arg version "$TARGET_GALLERY_VERSION" \
+              --arg state_sha256 "$recovery_state_sha256" \
+              '.schema == 1 and
+               .type == "miz-ubuntu2404-confidential-capture-recovery-intent" and
+               .repository == $repository and
+               .origin_run_id == $origin_run_id and
+               .origin_run_attempt == $origin_run_attempt and
+               .source_release_tag == $source_release_tag and
+               (.version_id | split("/") | last) == $version and
+               .state_sha256 == $state_sha256' \
+              .capture/prepare/recovery/recovery-intent.json >/dev/null
+            tool_commit=$(jq -er \
+              '.tool_commit' .capture/prepare/recovery/capture-state.json)
+
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$dispatch_artifact_name&per_page=100" \
+              >.capture/prepare/dispatch-artifacts.json
+            dispatch_count=$(jq -er '.total_count' \
+              .capture/prepare/dispatch-artifacts.json)
+            (( dispatch_count <= 1 ))
+            if (( dispatch_count == 1 )); then
+              jq -e \
+                --arg name "$dispatch_artifact_name" \
+                '.artifacts[0].name == $name and
+                 .artifacts[0].expired == false and
+                 (.artifacts[0].digest |
+                   test("^sha256:[0-9a-f]{64}$"))' \
+                .capture/prepare/dispatch-artifacts.json >/dev/null
+              dispatch_artifact_id=$(jq -er \
+                '.artifacts[0].id' .capture/prepare/dispatch-artifacts.json)
+              dispatch_artifact_digest=$(jq -er \
+                '.artifacts[0].digest' .capture/prepare/dispatch-artifacts.json)
+            fi
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$origin_run_id/artifacts?name=$result_artifact_name&per_page=100" \
+              >.capture/prepare/result-artifacts.json
+            result_count=$(jq -er '.total_count' \
+              .capture/prepare/result-artifacts.json)
+            (( result_count <= 1 ))
+            if (( result_count == 1 )); then
+              jq -e \
+                --arg name "$result_artifact_name" \
+                '.artifacts[0].name == $name and
+                 .artifacts[0].expired == false and
+                 (.artifacts[0].digest |
+                   test("^sha256:[0-9a-f]{64}$"))' \
+                .capture/prepare/result-artifacts.json >/dev/null
+              result_artifact_id=$(jq -er \
+                '.artifacts[0].id' .capture/prepare/result-artifacts.json)
+              result_artifact_digest=$(jq -er \
+                '.artifacts[0].digest' .capture/prepare/result-artifacts.json)
+            fi
+          fi
+
           [[ "$tool_commit" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse origin/main)" = "$tool_commit"
-          remote_main=$(git ls-remote origin refs/heads/main | awk 'NR == 1 {print $1}')
-          test "$remote_main" = "$tool_commit"
+          git fetch --no-tags --depth=1 origin "$tool_commit"
+          test "$(git rev-parse FETCH_HEAD)" = "$tool_commit"
+          if [[ "$recovery_mode" == false ]]; then
+            remote_main=$(
+              git ls-remote origin refs/heads/main | awk 'NR == 1 {print $1}'
+            )
+            test "$remote_main" = "$tool_commit"
+          fi
 
           direct_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
           peeled_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
@@ -98,9 +301,9 @@ jobs:
           provenance_commit=${peeled_provenance:-$direct_provenance}
           test "$provenance_commit" = "$tool_commit"
 
-          mkdir -p .capture/prepare
           source_release_json=.capture/prepare/source-release.json
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$SOURCE_RELEASE_TAG" \
+          gh api "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$SOURCE_RELEASE_TAG" \
             >"$source_release_json"
           jq -e \
             --arg tag "$SOURCE_RELEASE_TAG" \
@@ -111,6 +314,7 @@ jobs:
             '
             .tag_name == $tag and
             .name == $title and
+            .immutable == true and
             .draft == false and
             .prerelease == false and
             (.id | type == "number" and . > 0) and
@@ -122,14 +326,21 @@ jobs:
               (.size | type == "number" and . > 0))
             ' "$source_release_json" >/dev/null
 
-          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$provenance_release_tag" \
+          if [[ "$recovery_mode" == true ]]; then
+            test "$(jq -er '.source_commit' \
+              .capture/prepare/recovery/capture-state.json)" = "$source_commit"
+            test "$(jq -er '.tool_commit' \
+              .capture/prepare/recovery/recovery-intent.json)" = "$tool_commit"
+          elif gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$provenance_release_tag" \
               >.capture/prepare/reused-provenance-release.json \
               2>.capture/prepare/reused-provenance-release.stderr; then
-            echo "::error::Provenance release already exists; refusing reuse"
+            echo "::error::Provenance release already exists; use explicit recovery inputs"
             exit 1
+          else
+            grep -Eq 'HTTP 404|Not Found' \
+              .capture/prepare/reused-provenance-release.stderr
           fi
-          grep -Eq 'HTTP 404|Not Found' \
-            .capture/prepare/reused-provenance-release.stderr
 
           source_release_id=$(jq -er '.id' "$source_release_json")
           source_qcow_asset_id=$(jq -er \
@@ -152,6 +363,18 @@ jobs:
             echo "provenance_release_title=$provenance_release_title"
             echo "provenance_asset_name=$provenance_asset_name"
             echo "target_gallery_version=$TARGET_GALLERY_VERSION"
+            echo "recovery_mode=$recovery_mode"
+            echo "origin_run_id=$origin_run_id"
+            echo "origin_run_attempt=$origin_run_attempt"
+            echo "recovery_artifact_name=$recovery_artifact_name"
+            echo "recovery_artifact_id=$recovery_artifact_id"
+            echo "recovery_artifact_digest=$recovery_artifact_digest"
+            echo "dispatch_artifact_name=$dispatch_artifact_name"
+            echo "dispatch_artifact_id=$dispatch_artifact_id"
+            echo "dispatch_artifact_digest=$dispatch_artifact_digest"
+            echo "result_artifact_name=$result_artifact_name"
+            echo "result_artifact_id=$result_artifact_id"
+            echo "result_artifact_digest=$result_artifact_digest"
           } >>"$GITHUB_OUTPUT"
 
   capture:
@@ -166,12 +389,26 @@ jobs:
       contents: read
       id-token: write
     outputs:
-      capture_result_sha256: ${{ steps.result.outputs.capture_result_sha256 }}
+      capture_result_sha256: ${{ steps.result.outputs.capture_result_sha256 || steps.reused_result.outputs.capture_result_sha256 }}
+      origin_run_id: ${{ needs.prepare.outputs.origin_run_id }}
+      origin_run_attempt: ${{ needs.prepare.outputs.origin_run_attempt }}
+      recovery_artifact_name: ${{ needs.prepare.outputs.recovery_artifact_name }}
+      recovery_artifact_digest: ${{ steps.recovery_metadata.outputs.recovery_artifact_digest }}
+      recovery_intent_sha256: ${{ steps.recovery_metadata.outputs.recovery_intent_sha256 }}
+      result_artifact_name: ${{ needs.prepare.outputs.result_artifact_name }}
+      result_artifact_run_id: ${{ steps.capture_status.outputs.result_artifact_run_id }}
+      result_ready: ${{ steps.capture_status.outputs.result_ready }}
+      result_uploaded: ${{ steps.capture_status.outputs.result_uploaded }}
+      cleanup_failed: ${{ steps.capture_status.outputs.cleanup_failed }}
     env:
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       TOOL_COMMIT: ${{ needs.prepare.outputs.tool_commit }}
+      RECOVERY_MODE: ${{ needs.prepare.outputs.recovery_mode }}
+      ORIGIN_RUN_ID: ${{ needs.prepare.outputs.origin_run_id }}
+      ORIGIN_RUN_ATTEMPT: ${{ needs.prepare.outputs.origin_run_attempt }}
       SOURCE_RELEASE_TAG: ${{ inputs.source_release_tag }}
       TARGET_IMAGE_VERSION: ${{ needs.prepare.outputs.target_gallery_version }}
+      SCRATCH_RESOURCE_GROUP: ${{ inputs.scratch_resource_group }}
       PROTECTED_ENVIRONMENT: ubuntu2404-confidential-capture
       SOURCE_REPOSITORY: cataggar/miz
       CANDIDATE_DIR: ${{ github.workspace }}/.capture/source
@@ -180,6 +417,12 @@ jobs:
       SOURCE_ACCEPTANCE: ${{ github.workspace }}/.capture/source/Ubuntu-24.04-x86_64.confidential.azure-acceptance.json
       RESULT_DIR: ${{ github.workspace }}/.capture/evidence
       STATE_FILE: ${{ github.workspace }}/.capture/state/capture-state.json
+      RECOVERY_DIR: ${{ github.workspace }}/.capture/recovery
+      DISPATCH_DIR: ${{ github.workspace }}/.capture/dispatch
+      RECOVERY_ACTION_FILE: ${{ github.workspace }}/.capture/state/recovery-action
+      RECOVERY_ARTIFACT_NAME: ${{ needs.prepare.outputs.recovery_artifact_name }}
+      DISPATCH_ARTIFACT_NAME: ${{ needs.prepare.outputs.dispatch_artifact_name }}
+      RESULT_ARTIFACT_NAME: ${{ needs.prepare.outputs.result_artifact_name }}
       CLEANUP_LOGIN_MARKER: ${{ github.workspace }}/.capture/state/cleanup-login-succeeded
       AZURE_CONFIG_DIR: ${{ github.workspace }}/.capture/azure/capture
       PUBLICATION_AZURE_CONFIG_DIR: ${{ github.workspace }}/.capture/azure/publication
@@ -193,6 +436,10 @@ jobs:
       TARGET_GALLERY: ${{ vars.TARGET_GALLERY }}
       TARGET_IMAGE_DEFINITION: ${{ vars.TARGET_IMAGE_DEFINITION }}
       TARGET_OWNER_TAG: ${{ vars.TARGET_OWNER_TAG }}
+      SCRATCH_RESERVATION_TAG: ${{ secrets.SCRATCH_RESERVATION_TAG }}
+      CAPTURE_TARGET_READ_SCOPE: ${{ vars.CAPTURE_TARGET_READ_SCOPE }}
+      PUBLICATION_SNAPSHOT_READ_SCOPE: ${{ vars.PUBLICATION_SNAPSHOT_READ_SCOPE }}
+      PUBLICATION_VERSION_WRITE_SCOPE: ${{ vars.PUBLICATION_VERSION_WRITE_SCOPE }}
       PUBLICATION_LOCK_ID: ubuntu2404-confidential-cvm-target-version
       CAPTURE_PRINCIPAL_CLIENT_ID: ${{ secrets.AZURE_CAPTURE_CLIENT_ID }}
       PUBLICATION_PRINCIPAL_CLIENT_ID: ${{ secrets.AZURE_PUBLICATION_CLIENT_ID }}
@@ -222,9 +469,20 @@ jobs:
           [[ "$TARGET_GALLERY" =~ ^[A-Za-z0-9_]{1,80}$ ]]
           [[ "$TARGET_IMAGE_DEFINITION" =~ ^[A-Za-z0-9._()-]{1,80}$ ]]
           [[ "$TARGET_OWNER_TAG" =~ ^[A-Za-z0-9._:/-]{1,128}$ ]]
+          [[ "$SCRATCH_RESOURCE_GROUP" =~ ^miz-u2404-cvm-capture-[a-z0-9-]{8,48}$ ]]
+          [[ "$SCRATCH_RESERVATION_TAG" =~ ^[A-Za-z0-9._:/-]{16,128}$ ]]
+          [[ "$ORIGIN_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$ORIGIN_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ]]
+          expected_snapshot_scope="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$SCRATCH_RESOURCE_GROUP"
+          expected_capture_target_scope="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP"
+          expected_definition_scope="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP/providers/Microsoft.Compute/galleries/$TARGET_GALLERY/images/$TARGET_IMAGE_DEFINITION"
+          test "${CAPTURE_TARGET_READ_SCOPE,,}" = "${expected_capture_target_scope,,}"
+          test "${PUBLICATION_SNAPSHOT_READ_SCOPE,,}" = "${expected_snapshot_scope,,}"
+          test "${PUBLICATION_VERSION_WRITE_SCOPE,,}" = "${expected_definition_scope,,}"
           rm -rf -- .capture
           mkdir -m 0700 -p \
             "$CANDIDATE_DIR" "$RESULT_DIR" "$(dirname "$STATE_FILE")" \
+            "$RECOVERY_DIR" "$DISPATCH_DIR" \
             "$AZURE_CONFIG_DIR" "$PUBLICATION_AZURE_CONFIG_DIR"
 
       - name: Download exactly the accepted three-asset source release
@@ -240,9 +498,18 @@ jobs:
           direct_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
           peeled_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
           test "${peeled_source:-$direct_source}" = "$SOURCE_COMMIT"
+          api_headers=(
+            -H 'Accept: application/vnd.github+json'
+            -H "X-GitHub-Api-Version: $GH_API_VERSION"
+          )
+          gh api "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            >.capture/immutable-releases.json
+          jq -e '.enabled == true' .capture/immutable-releases.json >/dev/null
           source_release_title="Ubuntu 24.04 Confidential VM - ${SOURCE_RELEASE_TAG##*-}"
           release_json=.capture/source-release.json
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$SOURCE_RELEASE_TAG" \
+          gh api "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$SOURCE_RELEASE_TAG" \
             >"$release_json"
           jq -e \
             --argjson release_id "$SOURCE_RELEASE_ID" \
@@ -257,6 +524,7 @@ jobs:
             .id == $release_id and
             .tag_name == env.SOURCE_RELEASE_TAG and
             .name == $title and
+            .immutable == true and
             .draft == false and .prerelease == false and
             (.assets | length == 3) and
             ([.assets[].name] | sort) == ([$qcow, $provenance, $acceptance] | sort) and
@@ -264,17 +532,95 @@ jobs:
             ([.assets[] | select(.name == $provenance and .id == $provenance_id)] | length) == 1 and
             ([.assets[] | select(.name == $acceptance and .id == $acceptance_id)] | length) == 1
             ' "$release_json" >/dev/null
-          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$SOURCE_QCOW_ASSET_ID" \
+          gh api "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$SOURCE_QCOW_ASSET_ID" \
             -H 'Accept: application/octet-stream' >"$CANDIDATE"
-          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$SOURCE_PROVENANCE_ASSET_ID" \
+          gh api "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$SOURCE_PROVENANCE_ASSET_ID" \
             -H 'Accept: application/octet-stream' >"$PROVENANCE"
-          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$SOURCE_ACCEPTANCE_ASSET_ID" \
+          gh api "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$SOURCE_ACCEPTANCE_ASSET_ID" \
             -H 'Accept: application/octet-stream' >"$SOURCE_ACCEPTANCE"
           chmod 0600 "$CANDIDATE" "$PROVENANCE" "$SOURCE_ACCEPTANCE"
           test "$(find "$CANDIDATE_DIR" -maxdepth 1 -type f | wc -l)" -eq 3
           test -s "$CANDIDATE"
           test -s "$PROVENANCE"
           test -s "$SOURCE_ACCEPTANCE"
+
+      - name: Download and hash exact origin recovery artifacts
+        if: needs.prepare.outputs.recovery_mode == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECOVERY_ARTIFACT_ID: ${{ needs.prepare.outputs.recovery_artifact_id }}
+          RECOVERY_ARTIFACT_DIGEST: ${{ needs.prepare.outputs.recovery_artifact_digest }}
+          DISPATCH_ARTIFACT_ID: ${{ needs.prepare.outputs.dispatch_artifact_id }}
+          DISPATCH_ARTIFACT_DIGEST: ${{ needs.prepare.outputs.dispatch_artifact_digest }}
+        run: |
+          set -euo pipefail
+          umask 077
+          api_headers=(
+            -H 'Accept: application/vnd.github+json'
+            -H "X-GitHub-Api-Version: $GH_API_VERSION"
+          )
+          [[ "$RECOVERY_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RECOVERY_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          gh api "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$RECOVERY_ARTIFACT_ID/zip" \
+            >.capture/recovery.zip
+          test "sha256:$(sha256sum .capture/recovery.zip | awk '{print $1}')" \
+            = "$RECOVERY_ARTIFACT_DIGEST"
+          rm -rf -- "$RECOVERY_DIR"
+          mkdir -m 0700 "$RECOVERY_DIR"
+          unzip -q .capture/recovery.zip -d "$RECOVERY_DIR"
+          test "$(find "$RECOVERY_DIR" -maxdepth 1 -type f | wc -l)" -eq 2
+          test -f "$RECOVERY_DIR/capture-state.json"
+          test -f "$RECOVERY_DIR/recovery-intent.json"
+          chmod 0600 "$RECOVERY_DIR"/*.json
+          if [[ -n "$DISPATCH_ARTIFACT_ID" ||
+              -n "$DISPATCH_ARTIFACT_DIGEST" ]]; then
+            [[ "$DISPATCH_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+            [[ "$DISPATCH_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts/$DISPATCH_ARTIFACT_ID/zip" \
+              >.capture/dispatch.zip
+            test "sha256:$(sha256sum .capture/dispatch.zip | awk '{print $1}')" \
+              = "$DISPATCH_ARTIFACT_DIGEST"
+            rm -rf -- "$DISPATCH_DIR"
+            mkdir -m 0700 "$DISPATCH_DIR"
+            unzip -q .capture/dispatch.zip -d "$DISPATCH_DIR"
+            test "$(find "$DISPATCH_DIR" -maxdepth 1 -type f | wc -l)" -eq 1
+            test -f "$DISPATCH_DIR/put-dispatch.json"
+            chmod 0600 "$DISPATCH_DIR/put-dispatch.json"
+          fi
+          {
+            echo "RECOVERY_ARTIFACT_DIGEST=$RECOVERY_ARTIFACT_DIGEST"
+            echo "DISPATCH_ARTIFACT_DIGEST=$DISPATCH_ARTIFACT_DIGEST"
+          } >>"$GITHUB_ENV"
+
+      - name: Download exact already durable origin result
+        if: needs.prepare.outputs.result_artifact_id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT_ARTIFACT_ID: ${{ needs.prepare.outputs.result_artifact_id }}
+          RESULT_ARTIFACT_DIGEST: ${{ needs.prepare.outputs.result_artifact_digest }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$RESULT_ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$RESULT_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          api_headers=(
+            -H 'Accept: application/vnd.github+json'
+            -H "X-GitHub-Api-Version: $GH_API_VERSION"
+          )
+          gh api "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts/$RESULT_ARTIFACT_ID/zip" \
+            >.capture/result.zip
+          test "sha256:$(sha256sum .capture/result.zip | awk '{print $1}')" \
+            = "$RESULT_ARTIFACT_DIGEST"
+          unzip -q .capture/result.zip -d "$RESULT_DIR"
+          test "$(find "$RESULT_DIR" -maxdepth 1 -type f | wc -l)" -eq 1
+          test -f "$RESULT_DIR/capture-result.json"
+          chmod 0600 "$RESULT_DIR/capture-result.json"
 
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
@@ -350,7 +696,32 @@ jobs:
             echo "Azure acceptance SHA-256: \`$(sha256sum "$SOURCE_ACCEPTANCE" | awk '{print $1}')\`"
           } >>"$GITHUB_STEP_SUMMARY"
 
+      - name: Reuse only an exact already durable protected result
+        id: reused_result
+        if: needs.prepare.outputs.result_artifact_id != ''
+        run: |
+          set -euo pipefail
+          result="$RESULT_DIR/capture-result.json"
+          result_sha256=$(sha256sum "$result" | awk '{print $1}')
+          [[ "$result_sha256" =~ ^[0-9a-f]{64}$ ]]
+          target_definition_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP/providers/Microsoft.Compute/galleries/$TARGET_GALLERY/images/$TARGET_IMAGE_DEFINITION"
+          "$RELEASE_TOOL" verify-capture-publication \
+            --result "$result" \
+            --expected-result-sha256 "$result_sha256" \
+            --source-commit "$SOURCE_COMMIT" \
+            --source-release-tag "$SOURCE_RELEASE_TAG" \
+            --tool-commit "$TOOL_COMMIT" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$ORIGIN_RUN_ID" \
+            --run-attempt "$ORIGIN_RUN_ATTEMPT" \
+            --subscription-id "$AZURE_SUBSCRIPTION_ID" \
+            --location "$TARGET_LOCATION" \
+            --definition-id "$target_definition_id" \
+            --version-id "$target_definition_id/versions/$TARGET_IMAGE_VERSION"
+          echo "capture_result_sha256=$result_sha256" >>"$GITHUB_OUTPUT"
+
       - name: Log in capture principal with protected-environment OIDC
+        if: needs.prepare.outputs.result_artifact_id == ''
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
         with:
           client-id: ${{ secrets.AZURE_CAPTURE_CLIENT_ID }}
@@ -358,9 +729,76 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Prepare source recreation capture VM and snapshot
+        if: >-
+          ${{
+            needs.prepare.outputs.result_artifact_id == '' &&
+            needs.prepare.outputs.recovery_mode == 'false'
+          }}
         run: scripts/ubuntu2404_confidential_capture.sh prepare
 
-      - name: Log in exclusive publication principal only when prepared
+      - name: Export sanitized owner-only recovery intent before target PUT
+        if: >-
+          ${{
+            needs.prepare.outputs.result_artifact_id == '' &&
+            needs.prepare.outputs.recovery_mode == 'false'
+          }}
+        run: |
+          set -euo pipefail
+          intent_sha256=$(
+            scripts/ubuntu2404_confidential_capture.sh export-recovery |
+              tail -n 1
+          )
+          [[ "$intent_sha256" =~ ^[0-9a-f]{64}$ ]]
+          echo "Recovery intent SHA-256: \`$intent_sha256\`" \
+            >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload only sanitized recovery intent and state
+        id: recovery_upload
+        if: >-
+          ${{
+            needs.prepare.outputs.result_artifact_id == '' &&
+            needs.prepare.outputs.recovery_mode == 'false'
+          }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ env.RECOVERY_ARTIFACT_NAME }}
+          path: |
+            ${{ env.RECOVERY_DIR }}/capture-state.json
+            ${{ env.RECOVERY_DIR }}/recovery-intent.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Record exact durable recovery artifact digest
+        id: recovery_metadata
+        env:
+          NEW_RECOVERY_DIGEST: ${{ steps.recovery_upload.outputs['artifact-digest'] }}
+          ORIGIN_RECOVERY_DIGEST: ${{ needs.prepare.outputs.recovery_artifact_digest }}
+        run: |
+          set -euo pipefail
+          if [[ "$RECOVERY_MODE" == true ]]; then
+            recovery_digest=$ORIGIN_RECOVERY_DIGEST
+          else
+            recovery_digest=$NEW_RECOVERY_DIGEST
+          fi
+          [[ "$recovery_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          recovery_intent_sha256=$(
+            sha256sum "$RECOVERY_DIR/recovery-intent.json" | awk '{print $1}'
+          )
+          [[ "$recovery_intent_sha256" =~ ^[0-9a-f]{64}$ ]]
+          echo "recovery_artifact_digest=$recovery_digest" >>"$GITHUB_OUTPUT"
+          echo "recovery_intent_sha256=$recovery_intent_sha256" >>"$GITHUB_OUTPUT"
+          echo "RECOVERY_ARTIFACT_DIGEST=$recovery_digest" >>"$GITHUB_ENV"
+
+      - name: Mark recovery intent durably acknowledged
+        if: >-
+          ${{
+            needs.prepare.outputs.result_artifact_id == '' &&
+            needs.prepare.outputs.recovery_mode == 'false'
+          }}
+        run: scripts/ubuntu2404_confidential_capture.sh mark-recovery-durable
+
+      - name: Log in exclusive publication principal after durable recovery
+        if: needs.prepare.outputs.result_artifact_id == ''
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
         env:
           AZURE_CONFIG_DIR: ${{ env.PUBLICATION_AZURE_CONFIG_DIR }}
@@ -369,7 +807,8 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Refresh capture OIDC immediately before publication validation
+      - name: Refresh capture OIDC before recovery or publication validation
+        if: needs.prepare.outputs.result_artifact_id == ''
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
         env:
           AZURE_CONFIG_DIR: ${{ env.AZURE_CONFIG_DIR }}
@@ -378,16 +817,135 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Publish once attest and fully verify capture
-        run: scripts/ubuntu2404_confidential_capture.sh publish
+      - name: Restore exact origin and inspect fresh Azure recovery state
+        id: inspect
+        if: >-
+          ${{
+            needs.prepare.outputs.result_artifact_id == '' &&
+            needs.prepare.outputs.recovery_mode == 'true'
+          }}
+        env:
+          DISPATCH_ARTIFACT_DIGEST: ${{ needs.prepare.outputs.dispatch_artifact_digest }}
+        run: |
+          set -euo pipefail
+          scripts/ubuntu2404_confidential_capture.sh inspect-recovery
+          recovery_action=$(cat "$RECOVERY_ACTION_FILE")
+          [[ "$recovery_action" == publish || "$recovery_action" == resume ]]
+          echo "recovery_action=$recovery_action" >>"$GITHUB_OUTPUT"
+
+      - name: Export exact sanitized PUT dispatch marker
+        if: >-
+          ${{
+            needs.prepare.outputs.result_artifact_id == '' &&
+            (
+              needs.prepare.outputs.recovery_mode == 'false' ||
+              steps.inspect.outputs.recovery_action == 'publish'
+            )
+          }}
+        run: scripts/ubuntu2404_confidential_capture.sh export-dispatch
+
+      - name: Upload durable PUT dispatch marker before mutation
+        id: dispatch_upload
+        if: >-
+          ${{
+            needs.prepare.outputs.result_artifact_id == '' &&
+            (
+              needs.prepare.outputs.recovery_mode == 'false' ||
+              steps.inspect.outputs.recovery_action == 'publish'
+            )
+          }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ env.DISPATCH_ARTIFACT_NAME }}
+          path: ${{ env.DISPATCH_DIR }}/put-dispatch.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Mark exact PUT dispatch durably acknowledged
+        if: >-
+          ${{
+            needs.prepare.outputs.result_artifact_id == '' &&
+            (
+              needs.prepare.outputs.recovery_mode == 'false' ||
+              steps.inspect.outputs.recovery_action == 'publish'
+            )
+          }}
+        env:
+          DISPATCH_ARTIFACT_DIGEST: ${{ steps.dispatch_upload.outputs['artifact-digest'] }}
+        run: scripts/ubuntu2404_confidential_capture.sh mark-dispatch-durable
+
+      - name: Refresh exclusive publisher immediately before target boundary
+        if: needs.prepare.outputs.result_artifact_id == ''
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        env:
+          AZURE_CONFIG_DIR: ${{ env.PUBLICATION_AZURE_CONFIG_DIR }}
+        with:
+          client-id: ${{ secrets.AZURE_PUBLICATION_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Refresh capture identity immediately before target boundary
+        if: needs.prepare.outputs.result_artifact_id == ''
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        env:
+          AZURE_CONFIG_DIR: ${{ env.AZURE_CONFIG_DIR }}
+        with:
+          client-id: ${{ secrets.AZURE_CAPTURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Publish once or resume the exact existing version
+        id: core
+        if: needs.prepare.outputs.result_artifact_id == ''
+        env:
+          RECOVERY_ACTION: ${{ steps.inspect.outputs.recovery_action }}
+        run: |
+          set -euo pipefail
+          if [[ "$RECOVERY_MODE" == true &&
+              "$RECOVERY_ACTION" == resume ]]; then
+            scripts/ubuntu2404_confidential_capture.sh recover
+          else
+            scripts/ubuntu2404_confidential_capture.sh publish
+          fi
+
+      - name: Re-hash sanitized capture result before upload
+        id: result
+        if: needs.prepare.outputs.result_artifact_id == ''
+        run: |
+          set -euo pipefail
+          result="$RESULT_DIR/capture-result.json"
+          test -f "$result"
+          test ! -L "$result"
+          test "$(stat -c %a "$result")" = 600
+          result_sha256=$(sha256sum "$result" | awk '{print $1}')
+          [[ "$result_sha256" =~ ^[0-9a-f]{64}$ ]]
+          echo "capture_result_sha256=$result_sha256" >>"$GITHUB_OUTPUT"
+          echo "CAPTURE_RESULT_SHA256=$result_sha256" >>"$GITHUB_ENV"
+          echo "Durable capture result SHA-256: \`$result_sha256\`" \
+            >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload only exact sanitized durable capture result
+        id: result_upload
+        if: needs.prepare.outputs.result_artifact_id == ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ env.RESULT_ARTIFACT_NAME }}
+          path: ${{ env.RESULT_DIR }}/capture-result.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Mark result durable and finalize capture state
+        id: finalize
+        if: needs.prepare.outputs.result_artifact_id == ''
+        run: scripts/ubuntu2404_confidential_capture.sh finalize
 
       - name: Arm fail-closed unconditional cleanup login
-        if: always()
+        if: always() && needs.prepare.outputs.result_artifact_id == ''
         run: rm -f -- "$CLEANUP_LOGIN_MARKER"
 
       - name: Refresh capture OIDC for unconditional exact cleanup
         id: cleanup_login
-        if: always()
+        if: always() && needs.prepare.outputs.result_artifact_id == ''
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
         env:
           AZURE_CONFIG_DIR: ${{ env.AZURE_CONFIG_DIR }}
@@ -397,13 +955,19 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Record successful fresh cleanup identity
-        if: always() && steps.cleanup_login.outcome == 'success'
+        if: >-
+          ${{
+            always() &&
+            needs.prepare.outputs.result_artifact_id == '' &&
+            steps.cleanup_login.outcome == 'success'
+          }}
         run: |
           umask 077
           : >"$CLEANUP_LOGIN_MARKER"
 
       - name: Clean up only exact allowlisted scratch resources
-        if: always()
+        id: cleanup
+        if: always() && needs.prepare.outputs.result_artifact_id == ''
         run: |
           set -euo pipefail
           if [[ -e "$STATE_FILE" ]]; then
@@ -415,31 +979,60 @@ jobs:
             scripts/ubuntu2404_confidential_capture.sh cleanup
           fi
 
-      - name: Re-hash sanitized durable capture result
-        id: result
-        if: success()
+      - name: Record core result upload and cleanup outcomes
+        id: capture_status
+        if: always()
+        env:
+          CORE_OUTCOME: ${{ steps.core.outcome }}
+          RESULT_OUTCOME: ${{ steps.result.outcome }}
+          RESULT_UPLOAD_OUTCOME: ${{ steps.result_upload.outcome }}
+          REUSED_RESULT_OUTCOME: ${{ steps.reused_result.outcome }}
+          CLEANUP_OUTCOME: ${{ steps.cleanup.outcome }}
         run: |
           set -euo pipefail
-          result="$RESULT_DIR/capture-result.json"
-          test -f "$result"
-          test ! -L "$result"
-          test "$(stat -c %a "$result")" = 600
-          result_sha256=$(sha256sum "$result" | awk '{print $1}')
-          [[ "$result_sha256" =~ ^[0-9a-f]{64}$ ]]
-          echo "capture_result_sha256=$result_sha256" >>"$GITHUB_OUTPUT"
-          echo "Durable capture result SHA-256: \`$result_sha256\`" >>"$GITHUB_STEP_SUMMARY"
+          if [[ "$REUSED_RESULT_OUTCOME" == success ]]; then
+            result_ready=true
+            result_uploaded=true
+            result_artifact_run_id=$ORIGIN_RUN_ID
+          elif [[ "$CORE_OUTCOME" == success &&
+              "$RESULT_OUTCOME" == success ]]; then
+            result_ready=true
+            result_artifact_run_id=$GITHUB_RUN_ID
+          else
+            result_ready=false
+            result_artifact_run_id=$GITHUB_RUN_ID
+          fi
+          if [[ "$REUSED_RESULT_OUTCOME" == success ]]; then
+            result_uploaded=true
+          elif [[ "$RESULT_UPLOAD_OUTCOME" == success ]]; then
+            result_uploaded=true
+          else
+            result_uploaded=false
+          fi
+          if [[ "$CLEANUP_OUTCOME" == failure ]]; then
+            cleanup_failed=true
+          else
+            cleanup_failed=false
+          fi
+          {
+            echo "result_ready=$result_ready"
+            echo "result_uploaded=$result_uploaded"
+            echo "result_artifact_run_id=$result_artifact_run_id"
+            echo "cleanup_failed=$cleanup_failed"
+          } >>"$GITHUB_OUTPUT"
 
-      - name: Upload only sanitized durable capture result
-        if: success()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ubuntu2404-confidential-capture-result-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.RESULT_DIR }}/capture-result.json
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Remove all local source evidence credentials and Azure contexts
-        if: always()
+      - name: Remove local state only after durable finalization and cleanup
+        if: >-
+          ${{
+            always() &&
+            (
+              steps.reused_result.outcome == 'success' ||
+              (
+                steps.finalize.outcome == 'success' &&
+                steps.cleanup.outcome == 'success'
+              )
+            )
+          }}
         run: rm -rf -- .capture
 
   publish_provenance:
@@ -447,10 +1040,12 @@ jobs:
     needs: [prepare, capture]
     if: >-
       ${{
+        always() &&
         github.repository == 'cataggar/miz' &&
         github.ref == 'refs/heads/main' &&
         needs.prepare.result == 'success' &&
-        needs.capture.result == 'success'
+        needs.capture.outputs.capture_result_sha256 != '' &&
+        needs.capture.outputs.result_uploaded == 'true'
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -467,6 +1062,13 @@ jobs:
       PROVENANCE_RELEASE_TITLE: ${{ needs.prepare.outputs.provenance_release_title }}
       PROVENANCE_ASSET_NAME: ${{ needs.prepare.outputs.provenance_asset_name }}
       EXPECTED_RESULT_SHA256: ${{ needs.capture.outputs.capture_result_sha256 }}
+      ORIGIN_RUN_ID: ${{ needs.capture.outputs.origin_run_id }}
+      ORIGIN_RUN_ATTEMPT: ${{ needs.capture.outputs.origin_run_attempt }}
+      RECOVERY_ARTIFACT_NAME: ${{ needs.capture.outputs.recovery_artifact_name }}
+      RECOVERY_ARTIFACT_DIGEST: ${{ needs.capture.outputs.recovery_artifact_digest }}
+      RECOVERY_INTENT_SHA256: ${{ needs.capture.outputs.recovery_intent_sha256 }}
+      RESULT_ARTIFACT_NAME: ${{ needs.capture.outputs.result_artifact_name }}
+      RESULT_ARTIFACT_RUN_ID: ${{ needs.capture.outputs.result_artifact_run_id }}
       RESULT_DIR: ${{ github.workspace }}/.capture/publication/result
       STAGING_DIR: ${{ github.workspace }}/.capture/publication/staging
       VALIDATION_DIR: ${{ github.workspace }}/.capture/publication/validation
@@ -487,7 +1089,10 @@ jobs:
       - name: Download exact named durable result artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: ubuntu2404-confidential-capture-result-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ${{ env.RESULT_ARTIFACT_NAME }}
+          run-id: ${{ env.RESULT_ARTIFACT_RUN_ID }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
           path: ${{ env.RESULT_DIR }}
 
       - name: Install Zig via ghr
@@ -529,8 +1134,8 @@ jobs:
             --source-release-tag "$SOURCE_RELEASE_TAG" \
             --tool-commit "$TOOL_COMMIT" \
             --repository "$GITHUB_REPOSITORY" \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --run-id "$ORIGIN_RUN_ID" \
+            --run-attempt "$ORIGIN_RUN_ATTEMPT" \
             --subscription-id "$AZURE_SUBSCRIPTION_ID" \
             --location "$TARGET_LOCATION" \
             --definition-id "$target_definition_id" \
@@ -543,46 +1148,112 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          api_headers=(
+            -H 'Accept: application/vnd.github+json'
+            -H "X-GitHub-Api-Version: $GH_API_VERSION"
+          )
+          gh api "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            >"$VALIDATION_DIR/immutable-releases.json"
+          jq -e '.enabled == true' \
+            "$VALIDATION_DIR/immutable-releases.json" >/dev/null ||
+            {
+              echo "::error::Immutable releases are no longer guaranteed"
+              exit 1
+            }
           direct_tag=$(git ls-remote origin "refs/tags/$PROVENANCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
           peeled_tag=$(git ls-remote origin "refs/tags/$PROVENANCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
           test "${peeled_tag:-$direct_tag}" = "$TOOL_COMMIT"
           direct_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
           peeled_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
           test "${peeled_source:-$direct_source}" = "$SOURCE_COMMIT"
-          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$PROVENANCE_RELEASE_TAG" \
-              >"$VALIDATION_DIR/reused-release.json" \
-              2>"$VALIDATION_DIR/reused-release.stderr"; then
-            echo "::error::Provenance release already exists; refusing overwrite"
-            exit 1
+          [[ "$ORIGIN_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          [[ "$ORIGIN_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ]]
+          [[ "$RECOVERY_ARTIFACT_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          [[ "$RECOVERY_INTENT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          expected_notes=$(
+            printf '%s\n' \
+              "Sanitized durable provenance for Azure Compute Gallery version $TARGET_IMAGE_VERSION." \
+              "origin-run-id: $ORIGIN_RUN_ID" \
+              "origin-run-attempt: $ORIGIN_RUN_ATTEMPT" \
+              "recovery-artifact: $RECOVERY_ARTIFACT_NAME" \
+              "recovery-artifact-digest: $RECOVERY_ARTIFACT_DIGEST" \
+              "recovery-intent-sha256: $RECOVERY_INTENT_SHA256" \
+              "capture-result-sha256: $EXPECTED_RESULT_SHA256"
+          )
+          release_json="$VALIDATION_DIR/release.json"
+          release_exists=false
+          if gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$PROVENANCE_RELEASE_TAG" \
+              >"$release_json" 2>"$VALIDATION_DIR/release.stderr"; then
+            release_exists=true
+            rm -f -- "$VALIDATION_DIR/release.stderr"
+          else
+            grep -Eq 'HTTP 404|Not Found' "$VALIDATION_DIR/release.stderr"
+            rm -f -- "$VALIDATION_DIR/release.stderr"
           fi
-          grep -Eq 'HTTP 404|Not Found' "$VALIDATION_DIR/reused-release.stderr"
-          gh release create "$PROVENANCE_RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --draft \
-            --title "$PROVENANCE_RELEASE_TITLE" \
-            --notes "Sanitized durable provenance for Azure Compute Gallery version $TARGET_IMAGE_VERSION."
-          gh release upload "$PROVENANCE_RELEASE_TAG" \
-            "$STAGING_DIR/$PROVENANCE_ASSET_NAME" \
-            --repo "$GITHUB_REPOSITORY"
-          release_json="$VALIDATION_DIR/draft-release.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$PROVENANCE_RELEASE_TAG" \
-            >"$release_json"
+
+          if [[ "$release_exists" == false ]]; then
+            gh release create "$PROVENANCE_RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --target "$TOOL_COMMIT" \
+              --draft \
+              --title "$PROVENANCE_RELEASE_TITLE" \
+              --notes "$expected_notes"
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$PROVENANCE_RELEASE_TAG" \
+              >"$release_json"
+          fi
+
           jq -e \
             --arg tag "$PROVENANCE_RELEASE_TAG" \
             --arg title "$PROVENANCE_RELEASE_TITLE" \
             --arg name "$PROVENANCE_ASSET_NAME" \
+            --arg notes "$expected_notes" \
+            --arg tool_commit "$TOOL_COMMIT" \
             '
             .tag_name == $tag and .name == $title and
-            .draft == true and .prerelease == false and
-            (.assets | length == 1) and
-            .assets[0].name == $name and
-            .assets[0].state == "uploaded" and
-            (.assets[0].id | type == "number" and . > 0)
+            .target_commitish == $tool_commit and
+            .body == $notes and .prerelease == false and
+            (
+              (
+                .draft == true and .immutable == false and
+                (.assets | length == 0 or length == 1) and
+                all(.assets[];
+                  .name == $name and .state == "uploaded" and
+                  (.id | type == "number" and . > 0))
+              ) or
+              (
+                .draft == false and .immutable == true and
+                (.assets | length == 1) and
+                .assets[0].name == $name and
+                .assets[0].state == "uploaded"
+              )
+            )
             ' "$release_json" >/dev/null
+
+          if [[ "$(jq -r '.draft' "$release_json")" == true &&
+              "$(jq -r '.assets | length' "$release_json")" == 0 ]]; then
+            gh release upload "$PROVENANCE_RELEASE_TAG" \
+              "$STAGING_DIR/$PROVENANCE_ASSET_NAME" \
+              --repo "$GITHUB_REPOSITORY"
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$PROVENANCE_RELEASE_TAG" \
+              >"$release_json"
+          fi
+          jq -e \
+            --arg name "$PROVENANCE_ASSET_NAME" \
+            --arg digest "sha256:$EXPECTED_RESULT_SHA256" \
+            '(.assets | length == 1) and
+             .assets[0].name == $name and
+             .assets[0].state == "uploaded" and
+             .assets[0].digest == $digest' \
+            "$release_json" >/dev/null
           asset_id=$(jq -er '.assets[0].id' "$release_json")
           downloaded="$VALIDATION_DIR/$PROVENANCE_ASSET_NAME"
-          gh api "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
+          gh api "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" \
             -H 'Accept: application/octet-stream' >"$downloaded"
           test "$(sha256sum "$downloaded" | awk '{print $1}')" = "$EXPECTED_RESULT_SHA256"
           target_definition_id="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP/providers/Microsoft.Compute/galleries/$TARGET_GALLERY/images/$TARGET_IMAGE_DEFINITION"
@@ -593,25 +1264,37 @@ jobs:
             --source-release-tag "$SOURCE_RELEASE_TAG" \
             --tool-commit "$TOOL_COMMIT" \
             --repository "$GITHUB_REPOSITORY" \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --run-id "$ORIGIN_RUN_ID" \
+            --run-attempt "$ORIGIN_RUN_ATTEMPT" \
             --subscription-id "$AZURE_SUBSCRIPTION_ID" \
             --location "$TARGET_LOCATION" \
             --definition-id "$target_definition_id" \
             --version-id "$target_definition_id/versions/$TARGET_IMAGE_VERSION"
-          gh release edit "$PROVENANCE_RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --draft=false
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$PROVENANCE_RELEASE_TAG" \
-            >"$VALIDATION_DIR/published-release.json"
+          if [[ "$(jq -r '.draft' "$release_json")" == true ]]; then
+            gh release edit "$PROVENANCE_RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft=false
+          fi
+          published_release="$VALIDATION_DIR/published-release.json"
+          gh api "${api_headers[@]}" \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$PROVENANCE_RELEASE_TAG" \
+            >"$published_release"
           jq -e \
             --arg tag "$PROVENANCE_RELEASE_TAG" \
             --arg title "$PROVENANCE_RELEASE_TITLE" \
             --arg name "$PROVENANCE_ASSET_NAME" \
+            --arg notes "$expected_notes" \
+            --arg tool_commit "$TOOL_COMMIT" \
+            --arg digest "sha256:$EXPECTED_RESULT_SHA256" \
             '.tag_name == $tag and .name == $title and
+             .target_commitish == $tool_commit and
+             .body == $notes and .immutable == true and
              .draft == false and .prerelease == false and
-             (.assets | length == 1) and .assets[0].name == $name' \
-            "$VALIDATION_DIR/published-release.json" >/dev/null
+             (.assets | length == 1) and
+             .assets[0].name == $name and
+             .assets[0].state == "uploaded" and
+             .assets[0].digest == $digest' \
+            "$published_release" >/dev/null
 
       - name: Remove publication staging
         if: always()

@@ -235,6 +235,10 @@ Configure:
 | Variable | `TARGET_GALLERY` | pre-provisioned private gallery |
 | Variable | `TARGET_IMAGE_DEFINITION` | pre-provisioned full ConfidentialVM definition |
 | Variable | `TARGET_OWNER_TAG` | durable `miz-owner` tag on every target parent |
+| Secret | `SCRATCH_RESERVATION_TAG` | owner-only reservation value on the empty pre-provisioned scratch RG |
+| Variable | `CAPTURE_TARGET_READ_SCOPE` | exact preexisting target resource-group ID |
+| Variable | `PUBLICATION_SNAPSHOT_READ_SCOPE` | exact pre-provisioned scratch resource-group ID |
+| Variable | `PUBLICATION_VERSION_WRITE_SCOPE` | exact preexisting target image-definition resource ID |
 
 Both applications need a federated credential with subject
 `repo:cataggar/miz:environment:ubuntu2404-confidential-capture`. They must not
@@ -246,17 +250,38 @@ before publication validation and again on the unconditional cleanup path.
 No access token, OIDC request token, JWT, SAS, SSH key, Azure CLI configuration,
 or raw attestation bundle is serialized into recovery state or uploaded.
 
-Use custom roles with no wildcard control-plane permissions. The capture
-principal needs these actions only:
+Enable **immutable releases** in the repository settings before creating the
+accepted source release or dispatching capture. The workflow queries
+`GET /repos/cataggar/miz/immutable-releases` with the pinned official GitHub
+REST API version before any Azure login or mutation and requires
+`enabled=true`; it never changes the repository setting. The accepted source
+release itself must report `immutable=true`, be published, and be neither a
+draft nor a prerelease. Its exact tag must resolve to the recorded source
+commit. A repository or token for which the setting or release immutability
+cannot be queried is not eligible for capture.
 
-- at subscription scope, limited operationally to the randomized tagged
-  scratch group prefix:
-  `Microsoft.Resources/subscriptions/resourceGroups/read`,
+Before dispatch, provision a unique empty scratch resource group named
+`miz-u2404-cvm-capture-SUFFIX` in the configured subscription and region.
+Give it exactly the tags
+`miz-owner=ubuntu2404-confidential-capture`,
+`miz-repository=cataggar/miz`, and
+`miz-reservation=SCRATCH_RESERVATION_TAG`. Pass its name as the required
+`scratch_resource_group` dispatch input. Both role assignments on this group
+therefore exist before dispatch. The harness refuses a missing, nonempty,
+mismatched, or already claimed group, atomically replaces the reservation tags
+with the immutable origin tags, and later deletes only that exact claimed
+group.
+
+Use custom roles with no wildcard control-plane permissions. Assign the
+capture scratch-lifecycle role at that exact pre-provisioned scratch
+resource-group scope. Assign a separate custom role containing only
+`Microsoft.Compute/skus/read` at subscription scope for the configured
+region/SKU check. The scratch-lifecycle role's complete action list is:
+
+- `Microsoft.Resources/subscriptions/resourceGroups/read`,
   `Microsoft.Resources/subscriptions/resourceGroups/write`, and
-`Microsoft.Resources/subscriptions/resourceGroups/delete`, plus
-`Microsoft.Compute/skus/read` for the configured region/SKU check;
-- in its one randomized scratch resource group:
-  `Microsoft.Resources/subscriptions/resourceGroups/resources/read`,
+  `Microsoft.Resources/subscriptions/resourceGroups/delete`;
+- `Microsoft.Resources/subscriptions/resourceGroups/resources/read`,
   `Microsoft.Resources/tags/write`,
   `Microsoft.Compute/disks/read`,
   `Microsoft.Compute/disks/write`,
@@ -272,6 +297,8 @@ principal needs these actions only:
   `Microsoft.Compute/virtualMachines/deallocate/action`,
   `Microsoft.Compute/virtualMachines/generalize/action`,
   `Microsoft.Compute/virtualMachines/instanceView/read`,
+  `Microsoft.Compute/virtualMachines/extensions/read`,
+  `Microsoft.Compute/virtualMachines/extensions/write`,
   `Microsoft.Compute/galleries/read`,
   `Microsoft.Compute/galleries/write`,
   `Microsoft.Compute/galleries/images/read`,
@@ -294,21 +321,43 @@ principal needs these actions only:
   `Microsoft.Network/networkInterfaces/read`,
   `Microsoft.Network/networkInterfaces/write`,
   `Microsoft.Network/networkInterfaces/join/action`; and
-- on the exact durable target version resource ID,
-  `Microsoft.Compute/galleries/images/versions/read` only.
+- in a separate read-only custom role assigned at the preexisting durable
+  target resource-group scope,
+  `Microsoft.Resources/subscriptions/resourceGroups/read`,
+  `Microsoft.Compute/galleries/read`,
+  `Microsoft.Compute/galleries/images/read`, and
+  `Microsoft.Compute/galleries/images/versions/read`. These reads cover target
+  parent validation, exact target-version validation, and the final deployment
+  from that version. The capture principal has no target version delete and no
+  target resource-group, gallery, image-definition, or version write.
 
-The publisher principal needs only
-`Microsoft.Resources/subscriptions/resourceGroups/read` on the exact target
-resource group, `Microsoft.Compute/galleries/read` on the exact gallery,
-`Microsoft.Compute/galleries/images/read` on the exact definition, and
-`Microsoft.Compute/galleries/images/versions/read` plus
-`Microsoft.Compute/galleries/images/versions/write` on the exact new version
-resource ID. It must have no version delete permission and no target
-resource-group, gallery, or definition write/delete permission. The version
-scope and role assignments are pre-provisioned as part of the operator change
-for that target version; the workflow never grants RBAC. Azure RBAC and a
-malicious subscription Owner are outside what the workflow or harness can
-prove, so operators must independently review effective assignments before
+The exclusive publisher requires **two separate, pre-provisionable role
+assignments**:
+
+1. Assign a custom role containing only
+   `Microsoft.Compute/snapshots/read` at the pre-provisioned scratch
+   resource-group ID
+   `/subscriptions/SUBSCRIPTION_ID/resourceGroups/SCRATCH_RESOURCE_GROUP`.
+   The role has no other action and the harness accepts only the exact
+   origin-tagged snapshot ID in that group.
+2. Assign a second custom role at the **preexisting image-definition resource
+   ID**
+   `/subscriptions/SUBSCRIPTION_ID/resourceGroups/TARGET_RESOURCE_GROUP/providers/Microsoft.Compute/galleries/TARGET_GALLERY/images/TARGET_IMAGE_DEFINITION`.
+   Its complete action list is
+   `Microsoft.Compute/galleries/read`,
+   `Microsoft.Compute/galleries/images/read`,
+   `Microsoft.Compute/galleries/images/versions/read`, and
+   `Microsoft.Compute/galleries/images/versions/write`.
+
+The publisher has no version delete permission and no resource-group, gallery,
+or image-definition write/delete permission. In particular, do not attempt to
+assign its writer role at
+`.../images/TARGET_IMAGE_DEFINITION/versions/MAJOR.MINOR.PATCH`: that version
+scope does not exist before dispatch. The workflow never creates role
+definitions or assignments. The exclusive version writer plus the stable,
+non-canceling concurrency group is the check-to-PUT race boundary. Azure RBAC
+and a malicious subscription Owner are outside what the workflow or harness
+can prove, so operators must independently review effective assignments before
 dispatch.
 
 The durable target resource group, private gallery, and image definition must
@@ -322,29 +371,76 @@ gallery version records `EncryptedVMGuestStateOnlyWithPmk`. Replication is
 `Full`, and source recreation, capture, snapshot, target, and final acceptance
 remain in the same region and subscription.
 
-The source release must be published, non-draft, non-prerelease, and contain
-exactly the QCOW2, build provenance JSON, and Azure acceptance JSON documented
-above. The workflow downloads those three assets by exact asset ID, validates
-their hashes and shape with the accepted-source tooling, and derives the
-source commit, source run/attempt, location, and VM size from the validated
+The source release must be immutable, published, non-draft, non-prerelease, and
+contain exactly the QCOW2, build provenance JSON, and Azure acceptance JSON
+documented above. The workflow downloads those three assets by exact asset ID,
+validates their hashes and shape with the accepted-source tooling, and derives
+the source commit, source run/attempt, location, and VM size from the validated
 release evidence. It never adds an asset to that source release.
 
-The capture harness has explicit same-job `prepare`, `publish`, and `cleanup`
-stages. Recovery state and prepared evidence are owner-only, schema-validated,
-identity-bound, and hash-checked. `publish` revalidates the prepared snapshot,
-all target parents, and target-version absence before its sole non-retried PUT.
-Any ambiguous publication is quarantined: the target is never deleted, the
-scratch group is retained, and an operator must compare Azure activity logs,
-the exact version ID, tags, and state before break-glass cleanup. Do not rerun
-or retarget the provenance tag to bypass quarantine.
+The capture harness has explicit `prepare`, `inspect-recovery`, `publish`,
+`recover`, `finalize`, and `cleanup` stages. Normal dispatch fixes
+`origin_run_id` and `origin_run_attempt` to the initial run. Manual recovery
+requires both original values or neither; current retry identity never replaces
+the origin used in resource names, tags, artifact names, or durable provenance.
+Before target PUT, the workflow uploads only owner-readable sanitized
+`capture-state.json` and `recovery-intent.json`, then a separate sanitized PUT
+dispatch marker. All three artifacts are named from origin run, origin attempt,
+and target version and are retained for 90 days. They contain identities,
+resource IDs, state, and hashes only: no SAS, access token, OIDC token, JWT,
+nonce, key, Azure CLI configuration, OpenID document, JWKS, or raw attestation
+bundle.
 
-Only the sanitized `capture-result.json` crosses jobs. The publication job
+Once PUT is dispatched, scratch deletion is prohibited until the exact
+sanitized `capture-result.json` has been uploaded for 90 days and `finalize`
+has durably acknowledged its hash. A failed result upload, result
+acknowledgement, or post-PUT cleanup therefore leaves the origin-tagged scratch
+group visibly quarantined. An unconditional cleanup may delete only a
+pre-PUT group or a post-upload durable group.
+
+Recovery downloads the exact origin artifact, verifies the GitHub artifact
+digest, owner-only permissions, exact schema and full source/tool/target/origin
+identity, then freshly retrieves Azure and MAA evidence from retained scratch.
+If the exact target version exists, its tags, snapshot source, security
+contract, region, replication state, and origin must all match before recovery
+continues final deployment and attestation; recovery never issues a second
+PUT. If the version is absent and no durable dispatch marker exists, one new
+dispatch marker may be uploaded and publication may proceed once. An absent
+version after a durable dispatch marker, or any mismatched/missing artifact,
+digest, state, tag, or resource, is ambiguous and fails closed.
+
+If the origin result artifact is already durable—for example, only scratch
+cleanup or provenance publication failed—the recovery dispatch downloads and
+strictly verifies that exact origin result and proceeds directly to provenance
+publication without another Azure login, target PUT, deployment, or
+attestation run. This preserves the original result digest and allows an exact
+owned draft release to resume.
+
+Use explicit manual recovery rather than rerunning with a new origin:
+
+```console
+gh workflow run ubuntu2404-confidential-capture.yml --ref main \
+  -f source_release_tag=Ubuntu-24.04-confidential-YYYYMMDD \
+  -f target_gallery_version=MAJOR.MINOR.PATCH \
+  -f scratch_resource_group=miz-u2404-cvm-capture-SUFFIX \
+  -f origin_run_id=ORIGINAL_RUN_ID \
+  -f origin_run_attempt=ORIGINAL_RUN_ATTEMPT
+```
+
+Only the sanitized `capture-result.json` crosses into provenance publication.
+The publication job
 re-hashes it, validates protected source/tool/run/target identities with
 `verify-capture-publication`, uploads one deterministically named provenance
-JSON to a new draft GitHub release, downloads and revalidates that exact asset,
-then publishes the release. Full raw Azure and MAA verification has already
-succeeded inside the protected Azure job; the durable verifier does not claim
-to reauthenticate discarded transport evidence.
+JSON to a controlled draft GitHub release, downloads and revalidates that exact
+asset, then publishes the release. An exact owned draft may be resumed only
+when tag, tool commit, title, origin identity, recovery intent digest, and any
+staged asset all match; a foreign or mismatched draft is refused, and a
+published release is never overwritten. After publication the workflow
+requires GitHub to report the release immutable with the exact tag, title, and
+commit and exactly one asset with the exact name and SHA-256. Full raw Azure
+and MAA verification has already succeeded inside the protected Azure job; the
+durable verifier does not claim to reauthenticate discarded transport
+evidence.
 
 This workflow is not a substitute for qualification. A new region, SKU,
 definition contract, Azure API behavior, role design, or harness change
