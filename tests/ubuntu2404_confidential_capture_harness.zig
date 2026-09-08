@@ -1,6 +1,7 @@
 //! Structural and executable guards for the ConfidentialVM capture harness.
 
 const std = @import("std");
+const confidential_release = @import("ubuntu2404_confidential_release");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -64,6 +65,71 @@ fn section(text: []const u8, start: []const u8, end: []const u8) ![]const u8 {
     const end_index = std.mem.indexOf(u8, tail, end) orelse
         return error.RequiredTextMissing;
     return tail[0..end_index];
+}
+
+const CaptureArguments = struct {
+    argv: [128][]const u8 = undefined,
+    names: [64][]const u8 = undefined,
+    argv_len: usize = 0,
+    names_len: usize = 0,
+
+    fn appendLine(self: *CaptureArguments, line: []const u8) !void {
+        const trimmed = std.mem.trim(u8, line, " \t\r\\");
+        if (!std.mem.startsWith(u8, trimmed, "--")) return;
+        const separator = std.mem.indexOfAny(u8, trimmed, " \t") orelse
+            return error.MissingArgumentValue;
+        const value = std.mem.trim(u8, trimmed[separator..], " \t");
+        if (value.len == 0 or
+            self.argv_len + 2 > self.argv.len or
+            self.names_len == self.names.len)
+        {
+            return error.InvalidArgumentArray;
+        }
+        self.argv[self.argv_len] = trimmed[0..separator];
+        self.argv[self.argv_len + 1] = value;
+        self.argv_len += 2;
+        self.names[self.names_len] = trimmed[2..separator];
+        self.names_len += 1;
+    }
+
+    fn appendLines(self: *CaptureArguments, text: []const u8) !void {
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| try self.appendLine(line);
+    }
+};
+
+fn captureArguments(
+    script: []const u8,
+    command: []const u8,
+    invocation_end: []const u8,
+) !CaptureArguments {
+    var arguments: CaptureArguments = .{};
+    const common = try section(
+        script,
+        "capture_common_args=(\n",
+        ")\nverify_capture_evidence_revisions",
+    );
+    try arguments.appendLines(common);
+
+    var command_marker_buffer: [96]u8 = undefined;
+    const command_marker = try std.fmt.bufPrint(
+        &command_marker_buffer,
+        "\"$RELEASE_TOOL\" {s} \\\n",
+        .{command},
+    );
+    const invocation = try section(script, command_marker, invocation_end);
+    try arguments.appendLines(invocation);
+    return arguments;
+}
+
+fn expectArgumentSchema(
+    actual: CaptureArguments,
+    expected: []const []const u8,
+) !void {
+    try std.testing.expectEqual(expected.len, actual.names_len);
+    for (actual.names[0..actual.names_len], expected) |name, expected_name| {
+        try std.testing.expectEqualStrings(expected_name, name);
+    }
 }
 
 const Result = struct {
@@ -1102,4 +1168,38 @@ test "capture harness is executable valid shell" {
         .exited => |code| code,
         else => null,
     });
+}
+
+test "capture result and verification arguments match their CLI schemas" {
+    const allocator = std.testing.allocator;
+    const script = try readTracked(allocator, script_path);
+    defer allocator.free(script);
+
+    const result_arguments = try captureArguments(
+        script,
+        "capture-result",
+        "\nverify_capture_evidence_revisions\n",
+    );
+    try expectArgumentSchema(
+        result_arguments,
+        &confidential_release.capture_result_option_schema,
+    );
+    try confidential_release.parseCaptureCommandArguments(
+        "capture-result",
+        result_arguments.argv[0..result_arguments.argv_len],
+    );
+
+    const verify_arguments = try captureArguments(
+        script,
+        "verify-capture",
+        "\n\njq -e \\\n",
+    );
+    try expectArgumentSchema(
+        verify_arguments,
+        &confidential_release.capture_verify_option_schema,
+    );
+    try confidential_release.parseCaptureCommandArguments(
+        "verify-capture",
+        verify_arguments.argv[0..verify_arguments.argv_len],
+    );
 }

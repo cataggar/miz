@@ -2131,11 +2131,11 @@ capture_common_args=(
   --endpoint "$ATTESTATION_ENDPOINT"
   --nonce "$final_nonce"
   --now "$final_now"
-  --guest-vm-id "$final_guest_vm_id"
 )
 verify_capture_evidence_revisions
 "$RELEASE_TOOL" capture-result \
   "${capture_common_args[@]}" \
+  --guest-vm-id "$final_guest_vm_id" \
   --output "$capture_result"
 verify_capture_evidence_revisions
 "$RELEASE_TOOL" verify-capture \

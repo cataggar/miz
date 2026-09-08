@@ -71,7 +71,7 @@ const usage_text =
     \\
 ;
 
-const ArgumentError = error{Usage};
+pub const ArgumentError = error{Usage};
 
 const Options = struct {
     const capacity = 64;
@@ -2131,7 +2131,7 @@ fn runCheckCapturedVm(context: Context, argv: []const []const u8) !void {
     });
 }
 
-const capture_result_options = [_][]const u8{
+pub const capture_result_option_schema = [_][]const u8{
     "source-acceptance",
     "provenance",
     "qcow",
@@ -2181,7 +2181,7 @@ const capture_result_options = [_][]const u8{
     "output",
 };
 
-const capture_verify_options = [_][]const u8{
+pub const capture_verify_option_schema = [_][]const u8{
     "source-acceptance",
     "provenance",
     "qcow",
@@ -2229,6 +2229,19 @@ const capture_verify_options = [_][]const u8{
     "now",
     "result",
 };
+
+pub fn parseCaptureCommandArguments(
+    command: []const u8,
+    argv: []const []const u8,
+) ArgumentError!void {
+    const schema = if (std.mem.eql(u8, command, "capture-result"))
+        &capture_result_option_schema
+    else if (std.mem.eql(u8, command, "verify-capture"))
+        &capture_verify_option_schema
+    else
+        return error.Usage;
+    _ = try parseOptions(argv, schema);
+}
 
 fn captureExpected(
     options: *const Options,
@@ -2883,7 +2896,7 @@ fn captureEvidence(
 }
 
 fn runCaptureResult(context: Context, argv: []const []const u8) !void {
-    const options = try parseOptions(argv, &capture_result_options);
+    const options = try parseOptions(argv, &capture_result_option_schema);
     const verified = try verifiedCaptureInputs(context, &options);
     const staging = try validateStagingEvidence(
         context,
@@ -3010,7 +3023,7 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
 }
 
 fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
-    const options = try parseOptions(argv, &capture_verify_options);
+    const options = try parseOptions(argv, &capture_verify_option_schema);
     const verified = try verifiedCaptureInputs(context, &options);
     const staging = try validateStagingEvidence(
         context,
@@ -3196,8 +3209,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "command surface is exact and rejects incomplete invocations" {
-    try std.testing.expect(Options.capacity >= capture_result_options.len);
-    try std.testing.expect(Options.capacity >= capture_verify_options.len);
+    try std.testing.expect(Options.capacity >= capture_result_option_schema.len);
+    try std.testing.expect(Options.capacity >= capture_verify_option_schema.len);
     const names = [_][]const u8{
         "verify-build",
         "verify-vhd",
@@ -3306,7 +3319,7 @@ test "capture-result and verify-capture reject every evidence revision mismatch"
         "--openid",                   path,
         "--jwks",                     path,
     };
-    const options = try parseOptions(&argv, &capture_verify_options);
+    const options = try parseOptions(&argv, &capture_verify_option_schema);
     var discard: Writer.Discarding = .init(&.{});
     var diagnostic: Diagnostic = .{};
     const context: Context = .{

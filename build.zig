@@ -2200,6 +2200,12 @@ pub fn build(b: *std.Build) void {
                 ),
                 .target = b.graph.host,
                 .optimize = optimize,
+                .imports = &.{
+                    .{
+                        .name = "ubuntu2404_confidential_release",
+                        .module = ubuntu2404_confidential_release_mod,
+                    },
+                },
             }),
         });
         const run_ubuntu2404_confidential_capture_harness_tests = b.addRunArtifact(
