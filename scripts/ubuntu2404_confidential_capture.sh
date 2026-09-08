@@ -97,9 +97,10 @@ state_matches_identity() {
        (
          (.outstanding_write_access | type == "object") and
          (.outstanding_write_access | keys == [
-           "active", "disk_id", "disk_name", "resource_group"
+           "disk_id", "disk_name", "resource_group", "status"
          ]) and
-         .outstanding_write_access.active == true and
+         (.outstanding_write_access.status == "pending" or
+          .outstanding_write_access.status == "active") and
          (.outstanding_write_access.disk_id | type == "string") and
          (.outstanding_write_access.disk_name | type == "string") and
          (.outstanding_write_access.resource_group | type == "string")
@@ -136,12 +137,12 @@ validate_write_access_identity() {
 }
 
 revoke_outstanding_disk_write_access() {
-  local active disk_id disk_group disk_name metadata stderr_file
-  active=$(jq -r '.outstanding_write_access.active // false' "$STATE_FILE") ||
+  local status disk_id disk_group disk_name metadata stderr_file
+  status=$(jq -r '.outstanding_write_access.status // "none"' "$STATE_FILE") ||
     return
-  case "$active" in
-    false) return 0 ;;
-    true) ;;
+  case "$status" in
+    none) return 0 ;;
+    pending|active) ;;
     *) fail "Capture cleanup state has an invalid disk write grant"; return ;;
   esac
   disk_id=$(jq -er '.outstanding_write_access.disk_id' "$STATE_FILE") || return
@@ -578,6 +579,20 @@ grant_disk_write_access() {
     fail "Refusing to grant disk write access without exact run identity"
     return
   }
+  state_replace \
+    '.outstanding_write_access = {
+      status: "pending",
+      disk_id: $disk_id,
+      resource_group: $disk_group,
+      disk_name: $disk_name
+    }' \
+    --arg disk_id "$disk_id" \
+    --arg disk_group "$disk_group" \
+    --arg disk_name "$disk_name" ||
+    {
+      fail "Could not persist the pending disk write grant"
+      return
+    }
   request_dir="$RESULT_DIR/disk-access"
   rm -rf -- "$request_dir"
   mkdir -m 0700 "$request_dir"
@@ -625,17 +640,9 @@ grant_disk_write_access() {
   [[ "$status" == 200 ]] || return 1
   sas=$(jq -er '.accessSAS | strings | select(startswith("https://"))' "$response_body")
   if ! state_replace \
-      --arg disk_id "$disk_id" \
-      --arg disk_group "$disk_group" \
-      --arg disk_name "$disk_name" \
-      '.outstanding_write_access = {
-        active: true,
-        disk_id: $disk_id,
-        resource_group: $disk_group,
-        disk_name: $disk_name
-      }'; then
-    az disk revoke-access --ids "$disk_id" --output none ||
-      fail "Failed to revoke a disk write grant after state recording failed"
+      '.outstanding_write_access.status = "active"'; then
+    revoke_outstanding_disk_write_access ||
+      fail "Failed to revoke a disk write grant after state promotion failed"
     return 1
   fi
   printf '%s\n' "$sas"

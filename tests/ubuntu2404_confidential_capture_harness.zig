@@ -556,7 +556,7 @@ fn writeCleanupFixture(
     allocator: Allocator,
     root: []const u8,
     succeeded: bool,
-    active_write_access: bool,
+    write_access_status: ?[]const u8,
 ) !struct { state: []u8, log: []u8 } {
     const bin = try std.fmt.allocPrint(allocator, "{s}/bin", .{root});
     defer allocator.free(bin);
@@ -607,6 +607,19 @@ fn writeCleanupFixture(
     });
     const state = try std.fmt.allocPrint(allocator, "{s}/state.json", .{root});
     errdefer allocator.free(state);
+    const write_access_json = if (write_access_status) |status|
+        try std.fmt.allocPrint(
+            allocator,
+            \\{{"status":"{s}",
+            \\"disk_id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4/providers/Microsoft.Compute/disks/miz-u2404-capture-upload-123-4",
+            \\"disk_name":"miz-u2404-capture-upload-123-4",
+            \\"resource_group":"miz-u2404-cvm-capture-123-4"}}
+        ,
+            .{status},
+        )
+    else
+        try allocator.dupe(u8, "null");
+    defer allocator.free(write_access_json);
     const state_json = try std.fmt.allocPrint(
         allocator,
         \\{{"schema":1,"repository":"cataggar/miz","run_id":"123","run_attempt":"4",
@@ -623,13 +636,7 @@ fn writeCleanupFixture(
     ,
         .{
             if (succeeded) "true" else "false",
-            if (active_write_access)
-                \\{"active":true,
-                \\"disk_id":"/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4/providers/Microsoft.Compute/disks/miz-u2404-capture-upload-123-4",
-                \\"disk_name":"miz-u2404-capture-upload-123-4",
-                \\"resource_group":"miz-u2404-cvm-capture-123-4"}
-            else
-                "null",
+            write_access_json,
         },
     );
     defer allocator.free(state_json);
@@ -707,6 +714,171 @@ fn runCleanup(
     };
 }
 
+test "interrupted beginGetAccess leaves pending exact disk for cleanup revoke" {
+    const allocator = std.testing.allocator;
+    const script_source = try readTracked(allocator, script_path);
+    defer allocator.free(script_source);
+    const state_replace_source = try section(
+        script_source,
+        "state_replace() {",
+        "\nstate_file_is_safe() {",
+    );
+    const validate_source = try section(
+        script_source,
+        "validate_write_access_identity() {",
+        "\nrevoke_outstanding_disk_write_access() {",
+    );
+    const grant_source = try section(
+        script_source,
+        "grant_disk_write_access() {",
+        "\nresource_absent() {",
+    );
+    const pending = try indexOf(
+        grant_source,
+        "'.outstanding_write_access = {\n      status: \"pending\"",
+    );
+    const request = try indexOf(grant_source, "--request POST");
+    const promotion = try indexOf(
+        grant_source,
+        "'.outstanding_write_access.status = \"active\"'",
+    );
+    try std.testing.expect(pending < request);
+    try std.testing.expect(request < promotion);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository = try rootAlloc(allocator);
+    defer allocator.free(repository);
+    const root = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}",
+        .{ repository, tmp.sub_path },
+    );
+    defer allocator.free(root);
+    const fixture = try writeCleanupFixture(allocator, root, true, null);
+    defer allocator.free(fixture.state);
+    defer allocator.free(fixture.log);
+    const request_log = try std.fmt.allocPrint(
+        allocator,
+        "{s}/begin-get-access.log",
+        .{root},
+    );
+    defer allocator.free(request_log);
+    const disk_id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4/providers/Microsoft.Compute/disks/miz-u2404-capture-upload-123-4";
+    const grant_fixture_source = try std.fmt.allocPrint(
+        allocator,
+        \\#!/usr/bin/env bash
+        \\set -Eeuo pipefail
+        \\STATE_FILE='{s}'
+        \\RESULT_DIR='{s}'
+        \\GITHUB_RUN_ID=123
+        \\GITHUB_RUN_ATTEMPT=4
+        \\MOCK_REQUEST='{s}'
+        \\fail() {{ printf '%s\n' "$*" >&2; return 1; }}
+        \\az() {{
+        \\  test "$1 $2" = "account get-access-token"
+        \\  printf 'mock-token\n'
+        \\}}
+        \\curl() {{
+        \\  jq -e --arg disk_id '{s}' '
+        \\    .outstanding_write_access.status == "pending" and
+        \\    .outstanding_write_access.disk_id == $disk_id and
+        \\    .outstanding_write_access.resource_group == "miz-u2404-cvm-capture-123-4" and
+        \\    .outstanding_write_access.disk_name == "miz-u2404-capture-upload-123-4"
+        \\  ' "$STATE_FILE" >/dev/null
+        \\  printf '%s\n' "$*" >"$MOCK_REQUEST"
+        \\  return 52
+        \\}}
+        \\{s}
+        \\{s}
+        \\{s}
+        \\grant_disk_write_access \
+        \\  '{s}' miz-u2404-cvm-capture-123-4 miz-u2404-capture-upload-123-4 7200
+        \\
+    ,
+        .{
+            fixture.state,
+            root,
+            request_log,
+            disk_id,
+            state_replace_source,
+            validate_source,
+            grant_source,
+            disk_id,
+        },
+    );
+    defer allocator.free(grant_fixture_source);
+    const grant_result = try runShellSource(
+        allocator,
+        root,
+        "interrupted-grant-fixture.sh",
+        grant_fixture_source,
+    );
+    defer grant_result.deinit(allocator);
+    try std.testing.expect(!grant_result.succeeded());
+
+    const pending_state = try Dir.cwd().readFileAlloc(
+        std.testing.io,
+        fixture.state,
+        allocator,
+        .limited(max_output_bytes),
+    );
+    defer allocator.free(pending_state);
+    if (std.mem.indexOf(u8, pending_state, "\"status\":\"pending\"") == null) {
+        std.debug.print(
+            "interrupted grant state:\n{s}\nstdout:\n{s}\nstderr:\n{s}\n",
+            .{ pending_state, grant_result.stdout, grant_result.stderr },
+        );
+        return error.RequiredTextMissing;
+    }
+    try expectContains(pending_state, disk_id);
+    const request_contents = try Dir.cwd().readFileAlloc(
+        std.testing.io,
+        request_log,
+        allocator,
+        .limited(max_output_bytes),
+    );
+    defer allocator.free(request_contents);
+    try expectContains(
+        request_contents,
+        disk_id ++ "/beginGetAccess?api-version=2025-01-02",
+    );
+
+    const cleanup_result = try runCleanup(
+        allocator,
+        root,
+        fixture.state,
+        fixture.log,
+        "different-owner",
+        "ubuntu2404-confidential-capture",
+        "[]",
+        disk_id,
+        "ubuntu2404-confidential-capture",
+        "0",
+    );
+    defer cleanup_result.deinit(allocator);
+    if (!cleanup_result.succeeded()) {
+        std.debug.print(
+            "pending grant cleanup failed:\n{s}\n{s}\n",
+            .{ cleanup_result.stdout, cleanup_result.stderr },
+        );
+        return error.CleanupFailed;
+    }
+    const cleanup_log = try Dir.cwd().readFileAlloc(
+        std.testing.io,
+        fixture.log,
+        allocator,
+        .limited(max_output_bytes),
+    );
+    defer allocator.free(cleanup_log);
+    const exact_revoke = try indexOf(
+        cleanup_log,
+        "disk revoke-access --ids " ++ disk_id ++ " --output none",
+    );
+    const group_delete = try indexOf(cleanup_log, "group delete");
+    try std.testing.expect(exact_revoke < group_delete);
+}
+
 test "mocked cleanup deletes only exact-owned resources in dependency order" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -719,7 +891,7 @@ test "mocked cleanup deletes only exact-owned resources in dependency order" {
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const fixture = try writeCleanupFixture(allocator, root, false, false);
+    const fixture = try writeCleanupFixture(allocator, root, false, null);
     defer allocator.free(fixture.state);
     defer allocator.free(fixture.log);
     const result = try runCleanup(
@@ -765,7 +937,7 @@ test "mocked cleanup refuses mismatched target and group ownership" {
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const fixture = try writeCleanupFixture(allocator, root, false, false);
+    const fixture = try writeCleanupFixture(allocator, root, false, null);
     defer allocator.free(fixture.state);
     defer allocator.free(fixture.log);
     const result = try runCleanup(
@@ -806,7 +978,7 @@ test "successful-run cleanup retains persistent target and deletes exact temp gr
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const fixture = try writeCleanupFixture(allocator, root, true, false);
+    const fixture = try writeCleanupFixture(allocator, root, true, null);
     defer allocator.free(fixture.state);
     defer allocator.free(fixture.log);
     const result = try runCleanup(
@@ -847,7 +1019,7 @@ test "interrupted upload cleanup revokes exact disk before resource-group deleti
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const fixture = try writeCleanupFixture(allocator, root, false, true);
+    const fixture = try writeCleanupFixture(allocator, root, false, "active");
     defer allocator.free(fixture.state);
     defer allocator.free(fixture.log);
     const disk_id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4/providers/Microsoft.Compute/disks/miz-u2404-capture-upload-123-4";
@@ -900,7 +1072,7 @@ test "failed normal revoke remains active and surfaces cleanup failure" {
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const fixture = try writeCleanupFixture(allocator, root, true, true);
+    const fixture = try writeCleanupFixture(allocator, root, true, "active");
     defer allocator.free(fixture.state);
     defer allocator.free(fixture.log);
     const disk_id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4/providers/Microsoft.Compute/disks/miz-u2404-capture-upload-123-4";
@@ -936,7 +1108,7 @@ test "failed normal revoke remains active and surfaces cleanup failure" {
         .limited(max_output_bytes),
     );
     defer allocator.free(state);
-    try expectContains(state, "\"outstanding_write_access\":{\"active\":true");
+    try expectContains(state, "\"outstanding_write_access\":{\"status\":\"active\"");
 }
 
 test "cleanup never revokes an unrelated disk from active state" {
@@ -951,7 +1123,7 @@ test "cleanup never revokes an unrelated disk from active state" {
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const fixture = try writeCleanupFixture(allocator, root, true, true);
+    const fixture = try writeCleanupFixture(allocator, root, true, "active");
     defer allocator.free(fixture.state);
     defer allocator.free(fixture.log);
     const unrelated_id = "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/other/providers/Microsoft.Compute/disks/unrelated";
