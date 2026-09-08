@@ -155,6 +155,7 @@ test "builders encode every independent Confidential VM resource contract" {
         "azure_confidential_vm_snapshot_show_args",
         "azure_confidential_vm_capture_image_definition_create_args",
         "azure_confidential_vm_capture_image_definition_show_args",
+        "azure_confidential_vm_resource_group_create_args",
         "azure_confidential_vm_capture_gallery_version_put_args",
         "azure_confidential_vm_capture_gallery_version_get_args",
     };
@@ -200,6 +201,13 @@ test "builders encode every independent Confidential VM resource contract" {
     try expectAbsent(inherited_create, "--os-disk-security-encryption-type");
     try expectAbsent(inherited_create, "--enable-secure-boot");
     try expectAbsent(inherited_create, "--enable-vtpm");
+    try expectAbsent(library, "If-None-Match");
+    try expectAbsent(
+        library,
+        "azure_confidential_vm_capture_image_definition_conditional_create_args",
+    );
+    try expectContains(library, "--nics \"$nic_id\"");
+    try expectContains(library, "--os-disk-name \"$os_disk_name\"");
     try expectAbsent(library, "eval ");
     try expectAbsent(examples, "eval ");
 }

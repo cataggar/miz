@@ -4,6 +4,7 @@ UBUNTU2404_CONFIDENTIAL_GUEST_SSH_OPTIONS=()
 UBUNTU2404_CONFIDENTIAL_GUEST_SSH_TARGET=
 UBUNTU2404_CONFIDENTIAL_GUEST_VM_ID=
 UBUNTU2404_CONFIDENTIAL_GUEST_VALIDATION_FILES_COPIED=false
+UBUNTU2404_CONFIDENTIAL_GUEST_AZURE_TAGS=()
 
 UBUNTU2404_CONFIDENTIAL_ATTESTATION_PACKAGE_URL=https://packages.microsoft.com/repos/azurecore/pool/main/a/azguestattestation1/azguestattestation1_1.0.5_amd64.deb
 UBUNTU2404_CONFIDENTIAL_ATTESTATION_PACKAGE_SHA256=791dd441f84fca9ad3f9c46263a919ce50c987cfc4a80faf2f9d6bfc94d71815
@@ -164,15 +165,25 @@ GUEST
 ubuntu2404_confidential_guest_validate_persistent_data_disk() {
   local resource_group=$1 vm_name=$2 data_disk_name=$3 location=$4 nonce=$5
   local data_disk_size_gib=4 data_marker_sha256 old_boot_id new_boot_id attempt
+  local -a tag_args=()
   ubuntu2404_confidential_guest_require_ssh || return
 
+  if ((${#UBUNTU2404_CONFIDENTIAL_GUEST_AZURE_TAGS[@]} != 0)); then
+    tag_args=(--tags "${UBUNTU2404_CONFIDENTIAL_GUEST_AZURE_TAGS[@]}")
+  fi
   az disk create \
     --resource-group "$resource_group" \
     --name "$data_disk_name" \
     --location "$location" \
     --size-gb "$data_disk_size_gib" \
     --sku Standard_LRS \
+    "${tag_args[@]}" \
     --output none || return
+  if declare -F ubuntu2404_confidential_guest_record_created_data_disk \
+      >/dev/null; then
+    ubuntu2404_confidential_guest_record_created_data_disk \
+      "$resource_group" "$data_disk_name" "$location" || return
+  fi
   az vm disk attach \
     --resource-group "$resource_group" \
     --vm-name "$vm_name" \

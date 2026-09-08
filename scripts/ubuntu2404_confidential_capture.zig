@@ -14,7 +14,7 @@ const Diagnostic = release.contract.Diagnostic;
 const ObjectMap = std.json.ObjectMap;
 const Value = std.json.Value;
 
-pub const schema: i64 = 1;
+pub const schema: i64 = 2;
 pub const result_type = "miz-ubuntu2404-confidential-azure-capture";
 pub const source_acceptance_type =
     "miz-ubuntu2404-confidential-azure-acceptance";
@@ -35,6 +35,7 @@ pub const SourceExpected = struct {
     vm_size: []const u8,
     run_id: []const u8,
     run_attempt: []const u8,
+    staging_image_version_id: []const u8,
     artifact: Artifact,
 };
 
@@ -45,6 +46,8 @@ pub const Expected = struct {
     location: []const u8,
     run_id: []const u8,
     run_attempt: []const u8,
+    scratch_resource_group: []const u8,
+    target_resource_group: []const u8,
     capture_vm_id: []const u8,
     capture_disk_id: []const u8,
     snapshot_id: []const u8,
@@ -57,6 +60,7 @@ pub const Expected = struct {
 
 pub const Documents = struct {
     source_acceptance: *const ObjectMap,
+    scratch_inventory: *const ObjectMap,
     capture_vm: *const ObjectMap,
     capture_vm_instance: *const ObjectMap,
     capture_disk: *const ObjectMap,
@@ -76,6 +80,12 @@ pub const Attestation = struct {
 pub const Evidence = struct {
     source_acceptance_sha256: release.digest.Hex,
     source_provenance_sha256: release.digest.Hex,
+    scratch_inventory_sha256: release.digest.Hex,
+    source_staging_disk_sha256: release.digest.Hex,
+    source_staging_managed_image_sha256: release.digest.Hex,
+    source_staging_definition_sha256: release.digest.Hex,
+    source_staging_gallery_request_sha256: release.digest.Hex,
+    source_staging_gallery_response_sha256: release.digest.Hex,
     capture_vm_sha256: release.digest.Hex,
     capture_vm_instance_sha256: release.digest.Hex,
     capture_disk_sha256: release.digest.Hex,
@@ -162,8 +172,8 @@ fn positive(value: i64, label: []const u8, diagnostic: *Diagnostic) !u64 {
     return @intCast(value);
 }
 
-fn validDecimal(text: []const u8) bool {
-    if (text.len == 0 or text[0] == '0') return false;
+fn validDecimal(text: []const u8, maximum_length: usize) bool {
+    if (text.len == 0 or text.len > maximum_length or text[0] == '0') return false;
     for (text) |character| if (character < '0' or character > '9') return false;
     return true;
 }
@@ -229,6 +239,15 @@ fn validResourceName(name: []const u8) bool {
     return true;
 }
 
+fn validResourceGroupName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 90 or name[name.len - 1] == '.') return false;
+    for (name) |character| switch (character) {
+        'a'...'z', 'A'...'Z', '0'...'9', '-', '_', '.', '(', ')' => {},
+        else => return false,
+    };
+    return true;
+}
+
 fn validVersionName(name: []const u8) bool {
     var components = std.mem.splitScalar(u8, name, '.');
     var count: usize = 0;
@@ -265,7 +284,7 @@ fn azureResourceId(
         !std.ascii.eqlIgnoreCase(segments[1], "subscriptions") or
         !std.ascii.eqlIgnoreCase(segments[2], subscription_id) or
         !std.ascii.eqlIgnoreCase(segments[3], "resourceGroups") or
-        !validResourceName(segments[4]) or
+        !validResourceGroupName(segments[4]) or
         !std.ascii.eqlIgnoreCase(segments[5], "providers") or
         !std.ascii.eqlIgnoreCase(segments[6], "Microsoft.Compute"))
     {
@@ -321,30 +340,80 @@ pub fn validateSnapshotId(
     }
 }
 
-fn resourceGroup(id: []const u8) ?[]const u8 {
+const ArmScope = struct {
+    subscription_id: []const u8,
+    resource_group: []const u8,
+};
+
+fn armScope(id: []const u8) ?ArmScope {
     var split = std.mem.splitScalar(u8, id, '/');
     if (!std.mem.eql(u8, split.next() orelse return null, "") or
         !std.ascii.eqlIgnoreCase(split.next() orelse return null, "subscriptions"))
     {
         return null;
     }
-    _ = split.next() orelse return null;
+    const subscription_id = split.next() orelse return null;
+    if (!validGuid(subscription_id)) return null;
     if (!std.ascii.eqlIgnoreCase(
         split.next() orelse return null,
         "resourceGroups",
     )) return null;
     const group = split.next() orelse return null;
-    return if (group.len == 0) null else group;
+    if (!validResourceGroupName(group) or
+        !std.ascii.eqlIgnoreCase(split.next() orelse return null, "providers"))
+    {
+        return null;
+    }
+    if ((split.next() orelse return null).len == 0) return null;
+    var remaining: usize = 0;
+    while (split.next()) |segment| {
+        if (segment.len == 0) return null;
+        remaining += 1;
+    }
+    if (remaining < 2) return null;
+    return .{
+        .subscription_id = subscription_id,
+        .resource_group = group,
+    };
+}
+
+fn armScopeIs(
+    id: []const u8,
+    subscription_id: []const u8,
+    resource_group: []const u8,
+) bool {
+    const scope = armScope(id) orelse return false;
+    return std.ascii.eqlIgnoreCase(scope.subscription_id, subscription_id) and
+        std.ascii.eqlIgnoreCase(scope.resource_group, resource_group);
+}
+
+fn armIdMarker(text: []const u8) ?usize {
+    const prefix = "/subscriptions/";
+    if (text.len < prefix.len) return null;
+    var index: usize = 0;
+    while (index + prefix.len <= text.len) : (index += 1) {
+        if (std.ascii.eqlIgnoreCase(text[index .. index + prefix.len], prefix)) {
+            return index;
+        }
+    }
+    return null;
 }
 
 fn versionBelongsToDefinition(version_id: []const u8, definition_id: []const u8) bool {
     if (version_id.len <= definition_id.len or
-        !std.mem.eql(u8, version_id[0..definition_id.len], definition_id))
+        !std.ascii.eqlIgnoreCase(
+            version_id[0..definition_id.len],
+            definition_id,
+        ))
     {
         return false;
     }
     const suffix = version_id[definition_id.len..];
-    if (!std.mem.startsWith(u8, suffix, "/versions/")) return false;
+    if (suffix.len < "/versions/".len or
+        !std.ascii.eqlIgnoreCase(suffix[0.."/versions/".len], "/versions/"))
+    {
+        return false;
+    }
     const name = suffix["/versions/".len..];
     return validVersionName(name);
 }
@@ -379,16 +448,201 @@ pub fn validateCaptureGalleryIds(
     }
 }
 
-fn captureResourceGroup(
-    allocator: Allocator,
+fn validScratchResourceGroup(
+    resource_group: []const u8,
     run_id: []const u8,
     run_attempt: []const u8,
-) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "miz-u2404-cvm-capture-{s}-{s}",
+) bool {
+    if (!validResourceGroupName(resource_group)) return false;
+    var prefix_buffer: [96]u8 = undefined;
+    const prefix = std.fmt.bufPrint(
+        &prefix_buffer,
+        "miz-u2404-cvm-capture-{s}-{s}-",
         .{ run_id, run_attempt },
+    ) catch return false;
+    if (resource_group.len != prefix.len + 32 or
+        !std.mem.startsWith(u8, resource_group, prefix))
+    {
+        return false;
+    }
+    for (resource_group[prefix.len..]) |character| switch (character) {
+        '0'...'9', 'a'...'f' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn validateArmValue(
+    value: Value,
+    subscription_id: []const u8,
+    scratch_resource_group: []const u8,
+    exact_target_definition_id: ?[]const u8,
+    exact_target_version_id: ?[]const u8,
+    label: []const u8,
+    diagnostic: *Diagnostic,
+) !void {
+    switch (value) {
+        .string => |text| {
+            const marker = armIdMarker(text) orelse return;
+            if (marker != 0) return invalid(
+                diagnostic,
+                "{s} contains a prefixed ARM ID",
+                .{label},
+            );
+            const exact_target =
+                (exact_target_definition_id != null and std.ascii.eqlIgnoreCase(
+                    text,
+                    exact_target_definition_id.?,
+                )) or
+                (exact_target_version_id != null and std.ascii.eqlIgnoreCase(
+                    text,
+                    exact_target_version_id.?,
+                ));
+            if (!exact_target and !armScopeIs(
+                text,
+                subscription_id,
+                scratch_resource_group,
+            )) return invalid(
+                diagnostic,
+                "{s} contains an ARM ID outside the exact scratch scope",
+                .{label},
+            );
+        },
+        .array => |items| for (items.items) |item| {
+            try validateArmValue(
+                item,
+                subscription_id,
+                scratch_resource_group,
+                exact_target_definition_id,
+                exact_target_version_id,
+                label,
+                diagnostic,
+            );
+        },
+        .object => |map| {
+            var iterator = map.iterator();
+            while (iterator.next()) |entry| try validateArmValue(
+                entry.value_ptr.*,
+                subscription_id,
+                scratch_resource_group,
+                exact_target_definition_id,
+                exact_target_version_id,
+                label,
+                diagnostic,
+            );
+        },
+        else => {},
+    }
+}
+
+pub fn validateScratchArmDocument(
+    root: *const ObjectMap,
+    subscription_id: []const u8,
+    scratch_resource_group: []const u8,
+    label: []const u8,
+    diagnostic: *Diagnostic,
+) !void {
+    try validateArmValue(
+        .{ .object = root.* },
+        subscription_id,
+        scratch_resource_group,
+        null,
+        null,
+        label,
+        diagnostic,
     );
+}
+
+pub fn validateScratchArmId(
+    id: []const u8,
+    subscription_id: []const u8,
+    scratch_resource_group: []const u8,
+    label: []const u8,
+    diagnostic: *Diagnostic,
+) !void {
+    if (!armScopeIs(id, subscription_id, scratch_resource_group)) {
+        return invalid(
+            diagnostic,
+            "{s} is outside the exact scratch scope",
+            .{label},
+        );
+    }
+}
+
+fn validateScratchInventory(
+    root: *const ObjectMap,
+    expected: Expected,
+    diagnostic: *Diagnostic,
+) !void {
+    if (!exact(root.*, &.{
+        "resources",
+        "schema",
+        "scratch_resource_group",
+        "subscription_id",
+    }) or try integer(root, "schema", "scratch inventory schema", diagnostic) != 1) {
+        return invalid(diagnostic, "scratch inventory shape is invalid", .{});
+    }
+    try equalIgnoreCase(
+        try string(root, "subscription_id", "scratch subscription", diagnostic),
+        expected.subscription_id,
+        "scratch subscription",
+        diagnostic,
+    );
+    try equal(
+        try string(
+            root,
+            "scratch_resource_group",
+            "scratch resource group",
+            diagnostic,
+        ),
+        expected.scratch_resource_group,
+        "scratch resource group",
+        diagnostic,
+    );
+    const resources = release.azure_compute.arrayOf(root.get("resources")) orelse
+        return invalid(diagnostic, "scratch inventory resources are not an array", .{});
+    if (resources.len == 0 or resources.len > 64) {
+        return invalid(diagnostic, "scratch inventory resource count is invalid", .{});
+    }
+    for (resources, 0..) |resource, index| {
+        const item = release.azure_compute.objectOf(resource) orelse
+            return invalid(diagnostic, "scratch inventory resource is invalid", .{});
+        if (!exact(item, &.{ "id", "name", "type" })) {
+            return invalid(diagnostic, "scratch inventory resource shape is invalid", .{});
+        }
+        const id = try string(&item, "id", "scratch resource ID", diagnostic);
+        if (!armScopeIs(
+            id,
+            expected.subscription_id,
+            expected.scratch_resource_group,
+        )) return invalid(
+            diagnostic,
+            "scratch inventory contains an ARM ID outside the exact scratch scope",
+            .{},
+        );
+        if ((try string(&item, "name", "scratch resource name", diagnostic)).len == 0 or
+            (try string(&item, "type", "scratch resource type", diagnostic)).len == 0)
+        {
+            return invalid(diagnostic, "scratch inventory resource metadata is invalid", .{});
+        }
+        for (resources[0..index]) |previous| {
+            const previous_item = release.azure_compute.objectOf(previous) orelse
+                return invalid(diagnostic, "scratch inventory resource is invalid", .{});
+            const previous_id = try string(
+                &previous_item,
+                "id",
+                "scratch resource ID",
+                diagnostic,
+            );
+            if (std.ascii.eqlIgnoreCase(id, previous_id)) {
+                return invalid(
+                    diagnostic,
+                    "scratch inventory contains a duplicate ARM ID",
+                    .{},
+                );
+            }
+        }
+    }
 }
 
 fn validateExpected(
@@ -396,13 +650,14 @@ fn validateExpected(
     expected: Expected,
     diagnostic: *Diagnostic,
 ) !void {
+    _ = allocator;
     if (!std.mem.eql(u8, expected.source.repository, repository) or
         !std.mem.eql(u8, expected.repository, repository) or
         !validCommit(expected.source.commit) or
-        !validDecimal(expected.source.run_id) or
-        !validDecimal(expected.source.run_attempt) or
-        !validDecimal(expected.run_id) or
-        !validDecimal(expected.run_attempt))
+        !validDecimal(expected.source.run_id, 20) or
+        !validDecimal(expected.source.run_attempt, 10) or
+        !validDecimal(expected.run_id, 20) or
+        !validDecimal(expected.run_attempt, 10))
     {
         return invalid(diagnostic, "capture workflow identity is invalid", .{});
     }
@@ -414,11 +669,22 @@ fn validateExpected(
         expected.source.artifact.vhd_size == 0 or
         expected.source.artifact.virtual_size == 0 or
         !std.ascii.eqlIgnoreCase(expected.source.location, expected.location) or
-        !validEndpoint(expected.attestation_endpoint))
+        !validEndpoint(expected.attestation_endpoint) or
+        !validScratchResourceGroup(
+            expected.scratch_resource_group,
+            expected.run_id,
+            expected.run_attempt,
+        ) or
+        !validResourceGroupName(expected.target_resource_group) or
+        std.ascii.eqlIgnoreCase(
+            expected.scratch_resource_group,
+            expected.target_resource_group,
+        ))
     {
         return invalid(diagnostic, "capture source artifact or location is invalid", .{});
     }
     const ids = [_]struct { []const u8, ResourceKind }{
+        .{ expected.source.staging_image_version_id, .image_version },
         .{ expected.capture_vm_id, .virtual_machine },
         .{ expected.capture_disk_id, .disk },
         .{ expected.snapshot_id, .snapshot },
@@ -438,13 +704,21 @@ fn validateExpected(
         expected.subscription_id,
         diagnostic,
     );
-    const group = try captureResourceGroup(
-        allocator,
-        expected.run_id,
-        expected.run_attempt,
+    if (!armScopeIs(
+        expected.image_definition_id,
+        expected.subscription_id,
+        expected.target_resource_group,
+    ) or !armScopeIs(
+        expected.image_version_id,
+        expected.subscription_id,
+        expected.target_resource_group,
+    )) return invalid(
+        diagnostic,
+        "capture target is outside the exact configured target resource group",
+        .{},
     );
-    defer allocator.free(group);
     const ephemeral = [_][]const u8{
+        expected.source.staging_image_version_id,
         expected.capture_vm_id,
         expected.capture_disk_id,
         expected.snapshot_id,
@@ -452,7 +726,11 @@ fn validateExpected(
         expected.final_disk_id,
     };
     for (ephemeral) |id| {
-        if (!std.ascii.eqlIgnoreCase(resourceGroup(id) orelse "", group)) {
+        if (!armScopeIs(
+            id,
+            expected.subscription_id,
+            expected.scratch_resource_group,
+        )) {
             return invalid(
                 diagnostic,
                 "capture resource is outside the workflow-owned resource group",
@@ -676,6 +954,12 @@ fn evidenceValue(allocator: Allocator, evidence: Evidence) !Value {
         .{ "snapshot_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.snapshot_sha256)) },
         .{ "source_acceptance_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_acceptance_sha256)) },
         .{ "source_provenance_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_provenance_sha256)) },
+        .{ "scratch_inventory_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.scratch_inventory_sha256)) },
+        .{ "source_staging_definition_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_staging_definition_sha256)) },
+        .{ "source_staging_disk_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_staging_disk_sha256)) },
+        .{ "source_staging_gallery_request_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_staging_gallery_request_sha256)) },
+        .{ "source_staging_gallery_response_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_staging_gallery_response_sha256)) },
+        .{ "source_staging_managed_image_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_staging_managed_image_sha256)) },
         .{ "token_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.token_sha256)) },
     });
 }
@@ -689,6 +973,74 @@ pub fn result(
     diagnostic: *Diagnostic,
 ) !Value {
     try validateExpected(allocator, expected, diagnostic);
+    try validateScratchInventory(
+        documents.scratch_inventory,
+        expected,
+        diagnostic,
+    );
+    try validateArmValue(
+        .{ .object = documents.capture_vm.* },
+        expected.subscription_id,
+        expected.scratch_resource_group,
+        null,
+        null,
+        "capture VM evidence",
+        diagnostic,
+    );
+    try validateArmValue(
+        .{ .object = documents.capture_disk.* },
+        expected.subscription_id,
+        expected.scratch_resource_group,
+        null,
+        null,
+        "capture disk evidence",
+        diagnostic,
+    );
+    try validateArmValue(
+        .{ .object = documents.snapshot.* },
+        expected.subscription_id,
+        expected.scratch_resource_group,
+        null,
+        null,
+        "capture snapshot evidence",
+        diagnostic,
+    );
+    try validateArmValue(
+        .{ .object = documents.image_definition.* },
+        expected.subscription_id,
+        expected.scratch_resource_group,
+        expected.image_definition_id,
+        null,
+        "target definition evidence",
+        diagnostic,
+    );
+    try validateArmValue(
+        .{ .object = documents.gallery_request.* },
+        expected.subscription_id,
+        expected.scratch_resource_group,
+        null,
+        null,
+        "target gallery request evidence",
+        diagnostic,
+    );
+    try validateArmValue(
+        .{ .object = documents.gallery_response.* },
+        expected.subscription_id,
+        expected.scratch_resource_group,
+        null,
+        expected.image_version_id,
+        "target gallery response evidence",
+        diagnostic,
+    );
+    try validateArmValue(
+        .{ .object = documents.final_vm.* },
+        expected.subscription_id,
+        expected.scratch_resource_group,
+        null,
+        expected.image_version_id,
+        "final VM evidence",
+        diagnostic,
+    );
     const source = try validateSourceAcceptance(
         documents.source_acceptance,
         expected,
@@ -697,7 +1049,7 @@ pub fn result(
     const capture_contract: release.azure_confidential_vm.CaptureContract = .{
         .subscription_id = expected.subscription_id,
         .location = expected.location,
-        .source_image_version_id = source.gallery_image_version_id,
+        .source_image_version_id = expected.source.staging_image_version_id,
         .vm_id = expected.capture_vm_id,
         .disk_id = expected.capture_disk_id,
     };
@@ -781,11 +1133,12 @@ pub fn result(
         .{ "acceptance", source_acceptance },
         .{ "artifact", source_artifact },
         .{ "commit", release.azure_compute.string(expected.source.commit) },
-        .{ "gallery_image_version_id", release.azure_compute.string(source.gallery_image_version_id) },
+        .{ "accepted_gallery_image_version_id", release.azure_compute.string(source.gallery_image_version_id) },
         .{ "release", release.azure_compute.string("24.04") },
+        .{ "staging_gallery_image_version_id", release.azure_compute.string(expected.source.staging_image_version_id) },
     });
     const vm_value = try release.azure_compute.object(allocator, &.{
-        .{ "image_reference_id", release.azure_compute.string(source.gallery_image_version_id) },
+        .{ "image_reference_id", release.azure_compute.string(expected.source.staging_image_version_id) },
         .{ "managed_os_disk_id", release.azure_compute.string(expected.capture_disk_id) },
         .{ "os_disk_encryption_type", release.azure_compute.string(release.azure_confidential_vm.os_disk_security_encryption_type) },
         .{ "resource_id", release.azure_compute.string(expected.capture_vm_id) },
@@ -857,6 +1210,7 @@ pub fn result(
         .{ "location", release.azure_compute.string(expected.location) },
         .{ "release", release.azure_compute.string("24.04") },
         .{ "schema", release.azure_compute.integer(schema) },
+        .{ "scratch_resource_group", release.azure_compute.string(expected.scratch_resource_group) },
         .{ "source", source_value },
         .{ "subscription_id", release.azure_compute.string(expected.subscription_id) },
         .{ "type", release.azure_compute.string(result_type) },
@@ -978,10 +1332,6 @@ test "Azure capture resource IDs are structural and exact" {
         .{ definition, definition ++ "/versions/1.0" },
         .{ definition, definition ++ "/versions/1.0.0/extra" },
         .{ definition, definition ++ "-evil/versions/1.0.0" },
-        .{
-            definition,
-            "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/gallery/providers/Microsoft.Compute/galleries/g/images/Ubuntu/versions/1.0.0",
-        },
     };
     for (invalid_pairs) |pair| {
         diagnostic = .{};
@@ -992,15 +1342,25 @@ test "Azure capture resource IDs are structural and exact" {
             &diagnostic,
         ));
     }
+    try validateCaptureGalleryIds(
+        definition,
+        "/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/GALLERY/PROVIDERS/microsoft.compute/GALLERIES/G/IMAGES/Ubuntu/VERSIONS/1.0.0",
+        subscription,
+        &diagnostic,
+    );
 }
 
 const test_subscription = "00000000-0000-0000-0000-000000000000";
-const test_group = "miz-u2404-cvm-capture-456-2";
+const test_group =
+    "miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff";
 const test_prefix = "/subscriptions/" ++ test_subscription ++
     "/resourceGroups/" ++ test_group ++ "/providers/Microsoft.Compute/";
 const test_source_version = "/subscriptions/" ++ test_subscription ++
     "/resourceGroups/miz-u2404-cvm-123-1/providers/Microsoft.Compute/" ++
     "galleries/source/images/ubuntu/versions/1.0.0";
+const test_staging_version = "/subscriptions/" ++ test_subscription ++
+    "/resourceGroups/" ++ test_group ++ "/providers/Microsoft.Compute/" ++
+    "galleries/staging/images/ubuntu/versions/1.0.0";
 const test_capture_vm = test_prefix ++ "virtualMachines/capture";
 const test_capture_disk = test_prefix ++ "disks/capture-os";
 const test_snapshot = test_prefix ++ "snapshots/capture-os";
@@ -1022,6 +1382,7 @@ fn testExpected() Expected {
             .vm_size = "Standard_DC2as_v5",
             .run_id = "123",
             .run_attempt = "1",
+            .staging_image_version_id = test_staging_version,
             .artifact = .{
                 .qcow_sha256 = "1" ** 64,
                 .qcow_size = 1024,
@@ -1035,6 +1396,8 @@ fn testExpected() Expected {
         .location = "eastus2",
         .run_id = "456",
         .run_attempt = "2",
+        .scratch_resource_group = test_group,
+        .target_resource_group = "gallery",
         .capture_vm_id = test_capture_vm,
         .capture_disk_id = test_capture_disk,
         .snapshot_id = test_snapshot,
@@ -1050,6 +1413,12 @@ fn testEvidence() Evidence {
     return .{
         .source_acceptance_sha256 = release.digest.hexBytes("source acceptance"),
         .source_provenance_sha256 = release.digest.hexBytes("source provenance"),
+        .scratch_inventory_sha256 = release.digest.hexBytes("scratch inventory"),
+        .source_staging_disk_sha256 = release.digest.hexBytes("source staging disk"),
+        .source_staging_managed_image_sha256 = release.digest.hexBytes("source staging managed image"),
+        .source_staging_definition_sha256 = release.digest.hexBytes("source staging definition"),
+        .source_staging_gallery_request_sha256 = release.digest.hexBytes("source staging gallery request"),
+        .source_staging_gallery_response_sha256 = release.digest.hexBytes("source staging gallery response"),
         .capture_vm_sha256 = release.digest.hexBytes("capture VM"),
         .capture_vm_instance_sha256 = release.digest.hexBytes("capture VM instance"),
         .capture_disk_sha256 = release.digest.hexBytes("capture disk"),
@@ -1066,41 +1435,95 @@ fn testEvidence() Evidence {
     };
 }
 
-test "capture expectations reject malformed cross-scope identities" {
+test "capture expectations enforce exact randomized scratch scope" {
     var diagnostic: Diagnostic = .{};
+    try validateExpected(std.testing.allocator, testExpected(), &diagnostic);
+
+    const invalid_groups = [_][]const u8{
+        "miz-u2404-cvm-capture-456-2",
+        "miz-u2404-cvm-capture-456-2-00112233445566778899AABBCCDDEEFF",
+        "miz-u2404-cvm-capture-456-2-0011223344556677",
+        "miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff-extra",
+        "miz-u2404-cvm-capture-4567-2-00112233445566778899aabbccddeeff",
+        "miz-u2404-cvm-capture-45-6-2-00112233445566778899aabbccddeeff",
+    };
+    for (invalid_groups) |group| {
+        diagnostic = .{};
+        var expected = testExpected();
+        expected.scratch_resource_group = group;
+        try std.testing.expectError(
+            error.InvalidDocument,
+            validateExpected(std.testing.allocator, expected, &diagnostic),
+        );
+    }
+
     var expected = testExpected();
-    expected.image_version_id = test_definition ++ "-evil/versions/2.0.0";
+    expected.capture_disk_id =
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/" ++
+        "miz-u2404-cvm-capture-456-2-ffeeddccbbaa99887766554433221100" ++
+        "/providers/Microsoft.Compute/disks/capture-os";
+    diagnostic = .{};
     try std.testing.expectError(
         error.InvalidDocument,
         validateExpected(std.testing.allocator, expected, &diagnostic),
     );
 
-    diagnostic = .{};
     expected = testExpected();
     expected.capture_disk_id =
         "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/" ++
         test_group ++ "/providers/Microsoft.Compute/disks/capture-os";
+    diagnostic = .{};
     try std.testing.expectError(
         error.InvalidDocument,
         validateExpected(std.testing.allocator, expected, &diagnostic),
     );
 
-    diagnostic = .{};
     expected = testExpected();
-    expected.final_vm_id = test_prefix ++ "virtualMachines/final/extra";
-    try std.testing.expectError(
-        error.InvalidDocument,
-        validateExpected(std.testing.allocator, expected, &diagnostic),
-    );
-
+    expected.image_definition_id =
+        "/subscriptions/" ++ test_subscription ++ "/resourceGroups/" ++
+        test_group ++ "/providers/Microsoft.Compute/galleries/release/images/ubuntu-confidential";
+    expected.image_version_id =
+        "/subscriptions/" ++ test_subscription ++ "/resourceGroups/" ++
+        test_group ++ "/providers/Microsoft.Compute/galleries/release/images/ubuntu-confidential/versions/2.0.0";
     diagnostic = .{};
-    expected = testExpected();
-    expected.run_attempt = "3";
     try std.testing.expectError(
         error.InvalidDocument,
         validateExpected(std.testing.allocator, expected, &diagnostic),
     );
 }
+
+test "scratch ARM scope parsing is case-insensitive and segment-safe" {
+    var diagnostic: Diagnostic = .{};
+    try validateScratchArmId(
+        "/SUBSCRIPTIONS/00000000-0000-0000-0000-000000000000/RESOURCEGROUPS/MIZ-U2404-CVM-CAPTURE-456-2-00112233445566778899AABBCCDDEEFF/PROVIDERS/Microsoft.Network/networkInterfaces/source",
+        test_subscription,
+        test_group,
+        "network interface",
+        &diagnostic,
+    );
+    const invalid_ids = [_][]const u8{
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-456-2-ffeeddccbbaa99887766554433221100/providers/Microsoft.Compute/disks/data",
+        "/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff/providers/Microsoft.Compute/disks/data",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff-extra/providers/Microsoft.Compute/disks/data",
+        "prefix/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-456-2-00112233445566778899aabbccddeeff/providers/Microsoft.Compute/disks/data",
+    };
+    for (invalid_ids) |id| {
+        diagnostic = .{};
+        try std.testing.expectError(error.InvalidDocument, validateScratchArmId(
+            id,
+            test_subscription,
+            test_group,
+            "ephemeral resource",
+            &diagnostic,
+        ));
+    }
+}
+
+const test_scratch_inventory =
+    "{\"resources\":[{\"id\":\"" ++ test_capture_vm ++
+    "\",\"name\":\"capture\",\"type\":\"Microsoft.Compute/virtualMachines\"}]," ++
+    "\"schema\":1,\"scratch_resource_group\":\"" ++ test_group ++
+    "\",\"subscription_id\":\"" ++ test_subscription ++ "\"}";
 
 const test_source_acceptance =
     "{\"artifact\":{\"qcow_sha256\":\"" ++ "1" ** 64 ++
@@ -1121,7 +1544,7 @@ const test_capture_vm_document =
     "\"provisioningState\":\"Succeeded\",\"securityProfile\":{\"securityType\":" ++
     "\"ConfidentialVM\",\"uefiSettings\":{\"secureBootEnabled\":true," ++
     "\"vTpmEnabled\":true}},\"storageProfile\":{\"imageReference\":{\"id\":\"" ++
-    test_source_version ++ "\"},\"osDisk\":{\"managedDisk\":{\"id\":\"" ++
+    test_staging_version ++ "\"},\"osDisk\":{\"managedDisk\":{\"id\":\"" ++
     test_capture_disk ++ "\",\"diskEncryptionSet\":null,\"securityProfile\":" ++
     "{\"securityEncryptionType\":\"VMGuestStateOnly\",\"diskEncryptionSet\":null}}}}}";
 
@@ -1223,6 +1646,12 @@ test "capture result independently rejects provenance substitutions" {
         test_source_acceptance,
         .{},
     );
+    var scratch_inventory = try std.json.parseFromSlice(
+        Value,
+        allocator,
+        test_scratch_inventory,
+        .{},
+    );
     var capture_vm = try std.json.parseFromSlice(
         Value,
         allocator,
@@ -1278,6 +1707,7 @@ test "capture result independently rejects provenance substitutions" {
     );
     const documents: Documents = .{
         .source_acceptance = &source.value.object,
+        .scratch_inventory = &scratch_inventory.value.object,
         .capture_vm = &capture_vm.value.object,
         .capture_vm_instance = &capture_vm_instance.value.object,
         .capture_disk = &capture_disk.value.object,
@@ -1319,11 +1749,11 @@ test "capture result independently rejects provenance substitutions" {
             "\"qcow_sha256\":\"" ++ "9" ** 64 ++ "\"",
         },
         .{
-            "\"gallery_image_version_id\":\"" ++ test_source_version ++ "\"",
-            "\"gallery_image_version_id\":\"" ++ test_version ++ "\"",
+            "\"accepted_gallery_image_version_id\":\"" ++ test_source_version ++ "\"",
+            "\"accepted_gallery_image_version_id\":\"" ++ test_version ++ "\"",
         },
         .{
-            "\"image_reference_id\":\"" ++ test_source_version ++ "\"",
+            "\"image_reference_id\":\"" ++ test_staging_version ++ "\"",
             "\"image_reference_id\":\"" ++ test_version ++ "\"",
         },
         .{
@@ -1361,6 +1791,10 @@ test "capture result independently rejects provenance substitutions" {
         .{
             "\"run_id\":\"456\"",
             "\"run_id\":\"457\"",
+        },
+        .{
+            "\"scratch_resource_group\":\"" ++ test_group ++ "\"",
+            "\"scratch_resource_group\":\"miz-u2404-cvm-capture-456-2-ffeeddccbbaa99887766554433221100\"",
         },
         .{
             "\"architecture\":\"x64\",\"capture\"",
