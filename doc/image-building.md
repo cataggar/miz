@@ -119,8 +119,47 @@ miz build-efi-application \
   --esp-size 64M -O vhd -o unikernel.vhd
 
 miz check unikernel.vhd
-miz azure fixup --generation 2 unikernel.vhd
+miz check-efi-application \
+  --architecture x86_64 \
+  --expected-efi-sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
+  --output=json unikernel.vhd
 ```
+
+`check-efi-application` is read-only and is the intended deployment preflight.
+It requires a valid fixed VHD footer and exact file length, a whole-MiB virtual
+size, a Gen2 protective MBR with matching primary/backup GPT, exactly one
+FAT32 ESP beginning at 1 MiB with a whole-MiB length, and exactly the two
+directories plus one fallback EFI application. It validates the embedded
+PE32+ machine/subsystem, content-derived GPT/FAT/VHD identities, deterministic
+FAT label and VHD timestamp, and can pin the application digest and virtual
+size. Human output is the default; `--output=json` exposes this versioned
+automation contract:
+
+```json
+{
+  "schema-version": 1,
+  "contract": "miz.efi-application-image",
+  "valid": true,
+  "format": "vhd",
+  "subformat": "fixed",
+  "generation": 2,
+  "virtual-size": 69206016,
+  "file-size": 69206528,
+  "architecture": "x86_64",
+  "boot-path": "EFI/BOOT/BOOTX64.EFI",
+  "boot-file-size": 1300288,
+  "boot-file-sha256": "<64 lowercase hex characters>",
+  "disk-guid": "<lowercase canonical GUID>",
+  "esp-partition-guid": "<lowercase canonical GUID>",
+  "esp-offset": 1048576,
+  "esp-length": 67108864,
+  "esp-volume-id": 3050402668
+}
+```
+
+JSON is written only after the complete validation succeeds. Exit status is 0
+for a valid artifact, 1 for command-line errors, and 2 for image validation
+failures.
 
 These checks establish image structure and Azure fixed-VHD shape only. They do
 not establish that the application has storage/network drivers or that it has

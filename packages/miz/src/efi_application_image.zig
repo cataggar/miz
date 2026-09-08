@@ -14,6 +14,8 @@ const gpt = @import("gpt.zig");
 const guid = @import("guid.zig");
 const image_mod = @import("image.zig");
 const Image = image_mod.Image;
+const tree_cursor = @import("tree_cursor.zig");
+const vhd = @import("vhd.zig");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -59,6 +61,35 @@ pub const Report = struct {
     esp_length_bytes: u64,
     disk_guid: guid.Guid,
     esp_partition_guid: guid.Guid,
+    esp_volume_id: u32,
+};
+
+/// Read-only release/deployment preflight for artifacts produced by `build`.
+///
+/// The validator deliberately requires the narrow ESP-only fixed-VHD shape,
+/// rather than accepting any Gen2 disk that happens to contain an ESP. This
+/// makes it suitable as a contract between an image-producing build and a
+/// deployment runner: adding a root partition, changing the fallback path, or
+/// substituting different EFI bytes becomes a visible contract change.
+pub const ValidateFixedVhdOptions = struct {
+    path: []const u8,
+    architecture: ?Architecture = null,
+    expected_efi_sha256: ?[Sha256.digest_length]u8 = null,
+    expected_virtual_size: ?u64 = null,
+    max_efi_size: u64 = default_max_efi_size,
+};
+
+pub const ValidationReport = struct {
+    architecture: Architecture,
+    boot_path: []const u8,
+    boot_file_size: u64,
+    boot_file_sha256: [Sha256.digest_length]u8,
+    virtual_size: u64,
+    file_size: u64,
+    disk_guid: guid.Guid,
+    esp_partition_guid: guid.Guid,
+    esp_offset_bytes: u64,
+    esp_length_bytes: u64,
     esp_volume_id: u32,
 };
 
@@ -164,7 +195,7 @@ pub fn build(
         var destination = try Image.createExclusive(io, options.output_path, .vhd, disk_size, .{
             .vhd_subformat = .fixed,
             .unique_id = identity.vhd_unique_id,
-            .timestamp_unix = @import("vhd.zig").timestamp_base,
+            .timestamp_unix = vhd.timestamp_base,
         });
         var destination_open = true;
         var keep_output = false;
@@ -221,6 +252,155 @@ pub fn build(
     };
 }
 
+pub fn validateFixedVhd(
+    allocator: std.mem.Allocator,
+    io: Io,
+    options: ValidateFixedVhdOptions,
+) !ValidationReport {
+    if (options.max_efi_size == 0 or options.max_efi_size > std.math.maxInt(u32)) {
+        return error.InvalidEfiSizeLimit;
+    }
+
+    var image = try Image.openPathReadOnly(io, options.path);
+    defer image.close(io);
+    const info = try image.info(io);
+    if (info.format != .vhd or info.subformat != .fixed) return error.ExpectedFixedVhd;
+    if (info.virtual_size % azure.one_mib != 0) return error.VirtualSizeNotMibAligned;
+    if (options.expected_virtual_size) |expected| {
+        if (info.virtual_size != expected) return error.VirtualSizeMismatch;
+    }
+    const expected_file_size = std.math.add(u64, info.virtual_size, vhd.footer_size) catch
+        return error.SizeOverflow;
+    if (info.file_size != expected_file_size) return error.InvalidFixedVhdFileSize;
+    const image_check = try image.check(io);
+    if (!image_check.ok) return error.OutputImageCheckFailed;
+    var footer_bytes: [vhd.footer_size]u8 = undefined;
+    if (try image.file.readPositionalAll(io, &footer_bytes, info.virtual_size) != footer_bytes.len) {
+        return error.InvalidFixedVhdFileSize;
+    }
+    const footer = try vhd.Footer.decode(&footer_bytes);
+
+    const partition_style = try azure.checkPartitionStyle(image, io, allocator, .gen2);
+    if (!partition_style.ok) return error.PartitionStyleCheckFailed;
+    var table = try gpt.readVerifiedGpt(image, io, allocator, gpt.default_max_partition_array_bytes);
+    defer table.deinit(allocator);
+    if (table.partitions.len != 1) return error.ExpectedSingleEsp;
+    const partition = table.partitions[0];
+    if (!std.mem.eql(u8, &partition.partition_type_guid, &guid.esp)) {
+        return error.ExpectedSingleEsp;
+    }
+    const partition_offset = std.math.mul(u64, partition.first_lba, gpt.sector_size) catch
+        return error.SizeOverflow;
+    const partition_sectors = std.math.add(
+        u64,
+        partition.last_lba - partition.first_lba,
+        1,
+    ) catch return error.SizeOverflow;
+    const partition_length = std.math.mul(u64, partition_sectors, gpt.sector_size) catch
+        return error.SizeOverflow;
+    if (partition_offset != esp_offset) return error.UnexpectedEspPlacement;
+    if (partition_length % azure.one_mib != 0) {
+        return error.EspSizeNotMibAligned;
+    }
+    if (partition_length > maximum_esp_size) return error.EspTooLarge;
+
+    var filesystem = try fat32.open(&image, io, .{
+        .offset = partition_offset,
+        .length = partition_length,
+    });
+    var tree = try fat32.scanTree(&filesystem, io, allocator, .{
+        .max_nodes = 16,
+        .max_file_bytes = options.max_efi_size,
+        .max_total_bytes = options.max_efi_size,
+    });
+    defer tree.deinit();
+
+    var has_efi_directory = false;
+    var has_boot_directory = false;
+    var x86_entry: ?fat32.TreeEntry = null;
+    var arm_entry: ?fat32.TreeEntry = null;
+    for (0..tree.nodeCount()) |index| {
+        const entry = tree.entryAt(index);
+        if (std.mem.eql(u8, entry.path, "EFI") and entry.kind == .directory) {
+            has_efi_directory = true;
+        } else if (std.mem.eql(u8, entry.path, "EFI/BOOT") and entry.kind == .directory) {
+            has_boot_directory = true;
+        } else if (std.mem.eql(u8, entry.path, fallback_x86_64) and entry.kind == .file) {
+            x86_entry = entry;
+        } else if (std.mem.eql(u8, entry.path, fallback_aarch64) and entry.kind == .file) {
+            arm_entry = entry;
+        }
+    }
+    if (!has_efi_directory or !has_boot_directory or tree.nodeCount() != 3) {
+        return error.UnexpectedEspContents;
+    }
+
+    const selected: struct { architecture: Architecture, entry: fat32.TreeEntry } = if (options.architecture) |expected| switch (expected) {
+        .x86_64 => .{
+            .architecture = .x86_64,
+            .entry = x86_entry orelse return error.MissingFallbackBootApplication,
+        },
+        .aarch64 => .{
+            .architecture = .aarch64,
+            .entry = arm_entry orelse return error.MissingFallbackBootApplication,
+        },
+    } else if (x86_entry) |entry|
+        .{ .architecture = .x86_64, .entry = entry }
+    else if (arm_entry) |entry|
+        .{ .architecture = .aarch64, .entry = entry }
+    else
+        return error.MissingFallbackBootApplication;
+    if ((selected.architecture == .x86_64 and arm_entry != null) or
+        (selected.architecture == .aarch64 and x86_entry != null))
+    {
+        return error.MultipleFallbackBootApplications;
+    }
+
+    const content = selected.entry.content orelse return error.MissingFallbackBootApplication;
+    try inspectContent(
+        content,
+        selected.entry.size,
+        selected.architecture,
+        options.max_efi_size,
+    );
+    const digest = try hashContent(content, selected.entry.size);
+    if (options.expected_efi_sha256) |expected| {
+        if (!std.crypto.timing_safe.eql([Sha256.digest_length]u8, digest, expected)) {
+            return error.BootApplicationDigestMismatch;
+        }
+    }
+    const expected_identity = deriveIdentity(
+        digest,
+        selected.architecture,
+        partition_length,
+        info.virtual_size,
+    );
+    const volume = filesystem.volumeMetadata();
+    if (!std.mem.eql(u8, &table.primary_header.disk_guid, &expected_identity.disk_guid) or
+        !std.mem.eql(u8, &partition.unique_partition_guid, &expected_identity.esp_partition_guid) or
+        volume.volume_id != expected_identity.esp_volume_id or
+        !std.mem.eql(u8, &footer.unique_id, &expected_identity.vhd_unique_id) or
+        footer.timestamp != 0 or
+        !std.mem.eql(u8, &volume.volume_label, "MIZ EFI APP"))
+    {
+        return error.DeterministicMetadataMismatch;
+    }
+
+    return .{
+        .architecture = selected.architecture,
+        .boot_path = selected.architecture.fallbackPath(),
+        .boot_file_size = selected.entry.size,
+        .boot_file_sha256 = digest,
+        .virtual_size = info.virtual_size,
+        .file_size = info.file_size,
+        .disk_guid = table.primary_header.disk_guid,
+        .esp_partition_guid = partition.unique_partition_guid,
+        .esp_offset_bytes = partition_offset,
+        .esp_length_bytes = partition_length,
+        .esp_volume_id = volume.volume_id,
+    };
+}
+
 fn inspect(
     file: Io.File,
     io: Io,
@@ -271,6 +451,48 @@ fn inspect(
         .size = stat.size,
         .sha256 = try hashFile(file, io, stat.size),
     };
+}
+
+fn inspectContent(
+    content: tree_cursor.Cursor.ContentReader,
+    size: u64,
+    expected_architecture: Architecture,
+    max_size: u64,
+) !void {
+    if (size > std.math.maxInt(u32)) return error.EfiFileTooLarge;
+    if (size > max_size) return error.EfiFileExceedsLimit;
+    if (size < 64) return error.InvalidEfiImage;
+
+    var dos: [64]u8 = undefined;
+    try readContentExact(content, &dos, 0);
+    if (!std.mem.eql(u8, dos[0..2], "MZ")) return error.InvalidEfiImage;
+    const pe_offset: u64 = std.mem.readInt(u32, dos[0x3c..0x40], .little);
+    const coff_end = std.math.add(u64, pe_offset, 24) catch return error.InvalidEfiImage;
+    if (coff_end > size) return error.InvalidEfiImage;
+
+    var coff: [24]u8 = undefined;
+    try readContentExact(content, &coff, pe_offset);
+    if (!std.mem.eql(u8, coff[0..4], "PE\x00\x00")) return error.InvalidEfiImage;
+    const architecture: Architecture = switch (std.mem.readInt(u16, coff[4..6], .little)) {
+        0x8664 => .x86_64,
+        0xaa64 => .aarch64,
+        else => return error.UnsupportedEfiArchitecture,
+    };
+    if (architecture != expected_architecture) return error.EfiArchitectureMismatch;
+
+    const optional_size = std.mem.readInt(u16, coff[20..22], .little);
+    if (optional_size < 70) return error.InvalidEfiImage;
+    const optional_end = std.math.add(u64, coff_end, optional_size) catch
+        return error.InvalidEfiImage;
+    if (optional_end > size) return error.InvalidEfiImage;
+    var optional_prefix: [70]u8 = undefined;
+    try readContentExact(content, &optional_prefix, coff_end);
+    if (std.mem.readInt(u16, optional_prefix[0..2], .little) != 0x20b) {
+        return error.InvalidEfiImage;
+    }
+    if (std.mem.readInt(u16, optional_prefix[68..70], .little) != 10) {
+        return error.NotEfiApplication;
+    }
 }
 
 fn minimumEspSize(file_size: u64, boot_path: []const u8) !u64 {
@@ -430,9 +652,41 @@ fn hashFile(file: Io.File, io: Io, size: u64) ![Sha256.digest_length]u8 {
     return digest;
 }
 
+fn hashContent(
+    content: tree_cursor.Cursor.ContentReader,
+    size: u64,
+) ![Sha256.digest_length]u8 {
+    var hasher = Sha256.init(.{});
+    var buffer: [256 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < size) {
+        const wanted: usize = @intCast(@min(@as(u64, buffer.len), size - offset));
+        const got = try content.readAt(buffer[0..wanted], offset);
+        if (got == 0) return error.InvalidEfiImage;
+        hasher.update(buffer[0..got]);
+        offset += got;
+    }
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    return digest;
+}
+
 fn readExact(file: Io.File, io: Io, buffer: []u8, offset: u64) !void {
     if (try file.readPositionalAll(io, buffer, offset) != buffer.len) {
         return error.InvalidEfiImage;
+    }
+}
+
+fn readContentExact(
+    content: tree_cursor.Cursor.ContentReader,
+    buffer: []u8,
+    offset: u64,
+) !void {
+    var filled: usize = 0;
+    while (filled < buffer.len) {
+        const got = try content.readAt(buffer[filled..], offset + filled);
+        if (got == 0) return error.InvalidEfiImage;
+        filled += got;
     }
 }
 
@@ -592,7 +846,30 @@ test "build emits deterministic raw GPT and Azure-ready fixed VHD" {
     defer vhd_image.close(io);
     const info = try vhd_image.info(io);
     try std.testing.expectEqual(image_mod.VhdSubformat.fixed, info.subformat.?);
-    try std.testing.expectEqual(vhd_report.virtual_size + @import("vhd.zig").footer_size, info.file_size);
+    try std.testing.expectEqual(vhd_report.virtual_size + vhd.footer_size, info.file_size);
+
+    const validation = try validateFixedVhd(std.testing.allocator, io, .{
+        .path = vhd_path,
+        .architecture = .x86_64,
+        .expected_efi_sha256 = vhd_report.input_sha256,
+        .expected_virtual_size = vhd_report.virtual_size,
+    });
+    try std.testing.expectEqualStrings(fallback_x86_64, validation.boot_path);
+    try std.testing.expectEqual(vhd_report.input_size, validation.boot_file_size);
+    try std.testing.expectEqualSlices(u8, &vhd_report.input_sha256, &validation.boot_file_sha256);
+    try std.testing.expectError(error.ExpectedFixedVhd, validateFixedVhd(std.testing.allocator, io, .{
+        .path = raw_a_path,
+    }));
+    try std.testing.expectError(error.VirtualSizeMismatch, validateFixedVhd(std.testing.allocator, io, .{
+        .path = vhd_path,
+        .expected_virtual_size = vhd_report.virtual_size + azure.one_mib,
+    }));
+    var wrong_digest = vhd_report.input_sha256;
+    wrong_digest[0] ^= 1;
+    try std.testing.expectError(error.BootApplicationDigestMismatch, validateFixedVhd(std.testing.allocator, io, .{
+        .path = vhd_path,
+        .expected_efi_sha256 = wrong_digest,
+    }));
 }
 
 test "build refuses unsafe sizing, formats, and existing output" {

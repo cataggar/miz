@@ -23,6 +23,30 @@ requires fixed VHD virtual size alignment. Existing output paths are never
 overwritten. Deterministic identities are derived from the input digest,
 architecture, and requested sizes.
 
+Deployment tooling should preflight the finished artifact read-only with
+`validateFixedVhd`:
+
+```zig
+const validation = try miz.efi_application_image.validateFixedVhd(
+    allocator,
+    io,
+    .{
+        .path = "unikernel.vhd",
+        .architecture = .x86_64,
+        .expected_efi_sha256 = report.input_sha256,
+        .expected_virtual_size = report.virtual_size,
+    },
+);
+```
+
+The returned metadata includes fixed-VHD file/virtual sizes, GPT disk and ESP
+partition GUIDs, ESP offset/length/volume ID, fallback path, architecture, and
+the embedded application's size and SHA-256. Validation accepts no application
+specific knowledge: any matching PE32+ EFI application is valid. It also
+re-derives and checks the content-derived GPT, FAT, and VHD identities, so a
+structurally plausible image whose deterministic metadata was substituted does
+not satisfy the packaging contract.
+
 ## Grow an existing Ubuntu QCOW2 image
 
 `miz.root_resize.growExistingQcow2` performs the complete native growth

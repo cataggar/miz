@@ -1,5 +1,5 @@
 //! `miz`: a qemu-img-like CLI over the `miz` library. Supports `create`,
-//! `info`, `convert`, `write`, `resize`, `check`, `map`, `build-image`, `build-efi-application`, `build-iso`,
+//! `info`, `convert`, `write`, `resize`, `check`, `check-efi-application`, `map`, `build-image`, `build-efi-application`, `build-iso`,
 //! `recustomize-iso`, `resize-root`, `azure`, `cosi`, `oci`, `qemu`, and release signing over
 //! `raw`, `vhd`, `vhdx`, and `qcow2`.
 
@@ -13,6 +13,7 @@ const write_cmd = @import("commands/write.zig");
 const resize_cmd = @import("commands/resize.zig");
 const resize_root_cmd = @import("commands/resize_root.zig");
 const check_cmd = @import("commands/check.zig");
+const check_efi_application_cmd = @import("commands/check_efi_application.zig");
 const map_cmd = @import("commands/map.zig");
 const azure_cmd = @import("commands/azure.zig");
 const cosi_cmd = @import("commands/cosi.zig");
@@ -37,6 +38,7 @@ const usage =
     \\  resize <file> [+]<size>
     \\  resize-root [--label <label>] <file.qcow2> [+]<size>
     \\  check <file>
+    \\  check-efi-application [--output=human|json] [--architecture x86_64|aarch64] [--expected-efi-sha256 <hex>] [--expected-virtual-size <size>] <image.vhd>
     \\  map [--output=human|json] <file>
     \\  azure derive --input-sha256 <hex> [--expected-virtual-size <size>] <input.qcow2> <output.vhd>
     \\  azure fixup [--generation 1|2] <file>  # defaults to Gen2; non-VHD becomes <basename>.vhd
@@ -93,6 +95,7 @@ fn run(
         return resize_root_cmd.run(gpa, io, rest);
     }
     if (std.mem.eql(u8, command, "check")) return check_cmd.run(gpa, io, rest);
+    if (std.mem.eql(u8, command, "check-efi-application")) return check_efi_application_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "map")) return map_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "azure")) return azure_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "cosi")) return cosi_cmd.run(gpa, io, rest);
@@ -121,6 +124,7 @@ test {
     _ = resize_cmd;
     _ = resize_root_cmd;
     _ = check_cmd;
+    _ = check_efi_application_cmd;
     _ = map_cmd;
     _ = azure_cmd;
     _ = cosi_cmd;
