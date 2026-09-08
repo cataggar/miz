@@ -1955,6 +1955,87 @@ test "pending cleanup clears conclusively absent group and definition" {
     try expectAbsent(log, "group delete");
 }
 
+test "absent definition cleanup propagates state replacement failure" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository = try rootAlloc(allocator);
+    defer allocator.free(repository);
+    const root = try std.fmt.allocPrint(
+        allocator,
+        "{s}/.zig-cache/tmp/{s}",
+        .{ repository, tmp.sub_path },
+    );
+    defer allocator.free(root);
+    const fixture = try writeCleanupFixture(
+        allocator,
+        root,
+        false,
+        null,
+        null,
+        "pending",
+        false,
+    );
+    defer allocator.free(fixture.state);
+    defer allocator.free(fixture.log);
+    const original = try Dir.cwd().readFileAlloc(
+        std.testing.io,
+        fixture.state,
+        allocator,
+        .limited(max_output_bytes),
+    );
+    defer allocator.free(original);
+    const jq_mock = try std.fmt.allocPrint(allocator, "{s}/bin/jq", .{root});
+    defer allocator.free(jq_mock);
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = jq_mock,
+        .data =
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\for arg in "$@"; do
+        \\  if [[ "$arg" == '.target.definition_create = null' ]]; then
+        \\    printf '{"partial":'
+        \\    exit 74
+        \\  fi
+        \\done
+        \\exec /usr/bin/jq "$@"
+        \\
+        ,
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
+    const result = try runCleanup(
+        allocator,
+        root,
+        fixture.state,
+        fixture.log,
+        "different-owner",
+        "different-owner",
+        "absent",
+        "[]",
+        "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-capture-123-4/providers/Microsoft.Compute/disks/miz-u2404-capture-upload-123-4",
+        "different-owner",
+        "0",
+    );
+    defer result.deinit(allocator);
+    try std.testing.expect(!result.succeeded());
+    try expectContains(result.stderr, "Could not transform capture cleanup state");
+    const state = try Dir.cwd().readFileAlloc(
+        std.testing.io,
+        fixture.state,
+        allocator,
+        .limited(max_output_bytes),
+    );
+    defer allocator.free(state);
+    try std.testing.expectEqualSlices(u8, original, state);
+    try expectContains(state, "\"definition_create\":{\"status\":\"pending\"");
+    const next = try std.fmt.allocPrint(allocator, "{s}.next", .{fixture.state});
+    defer allocator.free(next);
+    try std.testing.expectError(
+        error.FileNotFound,
+        Dir.cwd().statFile(std.testing.io, next, .{}),
+    );
+}
+
 test "pending cleanup deletes exact-owned empty definition then temporary group" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

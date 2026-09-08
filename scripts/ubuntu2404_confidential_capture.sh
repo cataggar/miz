@@ -442,7 +442,9 @@ delete_created_definition() {
   if ! az sig image-definition show --ids "$definition_id" --output json >"$metadata" 2>"${metadata}.stderr"; then
     if grep -Eq '(^|[^0-9])404([^0-9]|$)|ResourceNotFound|was not found' "${metadata}.stderr"; then
       rm -f -- "$metadata" "${metadata}.stderr"
-      state_replace '.target.definition_create = null'
+      if ! state_replace '.target.definition_create = null'; then
+        return 1
+      fi
       return 0
     fi
     fail "Could not inspect the target image definition during cleanup"
