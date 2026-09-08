@@ -249,6 +249,7 @@ azure_confidential_vm_capture_gallery_version_put_args() {
     rest
     --method put
     --uri "https://management.azure.com${image_version_id}?api-version=2025-03-03"
+    --headers 'If-None-Match=*'
     --body "@$request"
     --output json
   )

@@ -47,9 +47,10 @@ const usage_text =
     \\  gallery-state          print a gallery version's provisioning state
     \\  check-gallery          bind the gallery version to the managed disk
     \\  check-vm               require ConfidentialVM, VMGuestStateOnly, Secure Boot, and vTPM
+    \\  verify-attestation     verify one nonce-bound MAA JWT against raw HTTPS evidence
     \\  acceptance-result      verify MAA attestation and write the bound result
     \\  verify-acceptance      revalidate the exact protected acceptance result for publication
-    \\  check-capture-vm       bind a fresh capture VM to the accepted source version
+    \\  check-capture-vm       bind a fresh capture VM to a re-created accepted source version
     \\  check-capture-disk     validate the capture VM managed OS disk
     \\  check-capture-snapshot validate the immutable same-region disk snapshot
     \\  check-capture-definition require the exact full ConfidentialVM definition
@@ -71,7 +72,7 @@ const usage_text =
 const ArgumentError = error{Usage};
 
 const Options = struct {
-    const capacity = 40;
+    const capacity = 64;
 
     names: [capacity][]const u8 = undefined,
     values: [capacity][]const u8 = undefined,
@@ -145,6 +146,7 @@ const command_table = [_]Command{
     .{ .name = "gallery-state", .handler = runGalleryState },
     .{ .name = "check-gallery", .handler = runCheckGallery },
     .{ .name = "check-vm", .handler = runCheckVm },
+    .{ .name = "verify-attestation", .handler = runVerifyAttestation },
     .{ .name = "acceptance-result", .handler = runAcceptanceResult },
     .{ .name = "verify-acceptance", .handler = runVerifyAcceptance },
     .{ .name = "check-capture-vm", .handler = runCheckCaptureVm },
@@ -1234,6 +1236,35 @@ fn verifyAttestation(
     };
 }
 
+fn runVerifyAttestation(context: Context, argv: []const []const u8) !void {
+    const options = try parseOptions(argv, &.{
+        "token",
+        "openid",
+        "jwks",
+        "endpoint",
+        "nonce",
+        "vm-id",
+        "now",
+    });
+    const evidence = try verifyAttestation(
+        context.allocator,
+        context.io,
+        try options.require("token"),
+        try options.require("openid"),
+        try options.require("jwks"),
+        try options.require("endpoint"),
+        try options.require("nonce"),
+        try options.require("vm-id"),
+        try options.requireInteger("now"),
+        context.diagnostic,
+    );
+    try context.out.print("{s}\n{s}\n{s}\n", .{
+        evidence.issuer,
+        &evidence.token_sha256,
+        &evidence.nonce_sha256,
+    });
+}
+
 fn readConversion(
     allocator: Allocator,
     io: Io,
@@ -1799,13 +1830,48 @@ fn runCheckCaptureVm(context: Context, argv: []const []const u8) !void {
         "run-id",
         "run-attempt",
         "repository",
+        "capture-run-id",
+        "capture-run-attempt",
         "subscription-id",
         "location",
+        "source-version-id",
+        "staging-disk",
+        "staging-managed-image",
+        "staging-definition",
+        "staging-gallery-request",
+        "staging-gallery-response",
         "vm-id",
         "disk-id",
     });
-    const source_version_id = try verifiedSourceVersion(context, &options);
-    defer context.allocator.free(source_version_id);
+    const accepted_version_id = try verifiedSourceVersion(context, &options);
+    defer context.allocator.free(accepted_version_id);
+    const verified = try verifyAcceptanceResult(
+        context.allocator,
+        context.io,
+        try options.require("source-acceptance"),
+        try options.require("provenance"),
+        try options.require("qcow"),
+        try options.require("source-commit"),
+        try options.require("location"),
+        try options.require("vm-size"),
+        try options.require("run-id"),
+        try options.require("run-attempt"),
+        context.diagnostic,
+    );
+    _ = try validateStagingEvidence(
+        context,
+        &options,
+        verified,
+        try options.require("capture-run-id"),
+        try options.require("capture-run-attempt"),
+        try options.require("repository"),
+    );
+    const source_version_id = try options.require("source-version-id");
+    try capture.validateSourceVersionId(
+        source_version_id,
+        try options.require("subscription-id"),
+        context.diagnostic,
+    );
     var document = try readObject(
         context.allocator,
         context.io,
@@ -2064,6 +2130,12 @@ const capture_result_options = [_][]const u8{
     "source-run-id",
     "source-run-attempt",
     "source-repository",
+    "source-version-id",
+    "staging-disk",
+    "staging-managed-image",
+    "staging-definition",
+    "staging-gallery-request",
+    "staging-gallery-response",
     "subscription-id",
     "location",
     "repository",
@@ -2105,6 +2177,12 @@ const capture_verify_options = [_][]const u8{
     "source-run-id",
     "source-run-attempt",
     "source-repository",
+    "source-version-id",
+    "staging-disk",
+    "staging-managed-image",
+    "staging-definition",
+    "staging-gallery-request",
+    "staging-gallery-response",
     "subscription-id",
     "location",
     "repository",
@@ -2175,6 +2253,7 @@ fn captureExpected(
             .vm_size = try options.require("source-vm-size"),
             .run_id = try options.require("source-run-id"),
             .run_attempt = try options.require("source-run-attempt"),
+            .staging_image_version_id = try options.require("source-version-id"),
             .artifact = .{
                 .qcow_sha256 = &build.qcow_sha256,
                 .qcow_size = qcow_size,
@@ -2236,9 +2315,336 @@ fn verifiedCaptureInputs(
     );
 }
 
+const StagingEvidenceRevisions = struct {
+    disk: FileIdentity,
+    managed_image: FileIdentity,
+    definition: FileIdentity,
+    gallery_request: FileIdentity,
+    gallery_response: FileIdentity,
+};
+
+fn resourceGroupFromId(id: []const u8) ?[]const u8 {
+    var segments = std.mem.splitScalar(u8, id, '/');
+    if (!std.mem.eql(u8, segments.next() orelse return null, "") or
+        !std.ascii.eqlIgnoreCase(segments.next() orelse return null, "subscriptions"))
+    {
+        return null;
+    }
+    _ = segments.next() orelse return null;
+    if (!std.ascii.eqlIgnoreCase(
+        segments.next() orelse return null,
+        "resourceGroups",
+    )) return null;
+    const group = segments.next() orelse return null;
+    return if (group.len == 0) null else group;
+}
+
+fn requireStagingOwnershipTags(
+    document: *const ObjectMap,
+    run_id: []const u8,
+    run_attempt: []const u8,
+    repository: []const u8,
+    source_commit: []const u8,
+    diagnostic: *Diagnostic,
+) !void {
+    const tags = try requireObject(
+        document,
+        "tags",
+        "staging resource ownership tags",
+        diagnostic,
+    );
+    const expected = [_]struct { []const u8, []const u8, []const u8 }{
+        .{ "miz-owner", "ubuntu2404-confidential-capture", "staging owner tag" },
+        .{ "miz-repository", repository, "staging repository tag" },
+        .{ "miz-run-id", run_id, "staging run ID tag" },
+        .{ "miz-run-attempt", run_attempt, "staging run attempt tag" },
+        .{ "miz-source-commit", source_commit, "staging source commit tag" },
+    };
+    for (expected) |entry| try requireEqual(
+        try requireString(&tags, entry[0], entry[2], diagnostic),
+        entry[1],
+        entry[2],
+        diagnostic,
+    );
+}
+
+fn requireStagingArtifactTags(
+    document: *const ObjectMap,
+    build: BuildEvidence,
+    source_acceptance_sha256: release.digest.Hex,
+    accepted_vhd_sha256: []const u8,
+    run_id: []const u8,
+    run_attempt: []const u8,
+    repository: []const u8,
+    source_commit: []const u8,
+    diagnostic: *Diagnostic,
+) !void {
+    try requireStagingOwnershipTags(
+        document,
+        run_id,
+        run_attempt,
+        repository,
+        source_commit,
+        diagnostic,
+    );
+    const tags = try requireObject(
+        document,
+        "tags",
+        "staging gallery artifact tags",
+        diagnostic,
+    );
+    try requireEqual(
+        try requireString(&tags, "miz-qcow-sha256", "staging QCOW2 tag", diagnostic),
+        &build.qcow_sha256,
+        "staging QCOW2 tag",
+        diagnostic,
+    );
+    try requireEqual(
+        try requireString(&tags, "miz-vhd-sha256", "staging VHD tag", diagnostic),
+        accepted_vhd_sha256,
+        "staging VHD tag",
+        diagnostic,
+    );
+    try requireEqual(
+        try requireString(
+            &tags,
+            "miz-source-acceptance-sha256",
+            "staging source acceptance tag",
+            diagnostic,
+        ),
+        &source_acceptance_sha256,
+        "staging source acceptance tag",
+        diagnostic,
+    );
+}
+
+fn validateStagingEvidence(
+    context: Context,
+    options: *const Options,
+    build: BuildEvidence,
+    run_id: []const u8,
+    run_attempt: []const u8,
+    repository: []const u8,
+) !StagingEvidenceRevisions {
+    var source_acceptance = try readObject(
+        context.allocator,
+        context.io,
+        try options.require("source-acceptance"),
+        context.diagnostic,
+    );
+    defer source_acceptance.deinit();
+    try requireSameRevision(
+        build.acceptance_identity.?,
+        source_acceptance.identity,
+        "source acceptance evidence",
+        context.diagnostic,
+    );
+    const artifact = try requireObject(
+        source_acceptance.object(),
+        "artifact",
+        "accepted source artifact",
+        context.diagnostic,
+    );
+    const accepted_vhd_sha256 = try requireString(
+        &artifact,
+        "vhd_sha256",
+        "accepted source VHD SHA-256",
+        context.diagnostic,
+    );
+    const source_acceptance_hash = try release.digest.hashFile(
+        context.io,
+        try options.require("source-acceptance"),
+        document_max_bytes,
+    );
+    try requireSameRevision(
+        source_acceptance.identity,
+        source_acceptance_hash.identity,
+        "source acceptance evidence",
+        context.diagnostic,
+    );
+
+    var disk = try readObject(
+        context.allocator,
+        context.io,
+        try options.require("staging-disk"),
+        context.diagnostic,
+    );
+    defer disk.deinit();
+    const disk_id = try release.azure_confidential_vm.validateManagedDisk(
+        disk.object(),
+        context.diagnostic,
+    );
+    const source_version_id = try options.require("source-version-id");
+    try capture.validateSourceVersionId(
+        source_version_id,
+        try options.require("subscription-id"),
+        context.diagnostic,
+    );
+    const staging_group = resourceGroupFromId(source_version_id) orelse
+        return invalid(context.diagnostic, "staging gallery resource group is invalid", .{});
+    try requireBoundAzureId(
+        context.allocator,
+        disk_id,
+        staging_group,
+        "/disks/",
+        "source staging disk",
+        context.diagnostic,
+    );
+    if (!release.azure_compute.resourceIdHasSubscription(
+        disk_id,
+        try options.require("subscription-id"),
+    )) return invalid(
+        context.diagnostic,
+        "source staging disk is cross-subscription",
+        .{},
+    );
+    try requireEqual(
+        try requireString(disk.object(), "location", "source staging disk location", context.diagnostic),
+        try options.require("location"),
+        "source staging disk location",
+        context.diagnostic,
+    );
+    var managed_image = try readObject(
+        context.allocator,
+        context.io,
+        try options.require("staging-managed-image"),
+        context.diagnostic,
+    );
+    defer managed_image.deinit();
+    const managed_image_id = try release.azure_confidential_vm.validateManagedImage(
+        managed_image.object(),
+        disk_id,
+        context.diagnostic,
+    );
+    try requireBoundAzureId(
+        context.allocator,
+        managed_image_id,
+        staging_group,
+        "/images/",
+        "source staging managed image",
+        context.diagnostic,
+    );
+    if (!release.azure_compute.resourceIdHasSubscription(
+        managed_image_id,
+        try options.require("subscription-id"),
+    )) return invalid(
+        context.diagnostic,
+        "source staging managed image is cross-subscription",
+        .{},
+    );
+    try requireEqual(
+        try requireString(
+            managed_image.object(),
+            "location",
+            "source staging managed-image location",
+            context.diagnostic,
+        ),
+        try options.require("location"),
+        "source staging managed-image location",
+        context.diagnostic,
+    );
+    var definition = try readObject(
+        context.allocator,
+        context.io,
+        try options.require("staging-definition"),
+        context.diagnostic,
+    );
+    defer definition.deinit();
+    const definition_id = try release.azure_confidential_vm.validateImageDefinition(
+        definition.object(),
+        context.diagnostic,
+    );
+    try capture.validateCaptureGalleryIds(
+        definition_id,
+        source_version_id,
+        try options.require("subscription-id"),
+        context.diagnostic,
+    );
+    try requireStagingOwnershipTags(
+        disk.object(),
+        run_id,
+        run_attempt,
+        repository,
+        try options.require("source-commit"),
+        context.diagnostic,
+    );
+    try requireStagingOwnershipTags(
+        managed_image.object(),
+        run_id,
+        run_attempt,
+        repository,
+        try options.require("source-commit"),
+        context.diagnostic,
+    );
+    try requireStagingOwnershipTags(
+        definition.object(),
+        run_id,
+        run_attempt,
+        repository,
+        try options.require("source-commit"),
+        context.diagnostic,
+    );
+    var gallery_request = try readObject(
+        context.allocator,
+        context.io,
+        try options.require("staging-gallery-request"),
+        context.diagnostic,
+    );
+    defer gallery_request.deinit();
+    var gallery_response = try readObject(
+        context.allocator,
+        context.io,
+        try options.require("staging-gallery-response"),
+        context.diagnostic,
+    );
+    defer gallery_response.deinit();
+    try release.azure_confidential_vm.validateGalleryVersion(
+        gallery_request.object(),
+        gallery_response.object(),
+        source_version_id,
+        managed_image_id,
+        true,
+        context.diagnostic,
+    );
+    try requireStagingArtifactTags(
+        gallery_request.object(),
+        build,
+        source_acceptance_hash.hex,
+        accepted_vhd_sha256,
+        run_id,
+        run_attempt,
+        repository,
+        try options.require("source-commit"),
+        context.diagnostic,
+    );
+    try requireStagingArtifactTags(
+        gallery_response.object(),
+        build,
+        source_acceptance_hash.hex,
+        accepted_vhd_sha256,
+        run_id,
+        run_attempt,
+        repository,
+        try options.require("source-commit"),
+        context.diagnostic,
+    );
+    return .{
+        .disk = disk.identity,
+        .managed_image = managed_image.identity,
+        .definition = definition.identity,
+        .gallery_request = gallery_request.identity,
+        .gallery_response = gallery_response.identity,
+    };
+}
+
 const EvidenceRevisions = struct {
     source_acceptance: FileIdentity,
     source_provenance: FileIdentity,
+    source_staging_disk: FileIdentity,
+    source_staging_managed_image: FileIdentity,
+    source_staging_definition: FileIdentity,
+    source_staging_gallery_request: FileIdentity,
+    source_staging_gallery_response: FileIdentity,
     capture_vm: FileIdentity,
     capture_vm_instance: FileIdentity,
     capture_disk: FileIdentity,
@@ -2306,6 +2712,41 @@ fn captureEvidence(
             document_max_bytes,
             revisions.source_provenance,
             "source provenance evidence",
+        ),
+        .source_staging_disk_sha256 = try hashValidatedEvidence(
+            context,
+            try options.require("staging-disk"),
+            document_max_bytes,
+            revisions.source_staging_disk,
+            "source staging disk evidence",
+        ),
+        .source_staging_managed_image_sha256 = try hashValidatedEvidence(
+            context,
+            try options.require("staging-managed-image"),
+            document_max_bytes,
+            revisions.source_staging_managed_image,
+            "source staging managed-image evidence",
+        ),
+        .source_staging_definition_sha256 = try hashValidatedEvidence(
+            context,
+            try options.require("staging-definition"),
+            document_max_bytes,
+            revisions.source_staging_definition,
+            "source staging definition evidence",
+        ),
+        .source_staging_gallery_request_sha256 = try hashValidatedEvidence(
+            context,
+            try options.require("staging-gallery-request"),
+            document_max_bytes,
+            revisions.source_staging_gallery_request,
+            "source staging gallery request evidence",
+        ),
+        .source_staging_gallery_response_sha256 = try hashValidatedEvidence(
+            context,
+            try options.require("staging-gallery-response"),
+            document_max_bytes,
+            revisions.source_staging_gallery_response,
+            "source staging gallery response evidence",
         ),
         .capture_vm_sha256 = try hashValidatedEvidence(
             context,
@@ -2392,6 +2833,14 @@ fn captureEvidence(
 fn runCaptureResult(context: Context, argv: []const []const u8) !void {
     const options = try parseOptions(argv, &capture_result_options);
     const verified = try verifiedCaptureInputs(context, &options);
+    const staging = try validateStagingEvidence(
+        context,
+        &options,
+        verified,
+        try options.require("run-id"),
+        try options.require("run-attempt"),
+        try options.require("repository"),
+    );
     var source_acceptance = try readObject(
         context.allocator,
         context.io,
@@ -2448,6 +2897,11 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
         .{
             .source_acceptance = source_acceptance.identity,
             .source_provenance = verified.provenance_identity,
+            .source_staging_disk = staging.disk,
+            .source_staging_managed_image = staging.managed_image,
+            .source_staging_definition = staging.definition,
+            .source_staging_gallery_request = staging.gallery_request,
+            .source_staging_gallery_response = staging.gallery_response,
             .capture_vm = capture_vm.identity,
             .capture_vm_instance = capture_vm_instance.identity,
             .capture_disk = capture_disk.identity,
@@ -2496,6 +2950,14 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
 fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
     const options = try parseOptions(argv, &capture_verify_options);
     const verified = try verifiedCaptureInputs(context, &options);
+    const staging = try validateStagingEvidence(
+        context,
+        &options,
+        verified,
+        try options.require("run-id"),
+        try options.require("run-attempt"),
+        try options.require("repository"),
+    );
     var source_acceptance = try readObject(
         context.allocator,
         context.io,
@@ -2564,6 +3026,11 @@ fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
         .{
             .source_acceptance = source_acceptance.identity,
             .source_provenance = verified.provenance_identity,
+            .source_staging_disk = staging.disk,
+            .source_staging_managed_image = staging.managed_image,
+            .source_staging_definition = staging.definition,
+            .source_staging_gallery_request = staging.gallery_request,
+            .source_staging_gallery_response = staging.gallery_response,
             .capture_vm = capture_vm.identity,
             .capture_vm_instance = capture_vm_instance.identity,
             .capture_disk = capture_disk.identity,
@@ -2657,6 +3124,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test "command surface is exact and rejects incomplete invocations" {
+    try std.testing.expect(Options.capacity >= capture_result_options.len);
+    try std.testing.expect(Options.capacity >= capture_verify_options.len);
     const names = [_][]const u8{
         "verify-build",
         "verify-vhd",
@@ -2668,6 +3137,7 @@ test "command surface is exact and rejects incomplete invocations" {
         "gallery-state",
         "check-gallery",
         "check-vm",
+        "verify-attestation",
         "acceptance-result",
         "verify-acceptance",
         "check-capture-vm",
@@ -2700,6 +3170,11 @@ test "command surface is exact and rejects incomplete invocations" {
 const EvidenceRevisionField = enum {
     source_acceptance,
     source_provenance,
+    source_staging_disk,
+    source_staging_managed_image,
+    source_staging_definition,
+    source_staging_gallery_request,
+    source_staging_gallery_response,
     capture_vm,
     capture_vm_instance,
     capture_disk,
@@ -2737,20 +3212,25 @@ test "capture-result and verify-capture reject every evidence revision mismatch"
         .data = bytes,
     });
     const argv = [_][]const u8{
-        "--source-acceptance",   path,
-        "--provenance",          path,
-        "--capture-vm",          path,
-        "--capture-vm-instance", path,
-        "--capture-disk",        path,
-        "--snapshot",            path,
-        "--definition",          path,
-        "--gallery-request",     path,
-        "--gallery-response",    path,
-        "--final-vm",            path,
-        "--final-vm-instance",   path,
-        "--token",               path,
-        "--openid",              path,
-        "--jwks",                path,
+        "--source-acceptance",        path,
+        "--provenance",               path,
+        "--staging-disk",             path,
+        "--staging-managed-image",    path,
+        "--staging-definition",       path,
+        "--staging-gallery-request",  path,
+        "--staging-gallery-response", path,
+        "--capture-vm",               path,
+        "--capture-vm-instance",      path,
+        "--capture-disk",             path,
+        "--snapshot",                 path,
+        "--definition",               path,
+        "--gallery-request",          path,
+        "--gallery-response",         path,
+        "--final-vm",                 path,
+        "--final-vm-instance",        path,
+        "--token",                    path,
+        "--openid",                   path,
+        "--jwks",                     path,
     };
     const options = try parseOptions(&argv, &capture_verify_options);
     var discard: Writer.Discarding = .init(&.{});
@@ -2769,6 +3249,11 @@ test "capture-result and verify-capture reject every evidence revision mismatch"
     const revisions: EvidenceRevisions = .{
         .source_acceptance = observed.identity,
         .source_provenance = observed.identity,
+        .source_staging_disk = observed.identity,
+        .source_staging_managed_image = observed.identity,
+        .source_staging_definition = observed.identity,
+        .source_staging_gallery_request = observed.identity,
+        .source_staging_gallery_response = observed.identity,
         .capture_vm = observed.identity,
         .capture_vm_instance = observed.identity,
         .capture_disk = observed.identity,

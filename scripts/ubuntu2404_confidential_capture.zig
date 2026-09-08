@@ -35,6 +35,7 @@ pub const SourceExpected = struct {
     vm_size: []const u8,
     run_id: []const u8,
     run_attempt: []const u8,
+    staging_image_version_id: []const u8,
     artifact: Artifact,
 };
 
@@ -76,6 +77,11 @@ pub const Attestation = struct {
 pub const Evidence = struct {
     source_acceptance_sha256: release.digest.Hex,
     source_provenance_sha256: release.digest.Hex,
+    source_staging_disk_sha256: release.digest.Hex,
+    source_staging_managed_image_sha256: release.digest.Hex,
+    source_staging_definition_sha256: release.digest.Hex,
+    source_staging_gallery_request_sha256: release.digest.Hex,
+    source_staging_gallery_response_sha256: release.digest.Hex,
     capture_vm_sha256: release.digest.Hex,
     capture_vm_instance_sha256: release.digest.Hex,
     capture_disk_sha256: release.digest.Hex,
@@ -419,6 +425,7 @@ fn validateExpected(
         return invalid(diagnostic, "capture source artifact or location is invalid", .{});
     }
     const ids = [_]struct { []const u8, ResourceKind }{
+        .{ expected.source.staging_image_version_id, .image_version },
         .{ expected.capture_vm_id, .virtual_machine },
         .{ expected.capture_disk_id, .disk },
         .{ expected.snapshot_id, .snapshot },
@@ -445,6 +452,7 @@ fn validateExpected(
     );
     defer allocator.free(group);
     const ephemeral = [_][]const u8{
+        expected.source.staging_image_version_id,
         expected.capture_vm_id,
         expected.capture_disk_id,
         expected.snapshot_id,
@@ -676,6 +684,11 @@ fn evidenceValue(allocator: Allocator, evidence: Evidence) !Value {
         .{ "snapshot_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.snapshot_sha256)) },
         .{ "source_acceptance_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_acceptance_sha256)) },
         .{ "source_provenance_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_provenance_sha256)) },
+        .{ "source_staging_definition_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_staging_definition_sha256)) },
+        .{ "source_staging_disk_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_staging_disk_sha256)) },
+        .{ "source_staging_gallery_request_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_staging_gallery_request_sha256)) },
+        .{ "source_staging_gallery_response_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_staging_gallery_response_sha256)) },
+        .{ "source_staging_managed_image_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.source_staging_managed_image_sha256)) },
         .{ "token_sha256", release.azure_compute.string(try allocator.dupe(u8, &evidence.token_sha256)) },
     });
 }
@@ -697,7 +710,7 @@ pub fn result(
     const capture_contract: release.azure_confidential_vm.CaptureContract = .{
         .subscription_id = expected.subscription_id,
         .location = expected.location,
-        .source_image_version_id = source.gallery_image_version_id,
+        .source_image_version_id = expected.source.staging_image_version_id,
         .vm_id = expected.capture_vm_id,
         .disk_id = expected.capture_disk_id,
     };
@@ -781,11 +794,12 @@ pub fn result(
         .{ "acceptance", source_acceptance },
         .{ "artifact", source_artifact },
         .{ "commit", release.azure_compute.string(expected.source.commit) },
-        .{ "gallery_image_version_id", release.azure_compute.string(source.gallery_image_version_id) },
+        .{ "accepted_gallery_image_version_id", release.azure_compute.string(source.gallery_image_version_id) },
         .{ "release", release.azure_compute.string("24.04") },
+        .{ "staging_gallery_image_version_id", release.azure_compute.string(expected.source.staging_image_version_id) },
     });
     const vm_value = try release.azure_compute.object(allocator, &.{
-        .{ "image_reference_id", release.azure_compute.string(source.gallery_image_version_id) },
+        .{ "image_reference_id", release.azure_compute.string(expected.source.staging_image_version_id) },
         .{ "managed_os_disk_id", release.azure_compute.string(expected.capture_disk_id) },
         .{ "os_disk_encryption_type", release.azure_compute.string(release.azure_confidential_vm.os_disk_security_encryption_type) },
         .{ "resource_id", release.azure_compute.string(expected.capture_vm_id) },
@@ -1001,6 +1015,9 @@ const test_prefix = "/subscriptions/" ++ test_subscription ++
 const test_source_version = "/subscriptions/" ++ test_subscription ++
     "/resourceGroups/miz-u2404-cvm-123-1/providers/Microsoft.Compute/" ++
     "galleries/source/images/ubuntu/versions/1.0.0";
+const test_staging_version = "/subscriptions/" ++ test_subscription ++
+    "/resourceGroups/" ++ test_group ++ "/providers/Microsoft.Compute/" ++
+    "galleries/staging/images/ubuntu/versions/1.0.0";
 const test_capture_vm = test_prefix ++ "virtualMachines/capture";
 const test_capture_disk = test_prefix ++ "disks/capture-os";
 const test_snapshot = test_prefix ++ "snapshots/capture-os";
@@ -1022,6 +1039,7 @@ fn testExpected() Expected {
             .vm_size = "Standard_DC2as_v5",
             .run_id = "123",
             .run_attempt = "1",
+            .staging_image_version_id = test_staging_version,
             .artifact = .{
                 .qcow_sha256 = "1" ** 64,
                 .qcow_size = 1024,
@@ -1050,6 +1068,11 @@ fn testEvidence() Evidence {
     return .{
         .source_acceptance_sha256 = release.digest.hexBytes("source acceptance"),
         .source_provenance_sha256 = release.digest.hexBytes("source provenance"),
+        .source_staging_disk_sha256 = release.digest.hexBytes("source staging disk"),
+        .source_staging_managed_image_sha256 = release.digest.hexBytes("source staging managed image"),
+        .source_staging_definition_sha256 = release.digest.hexBytes("source staging definition"),
+        .source_staging_gallery_request_sha256 = release.digest.hexBytes("source staging gallery request"),
+        .source_staging_gallery_response_sha256 = release.digest.hexBytes("source staging gallery response"),
         .capture_vm_sha256 = release.digest.hexBytes("capture VM"),
         .capture_vm_instance_sha256 = release.digest.hexBytes("capture VM instance"),
         .capture_disk_sha256 = release.digest.hexBytes("capture disk"),
@@ -1121,7 +1144,7 @@ const test_capture_vm_document =
     "\"provisioningState\":\"Succeeded\",\"securityProfile\":{\"securityType\":" ++
     "\"ConfidentialVM\",\"uefiSettings\":{\"secureBootEnabled\":true," ++
     "\"vTpmEnabled\":true}},\"storageProfile\":{\"imageReference\":{\"id\":\"" ++
-    test_source_version ++ "\"},\"osDisk\":{\"managedDisk\":{\"id\":\"" ++
+    test_staging_version ++ "\"},\"osDisk\":{\"managedDisk\":{\"id\":\"" ++
     test_capture_disk ++ "\",\"diskEncryptionSet\":null,\"securityProfile\":" ++
     "{\"securityEncryptionType\":\"VMGuestStateOnly\",\"diskEncryptionSet\":null}}}}}";
 
@@ -1319,11 +1342,11 @@ test "capture result independently rejects provenance substitutions" {
             "\"qcow_sha256\":\"" ++ "9" ** 64 ++ "\"",
         },
         .{
-            "\"gallery_image_version_id\":\"" ++ test_source_version ++ "\"",
-            "\"gallery_image_version_id\":\"" ++ test_version ++ "\"",
+            "\"accepted_gallery_image_version_id\":\"" ++ test_source_version ++ "\"",
+            "\"accepted_gallery_image_version_id\":\"" ++ test_version ++ "\"",
         },
         .{
-            "\"image_reference_id\":\"" ++ test_source_version ++ "\"",
+            "\"image_reference_id\":\"" ++ test_staging_version ++ "\"",
             "\"image_reference_id\":\"" ++ test_version ++ "\"",
         },
         .{

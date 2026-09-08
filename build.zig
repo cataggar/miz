@@ -2193,6 +2193,33 @@ pub fn build(b: *std.Build) void {
         ubuntu2404_confidential_release_test_step.dependOn(
             &run_ubuntu2404_confidential_acceptance_tests.step,
         );
+        const ubuntu2404_confidential_capture_harness_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(
+                    "tests/ubuntu2404_confidential_capture_harness.zig",
+                ),
+                .target = b.graph.host,
+                .optimize = optimize,
+            }),
+        });
+        const run_ubuntu2404_confidential_capture_harness_tests = b.addRunArtifact(
+            ubuntu2404_confidential_capture_harness_tests,
+        );
+        run_ubuntu2404_confidential_capture_harness_tests.has_side_effects = true;
+        run_ubuntu2404_confidential_capture_harness_tests.setEnvironmentVariable(
+            "MIZ_UBUNTU2404_CONFIDENTIAL_ROOT",
+            b.build_root.path orelse ".",
+        );
+        const ubuntu2404_confidential_capture_harness_test_step = b.step(
+            "test-ubuntu2404-confidential-capture-harness",
+            "Test the Ubuntu 24.04 ConfidentialVM capture harness",
+        );
+        ubuntu2404_confidential_capture_harness_test_step.dependOn(
+            &run_ubuntu2404_confidential_capture_harness_tests.step,
+        );
+        ubuntu2404_confidential_release_test_step.dependOn(
+            &run_ubuntu2404_confidential_capture_harness_tests.step,
+        );
         const ubuntu2404_confidential_workflow_tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(
@@ -2226,6 +2253,9 @@ pub fn build(b: *std.Build) void {
             );
             aggregate_test_step.dependOn(
                 &run_ubuntu2404_confidential_acceptance_tests.step,
+            );
+            aggregate_test_step.dependOn(
+                &run_ubuntu2404_confidential_capture_harness_tests.step,
             );
             aggregate_test_step.dependOn(
                 &run_ubuntu2404_confidential_workflow_tests.step,
