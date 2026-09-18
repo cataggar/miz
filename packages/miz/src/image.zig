@@ -31,6 +31,8 @@ pub const OpenError = error{
 } || block_device.PreflightError || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError ||
     vhd.Footer.DecodeError || vhd.DynamicHeader.DecodeError || vhdx.OpenError || qcow2.OpenError;
 
+pub const BoundedStandaloneQcow2OpenError = qcow2.BoundedOpenError;
+
 pub const OpenDeviceForWriteError = error{
     BlockDeviceWriteNotPermitted,
     NotBlockDevice,
@@ -540,10 +542,29 @@ pub const Image = struct {
         return openFileWithPath(io, file, null, options);
     }
 
-    /// Takes ownership of a standalone qcow2 file without resolving or
-    /// opening any path named by its header.
+    /// Takes ownership of a standalone qcow2 file on success without
+    /// resolving or opening any path named by its header. On error ownership
+    /// remains with the caller. Closing the returned `Image` closes `file`.
     pub fn openStandaloneQcow2File(io: Io, file: Io.File) OpenError!Image {
         const qcow2_info = try qcow2.openStandalone(io, file);
+        return .{
+            .file = file,
+            .format = .qcow2,
+            .data_offset = 0,
+            .virtual_size = qcow2_info.virtual_size,
+            .qcow2 = qcow2_info,
+        };
+    }
+
+    /// Bounded form of `openStandaloneQcow2File`. Header-derived limits are
+    /// enforced before large metadata scans or allocations. Ownership
+    /// transfers only on success; the caller must close `file` on error.
+    pub fn openStandaloneQcow2FileWithLimits(
+        io: Io,
+        file: Io.File,
+        limits: qcow2.StandaloneOpenLimits,
+    ) BoundedStandaloneQcow2OpenError!Image {
+        const qcow2_info = try qcow2.openStandaloneWithLimits(io, file, limits);
         return .{
             .file = file,
             .format = .qcow2,
@@ -2000,6 +2021,55 @@ test "resize rejects shrinking" {
     var img = try Image.create(io, path, .raw, 4096, .{});
     defer img.close(io);
     try std.testing.expectError(error.ShrinkNotSupported, img.resize(io, 1024));
+}
+
+test "Image legacy and bounded standalone qcow2 error contracts remain separate" {
+    comptime {
+        const HistoricalOpenError = error{
+            UnsupportedVhdDiskType,
+            InvalidBlockSize,
+            NotBlockDevice,
+        } || block_device.PreflightError || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError ||
+            vhd.Footer.DecodeError || vhd.DynamicHeader.DecodeError || vhdx.OpenError || qcow2.OpenError;
+        if (OpenError != HistoricalOpenError) {
+            @compileError("image.OpenError no longer matches the historical public contract");
+        }
+
+        const legacy_open: *const fn (Io, Io.File) HistoricalOpenError!Image = Image.openStandaloneQcow2File;
+        const bounded_open: *const fn (Io, Io.File, qcow2.StandaloneOpenLimits) BoundedStandaloneQcow2OpenError!Image =
+            Image.openStandaloneQcow2FileWithLimits;
+        _ = .{ legacy_open, bounded_open };
+    }
+}
+
+test "bounded standalone qcow2 image open preserves descriptor ownership" {
+    const io = std.testing.io;
+    const path = "test-image-bounded-qcow2-ownership.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    {
+        const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+        defer file.close(io);
+        _ = try qcow2.create(io, file, 4096);
+    }
+
+    {
+        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+        try std.testing.expectError(
+            error.VirtualSizeLimitExceeded,
+            Image.openStandaloneQcow2FileWithLimits(io, file, .{ .max_virtual_size = 4095 }),
+        );
+        _ = try file.stat(io);
+        file.close(io);
+    }
+
+    {
+        const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+        var image = try Image.openStandaloneQcow2FileWithLimits(io, file, .{});
+        defer image.close(io);
+        try std.testing.expectEqual(Format.qcow2, image.format);
+        try std.testing.expectEqual(@as(u64, 4096), image.virtual_size);
+    }
 }
 
 // ---- qcow2 end-to-end integration test ----

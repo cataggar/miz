@@ -65,6 +65,57 @@ const report = try miz.root_resize.growExistingQcow2(allocator, io, path, .{
 The operation accepts standalone QCOW2 files only and performs no qemu,
 libguestfs, `e2fsck`, or `resize2fs` process execution.
 
+## Open an untrusted standalone QCOW2 with explicit limits
+
+`miz.Image.openStandaloneQcow2FileWithLimits` rejects backing and external
+data references without opening their host paths, and applies caller policy
+immediately after decoding the fixed header:
+
+```zig
+const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_only });
+errdefer file.close(io);
+
+var image = try miz.Image.openStandaloneQcow2FileWithLimits(io, file, .{
+    .max_file_bytes = 256 * 1024 * 1024,
+    .max_virtual_size = 8 * 1024 * 1024 * 1024,
+    .min_cluster_bits = 12,
+    .max_cluster_bits = 21,
+    .max_l1_entries = 262_144,
+    .max_l1_table_bytes = 2 * 1024 * 1024,
+    .max_refcount_table_clusters = 64,
+    .max_refcount_table_bytes = 128 * 1024 * 1024,
+    .max_refcount_table_entries = 1_000_000,
+    .max_snapshot_count = 0,
+    .max_snapshot_table_bytes = 0,
+    .max_snapshot_l1_entries = 0,
+    .max_snapshot_l1_table_bytes = 0,
+    .max_metadata_bytes = 160 * 1024 * 1024,
+    .max_metadata_work = 1_100_000,
+});
+defer image.close(io);
+```
+
+`max_metadata_work` counts fixed-header, refcount-entry, snapshot, extension,
+header-string, and optional snapshot-virtual-size reads. The complete
+refcount-table entry count is charged before its first table read, preventing
+sparse-file read amplification. Snapshot directory bytes are charged once
+even when the fixed header and optional virtual-size field are read
+separately. Snapshot directory and snapshot-L1 byte limits are checked before
+payload allocation. Snapshot virtual sizes use the global
+`max_virtual_size`, and every snapshot L1 table must cover the size that
+`openSnapshot` exposes. Limit errors have dedicated names such as
+`error.RefcountTableEntriesLimitExceeded`; structural, unsupported-feature,
+decompression-format, host-I/O, allocation, and cancellation/resource errors
+remain distinct.
+
+The file descriptor transfers to `Image` only when the call succeeds. On
+failure the caller retains it and must close it. The existing
+`openStandaloneQcow2File` and `qcow2.openStandalone` APIs remain available
+with their historical unbounded policy and exact historical `OpenError`.
+Bounded callers can name the additional contract as
+`miz.Qcow2BoundedOpenError` (or `qcow2.BoundedOpenError` when importing the
+standalone QCOW2 package).
+
 ## Read and mutate an ext4 partition without mounting it
 
 `miz.ext4_mountless.FileSystem` opens an existing ext4 filesystem at a byte
