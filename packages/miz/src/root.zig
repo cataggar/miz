@@ -100,6 +100,7 @@ pub const Info = image_mod.Info;
 pub const CreateOptions = image_mod.CreateOptions;
 pub const OpenOptions = image_mod.OpenOptions;
 pub const Qcow2StandaloneOpenLimits = qcow2.StandaloneOpenLimits;
+pub const Qcow2BoundedOpenError = qcow2.BoundedOpenError;
 pub const DeviceWriteOptions = image_mod.DeviceWriteOptions;
 pub const DeviceInfo = image_mod.DeviceInfo;
 pub const DevicePreflightReport = block_device.PreflightReport;

@@ -96,10 +96,14 @@ defer image.close(io);
 ```
 
 `max_metadata_work` counts fixed-header, refcount-entry, snapshot, extension,
-and header-string records. The complete refcount-table entry count is charged
-before its first table read, preventing sparse-file read amplification.
-Snapshot directory and snapshot-L1 byte limits are checked before payload
-allocation. Limit errors have dedicated names such as
+header-string, and optional snapshot-virtual-size reads. The complete
+refcount-table entry count is charged before its first table read, preventing
+sparse-file read amplification. Snapshot directory bytes are charged once
+even when the fixed header and optional virtual-size field are read
+separately. Snapshot directory and snapshot-L1 byte limits are checked before
+payload allocation. Snapshot virtual sizes use the global
+`max_virtual_size`, and every snapshot L1 table must cover the size that
+`openSnapshot` exposes. Limit errors have dedicated names such as
 `error.RefcountTableEntriesLimitExceeded`; structural, unsupported-feature,
 decompression-format, host-I/O, allocation, and cancellation/resource errors
 remain distinct.
@@ -107,7 +111,10 @@ remain distinct.
 The file descriptor transfers to `Image` only when the call succeeds. On
 failure the caller retains it and must close it. The existing
 `openStandaloneQcow2File` and `qcow2.openStandalone` APIs remain available
-with their historical unbounded policy.
+with their historical unbounded policy and exact historical `OpenError`.
+Bounded callers can name the additional contract as
+`miz.Qcow2BoundedOpenError` (or `qcow2.BoundedOpenError` when importing the
+standalone QCOW2 package).
 
 ## Read and mutate an ext4 partition without mounting it
 

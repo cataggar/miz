@@ -88,7 +88,7 @@ pub const StandaloneOpenLimitError = error{
 pub const StandaloneOpenLimits = struct {
     /// Maximum stat-reported top-level file length, including sparse holes.
     max_file_bytes: u64 = std.math.maxInt(u64),
-    /// Maximum guest-visible disk size.
+    /// Maximum guest-visible disk size for the active image and snapshots.
     max_virtual_size: u64 = std.math.maxInt(u64),
     /// Inclusive caller-accepted cluster-bit range.
     min_cluster_bits: u32 = min_cluster_bits,
@@ -110,8 +110,8 @@ pub const StandaloneOpenLimits = struct {
     /// snapshot L1 tables, and header-extension records.
     max_metadata_bytes: u64 = std.math.maxInt(u64),
     /// Header-controlled records inspected during open: the fixed header,
-    /// refcount-table entries, snapshot records, extension records, and
-    /// header-string payload reads.
+    /// refcount-table entries, snapshot records and optional virtual-size
+    /// reads, extension records, and header-string payload reads.
     max_metadata_work: u64 = std.math.maxInt(u64),
 
     fn validate(self: StandaloneOpenLimits) StandaloneOpenLimitError!void {
@@ -149,11 +149,19 @@ pub const OpenError = error{
     RefcountTablePastEndOfFile,
     L1TablePastEndOfFile,
     L1TableTooSmall,
+} || std.mem.Allocator.Error || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError;
+
+pub const BoundedSnapshotValidationError = error{
     SnapshotTablePastEndOfFile,
     InvalidSnapshotEntry,
     MisalignedSnapshotL1Table,
     SnapshotL1TablePastEndOfFile,
-} || StandaloneOpenLimitError || std.mem.Allocator.Error || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError;
+    SnapshotL1TableTooSmall,
+};
+
+/// Errors unique to bounded standalone opens are kept separate so the
+/// historical `OpenError` contract remains source-compatible.
+pub const BoundedOpenError = OpenError || StandaloneOpenLimitError || BoundedSnapshotValidationError;
 
 pub const LookupError = error{
     L1TableTooSmall,
@@ -409,7 +417,7 @@ pub fn openStandaloneWithLimits(
     io: Io,
     file: Io.File,
     limits: StandaloneOpenLimits,
-) OpenError!Info {
+) BoundedOpenError!Info {
     const parsed = try parseLayerWithOptions(file, io, .{
         .standalone = true,
         .limits = limits,
@@ -437,7 +445,30 @@ fn openInternal(io: Io, file: Io.File, source_path: ?[]const u8) OpenError!Info 
 }
 
 fn parseLayer(file: Io.File, io: Io) OpenError!ParsedLayer {
-    return parseLayerWithOptions(file, io, .{});
+    return parseLayerWithOptions(file, io, .{}) catch |err| switch (err) {
+        error.InvalidStandaloneOpenLimits,
+        error.FileSizeLimitExceeded,
+        error.VirtualSizeLimitExceeded,
+        error.ClusterGeometryLimitExceeded,
+        error.L1EntriesLimitExceeded,
+        error.L1TableBytesLimitExceeded,
+        error.RefcountTableClustersLimitExceeded,
+        error.RefcountTableBytesLimitExceeded,
+        error.RefcountTableEntriesLimitExceeded,
+        error.SnapshotCountLimitExceeded,
+        error.SnapshotTableBytesLimitExceeded,
+        error.SnapshotL1EntriesLimitExceeded,
+        error.SnapshotL1TableBytesLimitExceeded,
+        error.MetadataBytesLimitExceeded,
+        error.MetadataWorkLimitExceeded,
+        error.SnapshotTablePastEndOfFile,
+        error.InvalidSnapshotEntry,
+        error.MisalignedSnapshotL1Table,
+        error.SnapshotL1TablePastEndOfFile,
+        error.SnapshotL1TableTooSmall,
+        => unreachable,
+        else => |legacy_err| return legacy_err,
+    };
 }
 
 const ParseLayerOptions = struct {
@@ -468,7 +499,7 @@ fn parseLayerWithOptions(
     file: Io.File,
     io: Io,
     options: ParseLayerOptions,
-) OpenError!ParsedLayer {
+) BoundedOpenError!ParsedLayer {
     const file_size = (try file.stat(io)).size;
     if (options.limits) |limits| {
         try limits.validate();
@@ -597,8 +628,8 @@ fn parseLayerWithOptions(
     }
 
     const l2_entries = cluster_size / l2EntrySizeBytes(incompatible_features);
-    const guest_clusters = divCeil(virtual_size, cluster_size);
-    const required_l1_entries = divCeil(guest_clusters, l2_entries);
+    const required_l1_entries = requiredL1Entries(virtual_size, cluster_size, l2_entries) orelse
+        return error.L1TableTooSmall;
     if (l1_size < required_l1_entries) return error.L1TableTooSmall;
 
     const refcount_table_capacity_blocks = @as(u64, refcount_table_clusters) * cluster_size / 8;
@@ -662,6 +693,7 @@ fn parseLayerWithOptions(
             io,
             parsed.info,
             limits,
+            work_budget.?,
             metadata_budget.?,
         );
         refcount_block_count = try scanRefcountBlockCount(
@@ -1325,7 +1357,7 @@ fn readHeaderExtensions(
     parsed: *ParsedLayer,
     work_budget: ?*OpenBudget,
     metadata_budget: ?*OpenBudget,
-) OpenError!void {
+) BoundedOpenError!void {
     var offset = @as(u64, header_length);
     while (true) {
         const header_end = std.math.add(u64, offset, 8) catch return error.InvalidHeaderStringRange;
@@ -1365,8 +1397,9 @@ fn scanSnapshotMetadata(
     io: Io,
     info: LayerInfo,
     limits: StandaloneOpenLimits,
+    work_budget: *OpenBudget,
     metadata_budget: *OpenBudget,
-) OpenError!SnapshotMetadata {
+) BoundedOpenError!SnapshotMetadata {
     var result: SnapshotMetadata = .{};
     if (info.snapshot_count == 0) return result;
     if (info.snapshots_offset == 0 or info.snapshots_offset >= info.file_size) {
@@ -1436,6 +1469,32 @@ fn scanSnapshotMetadata(
             }
             return error.SnapshotL1TablePastEndOfFile;
         }
+
+        var snapshot_virtual_size = info.virtual_size;
+        if (extra_data_size >= 16) {
+            try work_budget.charge(1, error.MetadataWorkLimitExceeded);
+            const virtual_size_offset = std.math.add(u64, header_end, 8) catch
+                return error.InvalidSnapshotEntry;
+            var virtual_size_bytes: [8]u8 = undefined;
+            const virtual_size_got = try file.readPositionalAll(
+                io,
+                &virtual_size_bytes,
+                virtual_size_offset,
+            );
+            if (virtual_size_got != virtual_size_bytes.len) {
+                return error.SnapshotTablePastEndOfFile;
+            }
+            snapshot_virtual_size = std.mem.readInt(u64, &virtual_size_bytes, .big);
+            if (snapshot_virtual_size > limits.max_virtual_size) {
+                return error.VirtualSizeLimitExceeded;
+            }
+        }
+        const required_l1_entries = requiredL1Entries(
+            snapshot_virtual_size,
+            info.cluster_size,
+            info.l2_entries,
+        ) orelse return error.InvalidSnapshotEntry;
+        if (l1_size < required_l1_entries) return error.SnapshotL1TableTooSmall;
 
         result = .{
             .table_bytes = table_bytes,
@@ -2273,6 +2332,11 @@ fn divCeil(numerator: u64, denominator: u64) u64 {
     return std.math.divCeil(u64, numerator, denominator) catch unreachable;
 }
 
+fn requiredL1Entries(virtual_size: u64, cluster_size: u64, l2_entries: u64) ?u64 {
+    const guest_clusters = std.math.divCeil(u64, virtual_size, cluster_size) catch return null;
+    return std.math.divCeil(u64, guest_clusters, l2_entries) catch return null;
+}
+
 // ---------------------------------------------------------------------------
 // Standalone compressed-image writer
 //
@@ -2652,6 +2716,49 @@ pub fn writeStandaloneCompressed(
     return info;
 }
 
+test "legacy and bounded open error contracts remain separate" {
+    comptime {
+        const HistoricalOpenError = error{
+            BadFileSignature,
+            UnsupportedVersion,
+            UnsupportedClusterSize,
+            HeaderTooShort,
+            HeaderExceedsClusterSize,
+            HeaderPastEndOfFile,
+            EncryptionNotSupported,
+            UnsupportedIncompatibleFeature,
+            ExternalDataFileNotSupported,
+            BackingFileNotSupported,
+            UnsupportedCompressionType,
+            ExtendedL2NotSupported,
+            MissingExternalDataFileName,
+            RelativeExternalDataFilePath,
+            RelativeBackingFilePath,
+            BackingChainTooDeep,
+            BackingChainLoop,
+            HeaderStringTooLong,
+            InvalidHeaderStringRange,
+            InvalidRefcountOrder,
+            MissingRefcountTable,
+            MisalignedRefcountTable,
+            InvalidRefcountBlock,
+            MisalignedL1Table,
+            RefcountTablePastEndOfFile,
+            L1TablePastEndOfFile,
+            L1TableTooSmall,
+        } || std.mem.Allocator.Error || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError;
+        if (OpenError != HistoricalOpenError) {
+            @compileError("qcow2.OpenError no longer matches the historical public contract");
+        }
+
+        const legacy_open: *const fn (Io, Io.File) HistoricalOpenError!Info = open;
+        const legacy_standalone: *const fn (Io, Io.File) HistoricalOpenError!Info = openStandalone;
+        const legacy_at_path: *const fn (Io, Io.File, []const u8) HistoricalOpenError!Info = openAtPath;
+        const bounded_open: *const fn (Io, Io.File, StandaloneOpenLimits) BoundedOpenError!Info = openStandaloneWithLimits;
+        _ = .{ legacy_open, legacy_standalone, legacy_at_path, bounded_open };
+    }
+}
+
 test "open parses a minimal qcow2 header" {
     const io = std.testing.io;
     const path = "test-qcow2-open.qcow2";
@@ -2842,6 +2949,99 @@ test "bounded standalone open rejects snapshot directory and L1 geometry before 
             .max_snapshot_table_bytes = entry.len,
             .max_snapshot_l1_table_bytes = 7,
         }),
+    );
+}
+
+test "bounded standalone open validates snapshot virtual sizes after aggregate budgets" {
+    const io = std.testing.io;
+    const path = "test-qcow2-bounded-snapshot-virtual-size.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const fixture = try writeTestFixture(io, path, .{});
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+
+    _ = try installBoundedSnapshot(file, io, fixture, .{
+        .extra_data_size = 8,
+        .virtual_size = 0,
+    });
+    _ = try openStandaloneWithLimits(io, file, .{
+        .max_virtual_size = 3 * fixture.cluster_size,
+        .max_snapshot_count = 1,
+        .max_snapshot_table_bytes = 48,
+        .max_snapshot_l1_entries = 1,
+        .max_snapshot_l1_table_bytes = 8,
+        .max_metadata_work = 515,
+    });
+
+    const snapshot_virtual_size = 4 * fixture.cluster_size;
+    _ = try installBoundedSnapshot(file, io, fixture, .{
+        .virtual_size = snapshot_virtual_size,
+    });
+    try std.testing.expectError(
+        error.MetadataWorkLimitExceeded,
+        openStandaloneWithLimits(io, file, .{
+            .max_virtual_size = 3 * fixture.cluster_size,
+            .max_metadata_work = 515,
+        }),
+    );
+    try std.testing.expectError(
+        error.VirtualSizeLimitExceeded,
+        openStandaloneWithLimits(io, file, .{
+            .max_virtual_size = 3 * fixture.cluster_size,
+            .max_metadata_work = 516,
+        }),
+    );
+
+    _ = try openStandaloneWithLimits(io, file, .{
+        .max_virtual_size = snapshot_virtual_size,
+        .max_snapshot_count = 1,
+        .max_snapshot_table_bytes = 56,
+        .max_snapshot_l1_entries = 1,
+        .max_snapshot_l1_table_bytes = 8,
+        .max_metadata_bytes = 4280,
+        .max_metadata_work = 516,
+    });
+}
+
+test "bounded standalone open rejects snapshot L1 coverage edges and truncation" {
+    const io = std.testing.io;
+    const path = "test-qcow2-bounded-snapshot-coverage.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const fixture = try writeTestFixture(io, path, .{});
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+
+    const two_l1_entries_virtual_size = fixture.cluster_size * (fixture.cluster_size / l2_entry_size) + 1;
+    _ = try installBoundedSnapshot(file, io, fixture, .{
+        .virtual_size = two_l1_entries_virtual_size,
+    });
+    const legacy_info = try openStandalone(io, file);
+    try std.testing.expectEqual(3 * fixture.cluster_size, legacy_info.virtual_size);
+    try std.testing.expectError(
+        error.SnapshotL1TableTooSmall,
+        openStandaloneWithLimits(io, file, .{
+            .max_virtual_size = two_l1_entries_virtual_size,
+            .max_metadata_work = 516,
+        }),
+    );
+
+    _ = try installBoundedSnapshot(file, io, fixture, .{
+        .virtual_size = std.math.maxInt(u64),
+    });
+    try std.testing.expectError(
+        error.SnapshotL1TableTooSmall,
+        openStandaloneWithLimits(io, file, .{ .max_metadata_work = 516 }),
+    );
+
+    const snapshot_offset = try installBoundedSnapshot(file, io, fixture, .{
+        .virtual_size = 3 * fixture.cluster_size,
+    });
+    try file.setLength(io, snapshot_offset + 48);
+    try std.testing.expectError(
+        error.SnapshotTablePastEndOfFile,
+        openStandaloneWithLimits(io, file, .{}),
     );
 }
 
@@ -3676,6 +3876,35 @@ const SnapshotEntrySpec = struct {
 const ExtendedL2Fixture = struct {
     cluster_size: u64,
 };
+
+const BoundedSnapshotSpec = struct {
+    l1_size: u32 = 1,
+    extra_data_size: u32 = 16,
+    virtual_size: u64,
+};
+
+fn installBoundedSnapshot(
+    file: Io.File,
+    io: Io,
+    fixture: TestFixture,
+    spec: BoundedSnapshotSpec,
+) !u64 {
+    std.debug.assert(spec.extra_data_size <= 16);
+    const snapshot_offset = 5 * fixture.cluster_size;
+    try writeHeaderU32Field(file, io, 60, 1);
+    try writeHeaderU64Field(file, io, 64, snapshot_offset);
+
+    var entry: [56]u8 = [_]u8{0} ** 56;
+    std.mem.writeInt(u64, entry[0..8], fixture.l1_table_offset, .big);
+    std.mem.writeInt(u32, entry[8..12], spec.l1_size, .big);
+    std.mem.writeInt(u32, entry[36..40], spec.extra_data_size, .big);
+    if (spec.extra_data_size >= 16) {
+        std.mem.writeInt(u64, entry[48..56], spec.virtual_size, .big);
+    }
+    const entry_len: usize = @intCast(40 + spec.extra_data_size);
+    try file.writePositionalAll(io, entry[0..entry_len], snapshot_offset);
+    return snapshot_offset;
+}
 
 fn writeTestFixture(io: Io, path: []const u8, options: TestFixtureOptions) !TestFixture {
     const cluster_bits: u32 = 12;
