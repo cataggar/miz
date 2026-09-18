@@ -540,10 +540,29 @@ pub const Image = struct {
         return openFileWithPath(io, file, null, options);
     }
 
-    /// Takes ownership of a standalone qcow2 file without resolving or
-    /// opening any path named by its header.
+    /// Takes ownership of a standalone qcow2 file on success without
+    /// resolving or opening any path named by its header. On error ownership
+    /// remains with the caller. Closing the returned `Image` closes `file`.
     pub fn openStandaloneQcow2File(io: Io, file: Io.File) OpenError!Image {
         const qcow2_info = try qcow2.openStandalone(io, file);
+        return .{
+            .file = file,
+            .format = .qcow2,
+            .data_offset = 0,
+            .virtual_size = qcow2_info.virtual_size,
+            .qcow2 = qcow2_info,
+        };
+    }
+
+    /// Bounded form of `openStandaloneQcow2File`. Header-derived limits are
+    /// enforced before large metadata scans or allocations. Ownership
+    /// transfers only on success; the caller must close `file` on error.
+    pub fn openStandaloneQcow2FileWithLimits(
+        io: Io,
+        file: Io.File,
+        limits: qcow2.StandaloneOpenLimits,
+    ) OpenError!Image {
+        const qcow2_info = try qcow2.openStandaloneWithLimits(io, file, limits);
         return .{
             .file = file,
             .format = .qcow2,

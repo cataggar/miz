@@ -64,6 +64,63 @@ const header_extension_end_magic: u32 = 0;
 const header_extension_external_data_file_magic: u32 = 0x4441_5441;
 const extl2_subcluster_count: u32 = 32;
 
+pub const StandaloneOpenLimitError = error{
+    InvalidStandaloneOpenLimits,
+    FileSizeLimitExceeded,
+    VirtualSizeLimitExceeded,
+    ClusterGeometryLimitExceeded,
+    L1EntriesLimitExceeded,
+    L1TableBytesLimitExceeded,
+    RefcountTableClustersLimitExceeded,
+    RefcountTableBytesLimitExceeded,
+    RefcountTableEntriesLimitExceeded,
+    SnapshotCountLimitExceeded,
+    SnapshotTableBytesLimitExceeded,
+    SnapshotL1EntriesLimitExceeded,
+    SnapshotL1TableBytesLimitExceeded,
+    MetadataBytesLimitExceeded,
+    MetadataWorkLimitExceeded,
+};
+
+/// Caller-owned policy for bounded standalone opens. Defaults retain the
+/// historical unbounded geometry while allowing callers to cap every
+/// header-controlled table and the aggregate records inspected during open.
+pub const StandaloneOpenLimits = struct {
+    /// Maximum stat-reported top-level file length, including sparse holes.
+    max_file_bytes: u64 = std.math.maxInt(u64),
+    /// Maximum guest-visible disk size.
+    max_virtual_size: u64 = std.math.maxInt(u64),
+    /// Inclusive caller-accepted cluster-bit range.
+    min_cluster_bits: u32 = min_cluster_bits,
+    max_cluster_bits: u32 = max_cluster_bits,
+    /// Active L1 table limits.
+    max_l1_entries: u64 = std.math.maxInt(u64),
+    max_l1_table_bytes: u64 = std.math.maxInt(u64),
+    /// Refcount table limits, including the number of eight-byte slots scanned.
+    max_refcount_table_clusters: u64 = std.math.maxInt(u64),
+    max_refcount_table_bytes: u64 = std.math.maxInt(u64),
+    max_refcount_table_entries: u64 = std.math.maxInt(u64),
+    /// Snapshot directory limits.
+    max_snapshot_count: u64 = std.math.maxInt(u64),
+    max_snapshot_table_bytes: u64 = std.math.maxInt(u64),
+    /// Aggregate L1 entries and bytes named by all snapshot records.
+    max_snapshot_l1_entries: u64 = std.math.maxInt(u64),
+    max_snapshot_l1_table_bytes: u64 = std.math.maxInt(u64),
+    /// Sum of the header, active L1 table, refcount table, snapshot directory,
+    /// snapshot L1 tables, and header-extension records.
+    max_metadata_bytes: u64 = std.math.maxInt(u64),
+    /// Header-controlled records inspected during open: the fixed header,
+    /// refcount-table entries, snapshot records, extension records, and
+    /// header-string payload reads.
+    max_metadata_work: u64 = std.math.maxInt(u64),
+
+    fn validate(self: StandaloneOpenLimits) StandaloneOpenLimitError!void {
+        if (self.min_cluster_bits > self.max_cluster_bits) {
+            return error.InvalidStandaloneOpenLimits;
+        }
+    }
+};
+
 pub const OpenError = error{
     BadFileSignature,
     UnsupportedVersion,
@@ -92,7 +149,11 @@ pub const OpenError = error{
     RefcountTablePastEndOfFile,
     L1TablePastEndOfFile,
     L1TableTooSmall,
-} || std.mem.Allocator.Error || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError;
+    SnapshotTablePastEndOfFile,
+    InvalidSnapshotEntry,
+    MisalignedSnapshotL1Table,
+    SnapshotL1TablePastEndOfFile,
+} || StandaloneOpenLimitError || std.mem.Allocator.Error || Io.File.OpenError || Io.File.ReadPositionalError || Io.File.StatError;
 
 pub const LookupError = error{
     L1TableTooSmall,
@@ -340,6 +401,24 @@ pub fn openStandalone(io: Io, file: Io.File) OpenError!Info {
     return infoFromParsed(parsed);
 }
 
+/// Bounded form of `openStandalone`. Limits are enforced from fixed-header
+/// metadata before any refcount-table scan, snapshot payload allocation, or
+/// referenced host-path I/O. The function borrows `file`; ownership is
+/// unchanged on both success and failure.
+pub fn openStandaloneWithLimits(
+    io: Io,
+    file: Io.File,
+    limits: StandaloneOpenLimits,
+) OpenError!Info {
+    const parsed = try parseLayerWithOptions(file, io, .{
+        .standalone = true,
+        .limits = limits,
+    });
+    if (parsed.backing_file_len != 0) return error.BackingFileNotSupported;
+    if (parsed.data_file_len != 0) return error.ExternalDataFileNotSupported;
+    return infoFromParsed(parsed);
+}
+
 pub fn openAtPath(io: Io, file: Io.File, path: []const u8) OpenError!Info {
     return openInternal(io, file, path);
 }
@@ -358,7 +437,43 @@ fn openInternal(io: Io, file: Io.File, source_path: ?[]const u8) OpenError!Info 
 }
 
 fn parseLayer(file: Io.File, io: Io) OpenError!ParsedLayer {
+    return parseLayerWithOptions(file, io, .{});
+}
+
+const ParseLayerOptions = struct {
+    standalone: bool = false,
+    limits: ?StandaloneOpenLimits = null,
+};
+
+const OpenBudget = struct {
+    remaining: u64,
+
+    fn charge(
+        self: *OpenBudget,
+        amount: u64,
+        limit_error: StandaloneOpenLimitError,
+    ) StandaloneOpenLimitError!void {
+        if (amount > self.remaining) return limit_error;
+        self.remaining -= amount;
+    }
+};
+
+const SnapshotMetadata = struct {
+    table_bytes: u64 = 0,
+    l1_entries: u64 = 0,
+    l1_table_bytes: u64 = 0,
+};
+
+fn parseLayerWithOptions(
+    file: Io.File,
+    io: Io,
+    options: ParseLayerOptions,
+) OpenError!ParsedLayer {
     const file_size = (try file.stat(io)).size;
+    if (options.limits) |limits| {
+        try limits.validate();
+        if (file_size > limits.max_file_bytes) return error.FileSizeLimitExceeded;
+    }
 
     var header: [header_buffer_size]u8 = undefined;
     const n = try file.readPositionalAll(io, &header, 0);
@@ -416,10 +531,57 @@ fn parseLayer(file: Io.File, io: Io) OpenError!ParsedLayer {
         return error.UnsupportedClusterSize;
     }
 
+    if (options.standalone) {
+        if (backing_file_size != 0) return error.BackingFileNotSupported;
+        if (backing_file_offset != 0) return error.InvalidHeaderStringRange;
+        if (incompatible_features & incompatible_data_file != 0) {
+            return error.ExternalDataFileNotSupported;
+        }
+    }
+
     if (refcount_order > 6) return error.InvalidRefcountOrder;
     if (refcount_table_clusters == 0) return error.MissingRefcountTable;
 
     const refcount_table_bytes = std.math.mul(u64, @as(u64, refcount_table_clusters), cluster_size) catch return error.RefcountTablePastEndOfFile;
+    const refcount_table_entries = refcount_table_bytes / l2_entry_size;
+    const l1_table_bytes = std.math.mul(u64, @as(u64, l1_size), l2_entry_size) catch return error.L1TablePastEndOfFile;
+
+    var work_budget_storage: OpenBudget = undefined;
+    var metadata_budget_storage: OpenBudget = undefined;
+    const work_budget: ?*OpenBudget = if (options.limits) |limits| blk: {
+        if (virtual_size > limits.max_virtual_size) return error.VirtualSizeLimitExceeded;
+        if (cluster_bits < limits.min_cluster_bits or cluster_bits > limits.max_cluster_bits) {
+            return error.ClusterGeometryLimitExceeded;
+        }
+        if (l1_size > limits.max_l1_entries) return error.L1EntriesLimitExceeded;
+        if (l1_table_bytes > limits.max_l1_table_bytes) return error.L1TableBytesLimitExceeded;
+        if (refcount_table_clusters > limits.max_refcount_table_clusters) {
+            return error.RefcountTableClustersLimitExceeded;
+        }
+        if (refcount_table_bytes > limits.max_refcount_table_bytes) {
+            return error.RefcountTableBytesLimitExceeded;
+        }
+        if (refcount_table_entries > limits.max_refcount_table_entries) {
+            return error.RefcountTableEntriesLimitExceeded;
+        }
+        if (snapshot_count > limits.max_snapshot_count) return error.SnapshotCountLimitExceeded;
+
+        work_budget_storage = .{ .remaining = limits.max_metadata_work };
+        try work_budget_storage.charge(1, error.MetadataWorkLimitExceeded);
+        try work_budget_storage.charge(refcount_table_entries, error.MetadataWorkLimitExceeded);
+        try work_budget_storage.charge(snapshot_count, error.MetadataWorkLimitExceeded);
+
+        metadata_budget_storage = .{ .remaining = limits.max_metadata_bytes };
+        try metadata_budget_storage.charge(header_length, error.MetadataBytesLimitExceeded);
+        try metadata_budget_storage.charge(l1_table_bytes, error.MetadataBytesLimitExceeded);
+        try metadata_budget_storage.charge(refcount_table_bytes, error.MetadataBytesLimitExceeded);
+        break :blk &work_budget_storage;
+    } else null;
+    const metadata_budget: ?*OpenBudget = if (options.limits != null)
+        &metadata_budget_storage
+    else
+        null;
+
     if (!tableFits(file_size, refcount_table_offset, refcount_table_bytes, cluster_size, cluster_size)) {
         if (!isAligned(refcount_table_offset, cluster_size) or refcount_table_offset < cluster_size) {
             return error.MisalignedRefcountTable;
@@ -427,7 +589,6 @@ fn parseLayer(file: Io.File, io: Io) OpenError!ParsedLayer {
         return error.RefcountTablePastEndOfFile;
     }
 
-    const l1_table_bytes = std.math.mul(u64, @as(u64, l1_size), l2_entry_size) catch return error.L1TablePastEndOfFile;
     if (!tableFits(file_size, l1_table_offset, l1_table_bytes, cluster_size, cluster_size)) {
         if (!isAligned(l1_table_offset, cluster_size) or l1_table_offset < cluster_size) {
             return error.MisalignedL1Table;
@@ -441,7 +602,10 @@ fn parseLayer(file: Io.File, io: Io) OpenError!ParsedLayer {
     if (l1_size < required_l1_entries) return error.L1TableTooSmall;
 
     const refcount_table_capacity_blocks = @as(u64, refcount_table_clusters) * cluster_size / 8;
-    const refcount_block_count = try scanRefcountBlockCount(file, io, refcount_table_offset, refcount_table_clusters, cluster_size, file_size);
+    var refcount_block_count: u32 = 0;
+    if (options.limits == null) {
+        refcount_block_count = try scanRefcountBlockCount(file, io, refcount_table_offset, refcount_table_clusters, cluster_size, file_size);
+    }
 
     var parsed = ParsedLayer{
         .info = .{
@@ -467,16 +631,48 @@ fn parseLayer(file: Io.File, io: Io) OpenError!ParsedLayer {
         },
     };
     if (backing_file_size != 0) {
+        if (work_budget) |budget| try budget.charge(1, error.MetadataWorkLimitExceeded);
         try readHeaderString(file, io, backing_file_offset, backing_file_size, file_size, &parsed.backing_file_path, &parsed.backing_file_len);
     } else if (backing_file_offset != 0) {
         return error.InvalidHeaderStringRange;
     }
     if (version >= 3) {
         const extensions_end = if (backing_file_offset != 0) backing_file_offset else cluster_size;
-        try readHeaderExtensions(file, io, header_length, extensions_end, file_size, &parsed);
+        try readHeaderExtensions(
+            file,
+            io,
+            header_length,
+            extensions_end,
+            file_size,
+            &parsed,
+            work_budget,
+            metadata_budget,
+        );
     }
     if (incompatible_features & incompatible_data_file != 0 and parsed.data_file_len == 0) {
         return error.MissingExternalDataFileName;
+    }
+    if (options.standalone and parsed.data_file_len != 0) {
+        return error.ExternalDataFileNotSupported;
+    }
+
+    if (options.limits) |limits| {
+        _ = try scanSnapshotMetadata(
+            file,
+            io,
+            parsed.info,
+            limits,
+            metadata_budget.?,
+        );
+        refcount_block_count = try scanRefcountBlockCount(
+            file,
+            io,
+            refcount_table_offset,
+            refcount_table_clusters,
+            cluster_size,
+            file_size,
+        );
+        parsed.info.refcount_block_count = refcount_block_count;
     }
     return parsed;
 }
@@ -1116,7 +1312,8 @@ fn readHeaderString(
     const end = std.math.add(u64, offset, size) catch return error.InvalidHeaderStringRange;
     if (offset == 0 or end > file_size) return error.InvalidHeaderStringRange;
     dest_len.* = @intCast(size);
-    _ = try file.readPositionalAll(io, dest[0..size], offset);
+    const got = try file.readPositionalAll(io, dest[0..size], offset);
+    if (got != size) return error.InvalidHeaderStringRange;
 }
 
 fn readHeaderExtensions(
@@ -1126,22 +1323,34 @@ fn readHeaderExtensions(
     extensions_end: u64,
     file_size: u64,
     parsed: *ParsedLayer,
+    work_budget: ?*OpenBudget,
+    metadata_budget: ?*OpenBudget,
 ) OpenError!void {
     var offset = @as(u64, header_length);
-    while (offset + 8 <= extensions_end and offset + 8 <= file_size) {
+    while (true) {
+        const header_end = std.math.add(u64, offset, 8) catch return error.InvalidHeaderStringRange;
+        if (header_end > extensions_end or header_end > file_size) return;
+        if (work_budget) |budget| try budget.charge(1, error.MetadataWorkLimitExceeded);
+        if (metadata_budget) |budget| try budget.charge(8, error.MetadataBytesLimitExceeded);
+
         var ext_header: [8]u8 = undefined;
-        _ = try file.readPositionalAll(io, &ext_header, offset);
+        const got = try file.readPositionalAll(io, &ext_header, offset);
+        if (got != ext_header.len) return error.InvalidHeaderStringRange;
         const magic = std.mem.readInt(u32, ext_header[0..4], .big);
         const len = std.mem.readInt(u32, ext_header[4..8], .big);
         if (magic == header_extension_end_magic) return;
 
-        const data_offset = offset + 8;
+        const data_offset = header_end;
         const data_end = std.math.add(u64, data_offset, len) catch return error.InvalidHeaderStringRange;
-        const ext_end = std.mem.alignForward(u64, data_end, 8);
+        const ext_end = alignForwardChecked(data_end, 8) orelse return error.InvalidHeaderStringRange;
         if (ext_end > extensions_end or data_end > file_size) return error.InvalidHeaderStringRange;
+        if (metadata_budget) |budget| {
+            try budget.charge(ext_end - data_offset, error.MetadataBytesLimitExceeded);
+        }
 
         switch (magic) {
             header_extension_external_data_file_magic => {
+                if (work_budget) |budget| try budget.charge(1, error.MetadataWorkLimitExceeded);
                 try readHeaderString(file, io, data_offset, len, file_size, &parsed.data_file_path, &parsed.data_file_len);
             },
             else => {},
@@ -1149,6 +1358,93 @@ fn readHeaderExtensions(
 
         offset = ext_end;
     }
+}
+
+fn scanSnapshotMetadata(
+    file: Io.File,
+    io: Io,
+    info: LayerInfo,
+    limits: StandaloneOpenLimits,
+    metadata_budget: *OpenBudget,
+) OpenError!SnapshotMetadata {
+    var result: SnapshotMetadata = .{};
+    if (info.snapshot_count == 0) return result;
+    if (info.snapshots_offset == 0 or info.snapshots_offset >= info.file_size) {
+        return error.SnapshotTablePastEndOfFile;
+    }
+
+    var cursor = info.snapshots_offset;
+    var index: u32 = 0;
+    while (index < info.snapshot_count) : (index += 1) {
+        const header_end = std.math.add(u64, cursor, 40) catch return error.InvalidSnapshotEntry;
+        if (header_end > info.file_size) return error.SnapshotTablePastEndOfFile;
+
+        const minimum_table_bytes = std.math.add(u64, result.table_bytes, 40) catch
+            return error.InvalidSnapshotEntry;
+        if (minimum_table_bytes > limits.max_snapshot_table_bytes) {
+            return error.SnapshotTableBytesLimitExceeded;
+        }
+        try metadata_budget.charge(40, error.MetadataBytesLimitExceeded);
+
+        var entry_header: [40]u8 = undefined;
+        const got = try file.readPositionalAll(io, &entry_header, cursor);
+        if (got != entry_header.len) return error.SnapshotTablePastEndOfFile;
+
+        const l1_table_offset = std.mem.readInt(u64, entry_header[0..8], .big);
+        const l1_size = std.mem.readInt(u32, entry_header[8..12], .big);
+        const id_len = std.mem.readInt(u16, entry_header[12..14], .big);
+        const name_len = std.mem.readInt(u16, entry_header[14..16], .big);
+        const extra_data_size = std.mem.readInt(u32, entry_header[36..40], .big);
+
+        const raw_entry_size = std.math.add(u64, 40, extra_data_size) catch return error.InvalidSnapshotEntry;
+        const with_id = std.math.add(u64, raw_entry_size, id_len) catch return error.InvalidSnapshotEntry;
+        const entry_size = std.math.add(u64, with_id, name_len) catch return error.InvalidSnapshotEntry;
+        const padded_entry_size = alignForwardChecked(entry_size, 8) orelse return error.InvalidSnapshotEntry;
+        const entry_end = std.math.add(u64, cursor, padded_entry_size) catch return error.InvalidSnapshotEntry;
+        if (entry_end > info.file_size) return error.SnapshotTablePastEndOfFile;
+
+        const table_bytes = std.math.add(u64, result.table_bytes, padded_entry_size) catch
+            return error.InvalidSnapshotEntry;
+        if (table_bytes > limits.max_snapshot_table_bytes) {
+            return error.SnapshotTableBytesLimitExceeded;
+        }
+        try metadata_budget.charge(padded_entry_size - 40, error.MetadataBytesLimitExceeded);
+
+        const l1_entries = std.math.add(u64, result.l1_entries, l1_size) catch
+            return error.SnapshotL1EntriesLimitExceeded;
+        if (l1_entries > limits.max_snapshot_l1_entries) {
+            return error.SnapshotL1EntriesLimitExceeded;
+        }
+        const l1_bytes = std.math.mul(u64, l1_size, l2_entry_size) catch
+            return error.SnapshotL1TableBytesLimitExceeded;
+        const total_l1_bytes = std.math.add(u64, result.l1_table_bytes, l1_bytes) catch
+            return error.SnapshotL1TableBytesLimitExceeded;
+        if (total_l1_bytes > limits.max_snapshot_l1_table_bytes) {
+            return error.SnapshotL1TableBytesLimitExceeded;
+        }
+        try metadata_budget.charge(l1_bytes, error.MetadataBytesLimitExceeded);
+
+        if (l1_size != 0 and !tableFits(
+            info.file_size,
+            l1_table_offset,
+            l1_bytes,
+            info.cluster_size,
+            info.cluster_size,
+        )) {
+            if (!isAligned(l1_table_offset, info.cluster_size) or l1_table_offset < info.cluster_size) {
+                return error.MisalignedSnapshotL1Table;
+            }
+            return error.SnapshotL1TablePastEndOfFile;
+        }
+
+        result = .{
+            .table_bytes = table_bytes,
+            .l1_entries = l1_entries,
+            .l1_table_bytes = total_l1_bytes,
+        };
+        cursor = entry_end;
+    }
+    return result;
 }
 
 fn resolveLayerDataFile(io: Io, info: anytype, source_path: ?[]const u8) OpenError!void {
@@ -1288,10 +1584,12 @@ pub fn listSnapshots(file: Io.File, io: Io, info: Info, allocator: std.mem.Alloc
     var cursor = info.snapshots_offset;
     var index: u32 = 0;
     while (index < info.snapshot_count) : (index += 1) {
-        if (cursor + 40 > info.file_size) return error.SnapshotTablePastEndOfFile;
+        const header_end = std.math.add(u64, cursor, 40) catch return error.InvalidSnapshotEntry;
+        if (header_end > info.file_size) return error.SnapshotTablePastEndOfFile;
 
         var entry_header: [40]u8 = undefined;
-        _ = try file.readPositionalAll(io, &entry_header, cursor);
+        const got = try file.readPositionalAll(io, &entry_header, cursor);
+        if (got != entry_header.len) return error.SnapshotTablePastEndOfFile;
 
         const l1_table_offset = std.mem.readInt(u64, entry_header[0..8], .big);
         const l1_size = std.mem.readInt(u32, entry_header[8..12], .big);
@@ -1305,7 +1603,7 @@ pub fn listSnapshots(file: Io.File, io: Io, info: Info, allocator: std.mem.Alloc
         const raw_entry_size = std.math.add(u64, 40, extra_data_size) catch return error.InvalidSnapshotEntry;
         const with_id = std.math.add(u64, raw_entry_size, id_len) catch return error.InvalidSnapshotEntry;
         const entry_size = std.math.add(u64, with_id, name_len) catch return error.InvalidSnapshotEntry;
-        const padded_entry_size = std.mem.alignForward(u64, entry_size, 8);
+        const padded_entry_size = alignForwardChecked(entry_size, 8) orelse return error.InvalidSnapshotEntry;
         const entry_end = std.math.add(u64, cursor, padded_entry_size) catch return error.InvalidSnapshotEntry;
         if (entry_end > info.file_size) return error.SnapshotTablePastEndOfFile;
 
@@ -1362,10 +1660,12 @@ fn snapshotTableByteLen(file: Io.File, io: Io, info: Info) ListSnapshotsError!u6
     var cursor = info.snapshots_offset;
     var index: u32 = 0;
     while (index < info.snapshot_count) : (index += 1) {
-        if (cursor + 40 > info.file_size) return error.SnapshotTablePastEndOfFile;
+        const header_end = std.math.add(u64, cursor, 40) catch return error.InvalidSnapshotEntry;
+        if (header_end > info.file_size) return error.SnapshotTablePastEndOfFile;
 
         var entry_header: [40]u8 = undefined;
-        _ = try file.readPositionalAll(io, &entry_header, cursor);
+        const got = try file.readPositionalAll(io, &entry_header, cursor);
+        if (got != entry_header.len) return error.SnapshotTablePastEndOfFile;
 
         const id_len = std.mem.readInt(u16, entry_header[12..14], .big);
         const name_len = std.mem.readInt(u16, entry_header[14..16], .big);
@@ -1374,7 +1674,7 @@ fn snapshotTableByteLen(file: Io.File, io: Io, info: Info) ListSnapshotsError!u6
         const raw_entry_size = std.math.add(u64, 40, extra_data_size) catch return error.InvalidSnapshotEntry;
         const with_id = std.math.add(u64, raw_entry_size, id_len) catch return error.InvalidSnapshotEntry;
         const entry_size = std.math.add(u64, with_id, name_len) catch return error.InvalidSnapshotEntry;
-        const padded_entry_size = std.mem.alignForward(u64, entry_size, 8);
+        const padded_entry_size = alignForwardChecked(entry_size, 8) orelse return error.InvalidSnapshotEntry;
         const entry_end = std.math.add(u64, cursor, padded_entry_size) catch return error.InvalidSnapshotEntry;
         if (entry_end > info.file_size) return error.SnapshotTablePastEndOfFile;
         cursor = entry_end;
@@ -1961,6 +2261,13 @@ fn isAligned(value: u64, alignment: u64) bool {
     return alignment != 0 and value % alignment == 0;
 }
 
+fn alignForwardChecked(value: u64, alignment: u64) ?u64 {
+    std.debug.assert(std.math.isPowerOfTwo(alignment));
+    const mask = alignment - 1;
+    const with_mask = std.math.add(u64, value, mask) catch return null;
+    return with_mask & ~mask;
+}
+
 fn divCeil(numerator: u64, denominator: u64) u64 {
     if (numerator == 0) return 0;
     return std.math.divCeil(u64, numerator, denominator) catch unreachable;
@@ -2367,6 +2674,250 @@ test "open parses a minimal qcow2 header" {
     try std.testing.expectEqual(@as(u32, 1), info.refcount_table_clusters);
 }
 
+test "bounded standalone open accepts native zstd and retains unbounded compatibility" {
+    const io = std.testing.io;
+    const path = "test-qcow2-bounded-zstd.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const cluster_size: u64 = 65536;
+    const virtual_size = 3 * cluster_size;
+    const data = try buildMixedGuestData(std.testing.allocator, cluster_size, 3);
+    defer std.testing.allocator.free(data);
+    var source = SliceSource{ .data = data };
+
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    const written = try writeStandaloneCompressed(
+        std.testing.allocator,
+        io,
+        file,
+        virtual_size,
+        source.reader(),
+        .{},
+    );
+
+    const unbounded = try openStandalone(io, file);
+    try std.testing.expectEqual(virtual_size, unbounded.virtual_size);
+    try std.testing.expectEqual(@as(u8, 1), unbounded.compression_type);
+
+    const metadata_bytes = @as(u64, written.header_length) +
+        @as(u64, written.l1_size) * l2_entry_size +
+        @as(u64, written.refcount_table_clusters) * written.cluster_size +
+        8;
+    const bounded = try openStandaloneWithLimits(io, file, .{
+        .max_file_bytes = written.file_size,
+        .max_virtual_size = virtual_size,
+        .min_cluster_bits = written.cluster_bits,
+        .max_cluster_bits = written.cluster_bits,
+        .max_l1_entries = written.l1_size,
+        .max_l1_table_bytes = @as(u64, written.l1_size) * l2_entry_size,
+        .max_refcount_table_clusters = written.refcount_table_clusters,
+        .max_refcount_table_bytes = @as(u64, written.refcount_table_clusters) * written.cluster_size,
+        .max_refcount_table_entries = written.refcount_table_capacity_blocks,
+        .max_snapshot_count = 0,
+        .max_snapshot_table_bytes = 0,
+        .max_snapshot_l1_entries = 0,
+        .max_snapshot_l1_table_bytes = 0,
+        .max_metadata_bytes = metadata_bytes,
+        .max_metadata_work = written.refcount_table_capacity_blocks + 2,
+    });
+    try std.testing.expectEqual(virtual_size, bounded.virtual_size);
+    try std.testing.expectEqual(@as(u8, 1), bounded.compression_type);
+
+    var round_trip: [32]u8 = undefined;
+    _ = try pread(file, io, bounded, &round_trip, 0);
+    try std.testing.expectEqualSlices(u8, data[0..round_trip.len], &round_trip);
+}
+
+test "bounded standalone open rejects fixed-header geometry before metadata scans" {
+    const io = std.testing.io;
+    const path = "test-qcow2-bounded-header-limits.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const fixture = try writeTestFixture(io, path, .{});
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    const file_size = (try file.stat(io)).size;
+
+    try std.testing.expectError(
+        error.InvalidStandaloneOpenLimits,
+        openStandaloneWithLimits(io, file, .{
+            .min_cluster_bits = 13,
+            .max_cluster_bits = 12,
+        }),
+    );
+    try std.testing.expectError(
+        error.FileSizeLimitExceeded,
+        openStandaloneWithLimits(io, file, .{ .max_file_bytes = file_size - 1 }),
+    );
+    try std.testing.expectError(
+        error.VirtualSizeLimitExceeded,
+        openStandaloneWithLimits(io, file, .{ .max_virtual_size = 3 * fixture.cluster_size - 1 }),
+    );
+    try std.testing.expectError(
+        error.ClusterGeometryLimitExceeded,
+        openStandaloneWithLimits(io, file, .{ .max_cluster_bits = 11 }),
+    );
+    try std.testing.expectError(
+        error.L1EntriesLimitExceeded,
+        openStandaloneWithLimits(io, file, .{ .max_l1_entries = 0 }),
+    );
+    try std.testing.expectError(
+        error.L1TableBytesLimitExceeded,
+        openStandaloneWithLimits(io, file, .{ .max_l1_table_bytes = 7 }),
+    );
+}
+
+test "bounded standalone open rejects refcount geometry and aggregate work before traversal" {
+    const io = std.testing.io;
+    const path = "test-qcow2-bounded-refcount-limits.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const fixture = try writeTestFixture(io, path, .{});
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+
+    // A scan would report this malformed first refcount-block pointer. Each
+    // limit error below therefore also proves the limit ran before traversal.
+    try writeU64(file, io, fixture.cluster_size, 3);
+
+    try std.testing.expectError(
+        error.RefcountTableClustersLimitExceeded,
+        openStandaloneWithLimits(io, file, .{ .max_refcount_table_clusters = 0 }),
+    );
+    try std.testing.expectError(
+        error.RefcountTableBytesLimitExceeded,
+        openStandaloneWithLimits(io, file, .{ .max_refcount_table_bytes = fixture.cluster_size - 1 }),
+    );
+    try std.testing.expectError(
+        error.RefcountTableEntriesLimitExceeded,
+        openStandaloneWithLimits(io, file, .{ .max_refcount_table_entries = fixture.cluster_size / 8 - 1 }),
+    );
+    try std.testing.expectError(
+        error.MetadataBytesLimitExceeded,
+        openStandaloneWithLimits(io, file, .{ .max_metadata_bytes = 4207 }),
+    );
+    try std.testing.expectError(
+        error.MetadataWorkLimitExceeded,
+        openStandaloneWithLimits(io, file, .{ .max_metadata_work = fixture.cluster_size / 8 }),
+    );
+}
+
+test "bounded standalone open rejects snapshot directory and L1 geometry before allocation" {
+    const io = std.testing.io;
+    const path = "test-qcow2-bounded-snapshot-limits.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const fixture = try writeTestFixture(io, path, .{});
+    const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+
+    const snapshot_offset = 5 * fixture.cluster_size;
+    try writeHeaderU32Field(file, io, 60, 1);
+    try writeHeaderU64Field(file, io, 64, snapshot_offset);
+    var entry: [104]u8 = [_]u8{0} ** 104;
+    std.mem.writeInt(u64, entry[0..8], 3 * fixture.cluster_size, .big);
+    std.mem.writeInt(u32, entry[8..12], 1, .big);
+    std.mem.writeInt(u32, entry[36..40], 64, .big);
+    try file.writePositionalAll(io, &entry, snapshot_offset);
+
+    try std.testing.expectError(
+        error.SnapshotCountLimitExceeded,
+        openStandaloneWithLimits(io, file, .{ .max_snapshot_count = 0 }),
+    );
+    try std.testing.expectError(
+        error.SnapshotTableBytesLimitExceeded,
+        openStandaloneWithLimits(io, file, .{ .max_snapshot_table_bytes = 40 }),
+    );
+    try std.testing.expectError(
+        error.SnapshotL1EntriesLimitExceeded,
+        openStandaloneWithLimits(io, file, .{
+            .max_snapshot_table_bytes = entry.len,
+            .max_snapshot_l1_entries = 0,
+        }),
+    );
+    try std.testing.expectError(
+        error.SnapshotL1TableBytesLimitExceeded,
+        openStandaloneWithLimits(io, file, .{
+            .max_snapshot_table_bytes = entry.len,
+            .max_snapshot_l1_table_bytes = 7,
+        }),
+    );
+}
+
+test "bounded standalone open rejects sparse refcount amplification before the first table entry" {
+    const io = std.testing.io;
+    const path = "test-qcow2-bounded-sparse-amplification.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const file_bytes: u64 = 256 * 1024 * 1024;
+    const cluster_size: u64 = 512;
+    const refcount_table_clusters: u32 = @intCast(file_bytes / cluster_size - 1);
+    const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
+    defer file.close(io);
+    try file.setLength(io, file_bytes);
+
+    var header: [header_buffer_size]u8 = [_]u8{0} ** header_buffer_size;
+    header[0..4].* = file_signature;
+    std.mem.writeInt(u32, header[4..8], 3, .big);
+    std.mem.writeInt(u32, header[20..24], 9, .big);
+    std.mem.writeInt(u64, header[40..48], cluster_size, .big);
+    std.mem.writeInt(u64, header[48..56], cluster_size, .big);
+    std.mem.writeInt(u32, header[56..60], refcount_table_clusters, .big);
+    std.mem.writeInt(u32, header[96..100], default_refcount_order, .big);
+    std.mem.writeInt(u32, header[100..104], header_length_v3, .big);
+    try file.writePositionalAll(io, &header, 0);
+    try writeU64(file, io, cluster_size, 3);
+
+    try std.testing.expectEqual(
+        @as(u64, 33_554_368),
+        @as(u64, refcount_table_clusters) * cluster_size / 8,
+    );
+    try std.testing.expectError(
+        error.RefcountTableEntriesLimitExceeded,
+        openStandaloneWithLimits(io, file, .{
+            .max_file_bytes = file_bytes,
+            .max_refcount_table_entries = 1_000_000,
+        }),
+    );
+}
+
+test "bounded standalone open preserves truncation and checked-offset errors" {
+    const io = std.testing.io;
+    const truncated_path = "test-qcow2-bounded-truncated-header.qcow2";
+    const overflow_path = "test-qcow2-bounded-offset-overflow.qcow2";
+    defer Io.Dir.cwd().deleteFile(io, truncated_path) catch {};
+    defer Io.Dir.cwd().deleteFile(io, overflow_path) catch {};
+
+    {
+        const file = try Io.Dir.cwd().createFile(io, truncated_path, .{ .read = true, .truncate = true });
+        defer file.close(io);
+        var header: [104]u8 = [_]u8{0} ** 104;
+        header[0..4].* = file_signature;
+        std.mem.writeInt(u32, header[4..8], 3, .big);
+        std.mem.writeInt(u32, header[20..24], 12, .big);
+        std.mem.writeInt(u32, header[56..60], 1, .big);
+        std.mem.writeInt(u32, header[96..100], default_refcount_order, .big);
+        std.mem.writeInt(u32, header[100..104], 105, .big);
+        try file.writePositionalAll(io, &header, 0);
+        try std.testing.expectError(
+            error.HeaderTooShort,
+            openStandaloneWithLimits(io, file, .{}),
+        );
+    }
+
+    {
+        _ = try writeTestFixture(io, overflow_path, .{});
+        const file = try Io.Dir.cwd().openFile(io, overflow_path, .{ .mode = .read_write });
+        defer file.close(io);
+        try writeHeaderU64Field(file, io, 48, std.math.maxInt(u64) - 4095);
+        try std.testing.expectError(
+            error.RefcountTablePastEndOfFile,
+            openStandaloneWithLimits(io, file, .{}),
+        );
+    }
+}
+
 test "lookupGuestCluster maps allocated and sparse clusters" {
     const io = std.testing.io;
     const path = "test-qcow2-lookup.qcow2";
@@ -2480,6 +3031,10 @@ test "openStandalone rejects a backing path without opening it" {
     try std.testing.expectError(
         error.BackingFileNotSupported,
         openStandalone(io, file),
+    );
+    try std.testing.expectError(
+        error.BackingFileNotSupported,
+        openStandaloneWithLimits(io, file, .{ .max_refcount_table_entries = 0 }),
     );
 }
 
@@ -2823,6 +3378,12 @@ test "openAtPath reads qcow2 external data files" {
     var tail: [12]u8 = undefined;
     _ = try pread(file, io, info, &tail, cluster_size + 32);
     try std.testing.expectEqualSlices(u8, "EXT-DATA-111", &tail);
+
+    try Io.Dir.cwd().deleteFile(io, data_path);
+    try std.testing.expectError(
+        error.ExternalDataFileNotSupported,
+        openStandaloneWithLimits(io, file, .{ .max_refcount_table_entries = 0 }),
+    );
 }
 
 test "pread and mapExtents handle extended L2 entries" {
