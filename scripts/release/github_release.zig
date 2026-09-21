@@ -2700,9 +2700,8 @@ pub fn validateVersionTag(
     tag: []const u8,
     diagnostic: *Diagnostic,
 ) Error!void {
-    if (tag.len != version.len + 1 or tag[0] != 'v' or
-        !std.mem.eql(u8, tag[1..], version))
-    {
+    const tag_version = try versionFromTag(tag, diagnostic);
+    if (!std.mem.eql(u8, tag_version, version)) {
         return diagnostic.fail(
             error.Failed,
             "release tag {s} does not exactly match package version {s}",
@@ -2716,48 +2715,22 @@ pub fn validateVersionTag(
     );
 }
 
-pub fn manifestVersion(
-    allocator: Allocator,
-    io: Io,
-    path: []const u8,
+pub fn versionFromTag(
+    tag: []const u8,
     diagnostic: *Diagnostic,
-) Error![]u8 {
-    const source = file_support.readBounded(
-        allocator,
-        io,
-        path,
-        1024 * 1024,
-    ) catch |err| return diagnostic.fail(
+) Error![]const u8 {
+    if (tag.len < 2 or tag[0] != 'v') return diagnostic.fail(
         error.Failed,
-        "cannot read package manifest: {t}",
-        .{err},
+        "release tag {s} is not a v-prefixed supported SemVer",
+        .{tag},
     );
-    defer allocator.free(source);
-    const marker = ".version";
-    var found: ?[]const u8 = null;
-    var lines = std.mem.splitScalar(u8, source, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (!std.mem.startsWith(u8, trimmed, marker)) continue;
-        var rest = std.mem.trimStart(u8, trimmed[marker.len..], " \t");
-        if (rest.len == 0 or rest[0] != '=') continue;
-        rest = std.mem.trimStart(u8, rest[1..], " \t");
-        if (rest.len < 4 or rest[0] != '"') continue;
-        const close = std.mem.indexOfScalarPos(u8, rest, 1, '"') orelse continue;
-        const tail = std.mem.trim(u8, rest[close + 1 ..], " \t");
-        if (!std.mem.eql(u8, tail, ",")) continue;
-        if (found != null) return diagnostic.fail(
-            error.Failed,
-            "package manifest has more than one version",
-            .{},
-        );
-        found = rest[1..close];
-    }
-    return allocator.dupe(u8, found orelse return diagnostic.fail(
+    const version = tag[1..];
+    _ = std.SemanticVersion.parse(version) catch return diagnostic.fail(
         error.Failed,
-        "package manifest has no exact version",
-        .{},
-    )) catch return error.OutOfMemory;
+        "release tag {s} is not a v-prefixed supported SemVer",
+        .{tag},
+    );
+    return version;
 }
 
 fn validateLocalAssets(
@@ -2968,8 +2941,20 @@ fn optionalBoolField(
 
 test "version and tag contract distinguishes prerelease SemVer" {
     var diagnostic: Diagnostic = .{};
+    try std.testing.expectEqualStrings(
+        "1.2.3",
+        try versionFromTag("v1.2.3", &diagnostic),
+    );
+    try std.testing.expectEqualStrings(
+        "1.2.3-rc.1",
+        try versionFromTag("v1.2.3-rc.1", &diagnostic),
+    );
     try validateVersionTag("1.2.3", "v1.2.3", &diagnostic);
     try validateVersionTag("1.2.3-rc.1", "v1.2.3-rc.1", &diagnostic);
+    try std.testing.expectError(
+        error.Failed,
+        versionFromTag("1.2.3", &diagnostic),
+    );
     try std.testing.expectError(
         error.Failed,
         validateVersionTag("1.2.3", "v1.2.4", &diagnostic),

@@ -105,6 +105,9 @@ The normal `.github/workflows/release.yml` tag job requires the protected
 require designated reviewers, disable self-review, and configure the two
 shared App secrets above. Disabling immutable releases or the global tag ruleset is an intentional
 repository-wide publication stop; workflows never enable either setting.
+The workflow validates the `v*` tag as SemVer, derives the release version from
+that immutable tag, and passes it to every CLI build with `-Dversion`; the
+source package manifest is not a release-version gate.
 
 A failure before publication leaves a resumable draft. Retrying is allowed
 only when the tag, target commit, title, install preamble, stored non-empty

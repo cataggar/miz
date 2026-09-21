@@ -894,6 +894,9 @@ test "main release workflow delegates the complete draft transaction to Zig" {
     try expectAbsent(path, source, "gh release upload");
     try expectContains(path, source, "zig build install-miz-release");
     try expectContains(path, source, "miz_release verify-version");
+    try expectAbsent(path, source, "--manifest build.zig.zon");
+    try expectContains(path, source, "\"-Dversion=${{ needs.verify.outputs.version }}\"");
+    try expectContains(path, source, "miz ${{ needs.verify.outputs.version }}");
     try expectContains(path, source, "miz_release publish");
     try expectContains(path, source, "--commit \"$GITHUB_SHA\"");
     try expectContains(path, source, "--workspace \"$GITHUB_WORKSPACE/.miz-release\"");
