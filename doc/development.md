@@ -22,8 +22,9 @@ prereleases and image/provenance releases explicitly do not.
 The repository controls are deliberately provisioned as a post-merge
 deployment, not by this code. Use this exact order:
 
-1. Install the shared release App and create the protected environments and
-   their App secrets while **Immutable releases** remains disabled.
+1. Install the shared release App for the image/provenance publishers and
+   create their protected environments and App secrets while **Immutable
+   releases** remains disabled.
 2. Merge the immutable-release migration.
 3. Exercise every protected gate, then enable **Immutable releases** at
    **Settings → General → Releases** only when all producers can pass.
@@ -34,8 +35,8 @@ immutable-release setting. The repository intentionally has no global tag
 ruleset: tags remain mutable until an immutable release is published. Every
 producer verifies the exact remote tag target at each mutation boundary.
 
-Every producer mints a fresh protected policy token with
-**Administration: write** and **Contents: read** to query
+Every App-backed image/provenance producer mints a fresh protected policy
+token with **Administration: write** and **Contents: read** to query
 `GET /repos/cataggar/miz/immutable-releases`. `GITHUB_TOKEN` cannot perform
 this Administration query.
 
@@ -44,9 +45,9 @@ permissions **Administration: write**, **Contents: write**, and
 **Workflows: write**. The capture workflow additionally needs **Actions:
 read**. Store its App ID and PEM key as
 `RELEASE_GITHUB_APP_ID` and `RELEASE_GITHUB_APP_PRIVATE_KEY` in every protected
-publishing environment: `miz-release`, `azurelinux4-release`,
+App-backed publishing environment: `azurelinux4-release`,
 `ubuntu2404-confidential-release`, `ubuntu2404-confidential-capture`, and
-`ubuntu2604-release`. Every publication job separately mints:
+`ubuntu2604-release`. Every App-backed publication job separately mints:
 
 - a policy token with **Administration: write** and **Contents: read**; and
 - a publication token with only **Contents: write** and **Workflows: write**.
@@ -58,12 +59,15 @@ gallery reissue shares `ubuntu2604-release`.
 
 The normal `.github/workflows/release.yml` tag job requires the protected
 `miz-release` environment. Restrict it to the repository's `v*` release tags,
-require designated reviewers, disable self-review, and configure the two
-shared App secrets above. Disabling immutable releases is an intentional
-repository-wide publication stop; workflows never enable the setting.
-The workflow validates the `v*` tag as SemVer, derives the release version from
-that tag, and passes it to every CLI build with `-Dversion`; the
-source package manifest is not a release-version gate.
+require designated reviewers, and disable self-review. It uses the job-scoped
+`GITHUB_TOKEN` with `Contents: write`; no GitHub App secrets are required.
+GitHub's repository setting enforces immutable publication, and the publisher
+requires the final release response to report `immutable=true`. Disabling
+immutable releases is an intentional repository-wide publication stop;
+workflows never enable the setting. The workflow validates the `v*` tag as
+SemVer, derives the release version from that tag, and passes it to every CLI
+build with `-Dversion`; the source package manifest is not a release-version
+gate.
 
 A failure before publication leaves a resumable draft. Retrying is allowed
 only when the tag, target commit, title, install preamble, stored non-empty

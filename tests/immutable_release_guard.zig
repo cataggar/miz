@@ -42,7 +42,6 @@ const write_workflows = [_][]const u8{
 const app_release_workflows = [_][]const u8{
     ".github/workflows/azurelinux4-release.yml",
     ".github/workflows/freebsd15-release.yml",
-    ".github/workflows/release.yml",
     ".github/workflows/ubuntu2404-confidential-release.yml",
     ".github/workflows/ubuntu2604-gallery-reissue.yml",
     ".github/workflows/ubuntu2604-release.yml",
@@ -902,13 +901,14 @@ test "main release workflow delegates the complete draft transaction to Zig" {
     try expectContains(path, source, "--workspace \"$GITHUB_WORKSPACE/.miz-release\"");
 }
 
-test "every publishing workflow mints the shared protected policy token" {
+test "App-backed workflows mint policy tokens and main release uses GITHUB_TOKEN" {
     const allocator = std.testing.allocator;
     const root = try rootAlloc(allocator);
     defer allocator.free(root);
     const pinned =
         "actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349";
     for (write_workflows) |path| {
+        if (std.mem.eql(u8, path, ".github/workflows/release.yml")) continue;
         const source = try readSource(allocator, std.testing.io, root, path);
         defer allocator.free(source);
         try expectContains(path, source, pinned);
@@ -923,14 +923,7 @@ test "every publishing workflow mints the shared protected policy token" {
         if (std.mem.endsWith(u8, path, "ubuntu2404-confidential-capture.yml")) {
             try expectContains(path, source, "POLICY_GH_TOKEN");
         } else {
-            try expectContains(
-                path,
-                source,
-                if (std.mem.endsWith(u8, path, "/release.yml"))
-                    "MIZ_RELEASE_POLICY_GH_TOKEN"
-                else
-                    "RELEASE_POLICY_GH_TOKEN",
-            );
+            try expectContains(path, source, "RELEASE_POLICY_GH_TOKEN");
         }
     }
     const main = try readSource(
@@ -941,11 +934,12 @@ test "every publishing workflow mints the shared protected policy token" {
     );
     defer allocator.free(main);
     try expectContains(".github/workflows/release.yml", main, "environment: miz-release");
-    try expectContains(
-        ".github/workflows/release.yml",
-        main,
-        "MIZ_RELEASE_POLICY_GH_TOKEN",
-    );
+    try expectContains(".github/workflows/release.yml", main, "contents: write");
+    try expectContains(".github/workflows/release.yml", main, "GH_TOKEN: ${{ github.token }}");
+    try expectAbsent(".github/workflows/release.yml", main, pinned);
+    try expectAbsent(".github/workflows/release.yml", main, "RELEASE_GITHUB_APP_ID");
+    try expectAbsent(".github/workflows/release.yml", main, "RELEASE_GITHUB_APP_PRIVATE_KEY");
+    try expectAbsent(".github/workflows/release.yml", main, "MIZ_RELEASE_POLICY_GH_TOKEN");
 }
 
 test "every release publisher uses separate least-privilege App tokens" {

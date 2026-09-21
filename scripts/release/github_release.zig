@@ -109,7 +109,6 @@ pub const PublishOptions = struct {
     gh_executable: []const u8 = "gh",
     summary_path: ?[]const u8 = null,
     environment: std.process.Environ,
-    policy_token: ?[]const u8 = null,
 };
 
 const GhResult = struct {
@@ -141,11 +140,7 @@ const Publisher = struct {
         return error.Failed;
     }
 
-    fn ghWithToken(
-        self: *Publisher,
-        arguments: []const []const u8,
-        token: ?[]const u8,
-    ) Error!GhResult {
+    fn gh(self: *Publisher, arguments: []const []const u8) Error!GhResult {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(self.allocator);
         argv.append(self.allocator, self.options.gh_executable) catch
@@ -157,11 +152,6 @@ const Publisher = struct {
             self.allocator,
         ) catch return error.OutOfMemory;
         defer environment.deinit();
-        environment.put("MIZ_RELEASE_POLICY_GH_TOKEN", "") catch
-            return error.OutOfMemory;
-        if (token) |value| {
-            environment.put("GH_TOKEN", value) catch return error.OutOfMemory;
-        }
         const result = std.process.run(self.allocator, self.io, .{
             .argv = argv.items,
             .environ_map = &environment,
@@ -186,27 +176,8 @@ const Publisher = struct {
         return .{ .stdout = result.stdout, .stderr = result.stderr };
     }
 
-    fn gh(self: *Publisher, arguments: []const []const u8) Error!GhResult {
-        return self.ghWithToken(arguments, null);
-    }
-
     fn ghJson(self: *Publisher, arguments: []const []const u8) Error!std.json.Parsed(Value) {
         const result = try self.gh(arguments);
-        defer result.deinit(self.allocator);
-        return std.json.parseFromSlice(
-            Value,
-            self.allocator,
-            result.stdout,
-            .{},
-        ) catch |err| self.fail("GitHub CLI returned invalid JSON: {t}", .{err});
-    }
-
-    fn ghJsonWithToken(
-        self: *Publisher,
-        arguments: []const []const u8,
-        token: []const u8,
-    ) Error!std.json.Parsed(Value) {
-        const result = try self.ghWithToken(arguments, token);
         defer result.deinit(self.allocator);
         return std.json.parseFromSlice(
             Value,
@@ -1007,8 +978,6 @@ const Publisher = struct {
             self.allocator,
         ) catch return error.OutOfMemory;
         defer environment.deinit();
-        environment.put("MIZ_RELEASE_POLICY_GH_TOKEN", "") catch
-            return error.OutOfMemory;
         var child = std.process.spawn(self.io, .{
             .argv = argv.items,
             .environ_map = &environment,
@@ -1090,7 +1059,6 @@ const Publisher = struct {
         const latest_field = try fieldAlloc(self, "make_latest", latest);
         defer self.allocator.free(latest_field);
         try self.verifyTag();
-        try self.requireReleasePolicy();
         var result = try self.ghJson(&.{
             "api",
             "--method",
@@ -1162,38 +1130,6 @@ const Publisher = struct {
                 .{self.metadata.tag},
             );
         }
-    }
-
-    fn requireReleasePolicy(self: *Publisher) Error!void {
-        const token = self.options.policy_token orelse return self.fail(
-            "release policy token is missing",
-            .{},
-        );
-        if (std.mem.trim(u8, token, " \t\r\n").len == 0) return self.fail(
-            "release policy token is missing",
-            .{},
-        );
-        var immutable_endpoint_buffer: [512]u8 = undefined;
-        const immutable_endpoint = std.fmt.bufPrint(
-            &immutable_endpoint_buffer,
-            "repos/{s}/immutable-releases",
-            .{self.options.repository_name},
-        ) catch return self.fail("immutable release endpoint is too long", .{});
-        var immutable_response = try self.ghJsonWithToken(&.{
-            "api",
-            "--method",
-            "GET",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "X-GitHub-Api-Version: " ++ github_api_version,
-            immutable_endpoint,
-        }, token);
-        defer immutable_response.deinit();
-        try validateImmutableReleasesValue(
-            immutable_response.value,
-            self.diagnostic,
-        );
     }
 
     fn writeSummary(self: *Publisher) Error!void {
@@ -1301,7 +1237,6 @@ pub fn publish(
         .assets = assets,
     };
     defer if (publisher.previous_main_tag) |tag| allocator.free(tag);
-    try publisher.requireReleasePolicy();
     try publisher.verifyTag();
     const discovered = try publisher.discover();
     var owned_body: ?[]u8 = null;
