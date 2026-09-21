@@ -11,9 +11,7 @@ const usage =
     \\  miz_release verify-version --tag TAG [--github-output PATH]
     \\  miz_release select-release-ruleset --repository OWNER/REPO
     \\      --rulesets-response PATH
-    \\  miz_release check-release-policy --repository OWNER/REPO
-    \\      --immutable-response PATH --rulesets-response PATH
-    \\      --ruleset-detail-response PATH
+    \\  miz_release check-release-policy --immutable-response PATH
     \\  miz_release publish --repository OWNER/REPO --tag TAG --version VERSION
     \\      --commit SHA --assets-directory PATH --workspace PATH
     \\      [--github-step-summary PATH]
@@ -154,19 +152,11 @@ fn run(
         return;
     }
     if (std.mem.eql(u8, argv[0], "check-release-policy")) {
-        try options.only(&.{
-            "--repository",
-            "--immutable-response",
-            "--rulesets-response",
-            "--ruleset-detail-response",
-        });
-        return release.github_release.validateRepositoryReleasePolicyFiles(
+        try options.only(&.{"--immutable-response"});
+        return release.github_release.validateRepositoryReleasePolicyFile(
             allocator,
             io,
             try options.require("--immutable-response"),
-            try options.require("--rulesets-response"),
-            try options.require("--ruleset-detail-response"),
-            try options.require("--repository"),
             diagnostic,
         );
     }

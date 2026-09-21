@@ -410,10 +410,10 @@ job mints a policy token with Administration write and Contents read and a
 separate publication token with Contents write and Workflows write. Only the
 publication token is passed as `GH_TOKEN` to release/tag/asset operations; the
 policy helper explicitly substitutes the policy token. It requires both
-immutable releases and the global
-`miz-immutable-release-tags-v1` no-bypass update/deletion ruleset before tag or
-draft mutation and again immediately before publication. A tag created before
-a draft failure is retained and quarantined; corrections always use a new tag.
+immutable releases before tag or draft mutation and again immediately before
+publication. Release tags remain mutable until publication, while every tag
+target is checked exactly at each mutation boundary. Immutable releases lock
+the published release and its tag.
 
 The released QCOW2 files are not directly uploadable to Azure. Derive aligned
 fixed VHDs without changing their partitions:

@@ -1106,24 +1106,20 @@ test "every shell asset publisher is draft-only until one-way publication" {
     }
 }
 
-test "shared repository policy fetch is read-only paginated and Zig-validated" {
+test "shared repository policy fetch requires immutable releases only" {
     const allocator = std.testing.allocator;
     const root = try rootAlloc(allocator);
     defer allocator.free(root);
     const path = "scripts/release/check_repository_release_policy.sh";
     const source = try readSource(allocator, std.testing.io, root, path);
     defer allocator.free(source);
-    for ([_][]const u8{
-        "repos/$repository/immutable-releases",
-        "--paginate --slurp",
-        "rulesets?includes_parents=true&targets=tag&per_page=100",
-        "\"$release_tool\" select-release-ruleset",
-        "rulesets/$ruleset_id?includes_parents=true",
-        "\"$release_tool\" check-release-policy",
-        "--immutable-response",
-        "--rulesets-response",
-        "--ruleset-detail-response",
-    }) |needle| try expectContains(path, source, needle);
+    try expectContains(path, source, "repos/$repository/immutable-releases");
+    try expectContains(path, source, "\"$release_tool\" check-release-policy");
+    try expectContains(path, source, "--immutable-response");
+    try expectAbsent(path, source, "rulesets?");
+    try expectAbsent(path, source, "select-release-ruleset");
+    try expectAbsent(path, source, "--rulesets-response");
+    try expectAbsent(path, source, "--ruleset-detail-response");
     try expectAbsent(path, source, "--method POST");
     try expectAbsent(path, source, "--method PATCH");
     try expectAbsent(path, source, "--method DELETE");

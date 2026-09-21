@@ -10,7 +10,7 @@ image customization, QEMU, and cloud-ready image workflows.
 Install the pre-built `miz` CLI from GitHub Releases with [ghr](https://github.com/cataggar/ghr):
 
 ```console
-ghr install cataggar/miz@v0.2.0
+ghr install cataggar/miz
 ```
 
 The only executable in release archives is the `miz` CLI. Build from source

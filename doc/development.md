@@ -22,66 +22,22 @@ prereleases and image/provenance releases explicitly do not.
 The repository controls are deliberately provisioned as a post-merge
 deployment, not by this code. Use this exact order:
 
-1. Install the shared release App, create the protected environments and their
-   App secrets, and create the required tag rulesets while **Immutable
-   releases** remains disabled.
+1. Install the shared release App and create the protected environments and
+   their App secrets while **Immutable releases** remains disabled.
 2. Merge the immutable-release migration.
 3. Exercise every protected gate, then enable **Immutable releases** at
    **Settings → General → Releases** only when all producers can pass.
 
 Until that deployment is complete, publication fails closed. Do not weaken a
-gate to accommodate an absent environment, secret, App installation, ruleset,
-or immutable-release setting. Create the mandatory global tag ruleset at
-**Settings → Rules → Rulesets → New ruleset → New tag ruleset**:
-
-- name: `miz-immutable-release-tags-v1`;
-- enforcement: **Active**;
-- bypass list: empty;
-- target: all tags (`~ALL`) with no exclusions;
-- rules: restrict updates and restrict deletions;
-- creation restriction: disabled.
-
-The equivalent rulesets API request body is:
-
-```json
-{
-  "name": "miz-immutable-release-tags-v1",
-  "target": "tag",
-  "enforcement": "active",
-  "bypass_actors": [],
-  "conditions": {
-    "ref_name": {
-      "include": ["~ALL"],
-      "exclude": []
-    }
-  },
-  "rules": [
-    {"type": "update"},
-    {"type": "deletion"}
-  ]
-}
-```
-
-Submit that body manually to `POST /repos/cataggar/miz/rulesets`; release
-workflows never create, edit, disable, or delete repository settings or
-rulesets. Omitting the `creation` rule deliberately leaves tag creation
-available to the publishing App. Once any tag exists, however, no bypass
-actor—including the publishing App—can move or delete it while the ruleset is
-active. Repository administrators remain the trusted root because they can
-disable repository policy.
+gate to accommodate an absent environment, secret, App installation, or
+immutable-release setting. The repository intentionally has no global tag
+ruleset: tags remain mutable until an immutable release is published. Every
+producer verifies the exact remote tag target at each mutation boundary.
 
 Every producer mints a fresh protected policy token with
 **Administration: write** and **Contents: read** to query
-`GET /repos/cataggar/miz/immutable-releases` and the paginated
-`GET /repos/cataggar/miz/rulesets?includes_parents=true&targets=tag&per_page=100`
-to select exactly one active named repository ruleset and its positive numeric
-ID. List summaries are not treated as detail: the policy path then fetches
-`GET /repos/cataggar/miz/rulesets/{id}?includes_parents=true` and validates the
-full target, source, enforcement, `~ALL`/no-exclusion conditions, exact update
-and deletion rules, and empty bypass list. GitHub omits `bypass_actors` from
-detail for callers that cannot write the ruleset, so a missing field fails
-closed even though the policy token performs reads only. `GITHUB_TOKEN` cannot
-perform these Administration queries.
+`GET /repos/cataggar/miz/immutable-releases`. `GITHUB_TOKEN` cannot perform
+this Administration query.
 
 Install one release GitHub App on only `cataggar/miz` with repository
 permissions **Administration: write**, **Contents: write**, and
@@ -103,10 +59,10 @@ gallery reissue shares `ubuntu2604-release`.
 The normal `.github/workflows/release.yml` tag job requires the protected
 `miz-release` environment. Restrict it to the repository's `v*` release tags,
 require designated reviewers, disable self-review, and configure the two
-shared App secrets above. Disabling immutable releases or the global tag ruleset is an intentional
-repository-wide publication stop; workflows never enable either setting.
+shared App secrets above. Disabling immutable releases is an intentional
+repository-wide publication stop; workflows never enable the setting.
 The workflow validates the `v*` tag as SemVer, derives the release version from
-that immutable tag, and passes it to every CLI build with `-Dversion`; the
+that tag, and passes it to every CLI build with `-Dversion`; the
 source package manifest is not a release-version gate.
 
 A failure before publication leaves a resumable draft. Retrying is allowed
@@ -120,11 +76,11 @@ tags, malformed SemVer tags, published prereleases, and no-ref drafts are
 ignored. If the publication App token expires before the
 one-way transition, the exact draft remains
 unpublished and a fresh-token rerun resumes it. A published release is never
-reopened, edited, clobbered, or corrected. A tag created before a failed draft
-is retained and quarantined rather than deleted. If post-publication
-verification fails, investigate without mutation. Every release tag
-correction, including a wrong target or abandoned draft tag, requires a new
-tag and a new release.
+reopened, edited, clobbered, or corrected. Before publication, a tag may be
+retargeted or deleted; an existing draft must be deleted before its tag is
+reused for a different target because the publisher never retargets a draft.
+If post-publication verification fails, investigate without mutation. Every
+published release correction requires a new tag and a new release.
 
 Run `zig build test-immutable-releases` when changing a release workflow,
 publisher, or GitHub release API call. The repository-wide guard intentionally

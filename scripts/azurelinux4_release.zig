@@ -77,7 +77,7 @@ const usage_text =
     \\  check-release-metadata require an exact resumable draft identity
     \\  check-immutable-releases require the protected repository policy
     \\  select-release-ruleset print the exact immutable tag ruleset ID
-    \\  check-release-policy   require immutable releases and global tag immutability
+    \\  check-release-policy   require immutable releases
     \\  check-draft-assets    plan/validate exact numeric draft asset mutations
     \\  release-stale-assets   print the asset IDs a release holds outside the allowlist
     \\  check-release-assets   require the exact remote allowlist in draft or published state
@@ -808,19 +808,11 @@ fn runSelectReleaseRuleset(context: Context, argv: []const []const u8) !void {
 }
 
 fn runCheckReleasePolicy(context: Context, argv: []const []const u8) !void {
-    const options = try parseOptions(argv, &.{
-        "repository",
-        "immutable-response",
-        "rulesets-response",
-        "ruleset-detail-response",
-    });
-    return release.github_release.validateRepositoryReleasePolicyFiles(
+    const options = try parseOptions(argv, &.{"immutable-response"});
+    return release.github_release.validateRepositoryReleasePolicyFile(
         context.allocator,
         context.io,
         try options.require("immutable-response"),
-        try options.require("rulesets-response"),
-        try options.require("ruleset-detail-response"),
-        try options.require("repository"),
         context.diagnostic,
     );
 }

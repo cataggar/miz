@@ -870,20 +870,12 @@ pub fn dispatch(
         return out.print("{d}\n", .{id});
     }
     if (std.mem.eql(u8, command, "check-release-policy")) {
-        var options = try parse(allocator, argv, &.{
-            "--repository",
-            "--immutable-response",
-            "--rulesets-response",
-            "--ruleset-detail-response",
-        });
+        var options = try parse(allocator, argv, &.{"--immutable-response"});
         defer options.deinit();
-        return support.github_release.validateRepositoryReleasePolicyFiles(
+        return support.github_release.validateRepositoryReleasePolicyFile(
             allocator,
             io,
             try options.require("--immutable-response"),
-            try options.require("--rulesets-response"),
-            try options.require("--ruleset-detail-response"),
-            try options.require("--repository"),
             diagnostic,
         );
     }

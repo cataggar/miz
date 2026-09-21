@@ -1194,55 +1194,6 @@ const Publisher = struct {
             immutable_response.value,
             self.diagnostic,
         );
-
-        var ruleset_list_endpoint_buffer: [512]u8 = undefined;
-        const ruleset_list_endpoint = std.fmt.bufPrint(
-            &ruleset_list_endpoint_buffer,
-            "repos/{s}/rulesets?includes_parents=true&targets=tag&per_page=100",
-            .{self.options.repository_name},
-        ) catch return self.fail("rulesets endpoint is too long", .{});
-        var ruleset_list_response = try self.ghJsonWithToken(&.{
-            "api",
-            "--method",
-            "GET",
-            "--paginate",
-            "--slurp",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "X-GitHub-Api-Version: " ++ github_api_version,
-            ruleset_list_endpoint,
-        }, token);
-        defer ruleset_list_response.deinit();
-        const ruleset_id = try selectImmutableTagRulesetIdValue(
-            ruleset_list_response.value,
-            self.options.repository_name,
-            self.diagnostic,
-        );
-
-        var ruleset_detail_endpoint_buffer: [512]u8 = undefined;
-        const ruleset_detail_endpoint = std.fmt.bufPrint(
-            &ruleset_detail_endpoint_buffer,
-            "repos/{s}/rulesets/{d}?includes_parents=true",
-            .{ self.options.repository_name, ruleset_id },
-        ) catch return self.fail("ruleset detail endpoint is too long", .{});
-        var ruleset_detail_response = try self.ghJsonWithToken(&.{
-            "api",
-            "--method",
-            "GET",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "X-GitHub-Api-Version: " ++ github_api_version,
-            ruleset_detail_endpoint,
-        }, token);
-        defer ruleset_detail_response.deinit();
-        try validateImmutableTagRulesetDetailValue(
-            ruleset_detail_response.value,
-            ruleset_id,
-            self.options.repository_name,
-            self.diagnostic,
-        );
     }
 
     fn writeSummary(self: *Publisher) Error!void {
@@ -1972,34 +1923,16 @@ pub fn validateImmutableTagRulesetDetailFile(
     );
 }
 
-pub fn validateRepositoryReleasePolicyFiles(
+pub fn validateRepositoryReleasePolicyFile(
     allocator: Allocator,
     io: Io,
     immutable_releases_path: []const u8,
-    ruleset_list_path: []const u8,
-    ruleset_detail_path: []const u8,
-    expected_repository: []const u8,
     diagnostic: *Diagnostic,
 ) Error!void {
-    try validateImmutableReleasesFile(
+    return validateImmutableReleasesFile(
         allocator,
         io,
         immutable_releases_path,
-        diagnostic,
-    );
-    const ruleset_id = try selectImmutableTagRulesetIdFile(
-        allocator,
-        io,
-        ruleset_list_path,
-        expected_repository,
-        diagnostic,
-    );
-    try validateImmutableTagRulesetDetailFile(
-        allocator,
-        io,
-        ruleset_detail_path,
-        ruleset_id,
-        expected_repository,
         diagnostic,
     );
 }

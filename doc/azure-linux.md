@@ -316,9 +316,9 @@ RELEASE_GITHUB_APP_PRIVATE_KEY
 The shared release App must have repository **Administration: write**,
 **Contents: write**, and **Workflows: write** permissions. The protected job
 mints separate tokens: Administration-write/Contents-read for the immutable
-release and full ruleset-detail checks, and Contents-write/Workflows-write as
-`GH_TOKEN` for release/tag/asset reads and mutations. Release tag corrections
-always use a new tag.
+release check, and Contents-write/Workflows-write as `GH_TOKEN` for
+release/tag/asset reads and mutations. A release tag may be corrected before
+publication; immutable releases lock published tags.
 
 and these variables:
 
