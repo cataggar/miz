@@ -93,7 +93,7 @@ const usage_text =
     \\  github-release-metadata       require an exact resumable draft identity
     \\  github-immutable-releases     require the protected repository policy
     \\  select-release-ruleset        print the exact immutable tag ruleset ID
-    \\  check-release-policy          require immutable releases and global tag immutability
+    \\  check-release-policy          require immutable releases
     \\  github-draft-assets           plan/validate exact numeric draft mutations
     \\  github-stale-assets           print release assets outside the allowlist
     \\  github-release-assets         check remote release assets

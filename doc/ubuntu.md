@@ -1583,11 +1583,9 @@ and publishes exactly full/core × x86_64/AArch64. Before dispatch:
 
 1. Create or retarget the required tag `Ubuntu-26.04-20260905` to the exact
    current `main` commit. Lightweight and annotated tags are accepted. The
-   mandatory global `miz-immutable-release-tags-v1` ruleset prevents every
-   existing tag from being moved or deleted, including by the publishing App,
-   so a wrong or abandoned tag must be replaced by a newly named release tag.
-   Verify the exact remote tag resolves to the current `main` commit before
-   dispatch. Earlier release tags are never retargeted.
+   tag remains mutable until its release is published. Verify the exact remote
+   tag resolves to the current `main` commit before dispatch. Immutable
+   releases lock the published release and its tag.
 2. Confirm the exact GitHub-hosted `ubuntu-24.04-arm` label is available.
    Publication cannot proceed without both `aarch64-full` and `aarch64-core`
    Secure Boot acceptance jobs using native Arm64

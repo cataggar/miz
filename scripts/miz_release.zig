@@ -8,12 +8,10 @@ const Io = std.Io;
 
 const usage =
     \\usage:
-    \\  miz_release verify-version --tag TAG --manifest PATH [--github-output PATH]
+    \\  miz_release verify-version --tag TAG [--github-output PATH]
     \\  miz_release select-release-ruleset --repository OWNER/REPO
     \\      --rulesets-response PATH
-    \\  miz_release check-release-policy --repository OWNER/REPO
-    \\      --immutable-response PATH --rulesets-response PATH
-    \\      --ruleset-detail-response PATH
+    \\  miz_release check-release-policy --immutable-response PATH
     \\  miz_release publish --repository OWNER/REPO --tag TAG --version VERSION
     \\      --commit SHA --assets-directory PATH --workspace PATH
     \\      [--github-step-summary PATH]
@@ -117,16 +115,9 @@ fn run(
     if (argv.len == 0) return error.Usage;
     const options = try Options.parse(argv[1..]);
     if (std.mem.eql(u8, argv[0], "verify-version")) {
-        try options.only(&.{ "--tag", "--manifest", "--github-output" });
-        const version = try release.github_release.manifestVersion(
-            allocator,
-            io,
-            try options.require("--manifest"),
-            diagnostic,
-        );
-        defer allocator.free(version);
+        try options.only(&.{ "--tag", "--github-output" });
         const tag = try options.require("--tag");
-        try release.github_release.validateVersionTag(version, tag, diagnostic);
+        const version = try release.github_release.versionFromTag(tag, diagnostic);
         if (options.get("--github-output")) |output_path| {
             var output = try std.Io.Dir.cwd().openFile(io, output_path, .{
                 .mode = .write_only,
@@ -161,19 +152,11 @@ fn run(
         return;
     }
     if (std.mem.eql(u8, argv[0], "check-release-policy")) {
-        try options.only(&.{
-            "--repository",
-            "--immutable-response",
-            "--rulesets-response",
-            "--ruleset-detail-response",
-        });
-        return release.github_release.validateRepositoryReleasePolicyFiles(
+        try options.only(&.{"--immutable-response"});
+        return release.github_release.validateRepositoryReleasePolicyFile(
             allocator,
             io,
             try options.require("--immutable-response"),
-            try options.require("--rulesets-response"),
-            try options.require("--ruleset-detail-response"),
-            try options.require("--repository"),
             diagnostic,
         );
     }

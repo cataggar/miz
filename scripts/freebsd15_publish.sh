@@ -83,7 +83,7 @@ preserve_draft_on_failure() {
     elif $release_created; then
       echo "::warning::Publication failed; retaining resumable draft $RELEASE_TAG"
     elif $tag_created; then
-      echo "::warning::Publication failed before draft creation; retaining and quarantining immutable tag $RELEASE_TAG"
+      echo "::warning::Publication failed before draft creation; tag $RELEASE_TAG remains mutable"
     fi
   fi
   exit "$status"

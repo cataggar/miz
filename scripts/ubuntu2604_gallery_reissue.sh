@@ -219,7 +219,7 @@ preserve_draft_on_failure() {
     elif [[ "$release_mutated" == true ]]; then
       echo "::warning::Reissue failed; retaining resumable draft $REISSUE_TAG"
     elif [[ "$tag_created" == true ]]; then
-      echo "::warning::Reissue failed before draft creation; retaining and quarantining immutable tag $REISSUE_TAG"
+      echo "::warning::Reissue failed before draft creation; tag $REISSUE_TAG remains mutable"
     fi
   fi
   exit "$status"

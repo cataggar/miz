@@ -1194,55 +1194,6 @@ const Publisher = struct {
             immutable_response.value,
             self.diagnostic,
         );
-
-        var ruleset_list_endpoint_buffer: [512]u8 = undefined;
-        const ruleset_list_endpoint = std.fmt.bufPrint(
-            &ruleset_list_endpoint_buffer,
-            "repos/{s}/rulesets?includes_parents=true&targets=tag&per_page=100",
-            .{self.options.repository_name},
-        ) catch return self.fail("rulesets endpoint is too long", .{});
-        var ruleset_list_response = try self.ghJsonWithToken(&.{
-            "api",
-            "--method",
-            "GET",
-            "--paginate",
-            "--slurp",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "X-GitHub-Api-Version: " ++ github_api_version,
-            ruleset_list_endpoint,
-        }, token);
-        defer ruleset_list_response.deinit();
-        const ruleset_id = try selectImmutableTagRulesetIdValue(
-            ruleset_list_response.value,
-            self.options.repository_name,
-            self.diagnostic,
-        );
-
-        var ruleset_detail_endpoint_buffer: [512]u8 = undefined;
-        const ruleset_detail_endpoint = std.fmt.bufPrint(
-            &ruleset_detail_endpoint_buffer,
-            "repos/{s}/rulesets/{d}?includes_parents=true",
-            .{ self.options.repository_name, ruleset_id },
-        ) catch return self.fail("ruleset detail endpoint is too long", .{});
-        var ruleset_detail_response = try self.ghJsonWithToken(&.{
-            "api",
-            "--method",
-            "GET",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "X-GitHub-Api-Version: " ++ github_api_version,
-            ruleset_detail_endpoint,
-        }, token);
-        defer ruleset_detail_response.deinit();
-        try validateImmutableTagRulesetDetailValue(
-            ruleset_detail_response.value,
-            ruleset_id,
-            self.options.repository_name,
-            self.diagnostic,
-        );
     }
 
     fn writeSummary(self: *Publisher) Error!void {
@@ -1972,34 +1923,16 @@ pub fn validateImmutableTagRulesetDetailFile(
     );
 }
 
-pub fn validateRepositoryReleasePolicyFiles(
+pub fn validateRepositoryReleasePolicyFile(
     allocator: Allocator,
     io: Io,
     immutable_releases_path: []const u8,
-    ruleset_list_path: []const u8,
-    ruleset_detail_path: []const u8,
-    expected_repository: []const u8,
     diagnostic: *Diagnostic,
 ) Error!void {
-    try validateImmutableReleasesFile(
+    return validateImmutableReleasesFile(
         allocator,
         io,
         immutable_releases_path,
-        diagnostic,
-    );
-    const ruleset_id = try selectImmutableTagRulesetIdFile(
-        allocator,
-        io,
-        ruleset_list_path,
-        expected_repository,
-        diagnostic,
-    );
-    try validateImmutableTagRulesetDetailFile(
-        allocator,
-        io,
-        ruleset_detail_path,
-        ruleset_id,
-        expected_repository,
         diagnostic,
     );
 }
@@ -2700,9 +2633,8 @@ pub fn validateVersionTag(
     tag: []const u8,
     diagnostic: *Diagnostic,
 ) Error!void {
-    if (tag.len != version.len + 1 or tag[0] != 'v' or
-        !std.mem.eql(u8, tag[1..], version))
-    {
+    const tag_version = try versionFromTag(tag, diagnostic);
+    if (!std.mem.eql(u8, tag_version, version)) {
         return diagnostic.fail(
             error.Failed,
             "release tag {s} does not exactly match package version {s}",
@@ -2716,48 +2648,22 @@ pub fn validateVersionTag(
     );
 }
 
-pub fn manifestVersion(
-    allocator: Allocator,
-    io: Io,
-    path: []const u8,
+pub fn versionFromTag(
+    tag: []const u8,
     diagnostic: *Diagnostic,
-) Error![]u8 {
-    const source = file_support.readBounded(
-        allocator,
-        io,
-        path,
-        1024 * 1024,
-    ) catch |err| return diagnostic.fail(
+) Error![]const u8 {
+    if (tag.len < 2 or tag[0] != 'v') return diagnostic.fail(
         error.Failed,
-        "cannot read package manifest: {t}",
-        .{err},
+        "release tag {s} is not a v-prefixed supported SemVer",
+        .{tag},
     );
-    defer allocator.free(source);
-    const marker = ".version";
-    var found: ?[]const u8 = null;
-    var lines = std.mem.splitScalar(u8, source, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (!std.mem.startsWith(u8, trimmed, marker)) continue;
-        var rest = std.mem.trimStart(u8, trimmed[marker.len..], " \t");
-        if (rest.len == 0 or rest[0] != '=') continue;
-        rest = std.mem.trimStart(u8, rest[1..], " \t");
-        if (rest.len < 4 or rest[0] != '"') continue;
-        const close = std.mem.indexOfScalarPos(u8, rest, 1, '"') orelse continue;
-        const tail = std.mem.trim(u8, rest[close + 1 ..], " \t");
-        if (!std.mem.eql(u8, tail, ",")) continue;
-        if (found != null) return diagnostic.fail(
-            error.Failed,
-            "package manifest has more than one version",
-            .{},
-        );
-        found = rest[1..close];
-    }
-    return allocator.dupe(u8, found orelse return diagnostic.fail(
+    const version = tag[1..];
+    _ = std.SemanticVersion.parse(version) catch return diagnostic.fail(
         error.Failed,
-        "package manifest has no exact version",
-        .{},
-    )) catch return error.OutOfMemory;
+        "release tag {s} is not a v-prefixed supported SemVer",
+        .{tag},
+    );
+    return version;
 }
 
 fn validateLocalAssets(
@@ -2968,8 +2874,20 @@ fn optionalBoolField(
 
 test "version and tag contract distinguishes prerelease SemVer" {
     var diagnostic: Diagnostic = .{};
+    try std.testing.expectEqualStrings(
+        "1.2.3",
+        try versionFromTag("v1.2.3", &diagnostic),
+    );
+    try std.testing.expectEqualStrings(
+        "1.2.3-rc.1",
+        try versionFromTag("v1.2.3-rc.1", &diagnostic),
+    );
     try validateVersionTag("1.2.3", "v1.2.3", &diagnostic);
     try validateVersionTag("1.2.3-rc.1", "v1.2.3-rc.1", &diagnostic);
+    try std.testing.expectError(
+        error.Failed,
+        versionFromTag("1.2.3", &diagnostic),
+    );
     try std.testing.expectError(
         error.Failed,
         validateVersionTag("1.2.3", "v1.2.4", &diagnostic),

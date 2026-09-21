@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const miz = @import("miz");
+const build_options = @import("build_options");
 
 const create_cmd = @import("commands/create.zig");
 const info_cmd = @import("commands/info.zig");
@@ -31,6 +32,7 @@ const usage =
     \\Usage: miz <command> [options]
     \\
     \\Commands:
+    \\  version
     \\  create -f <format> [-o subformat=fixed|dynamic] <file> <size>
     \\  info [--output=human|json] <file>
     \\  convert -f <src_format> -O <dst_format> [-o subformat=fixed|dynamic] [--compress-level <1-9>] <src> <dst|->
@@ -86,6 +88,14 @@ fn run(
     const command = args[0];
     const rest = args[1..];
 
+    if (std.mem.eql(u8, command, "version")) {
+        var stdout = std.Io.File.stdout();
+        stdout.writeStreamingAll(io, "miz " ++ build_options.version ++ "\n") catch |err| {
+            std.debug.print("miz: cannot write version: {t}\n", .{err});
+            return 1;
+        };
+        return 0;
+    }
     if (std.mem.eql(u8, command, "create")) return create_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "info")) return info_cmd.run(gpa, io, rest);
     if (std.mem.eql(u8, command, "convert")) return convert_cmd.run(gpa, io, rest);

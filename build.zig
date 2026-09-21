@@ -242,6 +242,11 @@ fn addUbuntu2604BinderProbe(
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
+    const version = b.option(
+        []const u8,
+        "version",
+        "Version string embedded in the miz CLI",
+    ) orelse "dev";
     // `std.Build.standardOptimizeOption` with no explicit flag, except the
     // fallback is ReleaseSafe rather than Debug. What this repository builds
     // is image tooling -- decompression, hashing, dependency solving, ext4
@@ -515,6 +520,8 @@ pub fn build(b: *std.Build) void {
     azagent_test_step.dependOn(&run_azagent_tests.step);
 
     // ---- cli: the `miz` executable ----
+    const cli_options = b.addOptions();
+    cli_options.addOption([]const u8, "version", version);
     const cli_exe = b.addExecutable(.{
         .name = "miz",
         .root_module = b.createModule(.{
@@ -525,6 +532,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "miz", .module = miz_mod },
                 .{ .name = "qemu_host", .module = qemu_host_mod },
                 .{ .name = "guest_validation", .module = guest_validation_mod },
+                .{ .name = "build_options", .module = cli_options.createModule() },
             },
         }),
     });

@@ -252,18 +252,8 @@ pub const release_commands = [_]Command{
     },
     .{
         .name = "check-release-policy",
-        .options = &.{
-            "repository",
-            "immutable-response",
-            "rulesets-response",
-            "ruleset-detail-response",
-        },
-        .required = &.{
-            "repository",
-            "immutable-response",
-            "rulesets-response",
-            "ruleset-detail-response",
-        },
+        .options = &.{"immutable-response"},
+        .required = &.{"immutable-response"},
     },
     .{
         .name = "verify-draft-assets",
@@ -640,13 +630,10 @@ fn dispatchRelease(
         return;
     }
     if (std.mem.eql(u8, name, "check-release-policy")) {
-        return support.github_release.validateRepositoryReleasePolicyFiles(
+        return support.github_release.validateRepositoryReleasePolicyFile(
             context.arena,
             context.io,
             requiredOption(options, "immutable-response"),
-            requiredOption(options, "rulesets-response"),
-            requiredOption(options, "ruleset-detail-response"),
-            requiredOption(options, "repository"),
             &context.diagnostic,
         ) catch return error.Invalid;
     }

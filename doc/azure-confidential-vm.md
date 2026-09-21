@@ -270,21 +270,14 @@ before publication validation and again on the unconditional cleanup path.
 No access token, OIDC request token, JWT, SAS, SSH key, Azure CLI configuration,
 or raw attestation bundle is serialized into recovery state or uploaded.
 
-Enable **immutable releases** and the global
-`miz-immutable-release-tags-v1` no-bypass update/deletion tag ruleset described
-in [Development](development.md#immutable-github-releases) before creating the
-accepted source release or dispatching capture. The workflow queries both
-policies with the pinned official GitHub REST API version in protected
-preflights before mutation and again immediately before provenance
-publication; it never changes repository settings.
+Enable **immutable releases** as described in
+[Development](development.md#immutable-github-releases) before creating the
+accepted source release or dispatching capture. The workflow queries that
+policy with the pinned official GitHub REST API version in protected preflights
+before mutation and again immediately before provenance publication; it never
+changes repository settings.
 Specifically, `GET /repos/cataggar/miz/immutable-releases` must report
-`enabled=true`, and the paginated
-`GET /repos/cataggar/miz/rulesets?includes_parents=true&targets=tag&per_page=100`
-response must identify exactly one active named global ruleset and its positive
-numeric ID. The workflow then retrieves
-`GET /repos/cataggar/miz/rulesets/{id}?includes_parents=true`; only this full
-detail response is used to validate conditions, rules, and the visible empty
-`bypass_actors` array.
+`enabled=true`.
 `GITHUB_TOKEN` cannot receive the required repository Administration access.
 Install the shared release GitHub App on only `cataggar/miz` with repository
 permissions **Administration: write**, **Actions: read**, **Contents: write**,
@@ -359,8 +352,8 @@ repository owner remains the human writer and administrator trust root; all
 non-owner human release writers are prohibited rather than treated as mutually
 trusted.
 
-In addition to the mandatory global ruleset, create exactly one repository tag
-ruleset named `ubuntu2404-confidential-provenance-tags`. The workflow asks
+Create exactly one repository tag ruleset named
+`ubuntu2404-confidential-provenance-tags`. The workflow asks
 `GET /repos/cataggar/miz/rulesets?includes_parents=true&targets=tag`, selects
 exactly one result with that name, retrieves its full representation, and
 fails closed on an inherited, ambiguous, inactive, or unsupported shape.
@@ -399,9 +392,7 @@ Create it manually with the repository rulesets
 `POST /repos/cataggar/miz/rulesets` endpoint; do not grant any other bypass
 actor or use `pull_request`/`exempt` bypass mode. The active creation, update,
 and deletion rules make the protected publishing App the only actor that can
-create a matching tag. The overlapping global ruleset intentionally denies
-updates and deletion even to that App, while its omission of a creation rule
-allows the App's namespace-specific creation bypass to work. The workflow
+create, update, or delete a matching provenance tag. The workflow
 verifies the exact
 conditions, rules, and sole `Integration`/`always` bypass through
 **Administration: write** before Azure mutation and again before draft
@@ -608,12 +599,12 @@ when tag, tool commit, title, origin identity, recovery intent digest, and any
 staged asset all match; a foreign or mismatched draft is refused, and a
 published release is never overwritten. The protected App creates the final lightweight provenance tag at the exact
 tool commit before draft creation and immediately verifies it. A retry may
-reuse only that exact retained tag; it can never move or delete it. Immediately
+reuse only that exact retained tag; the workflow never moves or deletes it. Immediately
 before draft discovery, draft creation, asset upload, and publication, the workflow
 revalidates the protected release-writer acknowledgement, owner-only human
 writer policy, and exact active tag ruleset. It also revalidates immutable
-releases, the global tag ruleset, current `main`, draft identity, asset digest,
-and the exact lightweight tag
+releases, current `main`, draft identity, asset digest, and the exact
+lightweight tag
 immediately before publication. Draft create, resume, upload, validation, and
 publication remain in one protected job after its single environment approval,
 with no later approval or wait gap.
@@ -621,8 +612,9 @@ The isolated content token then PATCHes the exact draft while resending
 `tag_name`, `target_commitish=TOOL_COMMIT`, title, body, `prerelease=false`,
 and the string-valued `make_latest="false"` together with `draft=false`. This
 keeps the provenance-only release from replacing the repository's Latest
-release and narrows accidental identity drift; writer exclusivity and immutable global tag policy remain the race-prevention
-boundary. The PATCH response must still contain the one exact asset digest
+release and narrows accidental identity drift; writer exclusivity and exact
+tag revalidation remain the race-prevention boundary. The PATCH response must
+still contain the one exact asset digest
 before tag validation continues. After publication the workflow reads
 `GET /repos/cataggar/miz/git/ref/tags/TAG`, requires a lightweight
 `object.type=commit` ref at exactly `TOOL_COMMIT`, and then applies the
