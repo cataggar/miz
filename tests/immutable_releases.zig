@@ -195,15 +195,6 @@ const Fixture = struct {
         scenario: []const u8,
         version: []const u8,
     ) !Run {
-        return self.runWithPolicy(scenario, version, "policy-token");
-    }
-
-    fn runWithPolicy(
-        self: *Fixture,
-        scenario: []const u8,
-        version: []const u8,
-        policy_token: ?[]const u8,
-    ) !Run {
         const tag = try std.fmt.allocPrint(self.allocator, "v{s}", .{version});
         defer self.allocator.free(tag);
         var environment = try std.process.Environ.createMap(
@@ -218,9 +209,6 @@ const Fixture = struct {
         try environment.put("MIZ_MOCK_GH_VERSION", version);
         try environment.put("MIZ_MOCK_GH_COMMIT", commit);
         try environment.put("GH_TOKEN", "content-token");
-        if (policy_token) |token| {
-            try environment.put("MIZ_RELEASE_POLICY_GH_TOKEN", token);
-        }
         const result = try std.process.run(self.allocator, std.testing.io, .{
             .argv = &.{
                 self.publisher,
@@ -369,14 +357,6 @@ test "fresh draft uploads verifies downloads and publishes once in order" {
         "32:Accept: application/octet-stream",
         "8:--method\x1f5:PATCH",
     );
-    const create_at = std.mem.indexOf(u8, log, create_endpoint) orelse
-        return error.MissingText;
-    const first_immutable = std.mem.indexOf(
-        u8,
-        log,
-        "repos/cataggar/miz/immutable-releases",
-    ) orelse return error.MissingText;
-    try std.testing.expect(first_immutable < create_at);
     const publish_at = std.mem.indexOf(
         u8,
         log,
@@ -388,14 +368,8 @@ test "fresh draft uploads verifies downloads and publishes once in order" {
         before_publish,
         "repos/cataggar/miz/git/ref/tags/v1.2.3",
     ) orelse return error.MissingText;
-    const final_immutable = std.mem.indexOfPos(
-        u8,
-        before_publish,
-        final_tag,
-        "repos/cataggar/miz/immutable-releases",
-    ) orelse return error.MissingText;
-    try std.testing.expect(final_tag < final_immutable);
-    try std.testing.expect(final_immutable < publish_at);
+    try std.testing.expect(final_tag < publish_at);
+    try expectAbsent(log, "repos/cataggar/miz/immutable-releases");
     try expectAbsent(log, "rulesets?includes_parents=true&targets=tag");
     const tag_after_publish = std.mem.indexOfPos(
         u8,
@@ -695,51 +669,6 @@ test "upload failure leaves a resumable draft and never publishes" {
     const log = try fixture.log();
     defer std.testing.allocator.free(log);
     try expectAbsent(log, "8:--method\x1f5:PATCH");
-}
-
-test "repository release policy failures occur before draft mutation" {
-    inline for ([_]struct {
-        scenario: []const u8,
-        policy_token: ?[]const u8,
-        diagnostic: []const u8,
-    }{
-        .{
-            .scenario = "immutable-disabled",
-            .policy_token = "policy-token",
-            .diagnostic = "immutable releases are disabled",
-        },
-        .{
-            .scenario = "immutable-missing",
-            .policy_token = "policy-token",
-            .diagnostic = "enabled state is missing",
-        },
-        .{
-            .scenario = "policy-unauthorized",
-            .policy_token = "expired-policy-token",
-            .diagnostic = "GitHub CLI command failed",
-        },
-        .{
-            .scenario = "fresh",
-            .policy_token = null,
-            .diagnostic = "policy token is missing",
-        },
-    }) |case| {
-        var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
-        defer fixture.deinit();
-        const result = try fixture.runWithPolicy(
-            case.scenario,
-            "1.2.3",
-            case.policy_token,
-        );
-        defer result.deinit(std.testing.allocator);
-        try std.testing.expect(!result.succeeded());
-        try expectContains(result.stderr, case.diagnostic);
-        const log = try fixture.log();
-        defer std.testing.allocator.free(log);
-        try expectAbsent(log, create_endpoint);
-        try expectAbsent(log, upload_endpoint);
-        try expectAbsent(log, "8:--method\x1f5:PATCH");
-    }
 }
 
 test "expired publication token retains one exact draft and rerun resumes" {
