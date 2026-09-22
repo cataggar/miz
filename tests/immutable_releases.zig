@@ -69,26 +69,24 @@ const Fixture = struct {
         errdefer allocator.free(workspace);
         try Dir.cwd().createDirPath(std.testing.io, assets);
         for (platforms) |platform| {
-            inline for ([_][]const u8{ ".tar.gz", ".sbom.spdx.json" }) |suffix| {
-                const name = try std.fmt.allocPrint(
-                    allocator,
-                    "miz-{s}-{s}{s}",
-                    .{ version, platform, suffix },
-                );
-                defer allocator.free(name);
-                const path = try std.fs.path.join(allocator, &.{ assets, name });
-                defer allocator.free(path);
-                const contents = try std.fmt.allocPrint(
-                    allocator,
-                    "fixture:{s}\n",
-                    .{name},
-                );
-                defer allocator.free(contents);
-                try Dir.cwd().writeFile(
-                    std.testing.io,
-                    .{ .sub_path = path, .data = contents },
-                );
-            }
+            const name = try std.fmt.allocPrint(
+                allocator,
+                "miz-{s}-{s}.tar.gz",
+                .{ version, platform },
+            );
+            defer allocator.free(name);
+            const path = try std.fs.path.join(allocator, &.{ assets, name });
+            defer allocator.free(path);
+            const contents = try std.fmt.allocPrint(
+                allocator,
+                "fixture:{s}\n",
+                .{name},
+            );
+            defer allocator.free(contents);
+            try Dir.cwd().writeFile(
+                std.testing.io,
+                .{ .sub_path = path, .data = contents },
+            );
         }
         const publisher = try std.testing.environ.getAlloc(
             allocator,
@@ -172,21 +170,19 @@ const Fixture = struct {
 
     fn addExactAssets(self: *Fixture, version: []const u8) !void {
         for (platforms) |platform| {
-            inline for ([_][]const u8{ ".tar.gz", ".sbom.spdx.json" }) |suffix| {
-                const name = try std.fmt.allocPrint(
-                    self.allocator,
-                    "miz-{s}-{s}{s}",
-                    .{ version, platform, suffix },
-                );
-                defer self.allocator.free(name);
-                const contents = try std.fmt.allocPrint(
-                    self.allocator,
-                    "fixture:{s}\n",
-                    .{name},
-                );
-                defer self.allocator.free(contents);
-                try self.addRemote(name, contents);
-            }
+            const name = try std.fmt.allocPrint(
+                self.allocator,
+                "miz-{s}-{s}.tar.gz",
+                .{ version, platform },
+            );
+            defer self.allocator.free(name);
+            const contents = try std.fmt.allocPrint(
+                self.allocator,
+                "fixture:{s}\n",
+                .{name},
+            );
+            defer self.allocator.free(contents);
+            try self.addRemote(name, contents);
         }
     }
 
@@ -895,4 +891,25 @@ test "missing unexpected and changed local assets fail closed" {
     defer changed_result.deinit(std.testing.allocator);
     try std.testing.expect(!changed_result.succeeded());
     try expectContains(changed_result.stderr, "local release asset changed");
+}
+
+test "SBOM files are excluded from release publication" {
+    var fixture = try Fixture.create(std.testing.allocator, "1.2.3");
+    defer fixture.deinit();
+    const name = "miz-1.2.3-linux-musl-x64.sbom.spdx.json";
+    const path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ fixture.assets, name },
+    );
+    defer std.testing.allocator.free(path);
+    try Dir.cwd().writeFile(
+        std.testing.io,
+        .{ .sub_path = path, .data = "excluded SBOM" },
+    );
+    const result = try fixture.run("fresh", "1.2.3");
+    defer result.deinit(std.testing.allocator);
+    try expectSucceeded(result);
+    const log = try fixture.log();
+    defer std.testing.allocator.free(log);
+    try expectAbsent(log, name);
 }

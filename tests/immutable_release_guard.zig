@@ -899,6 +899,8 @@ test "main release workflow delegates the complete draft transaction to Zig" {
     try expectContains(path, source, "miz_release publish");
     try expectContains(path, source, "--commit \"$GITHUB_SHA\"");
     try expectContains(path, source, "--workspace \"$GITHUB_WORKSPACE/.miz-release\"");
+    try expectAbsent(path, source, "anchore/sbom-action");
+    try expectAbsent(path, source, ".spdx.json");
 }
 
 test "App-backed workflows mint policy tokens and main release uses GITHUB_TOKEN" {
