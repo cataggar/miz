@@ -2608,19 +2608,13 @@ fn validateLocalAssets(
     version: []const u8,
     diagnostic: *Diagnostic,
 ) Error![]Asset {
-    var expected_names: [platforms.len * 2][]u8 = undefined;
+    var expected_names: [platforms.len][]u8 = undefined;
     var expected_count: usize = 0;
     defer for (expected_names[0..expected_count]) |name| allocator.free(name);
     for (platforms) |platform| {
         expected_names[expected_count] = std.fmt.allocPrint(
             allocator,
             "miz-{s}-{s}.tar.gz",
-            .{ version, platform },
-        ) catch return error.OutOfMemory;
-        expected_count += 1;
-        expected_names[expected_count] = std.fmt.allocPrint(
-            allocator,
-            "miz-{s}-{s}.sbom.spdx.json",
             .{ version, platform },
         ) catch return error.OutOfMemory;
         expected_count += 1;
@@ -2647,8 +2641,7 @@ fn validateLocalAssets(
         .{err},
     )) |entry| {
         const matching = std.mem.startsWith(u8, entry.name, prefix) and
-            (std.mem.endsWith(u8, entry.name, ".tar.gz") or
-                std.mem.endsWith(u8, entry.name, ".sbom.spdx.json"));
+            std.mem.endsWith(u8, entry.name, ".tar.gz");
         if (!matching) continue;
         var allowed = false;
         for (expected_names[0..expected_count]) |name| {

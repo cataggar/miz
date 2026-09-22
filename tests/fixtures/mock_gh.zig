@@ -400,7 +400,7 @@ fn uploadAsset(
         return error.MockUploadFailure;
     }
     if (std.mem.eql(u8, scenario, "missing-remote") and
-        std.mem.endsWith(u8, name, "windows-arm64.sbom.spdx.json"))
+        std.mem.endsWith(u8, name, "windows-arm64.tar.gz"))
     {
         return;
     }
@@ -418,7 +418,7 @@ fn uploadAsset(
     );
     defer allocator.free(destination);
     if (std.mem.eql(u8, scenario, "changed-remote") and
-        std.mem.endsWith(u8, name, "windows-arm64.sbom.spdx.json"))
+        std.mem.endsWith(u8, name, "windows-arm64.tar.gz"))
     {
         const changed = try std.mem.concat(allocator, u8, &.{ bytes, "changed" });
         defer allocator.free(changed);
