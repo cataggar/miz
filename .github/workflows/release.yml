@@ -25,10 +25,10 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build release contract tool
-        run: zig build install-miz-release -Doptimize=ReleaseSafe
+        run: zig build install-miz-release -Doptimize=safe
 
       - name: Set release version from tag
         id: version
@@ -65,7 +65,7 @@ jobs:
             target: x86_64-macos
             name: macos-x64
             executable: miz
-          - os: macos-14
+          - os: macos-15
             target: aarch64-macos
             name: macos-arm64
             executable: miz
@@ -88,10 +88,10 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build
-        run: zig build install-miz -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} "-Dversion=${{ needs.verify.outputs.version }}"
+        run: zig build install-miz -Doptimize=safe -Dtarget=${{ matrix.target }} "-Dversion=${{ needs.verify.outputs.version }}"
 
       - name: Verify embedded version
         if: >-
@@ -154,10 +154,10 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build release publisher
-        run: zig build install-miz-release -Doptimize=ReleaseSafe
+        run: zig build install-miz-release -Doptimize=safe
 
       - name: Download artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0

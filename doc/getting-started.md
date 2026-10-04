@@ -2,7 +2,11 @@
 
 ## Requirements
 
-- Zig **0.16.0** or later.
+- Zig **0.17.0**, matching the signed compiler pin used by CI and releases.
+- Target OS floors, including guest targets: **Linux 5.10+**, **macOS 15+**,
+  **Windows 10+**, and **FreeBSD 14+**. Linux-only image builders, package
+  operations, privileged integrations, and VM boot tests still require Linux;
+  portable CLI/library smoke tests run natively on Linux, macOS, and Windows.
 - `zig build` compiles the pinned static libzstd dependency from
   `build.zig.zon`; no system libzstd development package is needed for miz's
   zstd wrapper.
@@ -18,6 +22,10 @@
 - The released `miz` binary includes bzip2 support for packaged compressed firmware and does not require a system decompression tool.
 
 ## Build and run
+
+The default optimization mode is `.safe`. Override it with
+`-Doptimize=debug|safe|fast|small`; the former `Debug`, `ReleaseSafe`,
+`ReleaseFast`, and `ReleaseSmall` spellings are not Zig 0.17 modes.
 
 ```console
 zig build

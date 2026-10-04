@@ -14,7 +14,7 @@
 # protected release build is dispatched, per the release-gate requirement.
 #
 # Usage:
-#   ZIG=/path/to/zig-0.16.0 \
+#   ZIG=/path/to/zig-0.17.0 \
 #   SEED_CACHE=/home/you/.cache/zig \
 #   scripts/ubuntu2604_local_e2e.sh [x86_64|aarch64]
 #
@@ -39,7 +39,11 @@ esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-: "${ZIG:?set ZIG to the zig 0.16.0 binary used to build miz}"
+: "${ZIG:?set ZIG to the Zig 0.17.0 binary used to build miz}"
+test "$("$ZIG" version)" = 0.17.0 || {
+  echo "local e2e requires exactly Zig 0.17.0" >&2
+  exit 2
+}
 VIRTUAL_SIZE="${VIRTUAL_SIZE:-5368709120}"
 FIXTURE_DIR="$REPO_ROOT/tests/fixtures/ubuntu2604-local-signing"
 CERT="$FIXTURE_DIR/signing-cert.pem"
@@ -60,6 +64,7 @@ test -f "$KEY" || { echo "missing signing key fixture: $KEY" >&2; exit 3; }
 # a shared user cache. Seed it once from the caller's cache to avoid re-fetching
 # pinned dependencies under root.
 export ZIG_GLOBAL_CACHE_DIR="$REPO_ROOT/.zig-global-cache"
+export ZIG_LOCAL_PKG_DIR="$ZIG_GLOBAL_CACHE_DIR/zig-pkg"
 unset ZIG_LOCAL_CACHE_DIR || true
 if [ ! -d "$ZIG_GLOBAL_CACHE_DIR" ]; then
   if [ -n "${SEED_CACHE:-}" ] && [ -d "$SEED_CACHE" ]; then

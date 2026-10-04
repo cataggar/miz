@@ -996,7 +996,7 @@ the same guest bytes.
 
 ## Local build
 
-Use Zig 0.16.0 or later on a matching native Ubuntu host. Install the same
+Use Zig 0.17.0 on a matching native Ubuntu host. Install the same
 builder dependencies as the release workflow:
 
 ```console
@@ -1191,7 +1191,7 @@ sudo -E zig build \
 `zig build install-ubuntu2604-image-benchmark`. It is deliberately not part of
 normal CI. The profile is fixed to the
 pinned 20260731 Ubuntu 26.04 source, `aarch64`, `baremetal`, the exact 5 GiB
-size, and `ReleaseSafe`. It performs one warm-up and exactly three measured
+size, and `safe` optimization. It performs one warm-up and exactly three measured
 runs. Every run has a fresh work and output directory; only the explicitly
 named debz content-addressed cache, fixed package locks, and Zig compilation
 cache are reused. Every production-builder invocation also uses the fixed
@@ -1203,7 +1203,7 @@ Prerequisites:
 
 - a native `aarch64` Ubuntu host running as root, because package scripts run
   in the architecture-matched offline root;
-- Zig 0.16.0, `file`, and the aarch64 `systemd-boot-efi` stub;
+- exactly Zig 0.17.0, `file`, and the aarch64 `systemd-boot-efi` stub;
 - the pinned Canonical image, `SHA256SUMS`, detached signature, and arm64
   manifest with the hashes listed above;
 - the seven exact arm64 lock files emitted by a previously successful
@@ -1246,7 +1246,7 @@ sudo -E zig-out/bin/ubuntu2604-image-benchmark run \
   --signing-certificate-sha256 <canonical-DER-SHA-256> \
   --sign-command /absolute/path/to/miz \
   --sign-command-arg sign \
-  --zig /absolute/path/to/zig-0.16.0 \
+  --zig /absolute/path/to/zig-0.17.0 \
   --zig-global-cache /data/miz-inputs/zig-global-cache
 ```
 
@@ -1280,10 +1280,17 @@ QCOW2 SHA-256 values and raw structural metadata are retained as evidence.
 Raw byte hashes are not computed, and no image bytes are compared: bare-metal
 output has no documented byte-identical reproducibility contract.
 
-The historical 8m50s ReleaseSafe result remains the non-regression ceiling
+The historical Zig 0.16.0 8m50s ReleaseSafe result remains the non-regression ceiling
 until this protocol is run on the designated production benchmark host. Do
 not record a replacement baseline from a different architecture, cold cache,
 unreviewed lock set, or incomplete signing/boot environment.
+
+The compiler migration does not relabel historical measurements or fixtures
+as Zig 0.17 results. The current workflow and driver require exactly Zig
+0.17.0, rejecting older, newer, and development compilers. A new baseline must
+be recorded separately with its source commit, exact Zig 0.17.0 compiler,
+optimization mode, host, verified input/cache/lock identities, and complete
+measurement protocol; retain the earlier attribution when comparing results.
 
 The manual **Benchmark Ubuntu 26.04 aarch64 image** workflow makes this
 protocol reproducible on the repository's `ubuntu-24.04-arm` hosted runner.

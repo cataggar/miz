@@ -382,6 +382,16 @@ which run once in dedicated parallel jobs. Windows cross-builds and the
 native, cross-architecture, and modular real-VM boots also run as independent
 matrix shards (see below).
 
+The protected branch context remains **build + test**. A separate
+`native-smoke` matrix builds and executes the portable CLI/library smoke gate
+on hosted Ubuntu 24.04, macOS 15, and Windows 2025 runners in each of
+`debug`, `safe`, `fast`, and `small`. It runs `install-miz test-native-smoke`
+and the resulting native CLI's `version` and `--help` commands, not the
+Linux-only aggregate suite on macOS or Windows. These smoke jobs complement,
+rather than replace, the six release targets: Linux-musl, macOS, and Windows,
+each on x64 and arm64.
+The release archive still contains exactly one executable, `miz`.
+
 ### Stale brand guard
 
 `zig build test-stale-brand` runs `tests/stale_brand.zig`, which enumerates the
@@ -538,9 +548,25 @@ cover both halves of that sentence:
 `.github/workflows/boot-smoke.yml` runs `zig build test-boot-smoke` for every release tag and when manually dispatched. It installs `qemu-system-x86`/`ovmf`, downloads and caches the [Azure Linux 4.0 ISO](https://aka.ms/azurelinux-4.0-x86_64.iso), and builds the OCI fixtures used by the real-QEMU tests with `zig build oci-fixture -- <minimal|uki-stub|verity-initramfs> ...`. The job is required (not `continue-on-error`) for release tags but is not part of universal pull-request CI.
 
 
-## Notes on Zig 0.16
+## Notes on Zig 0.17
 
-This codebase targets Zig 0.16's new `std.Io` interface: every filesystem,
+This codebase targets Zig 0.17.0 and defaults to `.safe` optimization. The
+build option is `-Doptimize=debug|safe|fast|small`. Every filesystem,
 clock, and randomness operation takes an explicit `io: std.Io` parameter
 (via `std.process.Init.io` in the CLI, or `std.testing.io` in tests) rather
 than relying on implicit global state.
+
+Zig 0.17 separates package sources from compilation caches. Extracted package
+sources default to the checkout's `zig-pkg/` directory; the global cache holds
+compressed `p/<hash>.tar.gz` archives. `ZIG_LOCAL_PKG_DIR` (or `--pkg-dir`)
+selects the extracted source directory independently of `ZIG_LOCAL_CACHE_DIR`.
+Release workflows explicitly keep it under their isolated global-cache tree,
+including when building an accepted-source checkout or running under sudo.
+The benchmark keeps it with its staged inputs, so deleting the staging
+compilation cache cannot delete packages needed by the offline measured runs.
+
+`scripts/zig_fetch_retry.sh` uses `zig build --fetch=all` to stage both eager
+and lazy pinned dependencies before offline work. It still retries only
+allowlisted transient transport failures, at most four attempts; hash
+mismatches and other permanent failures abort immediately. Do not replace
+hash verification with an ambient package directory or a permissive inventory.

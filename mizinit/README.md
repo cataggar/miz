@@ -100,7 +100,7 @@ zig build test-mizinit
 
 The installed executable cross-compiles statically for the architecture
 selected by `-Dazurelinux-arch=x86_64|aarch64`; there is no `-Doptimize=`
-toggle because the binary hardcodes `ReleaseSmall`. Tests build for the
+toggle because the binary hardcodes `.small`. Tests build for the
 selected native test target.
 
 ## Using it

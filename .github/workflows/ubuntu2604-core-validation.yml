@@ -29,6 +29,9 @@ concurrency:
   group: ubuntu2604-core-validation
   cancel-in-progress: false
 
+env:
+  ZIG_LOCAL_PKG_DIR: ${{ github.workspace }}/.zig-global-cache/zig-pkg
+
 jobs:
   prepare:
     name: resolve immutable main source
@@ -182,7 +185,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Install complete Ubuntu image-builder dependencies
         run: |
@@ -629,7 +632,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Install same-architecture QEMU, firmware, and vTPM tooling
         run: |
@@ -677,7 +680,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch \
+          zig build --fetch=all \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
@@ -758,7 +761,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch \
+          zig build --fetch=all \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
           zig build \
             -Dubuntu2604-arch="$ARCHITECTURE" \
@@ -929,7 +932,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Require Azure acceptance tools
         run: |
@@ -946,9 +949,9 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch \
+          zig build --fetch=all \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-          zig build -Doptimize=ReleaseSafe
+          zig build -Doptimize=safe
           test -x zig-out/bin/miz
 
       - name: Build Binder device usability probe
@@ -958,7 +961,7 @@ jobs:
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           zig build-exe \
             -target "$ARCHITECTURE-linux" \
-            -O ReleaseSmall \
+            -O small \
             -static \
             tests/binder_probe.zig \
             -femit-bin="$BINDER_PROBE" \
@@ -1092,16 +1095,16 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build accepted-source release tooling
         run: |
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch \
+          zig build --fetch=all \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-          zig build -Doptimize=ReleaseSafe install-ubuntu2604-release
+          zig build -Doptimize=safe install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
 
       - name: Download both build-validated core candidates

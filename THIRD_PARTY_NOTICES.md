@@ -1,5 +1,16 @@
 # Third-Party Notices
 
+## translate-c (build tool)
+
+Zig 0.17 C-header bindings use `cataggar/translate-c` at immutable commit
+`62d06a5d3e93c82727544e8113e4762a315ca0ed`. This is the reviewed compiler
+compatibility revision; it is a build tool, not an additional runtime library.
+
+Copyright (c) Zig contributors.
+
+Licensed under the MIT License (Expat). See:
+https://github.com/cataggar/translate-c/blob/62d06a5d3e93c82727544e8113e4762a315ca0ed/LICENSE
+
 ## rpmz
 
 The host-only RPM package-family adapter uses `cataggar/rpmz` at immutable
@@ -34,8 +45,8 @@ https://github.com/cataggar/bzip2z/blob/05f6d4e34df2da2729490aee2a5bbe43b5ce94f6
 
 ## zstd
 
-Host/public miz module graphs link `cataggar/zstd` from its Zig 0.16 branch
-at immutable commit `45b6dfcd9d0ffdba99fb653c66b233179b9f7229` as a static,
+Host/public miz module graphs link `cataggar/zstd` at immutable commit
+`45b6dfcd9d0ffdba99fb653c66b233179b9f7229` as a static,
 single-threaded library (`tools=false`, `shared=false`, `multithread=false`).
 Private guest-root builds reuse only the public headers and do not link the
 library or libc.
@@ -51,7 +62,7 @@ does not build them because the dependency is configured with `tools=false`.
 ## tls.zig (test fixture only)
 
 The deterministic OCI registry TLS fixture uses `cataggar/tls.zig` at commit
-`2621e411af81c8b4d8fa5aaae08b9b183a80bb46` from its Zig 0.16 branch. It is
+`2621e411af81c8b4d8fa5aaae08b9b183a80bb46`. It is
 not linked into the library or CLI.
 
 Copyright (c) tls.zig contributors.
