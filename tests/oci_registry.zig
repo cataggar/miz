@@ -225,9 +225,8 @@ const RedirectTarget = struct {
     }
 };
 
-/// This is deliberately the only use of the pinned tls.zig dependency. Zig
-/// 0.16's std.http.Server is plaintext-only, while std.http.Client itself
-/// performs normal certificate and hostname verification.
+/// The pinned tls.zig dependency supplies the TLS transport around
+/// std.http.Server; std.http.Client verifies certificates and hostnames.
 const TlsFixture = struct {
     allocator: std.mem.Allocator,
     io: Io,
@@ -243,8 +242,7 @@ const TlsFixture = struct {
         var address = Io.net.IpAddress{ .ip4 = .loopback(0) };
         var listener = try address.listen(io, .{ .reuse_address = true });
         errdefer listener.deinit(io);
-        // Zig 0.16's TLS verifier matches dNSName SANs only; OpenSSL verifies
-        // this fixture's IP SAN separately with -verify_ip.
+        // Exercise the fixture's DNS SAN here; Zig 0.17 also verifies IP SANs.
         const authority = try allocator.print("localhost:{d}", .{try listenerPort(&listener)});
         return .{
             .allocator = allocator,

@@ -246,13 +246,62 @@ fn hasIfCondition(type_spec: std.json.Value) bool {
 
 /// Conservative Zig keyword set for identifiers derived from QAPI names.
 const zig_keywords = [_][]const u8{
-    "align",       "allowzero", "and",      "anyframe",    "anytype", "asm",         "async",          "await",
-    "break",       "callconv",  "catch",    "comptime",    "const",   "continue",    "defer",          "else",
-    "enum",        "errdefer",  "error",    "export",      "extern",  "fn",          "for",            "if",
-    "inline",      "noalias",   "noinline", "nosuspend",   "opaque",  "or",          "orelse",         "packed",
-    "pub",         "resume",    "return",   "linksection", "struct",  "suspend",     "switch",         "test",
-    "threadlocal", "try",       "type",     "undefined",   "union",   "unreachable", "usingnamespace", "var",
-    "volatile",    "while",     "null",     "true",        "false",   "void",        "noreturn",
+    "addrspace",
+    "align",
+    "allowzero",
+    "and",
+    "anyframe",
+    "anytype",
+    "asm",
+    "async",
+    "await",
+    "break",
+    "callconv",
+    "catch",
+    "comptime",
+    "const",
+    "continue",
+    "defer",
+    "else",
+    "enum",
+    "errdefer",
+    "error",
+    "export",
+    "extern",
+    "fn",
+    "for",
+    "if",
+    "inline",
+    "noalias",
+    "noinline",
+    "nosuspend",
+    "opaque",
+    "or",
+    "orelse",
+    "packed",
+    "pub",
+    "resume",
+    "return",
+    "linksection",
+    "struct",
+    "suspend",
+    "switch",
+    "test",
+    "threadlocal",
+    "try",
+    "type",
+    "undefined",
+    "union",
+    "unreachable",
+    "usingnamespace",
+    "var",
+    "volatile",
+    "while",
+    "null",
+    "true",
+    "false",
+    "void",
+    "noreturn",
 };
 
 fn isPlainIdent(name: []const u8) bool {
@@ -521,6 +570,10 @@ test "isPlainIdent: rejects keywords and non-identifier chars" {
     try std.testing.expect(!isPlainIdent("error"));
     try std.testing.expect(!isPlainIdent("type"));
     try std.testing.expect(!isPlainIdent(""));
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeIdent(&out.writer, "addrspace");
+    try std.testing.expectEqualStrings("@\"addrspace\"", out.written());
 }
 
 test "builtinType: maps QAPI scalar names to Zig types" {

@@ -1,7 +1,7 @@
 //! Build a generalized Azure Linux 4 Gen2 QCOW2 image.
 //!
 //! Equivalent to scripts/build-generalized-azurelinux4.py but implemented as
-//! native Zig 0.16 code. Invoked via `zig build generalized-azurelinux4 -- [args]`
+//! native Zig 0.17 code. Invoked via `zig build generalized-azurelinux4 -- [args]`
 //! rather than directly; the build system passes pre-built tool paths so this
 //! binary does not invoke `zig build` internally.
 //!
