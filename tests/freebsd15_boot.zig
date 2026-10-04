@@ -334,7 +334,7 @@ fn shellStatus(term: std.process.Child.Term) ?u8 {
         .signal => |signal| std.math.add(
             u8,
             128,
-            @intCast(@intFromEnum(signal)),
+            @intCast(@backingInt(signal)),
         ) catch null,
         else => null,
     };
@@ -543,11 +543,11 @@ fn sshFailureDiagnosticAlloc(
         ),
         .signal => |signal| try output.writer.print(
             "FreeBSD acceptance {s} ended by signal {d}\n",
-            .{ result.operation.description(), @intFromEnum(signal) },
+            .{ result.operation.description(), @backingInt(signal) },
         ),
         .stopped => |signal| try output.writer.print(
             "FreeBSD acceptance {s} stopped by signal {d}\n",
-            .{ result.operation.description(), @intFromEnum(signal) },
+            .{ result.operation.description(), @backingInt(signal) },
         ),
         .unknown => |status| try output.writer.print(
             "FreeBSD acceptance {s} ended with unknown status {d}\n",

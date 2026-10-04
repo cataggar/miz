@@ -208,9 +208,9 @@ fn exchangeDirectories(
     bundle_path: []const u8,
 ) !void {
     if (builtin.os.tag != .linux) return error.AtomicReplaceUnsupported;
-    const staging_z = try allocator.dupeZ(u8, staging_path);
+    const staging_z = try allocator.dupeSentinel(u8, staging_path, 0);
     defer allocator.free(staging_z);
-    const bundle_z = try allocator.dupeZ(u8, bundle_path);
+    const bundle_z = try allocator.dupeSentinel(u8, bundle_path, 0);
     defer allocator.free(bundle_z);
     const linux = std.os.linux;
     switch (linux.errno(linux.renameat2(

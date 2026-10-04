@@ -314,7 +314,7 @@ pub fn writeFrameForSlice(writer: *std.Io.Writer, bytes: []const u8, payload: ?[
 fn findBestMatch(bytes: []const u8, cursor: usize) ?Match {
     if (bytes.len < cursor + min_match_len + 1) return null;
 
-    var table = [_]u32{invalid_pos} ** hash_table_size;
+    var table = @as([hash_table_size]u32, @splat(invalid_pos));
     var preload: usize = 0;
     while (preload < cursor and preload + min_match_len <= bytes.len) : (preload += 1) {
         table[hash4(bytes[preload .. preload + 4])] = @intCast(preload);
@@ -615,7 +615,7 @@ test "compressing frame shrinks zeros and round-trips via CLI and local decoder"
 }
 
 test "compressing frame shrinks repeated text and round-trips" {
-    const input = ("The quick brown fox jumps over the lazy dog.\n" ** 2048);
+    const input = (repeatedBytes("The quick brown fox jumps over the lazy dog.\n", 2048));
     const encoded = try writeAndCheck(input[0..], null);
     defer std.testing.allocator.free(encoded);
 
@@ -631,7 +631,7 @@ test "compressing frame shrinks mixed repeated and noisy data" {
         byte.* = @truncate(x >> 24);
     }
 
-    const repeated = "root=/dev/dm-0 ro quiet splash console=ttyS0\n" ** 512;
+    const repeated = repeatedBytes("root=/dev/dm-0 ro quiet splash console=ttyS0\n", 512);
     var input_buf: [repeated.len + noise.len + repeated.len]u8 = undefined;
     @memcpy(input_buf[0..repeated.len], repeated[0..]);
     @memcpy(input_buf[repeated.len .. repeated.len + noise.len], &noise);
@@ -653,7 +653,7 @@ test "empty input emits a valid empty frame" {
 }
 
 test "raw-frame encoder still round-trips via stdlib-backed decoder" {
-    const input = "hello zstd raw blocks" ** 4096;
+    const input = repeatedBytes("hello zstd raw blocks", 4096);
 
     var out = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer out.deinit();
@@ -721,4 +721,17 @@ test "streaming frame encoder rejects empty buffers and size overflow" {
     }));
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
     try std.testing.expectError(error.SizeOverflow, maxEncodedSize(std.math.maxInt(u64), false));
+}
+
+fn repeatedBytes(comptime pattern: []const u8, comptime count: usize) *const [pattern.len * count:0]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1000 + count * 2);
+        var bytes: [pattern.len * count:0]u8 = undefined;
+        for (0..count) |i| {
+            @memcpy(bytes[i * pattern.len ..][0..pattern.len], pattern);
+        }
+        bytes[bytes.len] = 0;
+        const result = bytes;
+        break :blk &result;
+    };
 }

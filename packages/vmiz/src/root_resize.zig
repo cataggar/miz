@@ -381,7 +381,7 @@ test "grows a labeled root in a standalone QCOW2 transactionally" {
     const root_last_lba = old_last_usable - 7;
     const root_offset = root_first_lba * gpt.sector_size;
     const root_length = (root_last_lba - root_first_lba + 1) * gpt.sector_size;
-    const filesystem_uuid = [_]u8{0x41} ** 16;
+    const filesystem_uuid = @as([16]u8, @splat(0x41));
 
     var raw = try Image.create(io, raw_path, .raw, old_size, .{});
     var raw_open = true;
@@ -432,7 +432,7 @@ test "grows a labeled root in a standalone QCOW2 transactionally" {
     );
     std.mem.writeInt(u16, stock_superblock[0xFE..0x100], 64, .little);
     try raw.file.writePositionalAll(io, &stock_superblock, root_offset + 1024);
-    var stock_gdt: [4096]u8 = [_]u8{0} ** 4096;
+    var stock_gdt: [4096]u8 = @as([4096]u8, @splat(0));
     _ = try raw.file.readPositionalAll(io, &stock_gdt, root_offset + 4096);
     var first_descriptor: [32]u8 = undefined;
     @memcpy(&first_descriptor, stock_gdt[0..32]);

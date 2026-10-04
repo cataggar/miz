@@ -111,7 +111,7 @@ and are not inherited from the candidate.
 
 ## Local build
 
-Use Zig 0.16.0 or later on a matching native Ubuntu host. Install the same
+Use Zig 0.17.0 on a matching native Ubuntu host. Install the same
 builder dependencies as the release workflow:
 
 ```console

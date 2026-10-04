@@ -3,13 +3,13 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const dependency = b.dependency("image_toolkit", .{
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("main.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .imports = &.{
                 .{
                     .name = "package_family_host",

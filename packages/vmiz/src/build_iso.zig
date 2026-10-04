@@ -171,7 +171,7 @@ pub const BuildIsoReport = struct {
     /// Total output ISO size in bytes (0 for a dry run).
     output_size: u64 = 0,
     /// SHA-256 of the published ISO (all zero for a dry run).
-    output_sha256: [32]u8 = [_]u8{0} ** 32,
+    output_sha256: [32]u8 = @as([32]u8, @splat(0)),
     limit_peaks: limits_mod.Peaks = .{},
 
     pub fn deinit(self: *BuildIsoReport, allocator: std.mem.Allocator) void {
@@ -1140,7 +1140,7 @@ fn buildTar(allocator: std.mem.Allocator, entries: []const TarEntry) ![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     for (entries) |entry| {
-        var header = [_]u8{0} ** 512;
+        var header = @as([512]u8, @splat(0));
         @memcpy(header[0..entry.path.len], entry.path);
         testWriteOctal(header[100..108], 0o644);
         testWriteOctal(header[108..116], 0);
@@ -1238,7 +1238,7 @@ fn extractSquashfsFileToPath(allocator: std.mem.Allocator, io: Io, reader: *squa
 
 const deterministic_fixture = Determinism{
     .filesystem_timestamp = 1_700_000_000,
-    .root_filesystem_uuid = [_]u8{0x11} ** 16,
+    .root_filesystem_uuid = @as([16]u8, @splat(0x11)),
 };
 
 test "build-iso regenerates a LiveOS ISO: boot files survive, payload replaced, nested rootfs carries customized and OCI content" {

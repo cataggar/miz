@@ -227,7 +227,7 @@ fn runBoot(
                 .command = settings.emulator_path,
             } },
         .reproducibility = .{
-            .seed = .{ .bytes = [_]u8{0x57} ** 32 },
+            .seed = .{ .bytes = @as([32]u8, @splat(0x57)) },
             .source_date_epoch = 1_735_689_600,
         },
     };
@@ -450,7 +450,7 @@ fn createSourceDisk(
         .offset = partition_offset,
         .length = partition_length,
         .label = "vm-boot",
-        .uuid = [_]u8{0x57} ** 16,
+        .uuid = @as([16]u8, @splat(0x57)),
         .timestamp = 1_735_689_600,
     });
     return release;

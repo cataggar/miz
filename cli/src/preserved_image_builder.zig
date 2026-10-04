@@ -1720,7 +1720,7 @@ test "dependency closure is checked before a bundle can be reset" {
         .bundle_output_path = bundle_path,
         .image_basename = "disk.raw",
         .format = .raw,
-        .seed = .{ .bytes = [_]u8{0} ** 32 },
+        .seed = .{ .bytes = @as([32]u8, @splat(0)) },
         .source_date_epoch = 0,
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1740,7 +1740,7 @@ test "import limit flags raise the limits the request carries" {
         "--bundle-output",         "out",
         "--image-basename",        "image.raw",
         "-O",                      "raw",
-        "--seed",                  "00" ** 32,
+        "--seed",                  repeatedBytes("00", 32),
         "--source-date-epoch",     "0",
         "--max-nodes",             "8M",
         "--max-source-file-bytes", "4G",
@@ -1766,7 +1766,7 @@ test "a zero limit is rejected instead of silently rejecting every source" {
         "--bundle-output",     "out",
         "--image-basename",    "image.raw",
         "-O",                  "raw",
-        "--seed",              "00" ** 32,
+        "--seed",              repeatedBytes("00", 32),
         "--source-date-epoch", "0",
         "--max-nodes",         "0",
     };
@@ -1919,4 +1919,17 @@ test "the wire's synthesized FAT metadata defaults are the library's" {
     try std.testing.expectEqual(library_defaults.file_mode, wire_defaults.file_mode);
     try std.testing.expectEqual(library_defaults.uid, wire_defaults.uid);
     try std.testing.expectEqual(library_defaults.gid, wire_defaults.gid);
+}
+
+fn repeatedBytes(comptime pattern: []const u8, comptime count: usize) *const [pattern.len * count:0]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1000 + count * 2);
+        var bytes: [pattern.len * count:0]u8 = undefined;
+        for (0..count) |i| {
+            @memcpy(bytes[i * pattern.len ..][0..pattern.len], pattern);
+        }
+        bytes[bytes.len] = 0;
+        const result = bytes;
+        break :blk &result;
+    };
 }

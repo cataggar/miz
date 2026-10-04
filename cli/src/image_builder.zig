@@ -888,7 +888,7 @@ fn testArgs(extra: []const []const u8, buffer: [][]const u8) []const []const u8 
         "--image-basename",    "image.vhd",
         "-O",                  "vhd",
         "--size",              "4G",
-        "--seed",              "00" ** 32,
+        "--seed",              repeatedBytes("00", 32),
         "--source-date-epoch", "0",
     };
     @memcpy(buffer[0..base.len], &base);
@@ -1068,4 +1068,17 @@ test "a signature key beside a local layout is refused rather than ignored" {
             "--registry-signature-key", "/etc/vmiz/cosign.pub",
         }, &buffer),
     ));
+}
+
+fn repeatedBytes(comptime pattern: []const u8, comptime count: usize) *const [pattern.len * count:0]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1000 + count * 2);
+        var bytes: [pattern.len * count:0]u8 = undefined;
+        for (0..count) |i| {
+            @memcpy(bytes[i * pattern.len ..][0..pattern.len], pattern);
+        }
+        bytes[bytes.len] = 0;
+        const result = bytes;
+        break :blk &result;
+    };
 }

@@ -2349,7 +2349,7 @@ fn openPinnedStage(
 }
 
 fn zeroFileRange(io: Io, file: Io.File, offset: u64, length: u64) !void {
-    const zeroes: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024);
+    const zeroes: [64 * 1024]u8 = @as([(64 * 1024)]u8, @splat(0));
     var written: u64 = 0;
     while (written < length) {
         const chunk: usize = @intCast(@min(@as(u64, zeroes.len), length - written));
@@ -3022,7 +3022,7 @@ fn createTestDisk(io: Io, path: []const u8) !void {
     try image.pwrite(io, &encoded_mbr, 0);
     try image.pwrite(
         io,
-        &([_]u8{0xA5} ** 4096),
+        &(@as([4096]u8, @splat(0xA5))),
         @as(u64, test_unrelated_first_lba) * mbr.sector_size,
     );
 
@@ -3049,7 +3049,7 @@ fn createTestDisk(io: Io, path: []const u8) !void {
         .offset = @as(u64, test_partition_first_lba) * mbr.sector_size,
         .length = @as(u64, test_partition_sectors) * mbr.sector_size,
         .label = "preserved-root",
-        .uuid = [_]u8{0x42} ** 16,
+        .uuid = @as([16]u8, @splat(0x42)),
         .timestamp = 1_735_689_600,
     });
 }
@@ -3119,7 +3119,7 @@ fn expectRebuildArtifactsMissing(io: Io, output_path: []const u8) !void {
     }
 }
 
-const TestExt4Crc32c = std.hash.crc.Crc(u32, .{
+const TestExt4Crc32c = std.hash.crc.Generic(u32, .{
     .polynomial = 0x1edc6f41,
     .initial = 0xffff_ffff,
     .reflect_input = true,
@@ -3229,7 +3229,7 @@ test "rebuild inspection validates source without creating artifacts" {
     );
     try std.testing.expectEqual(ext4.SourceProfile.vmiz_ext4_v1, inspection.source_profile);
     try std.testing.expect(inspection.source_reproducible);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x42} ** 16), &inspection.ext4_uuid);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x42))), &inspection.ext4_uuid);
     try std.testing.expectEqual(@as(u32, 1_735_689_600), inspection.ext4_global_timestamp);
     try std.testing.expectEqual(@as(usize, 8), inspection.imported_node_count);
     try std.testing.expectEqualSlices(u8, &source_before, &(try hashTestPath(io, source_path)));
@@ -3367,7 +3367,7 @@ test "strict raw rebuild preserves identity tree metadata and outside bytes dete
         defer source.close(io);
         try source.pwrite(
             io,
-            &([_]u8{0xA7} ** ext4.default_block_size),
+            &(@as([ext4.default_block_size]u8, @splat(0xA7))),
             (@as(u64, test_partition_first_lba + test_partition_sectors) *
                 mbr.sector_size) - ext4.default_block_size,
         );
@@ -3418,7 +3418,7 @@ test "strict raw rebuild preserves identity tree metadata and outside bytes dete
     try std.testing.expectEqual(ext4.SourceProfile.vmiz_ext4_v1, report.source_profile);
     try std.testing.expect(report.source_reproducible);
     try std.testing.expectEqual(@as(u32, 1_735_689_600), report.ext4_global_timestamp);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x42} ** 16), &report.ext4_uuid);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x42))), &report.ext4_uuid);
     try std.testing.expectEqualSlices(
         u8,
         &report.source_manifest_sha256,
@@ -3691,7 +3691,7 @@ test "strict rebuild rejects filesystem trailers and unsupported partition layou
         var sector: [mbr.sector_size]u8 = undefined;
         if (try image.pread(io, &sector, 0) != sector.len) return error.UnexpectedEndOfFile;
         var table = try mbr.Mbr.decode(&sector);
-        table.entries[0].partition_type = @enumFromInt(0x07);
+        table.entries[0].partition_type = @fromBackingInt(@intCast(0x07));
         table.encodePartitionTableInto(&sector);
         try image.pwrite(io, &sector, 0);
     }
@@ -4128,7 +4128,7 @@ const lvm_test_root_offset: u64 = lvm_test_pv_offset + lvm_test_pe_start * lvm.s
 const lvm_test_root_length: u64 = lvm_test_extents * lvm_test_extent_sectors * lvm.sector_size;
 
 fn writeLvmTestPv(allocator: Allocator, io: Io, image: *Image, extra_lv: []const u8) !void {
-    var label = [_]u8{0} ** 512;
+    var label = @as([512]u8, @splat(0));
     label[0..8].* = lvm.label_id;
     std.mem.writeInt(u64, label[8..16], 1, .little);
     std.mem.writeInt(u32, label[20..24], 32, .little);
@@ -4239,7 +4239,7 @@ fn createLvmTestDisk(io: Io, path: []const u8, extra_lv: []const u8) !void {
         .offset = lvm_test_root_offset,
         .length = lvm_test_root_length,
         .label = "lvm-root",
-        .uuid = [_]u8{0x77} ** 16,
+        .uuid = @as([16]u8, @splat(0x77)),
         .timestamp = 1_735_689_600,
     });
 }
@@ -4544,9 +4544,9 @@ test "preserved editor rejects reversed GPT partition extents" {
         const protective = mbr.protectiveMbr(disk_size / mbr.sector_size).encode();
         try image.pwrite(io, &protective, 0);
 
-        var entries = [_]u8{0} ** (gpt.default_num_partition_entries * gpt.partition_entry_size);
-        entries[0..16].* = [_]u8{1} ** 16;
-        entries[16..32].* = [_]u8{2} ** 16;
+        var entries = @as([(gpt.default_num_partition_entries * gpt.partition_entry_size)]u8, @splat(0));
+        entries[0..16].* = @as([16]u8, @splat(1));
+        entries[16..32].* = @as([16]u8, @splat(2));
         std.mem.writeInt(u64, entries[32..40], 100, .little);
         std.mem.writeInt(u64, entries[40..48], 99, .little);
         const header = (gpt.Header{
@@ -4554,9 +4554,9 @@ test "preserved editor rejects reversed GPT partition extents" {
             .backup_lba = disk_size / gpt.sector_size - 1,
             .first_usable_lba = 34,
             .last_usable_lba = disk_size / gpt.sector_size - 34,
-            .disk_guid = [_]u8{3} ** 16,
+            .disk_guid = @as([16]u8, @splat(3)),
             .partition_entry_lba = 2,
-            .partition_array_crc32 = std.hash.crc.Crc32.hash(&entries),
+            .partition_array_crc32 = std.hash.Crc32.hash(&entries),
         }).encode();
         try image.pwrite(io, &header, gpt.sector_size);
         try image.pwrite(io, &entries, gpt.sector_size * 2);
@@ -4579,7 +4579,7 @@ test "preserved editor rejects overlapping GPT partitions and metadata" {
         .backup_lba = total_lbas - 1,
         .first_usable_lba = 34,
         .last_usable_lba = total_lbas - 34,
-        .disk_guid = [_]u8{3} ** 16,
+        .disk_guid = @as([16]u8, @splat(3)),
         .partition_entry_lba = 2,
         .partition_array_crc32 = 0,
     };
@@ -5054,7 +5054,7 @@ const merge_boot_first_lba: u32 = merge_esp_first_lba + merge_esp_sectors;
 const merge_boot_sectors: u32 = 8 * 2048;
 const merge_root_first_lba: u32 = merge_boot_first_lba + merge_boot_sectors;
 const merge_root_sectors: u32 = 24 * 2048;
-const esp_partition_type: mbr.PartitionType = @enumFromInt(0xEF);
+const esp_partition_type: mbr.PartitionType = @fromBackingInt(@intCast(0xEF));
 
 const merge_root_fixture_dir = "test-preserved-merge-root-src";
 const merge_boot_fixture_dir = "test-preserved-merge-boot-src";
@@ -6275,7 +6275,7 @@ fn createXfsIdentitySourceDisk(
         .offset = @as(u64, root_first_lba) * mbr.sector_size,
         .length = @as(u64, root_sectors) * mbr.sector_size,
         .label = "xfs-id-root",
-        .uuid = [_]u8{0x77} ** 16,
+        .uuid = @as([16]u8, @splat(0x77)),
         .timestamp = 1_735_689_600,
     });
 }

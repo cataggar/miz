@@ -894,7 +894,7 @@ test "an ESP whose declared sectors run past the disk is refused rather than tru
     _ = try image.pread(io, array, header.partition_entry_lba * gpt.sector_size);
     std.mem.writeInt(u64, array[40..48], std.math.maxInt(u64), .little);
     try image.pwrite(io, array, header.partition_entry_lba * gpt.sector_size);
-    header.partition_array_crc32 = std.hash.crc.Crc32.hash(array);
+    header.partition_array_crc32 = std.hash.Crc32.hash(array);
     try image.pwrite(io, &header.encode(), gpt.sector_size);
 
     try std.testing.expectError(
@@ -928,7 +928,7 @@ test "option text that could change more than the command line is refused" {
     try std.testing.expectError(error.InvalidKernelOptions, validateOptions("quiet "));
     try std.testing.expectError(error.InvalidKernelOptions, validateOptions("quiet\nmenuentry 'x' {"));
     try std.testing.expectError(error.InvalidKernelOptions, validateOptions("quiet\x00"));
-    try std.testing.expectError(error.InvalidKernelOptions, validateOptions("q" ** (max_options_bytes + 1)));
+    try std.testing.expectError(error.InvalidKernelOptions, validateOptions(&@as([(max_options_bytes + 1):0]u8, @splat("q"[0]))));
     try validateOptions("console=ttyS0 quiet");
 }
 

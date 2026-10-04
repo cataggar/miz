@@ -1304,7 +1304,7 @@ pub const RootTree = struct {
         }
         for (self.nodes.items) |node| {
             hashString(&hash, node.path);
-            hashInt(&hash, @intFromEnum(node.kind));
+            hashInt(&hash, @backingInt(node.kind));
             hashInt(&hash, node.metadata.mode);
             hashInt(&hash, node.metadata.uid);
             hashInt(&hash, node.metadata.gid);
@@ -2717,7 +2717,7 @@ test "ext4.populate emits identical bytes through cursor() and the ext4View() al
     // The new, neutrally-named primary shape.
     _ = try ext4.populate(io, image_a, std.testing.allocator, try tree_a.cursor(), .{
         .length = fs_size,
-        .uuid = [_]u8{0x61} ** 16,
+        .uuid = @as([16]u8, @splat(0x61)),
         .timestamp = 1_717_171_717,
     });
 
@@ -2727,7 +2727,7 @@ test "ext4.populate emits identical bytes through cursor() and the ext4View() al
     // `tree_cursor.Cursor` underneath.
     _ = try ext4.populate(io, image_b, std.testing.allocator, try tree_b.ext4View(), .{
         .length = fs_size,
-        .uuid = [_]u8{0x61} ** 16,
+        .uuid = @as([16]u8, @splat(0x61)),
         .timestamp = 1_717_171_717,
     });
 
@@ -3580,7 +3580,7 @@ test "opening a malformed XFS image is refused by the reader before any import" 
     // Not a valid XFS superblock at all: detection/opening must fail
     // outright rather than an import later silently producing an empty or
     // wrong tree.
-    var garbage: [xfs.integration_block_size]u8 = [_]u8{0xAA} ** xfs.integration_block_size;
+    var garbage: [xfs.integration_block_size]u8 = @as([xfs.integration_block_size]u8, @splat(0xAA));
     try writeXfsFixture(io, image_path, &garbage);
 
     try std.testing.expectError(

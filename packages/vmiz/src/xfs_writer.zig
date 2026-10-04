@@ -278,7 +278,7 @@ const agfl_reserve: u32 = 4;
 // big-endian; the four CRC bytes count as zero while hashing).
 // ---------------------------------------------------------------------------
 
-const Crc32c = std.hash.crc.Crc(u32, .{
+const Crc32c = std.hash.crc.Generic(u32, .{
     .polynomial = 0x1edc6f41,
     .initial = 0xffffffff,
     .reflect_input = true,
@@ -2478,7 +2478,7 @@ test "populate rejects unsupported shapes before writing" {
         try testing.expectError(error.LabelTooLong, res);
     }
     {
-        const xa = [_]tree_cursor.Xattr{.{ .name = "user.k", .value = &[_]u8{'v'} ** 300 }};
+        const xa = [_]tree_cursor.Xattr{.{ .name = "user.k", .value = &@as([300]u8, @splat('v')) }};
         var e = [_]FixtureEntry{.{ .path = "f", .kind = .file, .size = 1, .content = "x", .xattrs = &xa }};
         try expectReject(&e, .{}, big_len, error.XattrValueTooLarge);
     }
