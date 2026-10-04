@@ -266,11 +266,11 @@ test "azure acceptance uses the current harness with the accepted-source tool" {
     try expectContains(
         manifest,
         "git+https://github.com/cataggar/bzip2z" ++
-            "#05f6d4e34df2da2729490aee2a5bbe43b5ce94f6",
+            "#b1ee15f320f53a8f9794d4440fd43798c28f276d",
     );
     try expectContains(
         manifest,
-        "bzip2z-0.1.0-m5NdlhNXCwC5mTHdg2pgMytHjahuQP6nImdle78Pb9kO",
+        "bzip2z-0.1.0-m5NdlpirCwBFHH_3t0zvBLPeA0rNwqFU21SbRa6CPCDR",
     );
     try expectAbsent(manifest, "mirrors.kernel.org/sourceware/bzip2");
 
@@ -289,7 +289,7 @@ test "build manifest dependencies are git-pinned to a full commit" {
     const manifest = try readTracked(allocator, std.testing.io, "build.zig.zon");
     defer allocator.free(manifest);
 
-    const names = [_][]const u8{ "bzip2z", "tls", "debz", "rpmz", "zstd" };
+    const names = [_][]const u8{ "bzip2z", "tls", "debz", "rpmz", "zstd", "translate_c" };
     try expectCount(manifest, ".url = \"git+https://", names.len);
     for (names) |name| {
         const declaration = try allocator.print(".{s} = .{{", .{name});
@@ -312,8 +312,17 @@ test "build manifest dependencies are git-pinned to a full commit" {
     }
     try expectContains(
         manifest,
+        "git+https://github.com/cataggar/translate-c" ++
+            "#62d06a5d3e93c82727544e8113e4762a315ca0ed",
+    );
+    try expectContains(
+        manifest,
+        "translate_c-2.0.0-Q_BUWlpOBwBWvgGBM20tJq-GXgPio3v3UD39rXEn70KN",
+    );
+    try expectContains(
+        manifest,
         "git+https://github.com/cataggar/zstd" ++
-            "#45b6dfcd9d0ffdba99fb653c66b233179b9f7229",
+            "#71502da18ccdacac0c2049c033dedbbf25a40b93",
     );
 
     const build = try readTracked(allocator, std.testing.io, "build.zig");
