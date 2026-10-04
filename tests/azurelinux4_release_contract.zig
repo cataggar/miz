@@ -741,29 +741,29 @@ test "CI heavy phases are independent jobs" {
     try expectContains(
         workflow,
         "zig build check-ci-production-entrypoints test-package-family test-ci \\\n" ++
-            "            -Doptimize=Debug --summary all",
+            "            -Doptimize=debug --summary all",
     );
-    try expectAbsent(workflow, "run: zig build -Doptimize=Debug");
+    try expectAbsent(workflow, "run: zig build -Doptimize=debug");
     try expectCount(workflow, "zig build test-ci", 0);
     try expectCount(
         workflow,
-        "run: zig build test-vm-backend -Doptimize=Debug --summary all",
+        "run: zig build test-vm-backend -Doptimize=debug --summary all",
         1,
     );
     try expectCount(
         workflow,
-        "run: zig build test-device-write-integration -Doptimize=Debug --summary all",
+        "run: zig build test-device-write-integration -Doptimize=debug --summary all",
         1,
     );
     try expectCount(
         workflow,
-        "run: zig build test-unsafe-chroot-integration -Doptimize=Debug --summary all",
+        "run: zig build test-unsafe-chroot-integration -Doptimize=debug --summary all",
         1,
     );
     try expectCount(workflow, "zig build test-vm-real-boot", 3);
     try expectCount(workflow, "-Doptimize=${{ matrix.optimize }} --summary all", 3);
-    try expectCount(workflow, "optimize: Debug", 2);
-    try expectCount(workflow, "optimize: ReleaseSafe", 1);
+    try expectCount(workflow, "optimize: debug", 2);
+    try expectCount(workflow, "optimize: safe", 1);
     try expectContains(workflow, "cancel-in-progress: true");
 }
 

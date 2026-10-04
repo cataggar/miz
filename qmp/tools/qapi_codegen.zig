@@ -244,8 +244,7 @@ fn hasIfCondition(type_spec: std.json.Value) bool {
     return type_spec == .object and type_spec.object.contains("if");
 }
 
-/// Zig 0.16 keywords that would otherwise collide with a bare identifier
-/// derived from a QAPI name.
+/// Conservative Zig keyword set for identifiers derived from QAPI names.
 const zig_keywords = [_][]const u8{
     "align",       "allowzero", "and",      "anyframe",    "anytype", "asm",         "async",          "await",
     "break",       "callconv",  "catch",    "comptime",    "const",   "continue",    "defer",          "else",
