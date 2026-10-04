@@ -857,7 +857,7 @@ pub fn verifyRecordedManifest(
 test "each filesystem retained contract claims every clause" {
     for (std.enums.values(RootFilesystem)) |filesystem| {
         const required = forProfile(filesystem, .core).required;
-        var claimed = std.EnumSet(Clause).initEmpty();
+        var claimed: std.EnumSet(Clause) = .empty;
         for (required, 0..) |package, index| {
             try std.testing.expect(package.name.len != 0);
             try std.testing.expect(package.why.len != 0);
