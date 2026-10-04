@@ -70,13 +70,13 @@ does not build them because the dependency is configured with `tools=false`.
 ## tls.zig (test fixture only)
 
 The deterministic OCI registry TLS fixture uses `cataggar/tls.zig` at commit
-`2621e411af81c8b4d8fa5aaae08b9b183a80bb46`. It is
+`481b2a677244b994d216eb02a73bad89623610a9`. It is
 not linked into the library or CLI.
 
 Copyright (c) tls.zig contributors.
 
 Licensed under the MIT License. See:
-https://github.com/cataggar/tls.zig/blob/2621e411af81c8b4d8fa5aaae08b9b183a80bb46/LICENSE
+https://github.com/cataggar/tls.zig/blob/481b2a677244b994d216eb02a73bad89623610a9/LICENSE
 
 ## debz
 
