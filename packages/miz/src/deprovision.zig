@@ -347,7 +347,7 @@ test "findRootExt4Offset and deprovision work end to end on a partitioned disk i
     _ = try ext4.populate(io, img.file, allocator, &tree.view, .{
         .offset = partition_offset,
         .length = partition_length,
-        .uuid = [_]u8{0x33} ** 16,
+        .uuid = @as([16]u8, @splat(0x33)),
         .timestamp = 1_717_171_717,
     });
 
@@ -422,7 +422,7 @@ test "deprovision leaves a resolv.conf symlink pointing at the resolver in place
     _ = try ext4.populate(io, img.file, allocator, &tree.view, .{
         .offset = 0,
         .length = partition_length,
-        .uuid = [_]u8{0x44} ** 16,
+        .uuid = @as([16]u8, @splat(0x44)),
         .timestamp = 1_717_171_717,
     });
 

@@ -156,28 +156,28 @@ test "diagnostic records the failure text alongside the typed error" {
 
 test "diagnostic truncates rather than dropping an oversized message" {
     var diagnostic: Diagnostic = .{};
-    const long = "x" ** (message_capacity * 2);
+    const long = &@as([(message_capacity * 2):0]u8, @splat("x"[0]));
     diagnostic.set("{s}", .{long});
     try std.testing.expectEqual(message_capacity, diagnostic.message().len);
 }
 
 test "sha256 and commit shapes reject every non-canonical spelling" {
-    try std.testing.expect(isSha256Hex("a" ** 64));
-    try std.testing.expect(!isSha256Hex("A" ** 64));
-    try std.testing.expect(!isSha256Hex("a" ** 63));
-    try std.testing.expect(!isSha256Hex("a" ** 65));
-    try std.testing.expect(!isSha256Hex("sha256:" ++ "a" ** 64));
-    try std.testing.expect(!isSha256Hex("g" ** 64));
-    try std.testing.expect(isCommitHex("0" ** 40));
-    try std.testing.expect(!isCommitHex("0" ** 39));
-    try std.testing.expect(!isCommitHex("F" ** 40));
+    try std.testing.expect(isSha256Hex(&@as([64:0]u8, @splat("a"[0]))));
+    try std.testing.expect(!isSha256Hex(&@as([64:0]u8, @splat("A"[0]))));
+    try std.testing.expect(!isSha256Hex(&@as([63:0]u8, @splat("a"[0]))));
+    try std.testing.expect(!isSha256Hex(&@as([65:0]u8, @splat("a"[0]))));
+    try std.testing.expect(!isSha256Hex("sha256:" ++ &@as([64:0]u8, @splat("a"[0]))));
+    try std.testing.expect(!isSha256Hex(&@as([64:0]u8, @splat("g"[0]))));
+    try std.testing.expect(isCommitHex(&@as([40:0]u8, @splat("0"[0]))));
+    try std.testing.expect(!isCommitHex(&@as([39:0]u8, @splat("0"[0]))));
+    try std.testing.expect(!isCommitHex(&@as([40:0]u8, @splat("F"[0]))));
 }
 
 test "require helpers mirror the Python failure text" {
     var diagnostic: Diagnostic = .{};
-    const good: std.json.Value = .{ .string = "b" ** 64 };
+    const good: std.json.Value = .{ .string = &@as([64:0]u8, @splat("b"[0])) };
     try std.testing.expectEqualStrings(
-        "b" ** 64,
+        &@as([64:0]u8, @splat("b"[0])),
         try requireSha256(good, "candidate digest", &diagnostic),
     );
 
@@ -200,12 +200,12 @@ test "require helpers mirror the Python failure text" {
     );
 
     try std.testing.expectEqualStrings(
-        "c" ** 40,
-        try requireCommit(.{ .string = "c" ** 40 }, "source_commit", &diagnostic),
+        &@as([40:0]u8, @splat("c"[0])),
+        try requireCommit(.{ .string = &@as([40:0]u8, @splat("c"[0])) }, "source_commit", &diagnostic),
     );
     try std.testing.expectError(
         error.InvalidCommit,
-        requireCommit(.{ .string = "c" ** 39 }, "source_commit", &diagnostic),
+        requireCommit(.{ .string = &@as([39:0]u8, @splat("c"[0])) }, "source_commit", &diagnostic),
     );
     try std.testing.expectEqualStrings(
         "source_commit is not a full lowercase commit SHA",

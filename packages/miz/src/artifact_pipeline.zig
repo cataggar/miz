@@ -359,7 +359,7 @@ fn fetchNativeHttps(
     var response = try request.receiveHead(&.{});
     if (response.head.content_encoding != .identity)
         return error.InvalidResponseContentEncoding;
-    const status = @intFromEnum(response.head.status);
+    const status = @backingInt(response.head.status);
     if (status != 200) {
         const location: ?[]u8 = if (isRedirectStatus(status)) blk: {
             const raw_location = response.head.location orelse return error.InvalidRedirect;
@@ -1780,7 +1780,7 @@ fn validateXzCheck(
             if (hasher.final() != readU32Le(expected[0..4])) return error.XzDecompressionFailed;
         },
         4 => {
-            var hasher = std.hash.crc.Crc64Xz.init();
+            var hasher = std.hash.crc.@"CRC-64/XZ".init();
             while (current - offset < len) {
                 const amount: usize = @intCast(@min(len - (current - offset), buffer.len));
                 if (try output.readPositionalAll(io, buffer[0..amount], current) != amount) return error.XzDecompressionFailed;
@@ -2006,7 +2006,7 @@ test "parse and format SHA-256" {
     try std.testing.expectError(error.InvalidSha256, parseSha256("short"));
     try std.testing.expectError(
         error.InvalidSha256,
-        parseSha256("z" ** 64),
+        parseSha256(&@as([64:0]u8, @splat("z"[0]))),
     );
 }
 
@@ -2986,7 +2986,7 @@ test "fixed VHD derivation relocates mirrored GPT transactionally" {
             .max_virtual_size = 32 * 1024 * 1024,
             .output_path = output_path,
             .max_output_size = 32 * 1024 * 1024,
-            .unique_id = [_]u8{0x42} ** 16,
+            .unique_id = @as([16]u8, @splat(0x42)),
             .timestamp_unix = 0,
         },
     );
@@ -3277,7 +3277,7 @@ const TestNativeHttpsStep = union(enum) {
 const TestNativeHttpsTransport = struct {
     steps: []const TestNativeHttpsStep,
     calls: usize = 0,
-    urls: [8]?[]u8 = .{null} ** 8,
+    urls: [8]?[]u8 = @splat(null),
 
     fn deinit(self: *TestNativeHttpsTransport, allocator: Allocator) void {
         for (&self.urls) |*url| {
@@ -3321,7 +3321,7 @@ const TestNativeHttpsTransport = struct {
 
 const TestNativeHttpsSleep = struct {
     calls: usize = 0,
-    seconds: [8]u64 = .{0} ** 8,
+    seconds: [8]u64 = @splat(0),
 
     fn call(context_ptr: ?*anyopaque, _: Io, seconds: u64) !void {
         const context: *TestNativeHttpsSleep = @ptrCast(@alignCast(context_ptr.?));

@@ -542,7 +542,7 @@ pub fn prepareSessionDir(
     if (pathExistsOrSymlink(io, candidate)) {
         return context.fail("output root must not already exist: {s}", .{candidate});
     }
-    try Dir.cwd().createDir(io, candidate, @enumFromInt(0o755));
+    try Dir.cwd().createDir(io, candidate, @fromBackingInt(@intCast(0o755)));
     return candidate;
 }
 
@@ -2765,7 +2765,7 @@ const Statfs = extern struct {
 /// `shutil.disk_usage(path).free`: available bytes for an unprivileged writer.
 fn freeDiskBytes(allocator: Allocator, path: []const u8) !u64 {
     if (builtin.os.tag != .linux) return error.Unsupported;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     var buffer: Statfs = undefined;
     const result = std.os.linux.syscall2(
@@ -2839,8 +2839,8 @@ fn timevalNanoseconds(value: std.posix.timeval) i128 {
 fn exitCodeOf(term: std.process.Child.Term) i64 {
     return switch (term) {
         .exited => |code| code,
-        .signal => |signal| -@as(i64, @intFromEnum(signal)),
-        .stopped => |signal| -@as(i64, @intFromEnum(signal)),
+        .signal => |signal| -@as(i64, @backingInt(signal)),
+        .stopped => |signal| -@as(i64, @backingInt(signal)),
         .unknown => |code| @intCast(code),
     };
 }

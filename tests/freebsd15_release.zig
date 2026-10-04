@@ -186,7 +186,7 @@ test "candidate refuses every unpinned source claim" {
     };
 
     var bad_digest = base;
-    bad_digest.source_sha256 = "0" ** 64;
+    bad_digest.source_sha256 = &@as([64:0]u8, @splat("0"[0]));
     try std.testing.expectError(
         error.Invalid,
         candidate_support.candidateCommand(&context, bad_digest),
@@ -218,7 +218,7 @@ test "candidate refuses every unpinned source claim" {
     try expectFailure(&context, "virtual size does not match");
 
     var bad_validation = base;
-    bad_validation.validated_sha256 = "0" ** 64;
+    bad_validation.validated_sha256 = &@as([64:0]u8, @splat("0"[0]));
     try std.testing.expectError(
         error.Invalid,
         candidate_support.candidateCommand(&context, bad_validation),
@@ -556,7 +556,7 @@ test "staging refuses a changed or cross-commit candidate" {
     for (zfs_variants) |key| {
         const cross = std.mem.eql(u8, key, "x86_64-zfs-full");
         _ = try support.makeCandidate(&second, gpa, key, .{
-            .source_commit = if (cross) "b" ** 40 else support.source_commit,
+            .source_commit = if (cross) &@as([40:0]u8, @splat("b"[0])) else support.source_commit,
         });
         _ = try support.makeAzureResult(&second, gpa, key);
     }
@@ -656,7 +656,7 @@ test "staging refuses a candidate whose recorded manifest was edited" {
 const AzureResultOptions = struct {
     key: []const u8 = "x86_64-zfs-full",
     contracts: ?[]const u8 = null,
-    vhd_sha256: []const u8 = "f" ** 64,
+    vhd_sha256: []const u8 = &@as([64:0]u8, @splat("f"[0])),
     location: []const u8 = "westus3",
     manifest_key: ?[]const u8 = null,
 };
@@ -779,7 +779,7 @@ test "azure-result emits a complete, candidate-bound document" {
     }
     try std.testing.expect(root.get("azure_accepted_sha256") == null);
     try std.testing.expectEqualStrings(
-        "f" ** 64,
+        &@as([64:0]u8, @splat("f"[0])),
         document.stringOf(root.get("derived_vhd_sha256")).?,
     );
     try std.testing.expectEqual(
@@ -892,7 +892,7 @@ test "staging binds every Azure result to its candidate and workflow" {
         .{
             .key = "x86_64-zfs-full",
             .field = "qcow_sha256",
-            .value = "\"" ++ "0" ** 64 ++ "\"",
+            .value = "\"" ++ &@as([64:0]u8, @splat("0"[0])) ++ "\"",
             .message = "QCOW SHA-256",
         },
         .{
@@ -910,7 +910,7 @@ test "staging binds every Azure result to its candidate and workflow" {
         .{
             .key = "x86_64-zfs-full",
             .field = "source_commit",
-            .value = "\"" ++ "b" ** 40 ++ "\"",
+            .value = "\"" ++ &@as([40:0]u8, @splat("b"[0])) ++ "\"",
             .message = "source commit mismatch",
         },
         .{
@@ -1884,7 +1884,7 @@ test "the publish expectation binds the manifest to its dispatch" {
         },
         .{
             .tag = tag,
-            .commit = "b" ** 40,
+            .commit = &@as([40:0]u8, @splat("b"[0])),
             .count = 4,
             .message = "publish manifest source commit mismatch",
         },

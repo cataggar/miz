@@ -7330,7 +7330,7 @@ fn arm64VerifiedFixture(
 ) miz.gpt.VerifiedGpt {
     const total_sectors = virtual_size / miz.gpt.sector_size;
     const last_usable_lba = total_sectors - 2 - miz.gpt.partition_array_sectors;
-    const array_crc = std.hash.crc.Crc32.hash(partition_array);
+    const array_crc = std.hash.Crc32.hash(partition_array);
     const primary = miz.gpt.Header{
         .current_lba = 1,
         .backup_lba = total_sectors - 1,

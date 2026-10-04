@@ -2059,7 +2059,7 @@ test "finish writes an aligned WIN_CERTIFICATE and security directory" {
     var prepared = try prepareRsaSha256Alloc(allocator, image);
     defer prepared.deinit(allocator);
     const certificate = testCertificate();
-    const signature = [_]u8{0} ** 256;
+    const signature = @as([256]u8, @splat(0));
     const signed = try finishRsaSha256Alloc(allocator, prepared, certificate, &signature);
     defer allocator.free(signed);
 
@@ -2086,7 +2086,7 @@ test "finish rejects malformed certificates and unsupported signatures" {
     defer allocator.free(image);
     var prepared = try prepareRsaSha256Alloc(allocator, image);
     defer prepared.deinit(allocator);
-    const short_signature = [_]u8{0} ** 127;
+    const short_signature = @as([127]u8, @splat(0));
     try std.testing.expectError(
         error.InvalidSignatureLength,
         finishRsaSha256Alloc(allocator, prepared, testCertificate(), &short_signature),
@@ -2095,7 +2095,7 @@ test "finish rejects malformed certificates and unsupported signatures" {
         error.InvalidSignatureLength,
         finishRsaSha256Alloc(allocator, prepared, testCertificate(), ""),
     );
-    const signature = [_]u8{0} ** 128;
+    const signature = @as([128]u8, @splat(0));
     try std.testing.expectError(
         error.InvalidCertificate,
         finishRsaSha256Alloc(allocator, prepared, "\x30\x01\x00", &signature),
@@ -2112,7 +2112,7 @@ test "chain-aware finish omits self-issued roots and deduplicates certificates" 
     const intermediate = testCertificateTwo();
     const root = testCertificateThree();
     const chain = [_][]const u8{ root, intermediate, leaf, root, intermediate };
-    const signature = [_]u8{0} ** 256;
+    const signature = @as([256]u8, @splat(0));
     const signed = try finishRsaSha256WithChainAlloc(allocator, prepared, leaf, &chain, &signature);
     defer allocator.free(signed);
 
@@ -2142,7 +2142,7 @@ test "embedded signer follows SignerInfo instead of certificate order" {
     defer prepared.deinit(allocator);
     const leaf = testCertificate();
     const chain = [_][]const u8{testCertificateTwo()};
-    const signature = [_]u8{0} ** 256;
+    const signature = @as([256]u8, @splat(0));
     const signed = try finishRsaSha256WithChainAlloc(
         allocator,
         prepared,
@@ -2169,7 +2169,7 @@ test "embedded signer rejects unsigned malformed and unresolved signatures" {
 
     var prepared = try prepareRsaSha256Alloc(allocator, unsigned);
     defer prepared.deinit(allocator);
-    const signature = [_]u8{0} ** 256;
+    const signature = @as([256]u8, @splat(0));
     const signed = try finishRsaSha256Alloc(
         allocator,
         prepared,
@@ -2340,7 +2340,7 @@ test "a signature commits to the image it was made from" {
     defer allocator.free(image);
     var prepared = try prepareRsaSha256Alloc(allocator, image);
     defer prepared.deinit(allocator);
-    const signature = [_]u8{0} ** 256;
+    const signature = @as([256]u8, @splat(0));
     const signed = try finishRsaSha256Alloc(
         allocator,
         prepared,
@@ -2365,7 +2365,7 @@ test "a signature over other bytes is not mistaken for one over these" {
     defer allocator.free(image);
     var prepared = try prepareRsaSha256Alloc(allocator, image);
     defer prepared.deinit(allocator);
-    const signature = [_]u8{0} ** 256;
+    const signature = @as([256]u8, @splat(0));
     const signed = try finishRsaSha256Alloc(
         allocator,
         prepared,
@@ -2391,7 +2391,7 @@ test "image digest rejects an unsigned image with trailing bytes it cannot place
     defer allocator.free(image);
     var prepared = try prepareRsaSha256Alloc(allocator, image);
     defer prepared.deinit(allocator);
-    const signature = [_]u8{0} ** 256;
+    const signature = @as([256]u8, @splat(0));
     const signed = try finishRsaSha256Alloc(
         allocator,
         prepared,

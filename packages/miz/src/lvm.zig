@@ -1264,7 +1264,7 @@ pub fn candidateRegions(
         // Extended partitions are containers, not physical volumes; their
         // logical partitions would need the chain walked, which no default
         // LVM install produces.
-        switch (@intFromEnum(entry.partition_type)) {
+        switch (@backingInt(entry.partition_type)) {
             0x05, 0x0f, 0x85 => continue,
             else => {},
         }
@@ -1471,7 +1471,7 @@ const LabelSpec = struct {
 };
 
 fn buildLabelSector(spec: LabelSpec) [label_size]u8 {
-    var sector = [_]u8{0} ** label_size;
+    var sector = @as([label_size]u8, @splat(0));
     sector[0..8].* = label_id;
     std.mem.writeInt(u64, sector[8..16], spec.sector, .little);
     std.mem.writeInt(u32, sector[20..24], 32, .little);

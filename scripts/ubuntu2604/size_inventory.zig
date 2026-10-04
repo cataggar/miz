@@ -95,7 +95,7 @@ pub const Phase = enum {
 
     pub fn parse(text: []const u8) ?Phase {
         inline for (@typeInfo(Phase).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+            if (std.mem.eql(u8, text, field.name)) return @fromBackingInt(@intCast(field.value));
         }
         return null;
     }
@@ -303,7 +303,7 @@ pub const Report = struct {
     }
 
     pub fn has(self: *const Report, phase: Phase) bool {
-        return self.present[@intFromEnum(phase)];
+        return self.present[@backingInt(phase)];
     }
 
     /// Records `section` as `phase`. Refuses a repeat and refuses a phase that
@@ -330,7 +330,7 @@ pub const Report = struct {
         }
         const builder: Builder = .{ .arena = self.arena.allocator() };
         try builder.put(&self.fields, phase.key(), section);
-        self.present[@intFromEnum(phase)] = true;
+        self.present[@backingInt(phase)] = true;
     }
 
     /// The document as a JSON value. `phases_present` is rebuilt here so it
@@ -431,7 +431,7 @@ pub const PathKind = enum {
 
     pub fn parse(text: []const u8) ?PathKind {
         inline for (@typeInfo(PathKind).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+            if (std.mem.eql(u8, text, field.name)) return @fromBackingInt(@intCast(field.value));
         }
         return null;
     }
@@ -478,7 +478,7 @@ pub const UnownedCategory = enum {
 
     pub fn parse(text: []const u8) ?UnownedCategory {
         inline for (@typeInfo(UnownedCategory).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+            if (std.mem.eql(u8, text, field.name)) return @fromBackingInt(@intCast(field.value));
         }
         return null;
     }
@@ -501,7 +501,7 @@ pub const UnownedSource = enum {
 
     pub fn parse(text: []const u8) ?UnownedSource {
         inline for (@typeInfo(UnownedSource).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+            if (std.mem.eql(u8, text, field.name)) return @fromBackingInt(@intCast(field.value));
         }
         return null;
     }
@@ -876,7 +876,7 @@ pub const ContentDisposition = enum {
 
     pub fn parse(text: []const u8) ?ContentDisposition {
         inline for (@typeInfo(ContentDisposition).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+            if (std.mem.eql(u8, text, field.name)) return @fromBackingInt(@intCast(field.value));
         }
         return null;
     }
@@ -2279,7 +2279,7 @@ const Walk = struct {
         kind: std.Io.File.Kind,
         top_level: *Bucket,
     ) Error!void {
-        const host_z = try self.scratch.dupeZ(u8, host);
+        const host_z = try self.scratch.dupeSentinel(u8, host, 0);
         defer self.scratch.free(host_z);
         const usage = pathUsage(host_z) orelse {
             self.unreadable += 1;
@@ -2576,7 +2576,7 @@ pub const Summary = struct {
     content_policy_sha256: []const u8 = "",
 
     pub fn has(self: Summary, phase: Phase) bool {
-        return self.phases[@intFromEnum(phase)];
+        return self.phases[@backingInt(phase)];
     }
 };
 
@@ -2718,7 +2718,7 @@ pub fn validateDocument(
             "size inventory declares unknown phase {s}",
             .{text},
         );
-        const rank = @intFromEnum(phase);
+        const rank = @backingInt(phase);
         if (position != 0 and rank <= previous) return fail(
             diagnostic,
             "size inventory phases_present is out of order at {s}",

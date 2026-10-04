@@ -1122,7 +1122,7 @@ fn validateHooks(hooks: []const Hook) Error!void {
             if (std.mem.eql(u8, earlier.name, hook.name)) return error.DuplicateHookName;
         }
         if (previous_phase) |phase| {
-            if (@intFromEnum(hook.phase) < @intFromEnum(phase)) {
+            if (@backingInt(hook.phase) < @backingInt(phase)) {
                 return error.HookPhaseOutOfOrder;
             }
         }
@@ -1689,7 +1689,7 @@ test "a control document the guest could be driven by is rejected" {
         } },
         .{ .expected = error.TooManyModules, .control = blk: {
             var control = base;
-            control.modules = &([_][]const u8{"miz-module-00-ext4.ko"} ** (max_modules + 1));
+            control.modules = &(@as([(max_modules + 1)][]const u8, @splat("miz-module-00-ext4.ko")));
             break :blk control;
         } },
         .{ .expected = error.DuplicateRepositoryId, .control = blk: {
@@ -1925,7 +1925,7 @@ test "a control document the guest could be driven by is rejected" {
                 .name = "wordy",
                 .phase = .finalize,
                 .script_base64 = "IyEvYmluL3NoCmV4aXQgMAo=",
-                .arguments = &([_][]const u8{"x"} ** (max_hook_arguments + 1)),
+                .arguments = &(@as([(max_hook_arguments + 1)][]const u8, @splat("x"))),
             }};
             break :blk control;
         } },
@@ -2419,7 +2419,7 @@ test "credential material survives the device and comes back byte for byte" {
     // A device that was never written is not an empty credential set: the
     // guest has to be able to tell "no material arrived" from "no material was
     // asked for", because only the first is a failure.
-    const blank = [_]u8{0} ** 128;
+    const blank = @as([128]u8, @splat(0));
     try std.testing.expectError(error.BadFrameMagic, parseCredentials(&blank));
 }
 
@@ -2453,13 +2453,13 @@ test "the credential device and the result device cannot be read as each other" 
 test "the sealed blob refuses more than the guest agreed to read" {
     const allocator = std.testing.allocator;
 
-    const too_many = [_][]const u8{"x"} ** (max_credentials + 1);
+    const too_many = @as([(max_credentials + 1)][]const u8, @splat("x"));
     try std.testing.expectError(
         error.TooManyCredentials,
         sealCredentials(allocator, &too_many),
     );
 
-    const oversized = [_][]const u8{&([_]u8{'x'} ** (max_credential_material_bytes + 1))};
+    const oversized = [_][]const u8{&(@as([(max_credential_material_bytes + 1)]u8, @splat('x')))};
     try std.testing.expectError(
         error.CredentialMaterialTooLarge,
         sealCredentials(allocator, &oversized),

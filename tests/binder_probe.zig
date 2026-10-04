@@ -45,7 +45,7 @@ const BINDERFS_MAX_NAME = 255;
 /// `struct binderfs_device` (`<linux/android/binderfs.h>`): the caller fills
 /// in `name`; the driver fills in `major`/`minor` on success.
 const BinderfsDevice = extern struct {
-    name: [BINDERFS_MAX_NAME + 1]u8 = [_]u8{0} ** (BINDERFS_MAX_NAME + 1),
+    name: [BINDERFS_MAX_NAME + 1]u8 = @as([(BINDERFS_MAX_NAME + 1)]u8, @splat(0)),
     major: u32 = 0,
     minor: u32 = 0,
 };

@@ -2204,7 +2204,7 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
     _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
         .length = 32 * 1024 * 1024,
         .label = "mountless",
-        .uuid = [_]u8{0x52} ** 16,
+        .uuid = @as([16]u8, @splat(0x52)),
     });
     var fs = try FileSystem.open(allocator, io, image.file, .{
         .length = 32 * 1024 * 1024,
@@ -2212,7 +2212,7 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
         .atomic_path = image_path,
     });
     defer fs.deinit();
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x52} ** 16), &fs.filesystemIdentity().uuid);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x52))), &fs.filesystemIdentity().uuid);
     try std.testing.expectEqualSlices(u8, "mountless", fs.filesystemIdentity().label[0..9]);
     const listed = try fs.list(allocator, "/", 16);
     defer allocator.free(listed);
@@ -2275,7 +2275,7 @@ test "importHostTree frees excluded top-level directory names (#455)" {
     _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
         .length = 32 * 1024 * 1024,
         .label = "mountless",
-        .uuid = [_]u8{0x52} ** 16,
+        .uuid = @as([16]u8, @splat(0x52)),
     });
     var fs = try FileSystem.open(allocator, io, image.file, .{
         .length = 32 * 1024 * 1024,
@@ -2344,7 +2344,7 @@ test "exportHostTree preserves guest execute bits above the readable floor" {
     _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
         .length = 32 * 1024 * 1024,
         .label = "exec",
-        .uuid = [_]u8{0x53} ** 16,
+        .uuid = @as([16]u8, @splat(0x53)),
     });
     var fs = try FileSystem.open(allocator, io, image.file, .{
         .length = 32 * 1024 * 1024,
@@ -2416,7 +2416,7 @@ test "mountless commit preserves the pinned Ubuntu descriptor-64 profile" {
     _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
         .length = length,
         .label = "ubuntu-root",
-        .uuid = [_]u8{0x71} ** 16,
+        .uuid = @as([16]u8, @splat(0x71)),
         .timestamp = 1_724_000_000,
         .journal = .{ .enabled = true },
         .preserve_feature_ro_compat = 0x046b,
@@ -2526,7 +2526,7 @@ test "mountless round trip preserves security metadata and special nodes" {
         .mtime = 1_700_000_001,
         .xattrs = &xattrs,
     });
-    var sparse_bytes = [_]u8{0} ** 8192;
+    var sparse_bytes = @as([8192]u8, @splat(0));
     @memcpy(sparse_bytes[0..6], "sparse");
     try source_tree.putFileBytesSparse("etc/sparse", &sparse_bytes, &.{
         .{ .logical_block = 1, .block_count = 1 },
@@ -2544,7 +2544,7 @@ test "mountless round trip preserves security metadata and special nodes" {
     _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
         .length = 64 * 1024 * 1024,
         .label = "fidelity",
-        .uuid = [_]u8{0x45} ** 16,
+        .uuid = @as([16]u8, @splat(0x45)),
         .root_xattrs = &xattrs,
     });
 
@@ -2618,7 +2618,7 @@ test "mountless round trip preserves security metadata and special nodes" {
         "usr/bin/void-alias",
         (try fs.stat("/usr/bin/void-alias2")).payload.hardlink_target,
     );
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x45} ** 16), &fs.filesystemIdentity().uuid);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x45))), &fs.filesystemIdentity().uuid);
     try std.testing.expectEqualSlices(u8, "fidelity", fs.filesystemIdentity().label[0..8]);
     const locked = try fs.stat("/usr/bin/void-alias");
     try std.testing.expectEqual(@as(u16, 0), locked.metadata.mode);

@@ -410,7 +410,7 @@ const SelectionFixturePartition = struct {
     first_lba: u64,
     last_lba: u64,
     filesystem_label: ?[]const u8 = null,
-    filesystem_uuid: [16]u8 = [_]u8{0} ** 16,
+    filesystem_uuid: [16]u8 = @as([16]u8, @splat(0)),
 };
 
 fn createSelectionFixture(
@@ -465,8 +465,8 @@ test "root selection defaults to discoverable root GUIDs and returns stable meta
     const path = "test-root-selection-metadata.raw";
     defer Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    const data_uuid = [_]u8{0x11} ** 16;
-    const root_uuid = [_]u8{0x22} ** 16;
+    const data_uuid = @as([16]u8, @splat(0x11));
+    const root_uuid = @as([16]u8, @splat(0x22));
     const partitions = [_]SelectionFixturePartition{
         .{
             .type_guid = guid.linux_filesystem_data,
@@ -516,7 +516,7 @@ test "root selection requires deliberate Linux filesystem-data opt in" {
     const path = "test-root-selection-linux-data.raw";
     defer Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    const filesystem_uuid = [_]u8{0x33} ** 16;
+    const filesystem_uuid = @as([16]u8, @splat(0x33));
     const partitions = [_]SelectionFixturePartition{.{
         .type_guid = guid.linux_filesystem_data,
         .unique_guid = guid.parse("33333333-3333-3333-3333-333333333333"),
@@ -633,7 +633,7 @@ test "grows a labeled root in a standalone QCOW2 transactionally" {
     const root_last_lba = old_last_usable - 7;
     const root_offset = root_first_lba * gpt.sector_size;
     const root_length = (root_last_lba - root_first_lba + 1) * gpt.sector_size;
-    const filesystem_uuid = [_]u8{0x41} ** 16;
+    const filesystem_uuid = @as([16]u8, @splat(0x41));
 
     var raw = try Image.create(io, raw_path, .raw, old_size, .{});
     var raw_open = true;
@@ -684,7 +684,7 @@ test "grows a labeled root in a standalone QCOW2 transactionally" {
     );
     std.mem.writeInt(u16, stock_superblock[0xFE..0x100], 64, .little);
     try raw.file.writePositionalAll(io, &stock_superblock, root_offset + 1024);
-    var stock_gdt: [4096]u8 = [_]u8{0} ** 4096;
+    var stock_gdt: [4096]u8 = @as([4096]u8, @splat(0));
     _ = try raw.file.readPositionalAll(io, &stock_gdt, root_offset + 4096);
     var first_descriptor: [32]u8 = undefined;
     @memcpy(&first_descriptor, stock_gdt[0..32]);

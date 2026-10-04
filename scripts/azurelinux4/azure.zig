@@ -1222,7 +1222,7 @@ fn uefiDb(
     std.mem.writeInt(u32, header[8..12], signature_size, .little);
     try bytes.appendSlice(allocator, &header);
     for (certificates) |certificate| {
-        try bytes.appendSlice(allocator, &[_]u8{0xAB} ** 16);
+        try bytes.appendSlice(allocator, &@as([16]u8, @splat(0xAB)));
         try bytes.appendSlice(allocator, certificate);
     }
     return bytes.toOwnedSlice(allocator);
@@ -1262,7 +1262,7 @@ test "the guest UEFI db must hold the exact release certificate" {
     const hashed = try uefiDb(
         allocator,
         &.{certificate},
-        [_]u8{0x26} ++ [_]u8{0} ** 15,
+        [_]u8{0x26} ++ @as([15]u8, @splat(0)),
     );
     try std.testing.expectError(error.InvalidUefiDb, checkUefiDb(
         hashed,
@@ -1380,17 +1380,17 @@ test "the candidate signing identity is re-derived, not trusted" {
     const text = try std.fmt.allocPrint(allocator,
         \\{{"uki_signing": {{"certificate_sha256": "{s}",
         \\  "fallback_uki_sha256": "{s}", "certificate_der_base64": "{s}"}}}}
-    , .{ &fingerprint, "3" ** 64, encoded });
+    , .{ &fingerprint, &@as([64:0]u8, @splat("3"[0])), encoded });
     var manifest = try parse(text);
     defer manifest.deinit();
     const identity = try signingIdentity(allocator, &manifest.value.object, &diagnostic);
     try std.testing.expectEqualStrings(certificate, identity.certificate);
-    try std.testing.expectEqualStrings("3" ** 64, identity.fallback_uki_sha256);
+    try std.testing.expectEqualStrings(&@as([64:0]u8, @splat("3"[0])), identity.fallback_uki_sha256);
 
     const tampered = try std.fmt.allocPrint(allocator,
         \\{{"uki_signing": {{"certificate_sha256": "{s}",
         \\  "fallback_uki_sha256": "{s}", "certificate_der_base64": "{s}"}}}}
-    , .{ &fingerprint, "3" ** 64, "ZGlmZmVyZW50" });
+    , .{ &fingerprint, &@as([64:0]u8, @splat("3"[0])), "ZGlmZmVyZW50" });
     var wrong = try parse(tampered);
     defer wrong.deinit();
     try std.testing.expectError(error.InvalidSigningIdentity, signingIdentity(

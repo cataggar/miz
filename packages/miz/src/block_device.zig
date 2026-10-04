@@ -114,7 +114,7 @@ pub const FilesystemIdentityKind = enum {
 pub const FilesystemIdentity = struct {
     kind: FilesystemIdentityKind = .none,
     identifier: [identity_rewrite.canonical_uuid_bytes]u8 =
-        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+        @as([identity_rewrite.canonical_uuid_bytes]u8, @splat(0)),
     identifier_len: u8 = 0,
 
     pub fn identifierText(self: *const FilesystemIdentity) ?[]const u8 {
@@ -132,10 +132,10 @@ pub const PartitionReport = struct {
     table_index: u32,
     first_lba: u64,
     last_lba: u64,
-    name: [72]u8 = [_]u8{0} ** 72,
+    name: [72]u8 = @as([72]u8, @splat(0)),
     name_len: u8 = 0,
     gpt_unique_guid: [identity_rewrite.canonical_uuid_bytes]u8 =
-        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+        @as([identity_rewrite.canonical_uuid_bytes]u8, @splat(0)),
     gpt_unique_guid_len: u8 = 0,
     filesystem: FilesystemIdentity = .{},
     signatures: Signatures = .{},
@@ -157,7 +157,7 @@ pub const IdentityInventory = struct {
     partitions: []PartitionReport,
     device_signatures: Signatures,
     gpt_disk_guid: [identity_rewrite.canonical_uuid_bytes]u8 =
-        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+        @as([identity_rewrite.canonical_uuid_bytes]u8, @splat(0)),
     gpt_disk_guid_len: u8 = 0,
     device_filesystem: FilesystemIdentity = .{},
 
@@ -187,7 +187,7 @@ pub const PreflightReport = struct {
     partitions: []PartitionReport,
     device_signatures: Signatures,
     gpt_disk_guid: [identity_rewrite.canonical_uuid_bytes]u8 =
-        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+        @as([identity_rewrite.canonical_uuid_bytes]u8, @splat(0)),
     gpt_disk_guid_len: u8 = 0,
     device_filesystem: FilesystemIdentity = .{},
 
@@ -230,7 +230,7 @@ pub const CollisionKind = enum {
 pub const Collision = struct {
     kind: CollisionKind,
     identifier: [identity_rewrite.canonical_uuid_bytes]u8 =
-        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+        @as([identity_rewrite.canonical_uuid_bytes]u8, @splat(0)),
     identifier_len: u8 = 0,
     source_partition_table_index: ?u32 = null,
     source_filesystem: FilesystemIdentityKind = .none,
@@ -1032,7 +1032,7 @@ pub fn inspectIdentityInventory(
     const table: PartitionTable = if (has_gpt) .gpt else if (has_mbr) .mbr else .none;
     var gpt_disk_guid_len: u8 = 0;
     var gpt_disk_guid: [identity_rewrite.canonical_uuid_bytes]u8 =
-        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes;
+        @as([identity_rewrite.canonical_uuid_bytes]u8, @splat(0));
     if (has_gpt) {
         const entry_lba = std.mem.readInt(u64, gpt_header[72..80], .little);
         const entry_count = std.mem.readInt(u32, gpt_header[80..84], .little);
@@ -1545,7 +1545,7 @@ const TestIoctl = struct {
         self.request = request;
         self.argument = argument;
         if (self.result == .SUCCESS) return 0;
-        const errno_value: isize = @intCast(@intFromEnum(self.result));
+        const errno_value: isize = @intCast(@backingInt(self.result));
         return @bitCast(-errno_value);
     }
 };
@@ -1709,14 +1709,14 @@ const test_xfs_uuid = [16]u8{
 };
 
 fn writeTestExt4Identity(io: Io, file: Io.File, region_offset: u64) !void {
-    var superblock = [_]u8{0} ** 0x78;
+    var superblock = @as([0x78]u8, @splat(0));
     std.mem.writeInt(u16, superblock[0x38..0x3A], 0xEF53, .little);
     @memcpy(superblock[0x68..0x78], &test_ext4_uuid);
     try file.writePositionalAll(io, &superblock, region_offset + 1024);
 }
 
 fn writeTestFatIdentity(io: Io, file: Io.File, region_offset: u64) !void {
-    var boot = [_]u8{0} ** 512;
+    var boot = @as([512]u8, @splat(0));
     boot[510] = 0x55;
     boot[511] = 0xAA;
     boot[66] = 0x29;
@@ -1726,7 +1726,7 @@ fn writeTestFatIdentity(io: Io, file: Io.File, region_offset: u64) !void {
 }
 
 fn writeTestXfsIdentity(io: Io, file: Io.File, region_offset: u64) !void {
-    var superblock = [_]u8{0} ** 120;
+    var superblock = @as([120]u8, @splat(0));
     @memcpy(superblock[0..4], "XFSB");
     @memcpy(superblock[32..48], &test_xfs_uuid);
     try file.writePositionalAll(io, &superblock, region_offset);
@@ -1736,7 +1736,7 @@ fn writeTestGpt(io: Io, file: Io.File) !void {
     const protective = mbr.protectiveMbr(4096).encode();
     try file.writePositionalAll(io, &protective, 0);
 
-    var header = [_]u8{0} ** mbr.sector_size;
+    var header = @as([mbr.sector_size]u8, @splat(0));
     header[0..8].* = "EFI PART".*;
     @memcpy(header[56..72], &test_gpt_disk_guid);
     std.mem.writeInt(u64, header[72..80], 2, .little);
@@ -1744,7 +1744,7 @@ fn writeTestGpt(io: Io, file: Io.File) !void {
     std.mem.writeInt(u32, header[84..88], 128, .little);
     try file.writePositionalAll(io, &header, mbr.sector_size);
 
-    var entry = [_]u8{0} ** 128;
+    var entry = @as([128]u8, @splat(0));
     entry[0] = 1;
     @memcpy(entry[16..32], &test_gpt_partition_guid);
     std.mem.writeInt(u64, entry[32..40], 2048, .little);

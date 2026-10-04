@@ -1808,7 +1808,7 @@ test "debz lock retention matches the declared installed baseline" {
         &empty.value.object,
         "linux-azure",
         "amd64",
-        "a" ** 64,
+        &@as([64:0]u8, @splat("a"[0])),
         .empty,
         &diagnostic,
     );
@@ -1817,7 +1817,7 @@ test "debz lock retention matches the declared installed baseline" {
         &empty.value.object,
         "linux-azure",
         "amd64",
-        "a" ** 64,
+        &@as([64:0]u8, @splat("a"[0])),
         .retained,
         &diagnostic,
     ));
@@ -1842,7 +1842,7 @@ test "debz lock retention matches the declared installed baseline" {
         &retained.value.object,
         "linux-azure",
         "amd64",
-        "b" ** 64,
+        &@as([64:0]u8, @splat("b"[0])),
         .retained,
         &diagnostic,
     );
@@ -1851,7 +1851,7 @@ test "debz lock retention matches the declared installed baseline" {
         &retained.value.object,
         "linux-azure",
         "amd64",
-        "b" ** 64,
+        &@as([64:0]u8, @splat("b"[0])),
         .empty,
         &diagnostic,
     ));
@@ -1885,7 +1885,7 @@ test "Artifact Signing identity patterns reject non-canonical spellings" {
     try std.testing.expect(isArtifactSigningResource("miz-signing_1.0"));
     try std.testing.expect(!isArtifactSigningResource(""));
     try std.testing.expect(!isArtifactSigningResource("has space"));
-    try std.testing.expect(!isArtifactSigningResource("a" ** 129));
+    try std.testing.expect(!isArtifactSigningResource(&@as([129:0]u8, @splat("a"[0]))));
 }
 
 test "operation identifiers must be UUIDs" {

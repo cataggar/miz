@@ -1,4 +1,5 @@
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 
 const image_build = @import("build/image.zig");
 const iso_build = @import("build/iso.zig");
@@ -77,7 +78,7 @@ test {
 fn zstdDependency(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) *std.Build.Dependency {
     return b.dependency("zstd", .{
         .target = target,
@@ -90,6 +91,13 @@ fn zstdDependency(
 
 fn addZstdHeaders(module: *std.Build.Module, dependency: *std.Build.Dependency) void {
     module.addIncludePath(dependency.path("lib"));
+    const headers = Translator.init(module.owner.dependency("translate_c", .{}), .{
+        .c_source_file = dependency.path("lib/zstd.h"),
+        .target = module.resolved_target.?,
+        .optimize = module.optimize.?,
+        .link_libc = false,
+    });
+    module.addImport("zstd_c", headers.mod);
 }
 
 fn addZstdLibrary(module: *std.Build.Module, dependency: *std.Build.Dependency) void {
@@ -113,18 +121,18 @@ fn addUbuntu2604CoreArtifacts(
         },
         .os_tag = .linux,
     });
-    const guest_zstd = zstdDependency(b, guest_target, .ReleaseSmall);
+    const guest_zstd = zstdDependency(b, guest_target, .small);
     const cdrom_mod = b.createModule(.{
         .root_source_file = b.path("azagent/cdrom.zig"),
         .target = guest_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
     });
     const mizinit = b.addExecutable(.{
         .name = b.fmt("ubuntu2604-mizinit-{s}", .{@tagName(architecture)}),
         .root_module = b.createModule(.{
             .root_source_file = b.path("mizinit/init.zig"),
             .target = guest_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
             .imports = &.{
                 .{ .name = "provisioning_media", .module = cdrom_mod },
             },
@@ -134,20 +142,20 @@ fn addUbuntu2604CoreArtifacts(
     const miz_guest_mod = b.createModule(.{
         .root_source_file = b.path("packages/miz/src/root.zig"),
         .target = guest_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
     });
     addZstdHeaders(miz_guest_mod, guest_zstd);
     const wireserver_guest_mod = b.createModule(.{
         .root_source_file = b.path("wireserver/wireserver.zig"),
         .target = guest_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
     });
     const azagent = b.addExecutable(.{
         .name = b.fmt("ubuntu2604-azagent-{s}", .{@tagName(architecture)}),
         .root_module = b.createModule(.{
             .root_source_file = b.path("azagent/main.zig"),
             .target = guest_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
             .imports = &.{
                 .{ .name = "wireserver", .module = wireserver_guest_mod },
                 .{ .name = "miz", .module = miz_guest_mod },
@@ -168,7 +176,7 @@ fn addUbuntu2604CoreArtifacts(
 fn addUbuntu2604RuntimeContractModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path("scripts/ubuntu2604/runtime_contract.zig"),
@@ -203,10 +211,10 @@ fn addUbuntu2604RuntimeContractProbe(
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/ubuntu2604_runtime_contract_probe.zig"),
             .target = guest_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
             .imports = &.{.{
                 .name = "ubuntu2604_runtime_contract",
-                .module = addUbuntu2604RuntimeContractModule(b, guest_target, .ReleaseSmall),
+                .module = addUbuntu2604RuntimeContractModule(b, guest_target, .small),
             }},
         }),
         .linkage = .static,
@@ -234,7 +242,7 @@ fn addUbuntu2604BinderProbe(
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/ubuntu2604_binder_probe.zig"),
             .target = guest_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         }),
         .linkage = .static,
     });
@@ -257,13 +265,13 @@ pub fn build(b: *std.Build) void {
     // Spelled out rather than passing `preferred_optimize_mode`, which would
     // withdraw `-Doptimize` in favour of a `-Drelease` bool and break every
     // caller that names a mode.
-    const default_optimize: std.builtin.OptimizeMode = switch (b.release_mode) {
-        .off, .any, .safe => .ReleaseSafe,
-        .fast => .ReleaseFast,
-        .small => .ReleaseSmall,
+    const default_optimize: std.lang.Optimize = switch (b.graph.release_mode) {
+        .off, .any, .safe => .safe,
+        .fast => .fast,
+        .small => .small,
     };
     const optimize = b.option(
-        std.builtin.OptimizeMode,
+        std.lang.Optimize,
         "optimize",
         "Prioritize performance, safety, or binary size",
     ) orelse default_optimize;
@@ -537,7 +545,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(cli_exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run miz");
     run_step.dependOn(&run_cmd.step);
 
@@ -733,7 +741,7 @@ pub fn build(b: *std.Build) void {
 
     const run_qapi_codegen = b.addRunArtifact(qapi_codegen_exe);
     run_qapi_codegen.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_qapi_codegen.addArgs(args);
+    run_qapi_codegen.addPassthruArgs();
     const qapi_codegen_step = b.step("qapi-codegen", "Regenerate qmp/src/qapi_generated.zig from a QEMU checkout's qapi/qapi-schema.json");
     qapi_codegen_step.dependOn(&run_qapi_codegen.step);
 
@@ -797,7 +805,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(make_oci_fixture_exe);
     const run_make_oci_fixture = b.addRunArtifact(make_oci_fixture_exe);
-    if (b.args) |args| run_make_oci_fixture.addArgs(args);
+    run_make_oci_fixture.addPassthruArgs();
     const make_oci_fixture_step = b.step(
         "oci-fixture",
         "Build a from-scratch OCI image-layout fixture (minimal|uki-stub|verity-initramfs)",
@@ -1686,12 +1694,12 @@ pub fn build(b: *std.Build) void {
     const mizinit_cdrom_mod = b.createModule(.{
         .root_source_file = b.path("azagent/cdrom.zig"),
         .target = mizinit_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
     });
     const mizinit_mod = b.createModule(.{
         .root_source_file = b.path("mizinit/init.zig"),
         .target = mizinit_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
         .imports = &.{
             .{ .name = "provisioning_media", .module = mizinit_cdrom_mod },
         },
@@ -1739,14 +1747,14 @@ pub fn build(b: *std.Build) void {
         const guest_control_mod = b.createModule(.{
             .root_source_file = b.path("packages/miz/src/vm_control.zig"),
             .target = guest_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         });
         const mizguest_exe = b.addExecutable(.{
             .name = b.fmt("miz-guest-agent-{s}", .{@tagName(architecture)}),
             .root_module = b.createModule(.{
                 .root_source_file = b.path("mizguest/main.zig"),
                 .target = guest_target,
-                .optimize = .ReleaseSmall,
+                .optimize = .small,
                 .imports = &.{
                     .{ .name = "vm_control", .module = guest_control_mod },
                 },
@@ -1775,7 +1783,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tests/vm_guest_stub.zig"),
                 .target = guest_target,
-                .optimize = .ReleaseSmall,
+                .optimize = .small,
             }),
             .linkage = .static,
         });
@@ -1917,7 +1925,7 @@ pub fn build(b: *std.Build) void {
     // meaningful on Linux.  The zstd_max_preload shared library is also
     // Linux-specific. ----
     if (b.graph.host.result.os.tag == .linux) {
-        const guest_zstd_dependency = zstdDependency(b, mizinit_target, .ReleaseSmall);
+        const guest_zstd_dependency = zstdDependency(b, mizinit_target, .small);
 
         // Guest-targeted azagent for embedding in the generalized image.
         // It follows -Dazurelinux-arch and is static/ReleaseSmall, matching
@@ -1925,18 +1933,18 @@ pub fn build(b: *std.Build) void {
         const miz_guest_mod = b.createModule(.{
             .root_source_file = b.path("packages/miz/src/root.zig"),
             .target = mizinit_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         });
         addZstdHeaders(miz_guest_mod, guest_zstd_dependency);
         const wireserver_guest_mod = b.createModule(.{
             .root_source_file = b.path("wireserver/wireserver.zig"),
             .target = mizinit_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         });
         const azagent_guest_mod = b.createModule(.{
             .root_source_file = b.path("azagent/main.zig"),
             .target = mizinit_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
             .imports = &.{
                 .{ .name = "wireserver", .module = wireserver_guest_mod },
                 .{ .name = "miz", .module = miz_guest_mod },
@@ -1956,7 +1964,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("scripts/zstd_max_preload.zig"),
                 .target = b.graph.host,
-                .optimize = .ReleaseFast,
+                .optimize = .fast,
                 .link_libc = true,
             }),
         });
@@ -2012,7 +2020,7 @@ pub fn build(b: *std.Build) void {
         }
         run_builder.addArg("--preload");
         run_builder.addArtifactArg(zstd_preload_lib);
-        if (b.args) |args| run_builder.addArgs(args);
+        run_builder.addPassthruArgs();
         const generalized_step = b.step(
             "generalized-azurelinux4",
             "Build a generalized Azure Linux 4 Gen2 core or full QCOW2 image (requires root, Linux, dnf, qemu-img)",
@@ -2100,7 +2108,7 @@ pub fn build(b: *std.Build) void {
             run_ubuntu2604.addArg("--azagent");
             run_ubuntu2604.addArtifactArg(artifacts.azagent);
         }
-        if (b.args) |args| run_ubuntu2604.addArgs(args);
+        run_ubuntu2604.addPassthruArgs();
         const ubuntu2604_step = b.step(
             "generalized-ubuntu2604",
             "Build the selected generalized Ubuntu 26.04 Gen2 QCOW2 image",
@@ -2123,7 +2131,7 @@ pub fn build(b: *std.Build) void {
                 run_arch.addArg("--azagent");
                 run_arch.addArtifactArg(artifacts.azagent);
             }
-            if (b.args) |args| run_arch.addArgs(args);
+            run_arch.addPassthruArgs();
             const step_name = switch (architecture) {
                 .x86_64 => "generalized-ubuntu2604-amd64",
                 .aarch64 => "generalized-ubuntu2604-arm64",
@@ -2258,7 +2266,7 @@ pub fn build(b: *std.Build) void {
         ci_production_entrypoint_check.dependOn(&freebsd_builder_exe.step);
 
         const run_freebsd_builder = b.addRunArtifact(freebsd_builder_exe);
-        if (b.args) |args| run_freebsd_builder.addArgs(args);
+        run_freebsd_builder.addPassthruArgs();
         const generalized_freebsd_step = b.step(
             "generalized-freebsd15",
             "Build a generalized FreeBSD 15.1 QCOW2 (Linux, QEMU, UEFI)",

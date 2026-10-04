@@ -994,7 +994,7 @@ const PartitionRewrite = struct {
     role: PartitionRole = .other,
     mount_point: ?[]const u8 = null,
     mode: PartitionRewriteMode = .none,
-    new_uuid: [16]u8 = [_]u8{0} ** 16,
+    new_uuid: [16]u8 = @as([16]u8, @splat(0)),
     new_fat_volume_id: u32 = 0,
     source: PartitionSource = .none,
 };
@@ -3549,7 +3549,7 @@ fn createRootGptTestImageWithFilesystemLength(
             .offset = first_lba * miz.gpt.sector_size,
             .length = filesystem_length,
             .label = "miz-root",
-            .uuid = [_]u8{0x55} ** 16,
+            .uuid = @as([16]u8, @splat(0x55)),
         },
     );
 }
@@ -3562,7 +3562,7 @@ const WriteIdentityTestFile = struct {
 const old_root_partition_guid = miz.guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
 const old_esp_partition_guid = miz.guid.parse("11111111-1111-1111-1111-111111111111");
 const old_disk_guid = miz.guid.parse("99999999-8888-7777-6666-555555555555");
-const old_root_filesystem_uuid = [_]u8{0x55} ** 16;
+const old_root_filesystem_uuid = @as([16]u8, @splat(0x55));
 const old_esp_volume_id: u32 = 0x5A56_4D49;
 const old_root_filesystem_uuid_text = "55555555-5555-5555-5555-555555555555";
 const old_esp_volume_id_text = "5A56-4D49";
@@ -4096,7 +4096,7 @@ test "write passes through non-GPT sources while clearing stale destination meta
     {
         var image = try miz.Image.create(io, target, .raw, target_size, .{});
         defer image.close(io);
-        try image.pwrite(io, &([_]u8{0xa5} ** 512), target_size - 512);
+        try image.pwrite(io, &(@as([512]u8, @splat(0xa5))), target_size - 512);
     }
     var report = testReport();
     var fake = FakeOperations{ .report = &report, .real_pipeline = true };

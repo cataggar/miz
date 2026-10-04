@@ -4,13 +4,13 @@ const miz = @import("miz");
 pub fn build(b: *std.Build) void {
     const dependency = b.dependencyFromBuildZig(miz, .{
         .target = b.graph.host,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     const package_family_consumer = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("package_family_consumer.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .imports = &.{.{ .name = "miz", .module = dependency.module("miz_host") }},
         }),
     });
@@ -37,7 +37,7 @@ pub fn build(b: *std.Build) void {
         .target_architecture = .x86_64,
         .rootfs_path_in_iso = "images/rootfs.squashfs",
         .reproducibility = .{
-            .seed = [_]u8{0x55} ** 32,
+            .seed = @as([32]u8, @splat(0x55)),
             .source_date_epoch = 1_735_689_600,
         },
     });
@@ -64,7 +64,7 @@ pub fn build(b: *std.Build) void {
         .target_architecture = .x86_64,
         .rootfs_path_in_iso = "images/rootfs.squashfs",
         .reproducibility = .{
-            .seed = [_]u8{0x77} ** 32,
+            .seed = @as([32]u8, @splat(0x77)),
             .source_date_epoch = 1_735_689_600,
         },
     });
@@ -84,7 +84,7 @@ pub fn build(b: *std.Build) void {
         .rootfs_path_in_iso = "images/rootfs.squashfs",
         .root_filesystem = .xfs,
         .reproducibility = .{
-            .seed = [_]u8{0x11} ** 32,
+            .seed = @as([32]u8, @splat(0x11)),
             .source_date_epoch = 1_735_689_600,
         },
         .os = .{
@@ -124,7 +124,7 @@ pub fn build(b: *std.Build) void {
         .target_architecture = .x86_64,
         .rootfs_path_in_iso = "images/rootfs.squashfs",
         .reproducibility = .{
-            .seed = [_]u8{0x22} ** 32,
+            .seed = @as([32]u8, @splat(0x22)),
             .source_date_epoch = 1_735_689_600,
         },
         .boot_mode = .both,
@@ -193,7 +193,7 @@ pub fn build(b: *std.Build) void {
         .target_architecture = .x86_64,
         .rootfs_path_in_iso = "images/rootfs.squashfs",
         .reproducibility = .{
-            .seed = [_]u8{0x44} ** 32,
+            .seed = @as([32]u8, @splat(0x44)),
             .source_date_epoch = 1_735_689_600,
         },
     });
@@ -212,7 +212,7 @@ pub fn build(b: *std.Build) void {
         .target_architecture = .x86_64,
         .rootfs_path_in_iso = "images/rootfs.squashfs",
         .reproducibility = .{
-            .seed = [_]u8{0x33} ** 32,
+            .seed = @as([32]u8, @splat(0x33)),
             .source_date_epoch = 1_735_689_600,
         },
     });
@@ -222,7 +222,7 @@ pub fn build(b: *std.Build) void {
             .cpu_arch = .aarch64,
             .os_tag = .linux,
         }),
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     const preserved_image = miz.addPreservedImage(b, foreign_dependency, .{
         .name = "preserved-fixture",
@@ -239,7 +239,7 @@ pub fn build(b: *std.Build) void {
         .backend = .unsafe_chroot,
         .acknowledge_unsafe = true,
         .reproducibility = .{
-            .seed = [_]u8{0x44} ** 32,
+            .seed = @as([32]u8, @splat(0x44)),
             .source_date_epoch = 1_735_689_600,
         },
         .operations = &.{
@@ -292,7 +292,7 @@ pub fn build(b: *std.Build) void {
         .target_architecture = .aarch64,
         .backend = .vm,
         .reproducibility = .{
-            .seed = [_]u8{0x55} ** 32,
+            .seed = @as([32]u8, @splat(0x55)),
             .source_date_epoch = 1_735_689_600,
         },
         .guest_execution = .cross_architecture,

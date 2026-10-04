@@ -82,7 +82,7 @@ pub fn capture(
     try entries.append(.{
         .path = "",
         .kind = .directory,
-        .mode = @intFromEnum(root_stat.permissions) & 0o7777,
+        .mode = @backingInt(root_stat.permissions) & 0o7777,
         .uid = root_system.uid,
         .gid = root_system.gid,
         .mtime = timestamp(root_stat.mtime),
@@ -103,7 +103,7 @@ pub fn capture(
         var entry = Entry{
             .path = path,
             .kind = kind,
-            .mode = @intFromEnum(stat.permissions) & 0o7777,
+            .mode = @backingInt(stat.permissions) & 0o7777,
             .mtime = timestamp(stat.mtime),
             .size = if (kind == .file) stat.size else 0,
             .inode = @intCast(stat.inode),
@@ -271,7 +271,7 @@ fn readXattrs(
             return error.ReadXattrFailed;
         if (end == offset) return error.ReadXattrFailed;
         const name = names[offset..end];
-        const name_z = try allocator.dupeZ(u8, name);
+        const name_z = try allocator.dupeSentinel(u8, name, 0);
         const value_size_result = linux.lgetxattr(proc_path.ptr, name_z.ptr, &empty, 0);
         if (linux.errno(value_size_result) != .SUCCESS or value_size_result > 1024 * 1024) {
             return error.ReadXattrFailed;

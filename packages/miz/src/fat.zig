@@ -659,8 +659,8 @@ test "fat identity preserves unrelated bytes in and around rewritten boot sector
     var volume = try createTestVolume(io, path, layout, region_offset, 0x93);
     defer volume.image.close(io);
 
-    var prefix = [_]u8{0xA5} ** 4_096;
-    var tail = [_]u8{0x5A} ** 4_096;
+    var prefix = @as([4_096]u8, @splat(0xA5));
+    var tail = @as([4_096]u8, @splat(0x5A));
     try volume.image.pwrite(io, &prefix, 0);
     try volume.image.pwrite(io, &tail, volume.region.offset + volume.region.length);
 
@@ -670,11 +670,11 @@ test "fat identity preserves unrelated bytes in and around rewritten boot sector
     const report = try rewriteIdentity(&volume.image, io, volume.region, 0xFACE_B00C);
     try std.testing.expectEqual(@as(u8, 2), report.boot_sector_copies_rewritten);
 
-    var after_prefix = [_]u8{0} ** 4_096;
+    var after_prefix = @as([4_096]u8, @splat(0));
     try readAllAt(&volume.image, io, &after_prefix, 0);
     try std.testing.expectEqualSlices(u8, &prefix, &after_prefix);
 
-    var after_tail = [_]u8{0} ** 4_096;
+    var after_tail = @as([4_096]u8, @splat(0));
     try readAllAt(&volume.image, io, &after_tail, volume.region.offset + volume.region.length);
     try std.testing.expectEqualSlices(u8, &tail, &after_tail);
 

@@ -3865,7 +3865,7 @@ test "qemu architecture inference uses only recognized GPT root or usr GUIDs" {
 }
 
 test "qemu architecture inference reads PE machine metadata" {
-    var bytes = [_]u8{0} ** 128;
+    var bytes = @as([128]u8, @splat(0));
     bytes[0..2].* = "MZ".*;
     std.mem.writeInt(u32, bytes[0x3c..][0..4], 64, .little);
     bytes[64..68].* = "PE\x00\x00".*;
@@ -4283,7 +4283,7 @@ fn writeTestVars(
 const test_microsoft_db =
     "\xa1\x59\xc0\xa5\xe4\x94\xa7\x4a\x87\xb5\xab\x15\x5c\x2b\xf0\x72" ++
     "\x38\x00\x00\x00\x00\x00\x00\x00\x1c\x00\x00\x00" ++
-    "\x00" ** 16 ++ "microsoft db";
+    &@as([16:0]u8, @splat("\x00"[0])) ++ "microsoft db";
 
 test "qemu enrolls and validates the exact release leaf in native vars" {
     const allocator = std.testing.allocator;

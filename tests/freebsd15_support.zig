@@ -288,7 +288,7 @@ pub fn expectNames(actual: []const []const u8, expected: []const []const u8) !vo
 
 // ---- Release fixtures -----------------------------------------------------
 
-pub const source_commit = "a" ** 40;
+pub const source_commit = &@as([40:0]u8, @splat("a"[0]));
 pub const release_date = "20260812";
 
 /// The recorded `<asset>.packages.txt` a builder would have produced, with
@@ -449,7 +449,7 @@ pub fn makeAzureResult(
         document.integerOf(candidate.get("virtual_size")).?,
         document.integerOf(candidate.get("allocated_size")).?,
         document.integerOf(candidate.get("compressed_size")).?,
-        "d" ** 64,
+        &@as([64:0]u8, @splat("d"[0])),
     });
     for (contracts, 0..) |name, index| {
         if (index > 0) try text.writer.writeAll(", ");
