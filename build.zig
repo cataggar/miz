@@ -564,7 +564,7 @@ pub fn build(b: *std.Build) void {
     });
     // Windows QCOW2 path buffers make allocation-free Image temporaries
     // larger than the default PE stack reserve.
-    const windows_image_stack_reserve = 32 * 1024 * 1024;
+    const windows_image_stack_reserve = 128 * 1024 * 1024;
     if (target.result.os.tag == .windows) cli_exe.stack_size = windows_image_stack_reserve;
     ci_production_entrypoint_check.dependOn(&cli_exe.step);
     const install_cli = b.addInstallArtifact(cli_exe, .{});
@@ -622,18 +622,18 @@ pub fn build(b: *std.Build) void {
     const smoke_info = b.addRunArtifact(cli_exe);
     smoke_info.addArgs(&.{ "info", "--output=json" });
     smoke_info.addFileArg(smoke_image);
+    smoke_info.expectExitCode(0);
     smoke_info.expectStdOutMatch("\"format\":\"vhd\"");
     smoke_info.expectStdOutMatch("\"virtual-size\":1048576");
     smoke_info.expectStdOutMatch("\"subformat\":\"fixed\"");
     smoke_info.expectStdErrEqual("");
-    smoke_info.expectExitCode(0);
     native_smoke_step.dependOn(&smoke_info.step);
 
     const smoke_check = b.addRunArtifact(cli_exe);
     smoke_check.addArg("check");
     smoke_check.addFileArg(smoke_image);
-    smoke_check.expectStdErrMatch("No errors were found on the image.");
     smoke_check.expectExitCode(0);
+    smoke_check.expectStdErrMatch("No errors were found on the image.");
     native_smoke_step.dependOn(&smoke_check.step);
 
     // Host-only image builders used by the exported build helpers. They remain
