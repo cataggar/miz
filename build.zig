@@ -287,7 +287,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(cli_exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run vmiz");
     run_step.dependOn(&run_cmd.step);
 
@@ -470,7 +470,7 @@ pub fn build(b: *std.Build) void {
 
     const run_qapi_codegen = b.addRunArtifact(qapi_codegen_exe);
     run_qapi_codegen.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_qapi_codegen.addArgs(args);
+    run_qapi_codegen.addPassthruArgs();
     const qapi_codegen_step = b.step("qapi-codegen", "Regenerate qmp/src/qapi_generated.zig from a QEMU checkout's qapi/qapi-schema.json");
     qapi_codegen_step.dependOn(&run_qapi_codegen.step);
 
@@ -722,12 +722,12 @@ pub fn build(b: *std.Build) void {
     const vmizinit_cdrom_mod = b.createModule(.{
         .root_source_file = b.path("azagent/cdrom.zig"),
         .target = vmizinit_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
     });
     const vmizinit_mod = b.createModule(.{
         .root_source_file = b.path("vmizinit/init.zig"),
         .target = vmizinit_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
         .imports = &.{
             .{ .name = "provisioning_media", .module = vmizinit_cdrom_mod },
         },
@@ -775,14 +775,14 @@ pub fn build(b: *std.Build) void {
         const guest_control_mod = b.createModule(.{
             .root_source_file = b.path("packages/vmiz/src/vm_control.zig"),
             .target = guest_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         });
         const vmizguest_exe = b.addExecutable(.{
             .name = b.fmt("vmiz-guest-agent-{s}", .{@tagName(architecture)}),
             .root_module = b.createModule(.{
                 .root_source_file = b.path("vmizguest/main.zig"),
                 .target = guest_target,
-                .optimize = .ReleaseSmall,
+                .optimize = .small,
                 .imports = &.{
                     .{ .name = "vm_control", .module = guest_control_mod },
                 },
@@ -811,7 +811,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tests/vm_guest_stub.zig"),
                 .target = guest_target,
-                .optimize = .ReleaseSmall,
+                .optimize = .small,
             }),
             .linkage = .static,
         });
@@ -935,17 +935,17 @@ pub fn build(b: *std.Build) void {
         const vmiz_guest_mod = b.createModule(.{
             .root_source_file = b.path("packages/vmiz/src/root.zig"),
             .target = vmizinit_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         });
         const wireserver_guest_mod = b.createModule(.{
             .root_source_file = b.path("wireserver/wireserver.zig"),
             .target = vmizinit_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         });
         const azagent_guest_mod = b.createModule(.{
             .root_source_file = b.path("azagent/main.zig"),
             .target = vmizinit_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
             .imports = &.{
                 .{ .name = "wireserver", .module = wireserver_guest_mod },
                 .{ .name = "vmiz", .module = vmiz_guest_mod },
@@ -965,7 +965,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("scripts/zstd_max_preload.zig"),
                 .target = b.graph.host,
-                .optimize = .ReleaseFast,
+                .optimize = .fast,
                 .link_libc = true,
             }),
         });
@@ -1021,7 +1021,7 @@ pub fn build(b: *std.Build) void {
         }
         run_builder.addArg("--preload");
         run_builder.addArtifactArg(zstd_preload_lib);
-        if (b.args) |args| run_builder.addArgs(args);
+        run_builder.addPassthruArgs();
         const generalized_step = b.step(
             "generalized-azurelinux4",
             "Build a generalized Azure Linux 4 Gen2 core or full QCOW2 image (requires root, Linux, dnf, qemu-img)",
@@ -1076,7 +1076,7 @@ pub fn build(b: *std.Build) void {
 
         const run_ubuntu2604 = b.addRunArtifact(ubuntu2604_builder_exe);
         run_ubuntu2604.addArgs(&.{ "--architecture", @tagName(ubuntu2604_architecture) });
-        if (b.args) |args| run_ubuntu2604.addArgs(args);
+        run_ubuntu2604.addPassthruArgs();
         const ubuntu2604_step = b.step(
             "generalized-ubuntu2604",
             "Build the selected generalized Ubuntu 26.04 Gen2 QCOW2 image",
@@ -1086,7 +1086,7 @@ pub fn build(b: *std.Build) void {
         inline for (.{ Ubuntu2604Architecture.x86_64, Ubuntu2604Architecture.aarch64 }) |architecture| {
             const run_arch = b.addRunArtifact(ubuntu2604_builder_exe);
             run_arch.addArgs(&.{ "--architecture", @tagName(architecture) });
-            if (b.args) |args| run_arch.addArgs(args);
+            run_arch.addPassthruArgs();
             const step_name = switch (architecture) {
                 .x86_64 => "generalized-ubuntu2604-amd64",
                 .aarch64 => "generalized-ubuntu2604-arm64",
@@ -1183,7 +1183,7 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(freebsd_builder_exe);
 
         const run_freebsd_builder = b.addRunArtifact(freebsd_builder_exe);
-        if (b.args) |args| run_freebsd_builder.addArgs(args);
+        run_freebsd_builder.addPassthruArgs();
         const generalized_freebsd_step = b.step(
             "generalized-freebsd15",
             "Build a generalized FreeBSD 15.1 QCOW2 (Linux, QEMU, UEFI)",

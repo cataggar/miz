@@ -3812,7 +3812,7 @@ test "qemu architecture inference uses only recognized GPT root or usr GUIDs" {
 }
 
 test "qemu architecture inference reads PE machine metadata" {
-    var bytes = [_]u8{0} ** 128;
+    var bytes = @as([128]u8, @splat(0));
     bytes[0..2].* = "MZ".*;
     std.mem.writeInt(u32, bytes[0x3c..][0..4], 64, .little);
     bytes[64..68].* = "PE\x00\x00".*;
@@ -4113,7 +4113,7 @@ test "qemu validates the exact release leaf in enrolled vars JSON" {
         0xa1, 0x59, 0xc0, 0xa5, 0xe4, 0x94, 0xa7, 0x4a,
         0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
     };
-    var database = [_]u8{0} ** (28 + 16 + certificate.len);
+    var database = @as([(28 + 16 + certificate.len)]u8, @splat(0));
     @memcpy(database[0..efi_cert_x509_guid.len], &efi_cert_x509_guid);
     std.mem.writeInt(u32, database[16..20], database.len, .little);
     std.mem.writeInt(u32, database[20..24], 0, .little);

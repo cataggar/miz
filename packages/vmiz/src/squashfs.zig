@@ -199,7 +199,7 @@ pub const Reader = struct {
         const fragment_meta_start = try firstIndexedMetadataStart(allocator, io, file, sb.fragment_table_start, sb.fragments, @sizeOf(FragmentEntry));
         const id_meta_start = try firstIndexedMetadataStart(allocator, io, file, sb.id_table_start, sb.no_ids, @sizeOf(u32));
 
-        const compression: Compression = @enumFromInt(sb.compression);
+        const compression: Compression = @fromBackingInt(@intCast(sb.compression));
 
         var inode_table = try readMetadataTable(allocator, io, file, compression, sb.inode_table_start, sb.directory_table_start);
         var inode_table_owned = true;
@@ -393,7 +393,7 @@ pub const Reader = struct {
         _ = try self.file.readPositionalAll(io, stored, file_offset);
 
         self.cache_stats.data_block_decompressions += 1;
-        const block = try decompressDataBlockAlloc(allocator, @enumFromInt(self.superblock.compression), stored, expected_size);
+        const block = try decompressDataBlockAlloc(allocator, @fromBackingInt(@intCast(self.superblock.compression)), stored, expected_size);
         if (block.len != expected_size) {
             allocator.free(block);
             return error.InvalidDataBlock;
@@ -417,7 +417,7 @@ pub const Reader = struct {
 
         if ((fragment.raw_size & data_uncompressed_bit) != 0) return allocator.dupe(u8, stored);
         self.cache_stats.fragment_block_decompressions += 1;
-        return decompressDataBlockAlloc(allocator, @enumFromInt(self.superblock.compression), stored, self.superblock.block_size);
+        return decompressDataBlockAlloc(allocator, @fromBackingInt(@intCast(self.superblock.compression)), stored, self.superblock.block_size);
     }
 
     fn lookupFrom(self: *const Reader, start_index: usize, path: []const u8, follow_final_symlink: bool, depth: u8) LookupError!usize {
@@ -754,7 +754,7 @@ fn parseSuperblock(buf: *const [96]u8) OpenError!Superblock {
 fn parseCompressorOptions(io: Io, file: Io.File, sb: Superblock) OpenError!?CompressorOptions {
     if ((sb.flags & compressor_options_flag) == 0) return null;
 
-    return switch (@as(Compression, @enumFromInt(sb.compression))) {
+    return switch (@as(Compression, @fromBackingInt(@intCast(sb.compression)))) {
         .xz => blk: {
             var buf: [8]u8 = undefined;
             _ = try file.readPositionalAll(io, &buf, 96);
@@ -1772,7 +1772,7 @@ const Writer = struct {
         var buf = std.array_list.Managed(u8).init(self.arena);
         defer buf.deinit();
         if (extended) {
-            try appendU16Le(&buf, @intFromEnum(InodeType.ext_file));
+            try appendU16Le(&buf, @backingInt(InodeType.ext_file));
             try appendU16Le(&buf, mode);
             try appendU16Le(&buf, uid_index);
             try appendU16Le(&buf, gid_index);
@@ -1785,9 +1785,9 @@ const Writer = struct {
             try appendU32Le(&buf, node.fragment_index);
             try appendU32Le(&buf, node.fragment_offset);
             try appendU32Le(&buf, no_xattr);
-            node.entry_type = @intFromEnum(InodeType.ext_file);
+            node.entry_type = @backingInt(InodeType.ext_file);
         } else {
-            try appendU16Le(&buf, @intFromEnum(InodeType.basic_file));
+            try appendU16Le(&buf, @backingInt(InodeType.basic_file));
             try appendU16Le(&buf, mode);
             try appendU16Le(&buf, uid_index);
             try appendU16Le(&buf, gid_index);
@@ -1797,7 +1797,7 @@ const Writer = struct {
             try appendU32Le(&buf, node.fragment_index);
             try appendU32Le(&buf, node.fragment_offset);
             try appendU32Le(&buf, @intCast(node.file_size));
-            node.entry_type = @intFromEnum(InodeType.basic_file);
+            node.entry_type = @backingInt(InodeType.basic_file);
         }
         for (node.block_sizes) |size_field| try appendU32Le(&buf, size_field);
 
@@ -1813,7 +1813,7 @@ const Writer = struct {
 
         var buf = std.array_list.Managed(u8).init(self.arena);
         defer buf.deinit();
-        try appendU16Le(&buf, @intFromEnum(InodeType.basic_symlink));
+        try appendU16Le(&buf, @backingInt(InodeType.basic_symlink));
         try appendU16Le(&buf, mode);
         try appendU16Le(&buf, uid_index);
         try appendU16Le(&buf, gid_index);
@@ -1822,7 +1822,7 @@ const Writer = struct {
         try appendU32Le(&buf, 1); // nlink
         try appendU32Le(&buf, @intCast(node.symlink_target.len));
         try buf.appendSlice(node.symlink_target);
-        node.entry_type = @intFromEnum(InodeType.basic_symlink);
+        node.entry_type = @backingInt(InodeType.basic_symlink);
 
         node.inode_ref = self.inodeRefForNext();
         try self.inode_table.write(buf.items);
@@ -1846,7 +1846,7 @@ const Writer = struct {
         var buf = std.array_list.Managed(u8).init(self.arena);
         defer buf.deinit();
         if (extended) {
-            try appendU16Le(&buf, @intFromEnum(InodeType.ext_dir));
+            try appendU16Le(&buf, @backingInt(InodeType.ext_dir));
             try appendU16Le(&buf, mode);
             try appendU16Le(&buf, uid_index);
             try appendU16Le(&buf, gid_index);
@@ -1859,9 +1859,9 @@ const Writer = struct {
             try appendU16Le(&buf, 0); // index count
             try appendU16Le(&buf, node.dir_offset);
             try appendU32Le(&buf, no_xattr);
-            node.entry_type = @intFromEnum(InodeType.ext_dir);
+            node.entry_type = @backingInt(InodeType.ext_dir);
         } else {
-            try appendU16Le(&buf, @intFromEnum(InodeType.basic_dir));
+            try appendU16Le(&buf, @backingInt(InodeType.basic_dir));
             try appendU16Le(&buf, mode);
             try appendU16Le(&buf, uid_index);
             try appendU16Le(&buf, gid_index);
@@ -1872,7 +1872,7 @@ const Writer = struct {
             try appendU16Le(&buf, @intCast(raw_size));
             try appendU16Le(&buf, node.dir_offset);
             try appendU32Le(&buf, node.parent_inode);
-            node.entry_type = @intFromEnum(InodeType.basic_dir);
+            node.entry_type = @backingInt(InodeType.basic_dir);
         }
 
         node.inode_ref = self.inodeRefForNext();
@@ -1999,8 +1999,8 @@ const Writer = struct {
     fn writeSuperblock(self: *Writer, layout: SuperblockLayout) anyerror!void {
         const block_log: u16 = @intCast(std.math.log2_int(u32, self.options.block_size));
         const compression_id: u16 = switch (self.options.compression) {
-            .none => @intFromEnum(Compression.gzip),
-            .zstd => @intFromEnum(Compression.zstd),
+            .none => @backingInt(Compression.gzip),
+            .zstd => @backingInt(Compression.zstd),
         };
         var flags: u16 = no_xattrs_flag;
         if (self.options.compression == .none) {
@@ -2171,9 +2171,9 @@ pub fn buildSyntheticSquashfsImage(allocator: std.mem.Allocator, options: Synthe
     else
         @intCast(options.fragment_tail_size);
     const compression_id: u16 = switch (options.compression) {
-        .none => @intFromEnum(Compression.gzip),
-        .xz => @intFromEnum(Compression.xz),
-        .zstd => @intFromEnum(Compression.zstd),
+        .none => @backingInt(Compression.gzip),
+        .xz => @backingInt(Compression.xz),
+        .zstd => @backingInt(Compression.zstd),
     };
     const compressor_options_len: usize = if (options.compression == .xz) 8 else 0;
     const data_block_start: u64 = 96 + compressor_options_len;

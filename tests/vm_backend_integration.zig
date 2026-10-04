@@ -835,7 +835,7 @@ const Workspace = struct {
                 },
             },
             .reproducibility = .{
-                .seed = .{ .bytes = [_]u8{0x56} ** 32 },
+                .seed = .{ .bytes = @as([32]u8, @splat(0x56)) },
                 .source_date_epoch = 1_735_689_600,
             },
         };
@@ -1403,7 +1403,7 @@ fn createSourceDisk(
         .offset = partition_offset,
         .length = partition_length,
         .label = "vm-test",
-        .uuid = [_]u8{0x56} ** 16,
+        .uuid = @as([16]u8, @splat(0x56)),
         .timestamp = 1_735_689_600,
     });
 }

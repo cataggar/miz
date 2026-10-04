@@ -544,13 +544,13 @@ fn waitpidFallback(
 ) !std.process.Child.Term {
     while (true) {
         const remaining = deadline.toDurationFromNow(io) orelse {
-            var status: u32 = undefined;
+            var status: i32 = undefined;
             _ = std.os.linux.waitpid(pid, &status, 0);
             clearReapedChild(io, child);
             return waitStatusTerm(status);
         };
         if (remaining.raw.nanoseconds <= 0) return error.Timeout;
-        var status: u32 = undefined;
+        var status: i32 = undefined;
         const result = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
         switch (std.os.linux.errno(result)) {
             .SUCCESS => {
@@ -583,8 +583,8 @@ fn clearReapedChild(io: Io, child: *std.process.Child) void {
 fn waitStatusTerm(status: u32) std.process.Child.Term {
     const signal = status & 0x7f;
     if (signal == 0) return .{ .exited = @intCast((status >> 8) & 0xff) };
-    if (signal == 0x7f) return .{ .stopped = @enumFromInt(@as(u8, @intCast((status >> 8) & 0xff))) };
-    return .{ .signal = @enumFromInt(@as(u8, @intCast(signal))) };
+    if (signal == 0x7f) return .{ .stopped = @fromBackingInt(@intCast(@as(u8, @intCast((status >> 8) & 0xff)))) };
+    return .{ .signal = @fromBackingInt(@intCast(@as(u8, @intCast(signal)))) };
 }
 
 pub const Root = struct {
@@ -1286,7 +1286,7 @@ const FakeRunner = struct {
 };
 
 fn fakePidfdErrno(errno: std.os.linux.E) usize {
-    return @bitCast(-@as(isize, @intCast(@intFromEnum(errno))));
+    return @bitCast(-@as(isize, @intCast(@backingInt(errno))));
 }
 
 fn fakePidfdEnosys(_: i32) usize {

@@ -571,7 +571,7 @@ test "signing mode names are stable provenance values" {
 }
 
 test "certificate fingerprints accept canonical SHA-256 forms" {
-    const expected = [_]u8{0x11} ** 32;
+    const expected = @as([32]u8, @splat(0x11));
     try std.testing.expectEqual(
         expected,
         try parseFingerprint("1111111111111111111111111111111111111111111111111111111111111111"),

@@ -1039,7 +1039,7 @@ test "forced bundle unpack rejects a symlink destination" {
         ),
     );
     const outside = try Io.Dir.cwd().statFile(io, outside_root, .{});
-    try std.testing.expectEqual(@as(u32, 0o755), @intFromEnum(outside.permissions) & 0o7777);
+    try std.testing.expectEqual(@as(u32, 0o755), @backingInt(outside.permissions) & 0o7777);
 }
 
 test "bundle repack publishes deterministic additions changes and whiteouts" {
@@ -1162,7 +1162,7 @@ test "bundle repack publishes deterministic additions changes and whiteouts" {
         try std.testing.expectEqualStrings("round-trip", value[0..xattr_result]);
     }
     const verified_root = try verified.stat(io);
-    try std.testing.expectEqual(@as(u32, 0o750), @intFromEnum(verified_root.permissions) & 0o7777);
+    try std.testing.expectEqual(@as(u32, 0o750), @backingInt(verified_root.permissions) & 0o7777);
     try std.testing.expectError(error.FileNotFound, verified.statFile(io, "etc/keep.txt", .{}));
     try verified.writeFile(io, .{ .sub_path = ".wh.reserved", .data = "not a whiteout" });
     const reserved_target = (try reference.parse(
@@ -1795,7 +1795,7 @@ fn buildTarArchive(allocator: Allocator, specs: []const TarSpec) ![]u8 {
 }
 
 fn appendTarSpec(out: *std.Io.Writer.Allocating, spec: TarSpec) !void {
-    var header: [512]u8 = [_]u8{0} ** 512;
+    var header: [512]u8 = @as([512]u8, @splat(0));
     if (spec.path.len > 100) return error.InvalidHeader;
     @memcpy(header[0..spec.path.len], spec.path);
     try writeOctalField(header[100..108], spec.mode);

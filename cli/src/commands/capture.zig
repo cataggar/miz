@@ -1564,7 +1564,7 @@ test "resolveRoot refuses ambiguity between an ext4 root and an xfs root" {
         img.file,
         ext4_offset,
         ext4_length,
-        [_]u8{0xAA} ** 16,
+        @as([16]u8, @splat(0xAA)),
         "extroot",
         os_release,
     );
@@ -1724,7 +1724,7 @@ test "a malformed XFS candidate propagates as a genuine failure, not a silently 
     // field no reader supports -- exactly the case that must surface as
     // `error.UnsupportedSuperblockVersion` rather than being reported as
     // "no root filesystem found".
-    var malformed = [_]u8{0} ** 512;
+    var malformed = @as([512]u8, @splat(0));
     std.mem.writeInt(u32, malformed[0..4], vmiz.xfs.magic, .big);
     const root_offset = placements[1].first_lba * vmiz.gpt.sector_size;
     try img.pwrite(io, &malformed, root_offset);

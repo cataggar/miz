@@ -451,7 +451,7 @@ const Session = struct {
     fn loadModules(self: *Session, members: []const []const u8) !void {
         for (members) |member| {
             if (!control_mod.validModuleMember(member)) return error.InvalidModuleMember;
-            const path = try self.allocator.dupeZ(u8, member);
+            const path = try self.allocator.dupeSentinel(u8, member, 0);
             defer self.allocator.free(path);
 
             const fd_rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
@@ -472,7 +472,7 @@ const Session = struct {
     fn mountTarget(self: *Session, device: []const u8, filesystem: control_mod.RootFilesystemKind) !void {
         try mkdirPath("/mnt");
         try mkdirPath(guest_root);
-        const device_z = try self.allocator.dupeZ(u8, device);
+        const device_z = try self.allocator.dupeSentinel(u8, device, 0);
         // Block-device probing finishes on a kernel workqueue that can outlast
         // the jump to `rdinit`, so the node may not exist yet even though the
         // driver is built in and the disk is present.
@@ -1100,7 +1100,7 @@ const Session = struct {
             guest_root ++ "{s}",
             .{guest_path},
         );
-        const path_z = try self.allocator.dupeZ(u8, host_path);
+        const path_z = try self.allocator.dupeSentinel(u8, host_path, 0);
         const fd_raw = linux.open(
             path_z,
             .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true },
@@ -1211,7 +1211,7 @@ fn discoverKernels(
     modules_path: []const u8,
     skipped: *std.array_list.Managed(control_mod.SkippedKernel),
 ) ![]const []const u8 {
-    const modules_z = try allocator.dupeZ(u8, modules_path);
+    const modules_z = try allocator.dupeSentinel(u8, modules_path, 0);
     defer allocator.free(modules_z);
     const fd_raw = linux.open(modules_z, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
     switch (linux.errno(fd_raw)) {
@@ -1341,7 +1341,7 @@ const Captured = struct {
 fn runInChroot(allocator: Allocator, argv: []const []const u8) !Captured {
     const argv_z = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
     for (argv, 0..) |argument, index| {
-        argv_z[index] = (try allocator.dupeZ(u8, argument)).ptr;
+        argv_z[index] = (try allocator.dupeSentinel(u8, argument, 0)).ptr;
     }
     const envp = [_:null]?[*:0]const u8{
         "HOME=/root",
@@ -1392,17 +1392,17 @@ fn runInChroot(allocator: Allocator, argv: []const []const u8) !Captured {
     }
     _ = linux.close(fds[0]);
 
-    var status: u32 = 0;
+    var status: i32 = 0;
     while (true) {
         const rc = linux.wait4(pid, &status, 0, null);
         if (linux.errno(rc) != .INTR) break;
     }
-    const exit_code: u8 = if (linux.W.IFEXITED(status))
-        linux.W.EXITSTATUS(status)
+    const exit_code: u8 = if (linux.W.IFEXITED(@bitCast(status)))
+        linux.W.EXITSTATUS(@bitCast(status))
     else
         // A signalled command has no exit status of its own; 128+n is the shell
         // convention and keeps the field meaningful rather than merely nonzero.
-        @truncate(128 +% @intFromEnum(linux.W.TERMSIG(status)));
+        @truncate(128 +% @backingInt(linux.W.TERMSIG(@bitCast(status))));
     return .{ .exit_code = exit_code, .output = output.items };
 }
 
@@ -1441,7 +1441,9 @@ const rtf_gateway: u16 = 0x0002;
 
 fn sockaddrIn(address: [4]u8) linux.sockaddr {
     const in: linux.sockaddr.in = .{ .port = 0, .addr = @bitCast(address) };
-    return @bitCast(in);
+    var result: linux.sockaddr = undefined;
+    @memcpy(std.mem.asBytes(&result), std.mem.asBytes(&in));
+    return result;
 }
 
 fn interfaceUp(socket: i32, name: []const u8) void {
@@ -1468,7 +1470,7 @@ fn addDefaultRoute(
     gateway: []const u8,
 ) !void {
     const address = control_mod.parseIpv4(gateway) orelse return error.InvalidGateway;
-    const interface_z = try allocator.dupeZ(u8, interface);
+    const interface_z = try allocator.dupeSentinel(u8, interface, 0);
     var route: rtentry = .{
         .rt_dst = sockaddrIn(.{ 0, 0, 0, 0 }),
         .rt_genmask = sockaddrIn(.{ 0, 0, 0, 0 }),
@@ -1499,7 +1501,7 @@ fn publish(allocator: Allocator, device: []const u8, result: control_mod.Result)
 }
 
 fn writeDevice(allocator: Allocator, device: []const u8, bytes: []const u8) void {
-    const device_z = allocator.dupeZ(u8, device) catch return;
+    const device_z = allocator.dupeSentinel(u8, device, 0) catch return;
     const fd_raw = linux.open(device_z, .{ .ACCMODE = .WRONLY }, 0);
     if (linux.errno(fd_raw) != .SUCCESS) {
         log("[vmiz-guest] result device could not be opened\n");
@@ -1572,7 +1574,7 @@ fn mkdirPath(path: [*:0]const u8) !void {
 /// Sets a file's mode outright, which a truncating open does not do for a
 /// file that already exists.
 fn setMode(allocator: Allocator, path: []const u8, mode: linux.mode_t) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const err = linux.errno(linux.chmod(path_z, mode));
     if (err != .SUCCESS) return error.ChmodFailed;
@@ -1584,7 +1586,7 @@ fn setMode(allocator: Allocator, path: []const u8, mode: linux.mode_t) !void {
 fn mkdirParents(allocator: Allocator, path: []const u8) !void {
     var index: usize = 0;
     while (std.mem.indexOfScalarPos(u8, path, index + 1, '/')) |separator| {
-        const directory = try allocator.dupeZ(u8, path[0..separator]);
+        const directory = try allocator.dupeSentinel(u8, path[0..separator], 0);
         defer allocator.free(directory);
         try mkdirPath(directory);
         index = separator;
@@ -1651,7 +1653,7 @@ fn sleepMilliseconds(milliseconds: u32) void {
 /// agent's arena is never reset, so abandoned is not the same as gone. One
 /// allocation read into directly is one thing to scrub.
 fn readDeviceAlloc(allocator: Allocator, device: []const u8, size: u64) ![]u8 {
-    const device_z = try allocator.dupeZ(u8, device);
+    const device_z = try allocator.dupeSentinel(u8, device, 0);
     defer allocator.free(device_z);
     const fd_raw = linux.open(device_z, .{ .ACCMODE = .RDONLY }, 0);
     switch (linux.errno(fd_raw)) {
@@ -1737,7 +1739,7 @@ const MeasuredFile = struct {
 };
 
 fn readFileAlloc(allocator: Allocator, path: []const u8, limit: usize) ![]u8 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     const fd_raw = linux.open(path_z, .{ .ACCMODE = .RDONLY }, 0);
     switch (linux.errno(fd_raw)) {
         .SUCCESS => {},
@@ -1841,7 +1843,7 @@ fn pathExistsNoFollow(path: [*:0]const u8) bool {
 /// Creates a file that must not already exist. `EXCL` refuses a symlink at the
 /// path outright, so this cannot write through one into somewhere else.
 fn writeNewFileBytes(allocator: Allocator, path: []const u8, bytes: []const u8) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     const fd_raw = linux.open(
         path_z,
         .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true },
@@ -1859,7 +1861,7 @@ fn writeFileBytes(
     bytes: []const u8,
     mode: linux.mode_t,
 ) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     const fd_raw = linux.open(
         path_z,
         .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },

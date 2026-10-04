@@ -2,16 +2,16 @@
     .name = .vmiz,
     .version = "0.2.0",
     .fingerprint = 0x2bf030e3d064be03,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
 
     .dependencies = .{
         .bzip2z = .{
-            .url = "git+https://github.com/cataggar/bzip2z#05f6d4e34df2da2729490aee2a5bbe43b5ce94f6",
-            .hash = "bzip2z-0.1.0-m5NdlhNXCwC5mTHdg2pgMytHjahuQP6nImdle78Pb9kO",
+            .url = "git+https://github.com/cataggar/bzip2z#0f68f7ae3a42b1ef9e4ab00291f139700932f233",
+            .hash = "bzip2z-0.1.0-m5Ndli7cCwDhpSA7JvF7_pBHYju1ZMAnW-Y-39NKdzEH",
         },
         .tls = .{
-            .url = "git+https://github.com/cataggar/tls.zig#2621e411af81c8b4d8fa5aaae08b9b183a80bb46",
-            .hash = "tls-0.1.0-ER2e0vpTBgCVdP6tvFCii9_PFjATLb23ht2_xbGy5mYU",
+            .url = "git+https://github.com/cataggar/tls.zig#481b2a677244b994d216eb02a73bad89623610a9",
+            .hash = "tls-0.1.0-ER2e0jFWBgCrVPpTRsqUiILFT0yFB4uykyvXg1Xbeqk3",
         },
         .debz = .{
             .url = "git+https://github.com/cataggar/debz.git#9cabfc0f808a8beb4709d7e5b3ae7baf19d733d5",

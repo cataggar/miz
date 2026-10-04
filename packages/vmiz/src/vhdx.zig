@@ -87,7 +87,7 @@ pub const logical_sector_size_guid: guid.Guid = guid.parse("8141BF1D-A96F-4709-B
 pub const physical_sector_size_guid: guid.Guid = guid.parse("CDA348C7-445D-4471-9CC9-E9885251C556");
 pub const parent_locator_guid: guid.Guid = guid.parse("A8D35F2D-B30B-454D-ABF7-D3D84834AB0C");
 
-const Crc32c = std.hash.crc.Crc32Iscsi;
+const Crc32c = std.hash.crc.@"CRC-32/ISCSI";
 
 pub const OpenError = error{
     BadFileSignature,
@@ -272,7 +272,7 @@ pub fn pread(file: Io.File, io: Io, info: Info, buffer: []u8, offset: u64) Pread
         const chunk: usize = @intCast(@min(@as(u64, remaining), info.block_size - in_block_offset));
 
         const entry = try readBatEntry(file, io, info.bat_offset, batIndexForBlock(block_index, info.chunk_ratio));
-        const state: BlockState = @enumFromInt(entry & bat_state_mask);
+        const state: BlockState = @fromBackingInt(@intCast(entry & bat_state_mask));
 
         switch (state) {
             .fully_present => {
@@ -315,7 +315,7 @@ pub fn pwrite(file: Io.File, io: Io, info: *Info, buffer: []const u8, offset: u6
         const bat_index = batIndexForBlock(block_index, info.chunk_ratio);
 
         var entry = try readBatEntry(file, io, info.bat_offset, bat_index);
-        const state: BlockState = @enumFromInt(entry & bat_state_mask);
+        const state: BlockState = @fromBackingInt(@intCast(entry & bat_state_mask));
         var file_offset = entry & bat_file_off_mask;
 
         switch (state) {
@@ -324,7 +324,7 @@ pub fn pwrite(file: Io.File, io: Io, info: *Info, buffer: []const u8, offset: u6
             },
             .not_present, .undefined_state, .zero, .unmapped, .unmapped_v095 => {
                 file_offset = try allocatePayloadBlock(file, io, info.*);
-                entry = file_offset | @intFromEnum(BlockState.fully_present);
+                entry = file_offset | @backingInt(BlockState.fully_present);
                 try writeBatEntry(file, io, info.bat_offset, bat_index, entry);
             },
             else => return error.UnsupportedBlockState,
@@ -525,7 +525,7 @@ const HeaderWriteInfo = struct {
 };
 
 fn writeFileIdentifier(file: Io.File, io: Io) Io.File.WritePositionalError!void {
-    var buf: [header_block_size]u8 = [_]u8{0} ** header_block_size;
+    var buf: [header_block_size]u8 = @as([header_block_size]u8, @splat(0));
     buf[0..8].* = file_signature;
     try file.writePositionalAll(io, &buf, file_id_offset);
 }
@@ -546,7 +546,7 @@ fn writeOneHeader(
     data_write_guid: guid.Guid,
     log_guid: guid.Guid,
 ) Io.File.WritePositionalError!void {
-    var buf: [header_size]u8 = [_]u8{0} ** header_size;
+    var buf: [header_size]u8 = @as([header_size]u8, @splat(0));
     buf[0..4].* = header_signature;
     std.mem.writeInt(u64, buf[8..16], sequence_number, .little);
     buf[16..32].* = file_write_guid;
@@ -596,7 +596,7 @@ fn updateHeaders(
 }
 
 fn writeRegionTables(file: Io.File, io: Io, bat_offset: u64, bat_length: u64, metadata_offset: u64) Io.File.WritePositionalError!void {
-    var buf: [header_block_size]u8 = [_]u8{0} ** header_block_size;
+    var buf: [header_block_size]u8 = @as([header_block_size]u8, @splat(0));
     buf[0..4].* = region_signature;
     std.mem.writeInt(u32, buf[8..12], 2, .little);
 
@@ -623,7 +623,7 @@ fn writeMetadataRegion(
     metadata_offset: u64,
     page83_guid: guid.Guid,
 ) Io.File.WritePositionalError!void {
-    var table: [header_block_size]u8 = [_]u8{0} ** header_block_size;
+    var table: [header_block_size]u8 = @as([header_block_size]u8, @splat(0));
     table[0..8].* = metadata_signature;
     std.mem.writeInt(u16, table[10..12], 5, .little);
 
@@ -634,7 +634,7 @@ fn writeMetadataRegion(
     writeMetadataTableEntry(table[160..192], physical_sector_size_guid, metadata_item_base_offset + 36, 4, metadata_flag_is_required | metadata_flag_is_virtual_disk);
     try file.writePositionalAll(io, &table, metadata_offset);
 
-    var items: [40]u8 = [_]u8{0} ** 40;
+    var items: [40]u8 = @as([40]u8, @splat(0));
     std.mem.writeInt(u32, items[0..4], block_size, .little);
     std.mem.writeInt(u32, items[4..8], 0, .little);
     std.mem.writeInt(u64, items[8..16], virtual_size, .little);
@@ -796,7 +796,7 @@ test "create, write, resize, and reopen vhdx images" {
     const distant_offset: u64 = 130 * gib + 123;
     const payload0 = "vhdx-direct-0";
     const payload1 = "vhdx-direct-1";
-    const payload2 = [_]u8{0x3C} ** 256;
+    const payload2 = @as([256]u8, @splat(0x3C));
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
@@ -830,7 +830,7 @@ test "create, write, resize, and reopen vhdx images" {
 
     var zero_buf: [64]u8 = undefined;
     _ = try pread(file, io, reopened, &zero_buf, @as(u64, default_block_size));
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &zero_buf);
+    try std.testing.expectEqualSlices(u8, &(@as([64]u8, @splat(0))), &zero_buf);
 }
 
 test "create rejects an overflowing header sequence before modifying the file" {

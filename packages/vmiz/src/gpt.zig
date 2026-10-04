@@ -40,7 +40,7 @@ pub const Header = struct {
     partition_array_crc32: u32,
 
     pub fn encode(self: Header) [sector_size]u8 {
-        var buf: [sector_size]u8 = [_]u8{0} ** sector_size;
+        var buf: [sector_size]u8 = @as([sector_size]u8, @splat(0));
         buf[0..8].* = signature;
         std.mem.writeInt(u32, buf[8..12], self.revision, .little);
         std.mem.writeInt(u32, buf[12..16], self.header_size, .little);
@@ -56,7 +56,7 @@ pub const Header = struct {
         std.mem.writeInt(u32, buf[84..88], self.partition_entry_size, .little);
         std.mem.writeInt(u32, buf[88..92], self.partition_array_crc32, .little);
 
-        const crc = std.hash.crc.Crc32.hash(buf[0..self.header_size]);
+        const crc = std.hash.Crc32.hash(buf[0..self.header_size]);
         std.mem.writeInt(u32, buf[16..20], crc, .little);
         return buf;
     }
@@ -72,7 +72,7 @@ pub const Header = struct {
 
         var checked = buf.*;
         checked[16..20].* = .{ 0, 0, 0, 0 };
-        const computed_crc = std.hash.crc.Crc32.hash(checked[0..hdr_size]);
+        const computed_crc = std.hash.Crc32.hash(checked[0..hdr_size]);
         if (computed_crc != stored_crc) return error.BadHeaderChecksum;
 
         return .{
@@ -101,7 +101,7 @@ pub const PartitionEntry = struct {
     last_lba: u64 = 0,
     attributes: u64 = 0,
     /// 36 UTF-16LE code units, matching the spec's fixed-width name field.
-    name_utf16le: [36]u16 = [_]u16{0} ** 36,
+    name_utf16le: [36]u16 = @as([36]u16, @splat(0)),
 
     pub fn isEmpty(self: PartitionEntry) bool {
         return std.mem.eql(u8, &self.partition_type_guid, &guid.nil);
@@ -137,7 +137,7 @@ pub const PartitionEntry = struct {
 /// Encodes an ASCII partition name into the fixed 36-UTF-16LE-code-unit
 /// field (truncated if too long; zero-padded if shorter).
 pub fn asciiName(name: []const u8) [36]u16 {
-    var out: [36]u16 = [_]u16{0} ** 36;
+    var out: [36]u16 = @as([36]u16, @splat(0));
     const n = @min(name.len, 36);
     for (name[0..n], 0..) |c, i| out[i] = c;
     return out;
@@ -147,7 +147,7 @@ pub const PartitionSpec = struct {
     type_guid: guid.Guid,
     unique_guid: guid.Guid,
     size_sectors: u64,
-    name_utf16le: [36]u16 = [_]u16{0} ** 36,
+    name_utf16le: [36]u16 = @as([36]u16, @splat(0)),
 };
 
 pub const Placement = struct {
@@ -166,7 +166,7 @@ pub const PlacedPartitionSpec = struct {
     type_guid: guid.Guid,
     unique_guid: guid.Guid,
     placement: Placement,
-    name_utf16le: [36]u16 = [_]u16{0} ** 36,
+    name_utf16le: [36]u16 = @as([36]u16, @splat(0)),
 };
 
 fn writePartitionTables(
@@ -175,11 +175,11 @@ fn writePartitionTables(
     disk_guid: guid.Guid,
     entries: []const PartitionEntry,
 ) WriteError!void {
-    var array_buf: [default_num_partition_entries * partition_entry_size]u8 = [_]u8{0} ** (default_num_partition_entries * partition_entry_size);
+    var array_buf: [default_num_partition_entries * partition_entry_size]u8 = @as([(default_num_partition_entries * partition_entry_size)]u8, @splat(0));
     for (entries, 0..) |entry, i| {
         entry.encode(array_buf[i * partition_entry_size ..][0..partition_entry_size]);
     }
-    const array_crc = std.hash.crc.Crc32.hash(&array_buf);
+    const array_crc = std.hash.Crc32.hash(&array_buf);
 
     const total_sectors = img.virtual_size / sector_size;
     const first_usable_lba: u64 = 2 + partition_array_sectors;
@@ -233,7 +233,7 @@ pub fn writeGpt(
     const first_usable_lba: u64 = 2 + partition_array_sectors;
     const last_usable_lba: u64 = total_sectors - 2 - partition_array_sectors;
 
-    var entries: [default_num_partition_entries]PartitionEntry = [_]PartitionEntry{.{}} ** default_num_partition_entries;
+    var entries: [default_num_partition_entries]PartitionEntry = @as([default_num_partition_entries]PartitionEntry, @splat(.{}));
     var cursor = first_usable_lba;
     for (specs, 0..) |spec, i| {
         if (spec.size_sectors == 0) return error.NotEnoughSpace;
@@ -269,7 +269,7 @@ pub fn writeGptPlaced(
     const first_usable_lba: u64 = 2 + partition_array_sectors;
     const last_usable_lba: u64 = total_sectors - 2 - partition_array_sectors;
 
-    var entries: [default_num_partition_entries]PartitionEntry = [_]PartitionEntry{.{}} ** default_num_partition_entries;
+    var entries: [default_num_partition_entries]PartitionEntry = @as([default_num_partition_entries]PartitionEntry, @splat(.{}));
     var prev_last_lba: u64 = 0;
     for (specs, 0..) |spec, i| {
         const placement = spec.placement;
@@ -387,7 +387,7 @@ pub fn readGpt(img: Image, io: Io, allocator: std.mem.Allocator) ReadError!Parse
         return error.UnexpectedEndOfFile;
     }
 
-    if (std.hash.crc.Crc32.hash(array_buf) != header.partition_array_crc32) {
+    if (std.hash.Crc32.hash(array_buf) != header.partition_array_crc32) {
         return error.BadPartitionArrayChecksum;
     }
 
@@ -540,7 +540,7 @@ pub fn readVerifiedGpt(
         primary_array,
         try sectorOffset(primary.partition_entry_lba),
     );
-    if (std.hash.crc.Crc32.hash(primary_array) !=
+    if (std.hash.Crc32.hash(primary_array) !=
         primary.partition_array_crc32)
     {
         return error.BadPartitionArrayChecksum;
@@ -554,7 +554,7 @@ pub fn readVerifiedGpt(
         backup_array,
         try sectorOffset(backup.partition_entry_lba),
     );
-    if (std.hash.crc.Crc32.hash(backup_array) !=
+    if (std.hash.Crc32.hash(backup_array) !=
         backup.partition_array_crc32)
     {
         return error.BadPartitionArrayChecksum;
@@ -709,7 +709,7 @@ pub fn growPartitionToEnd(
         relocation.new_last_usable_lba,
         .little,
     );
-    const array_crc = std.hash.crc.Crc32.hash(array);
+    const array_crc = std.hash.Crc32.hash(array);
     std.mem.writeInt(u32, primary_sector[88..92], array_crc, .little);
     std.mem.writeInt(u32, backup_sector[88..92], array_crc, .little);
     updateHeaderChecksum(&primary_sector);
@@ -916,7 +916,7 @@ fn updateHeaderChecksum(buf: *[sector_size]u8) void {
     std.debug.assert(encoded_header_size >= header_size);
     std.debug.assert(encoded_header_size <= sector_size);
     buf[16..20].* = .{ 0, 0, 0, 0 };
-    const checksum = std.hash.crc.Crc32.hash(buf[0..encoded_header_size]);
+    const checksum = std.hash.Crc32.hash(buf[0..encoded_header_size]);
     std.mem.writeInt(u32, buf[16..20], checksum, .little);
 }
 
@@ -1227,7 +1227,7 @@ test "readGpt detects a corrupted partition array" {
 }
 
 test "Header.decode rejects invalid header sizes before checksumming" {
-    var encoded = [_]u8{0} ** sector_size;
+    var encoded = @as([sector_size]u8, @splat(0));
     encoded[0..signature.len].* = signature;
 
     std.mem.writeInt(u32, encoded[12..16], header_size - 1, .little);
