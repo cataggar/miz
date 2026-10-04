@@ -345,7 +345,7 @@ pub fn main(init: std.process.Init) !void {
         );
         return;
     }
-    if (!std.mem.eql(u8, result.output_path, output_path)) {
+    if (!publishedOutputMatchesPlan(&resolved.plan.?, result.output_path)) {
         try writeRunnerDiagnostic(
             arena,
             init.io,
@@ -1673,6 +1673,41 @@ test "a mapper that refuses an out-of-range source keeps nothing it allocated" {
         },
         &.{"staged"},
     ));
+}
+
+fn publishedOutputMatchesPlan(plan: *const zvmi.customize.ResolvedPlan, output_path: []const u8) bool {
+    return std.mem.eql(u8, output_path, plan.view().output.path);
+}
+
+test "published output must match the normalized resolved plan exactly" {
+    for ([_]struct { requested: []const u8, committed: []const u8 }{
+        .{ .requested = "./result/image.qcow2", .committed = "result/image.qcow2" },
+        .{ .requested = "./result/../result/image.qcow2", .committed = "result/image.qcow2" },
+        .{ .requested = "/result/./image.qcow2", .committed = "/result/image.qcow2" },
+    }) |case| {
+        const request = zvmi.customize.Request{
+            .target_architecture = .x86_64,
+            .input = .{ .iso_oci = .{
+                .iso_path = "source.iso",
+                .container = .{ .host_path = "oci-layout" },
+                .rootfs_path_in_iso = "images/rootfs.squashfs",
+            } },
+            .output = .{ .path = case.requested, .format = .qcow2, .size = 128 * 1024 * 1024 },
+            .storage = .{ .fresh = .{} },
+            .execution = .{ .workspace_path = std.fs.path.dirname(case.requested).? },
+            .reproducibility = .{
+                .seed = .{ .bytes = @as([32]u8, @splat(0x74)) },
+                .source_date_epoch = 1_735_689_600,
+            },
+        };
+        var resolved = try zvmi.customize.resolve(std.testing.allocator, &request, .{ .host_architecture = .x86_64 });
+        defer resolved.deinit(std.testing.allocator);
+        const plan = if (resolved.plan) |*value| value else return error.TestUnexpectedResult;
+        try std.testing.expect(publishedOutputMatchesPlan(plan, case.committed));
+        try std.testing.expect(!publishedOutputMatchesPlan(plan, case.requested));
+        try std.testing.expect(!publishedOutputMatchesPlan(plan, "other/image.qcow2"));
+        try std.testing.expect(!publishedOutputMatchesPlan(plan, "result/other.qcow2"));
+    }
 }
 
 test "unsafe image basenames are rejected" {

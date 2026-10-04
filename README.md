@@ -11,6 +11,11 @@ and module names, preserved released ESP/signed UKI, artifact acquisition,
 customization requests, offline package inputs and execution deadlines remain
 unchanged. Source builds require Linux 5.10+ or macOS 15+. Released image
 versions and package inputs are not refreshed or published by this port.
+The preserved-image helper verifies the committed path against the unchanged
+resolved plan, not the raw argument spelling. Relative maker paths beginning
+with `./` remain supported without accepting a different output target.
+A native tailnet-style rebuild and status check retain the complete released
+ESP byte-for-byte. This is not guest boot or native macOS/AArch64 acceptance.
 
 ## Install
 
