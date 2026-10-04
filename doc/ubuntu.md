@@ -277,7 +277,7 @@ The following inputs are compiled into the builder:
 - arm64 manifest SHA-256:
   `2889120db0432e8029f8f01622efb40ce964e434ba2c81e98937ad1e2616e4f5`
 - embedded debz API commit:
-  `beac3f20dd93fd98863af71e8fe621d47db663f6`
+  `56be0a32fac5293f20bde45d266b708e53321c73`
 
 The builder first verifies the pinned checksum files with its bounded native
 OpenPGP verifier. It embeds Canonical's ASCII-armored public key, pins the

@@ -27,7 +27,7 @@ operation. miz exposes a package list but rejects more than one name with a
 typed diagnostic rather than silently dropping names.
 
 The immutable Zig dependency is debz commit
-`beac3f20dd93fd98863af71e8fe621d47db663f6`. At every call boundary miz checks
+`56be0a32fac5293f20bde45d266b708e53321c73`. At every call boundary miz checks
 the debz capability, request, result, exact-lock, and provenance schemas before
 accepting output.
 
