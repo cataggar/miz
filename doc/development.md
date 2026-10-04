@@ -565,6 +565,12 @@ including when building an accepted-source checkout or running under sudo.
 The benchmark keeps it with its staged inputs, so deleting the staging
 compilation cache cannot delete packages needed by the offline measured runs.
 
+Zig 0.17 `Run` directory arguments hash their paths, not mutable directory
+contents. Image inputs therefore remain content-addressed snapshots, while
+source validators and mutable-result checks run uncached. A directory argument
+alone must not be treated as proof that changed image or provenance contents
+will invalidate a cached result.
+
 `scripts/zig_fetch_retry.sh` uses `zig build --fetch=all` to stage both eager
 and lazy pinned dependencies before offline work. It still retries only
 allowlisted transient transport failures, at most four attempts; hash
