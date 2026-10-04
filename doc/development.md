@@ -565,6 +565,14 @@ including when building an accepted-source checkout or running under sudo.
 The benchmark keeps it with its staged inputs, so deleting the staging
 compilation cache cannot delete packages needed by the offline measured runs.
 
+Git and GitHub archive fetch hashes are not interchangeable, even for the
+same commit. Keep each immutable URL paired with its verified fetch hash and
+validate the pair with a fresh downstream build, not just `zig fetch`.
+Prefer reviewed Git pins for the Zig 0.17 ports: an archive cached with an
+extra wrapper directory can fail package hash verification when a later
+build extracts it. Do not repair cache sources or relax inventories to
+accept that mismatch.
+
 Zig 0.17 `Run` directory arguments hash their paths, not mutable directory
 contents. Image inputs therefore remain content-addressed snapshots, while
 source validators and mutable-result checks run uncached. A directory argument
