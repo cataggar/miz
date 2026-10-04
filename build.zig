@@ -562,6 +562,10 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // Windows QCOW2 path buffers make allocation-free Image temporaries
+    // larger than the default PE stack reserve.
+    const windows_image_stack_reserve = 32 * 1024 * 1024;
+    if (target.result.os.tag == .windows) cli_exe.stack_size = windows_image_stack_reserve;
     ci_production_entrypoint_check.dependOn(&cli_exe.step);
     const install_cli = b.addInstallArtifact(cli_exe, .{});
     b.getInstallStep().dependOn(&install_cli.step);
@@ -576,6 +580,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const cli_tests = b.addTest(.{ .root_module = cli_exe.root_module });
+    if (target.result.os.tag == .windows) cli_tests.stack_size = cli_exe.stack_size;
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const cli_test_step = b.step("test-cli", "Run miz CLI tests");
     cli_test_step.dependOn(&run_cli_tests.step);
@@ -780,6 +785,20 @@ pub fn build(b: *std.Build) void {
     ci_production_entrypoint_check.dependOn(&image_status_check_exe.step);
     const image_status_check_tests = b.addTest(.{ .root_module = image_status_check_mod });
     const run_image_status_check_tests = b.addRunArtifact(image_status_check_tests);
+    if (b.graph.host.result.os.tag == .windows) {
+        for ([_]*std.Build.Step.Compile{
+            image_builder_exe,
+            image_builder_tests,
+            iso_builder_exe,
+            iso_builder_tests,
+            recustomize_iso_builder_exe,
+            recustomize_iso_builder_tests,
+            preserved_image_builder_exe,
+            preserved_image_builder_tests,
+            image_status_check_exe,
+            image_status_check_tests,
+        }) |artifact| artifact.stack_size = windows_image_stack_reserve;
+    }
 
     // ---- qmp: native Zig QEMU Machine Protocol (QMP) client ----
     const qmp_mod = b.addModule("qmp", .{
