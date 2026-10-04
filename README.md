@@ -18,9 +18,14 @@ at `a8cf2f7` replace their incompatible compiler inputs without adopting
 newer image or package behavior. Request lists are borrowed from the
 caller rather than a returned stack frame; the original 30-minute package
 deadline remains unchanged.
+The preserved-image helper verifies the committed path against the unchanged
+resolved plan, not the raw argument spelling. Relative maker paths beginning
+with `./` remain supported without accepting a different output target.
+A native tailnet-style rebuild and status check retain the complete released
+ESP byte-for-byte. This is not guest boot or native macOS/AArch64 acceptance.
 The complete default and safe test graphs pass (180 steps), along with
 151 release contract tests and native tooling/static x86_64 and AArch64
-payload builds. Native macOS/AArch64 execution and real image/privileged
+payload builds. Native macOS/AArch64 execution and broader image/privileged
 acceptance remain open, not successful skips.
 The source target is Zig 0.17.0, Linux 5.10+ and macOS 15+; no image
 publication/deployment or hosted workflow dispatch is part of this work.
