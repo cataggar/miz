@@ -640,9 +640,9 @@ fn writeAndCheck(
     return try out.toOwnedSlice();
 }
 
-fn repeatText(comptime text: []const u8, comptime count: usize) []const u8 {
+fn repeatText(comptime text: []const u8, comptime count: usize) *const [count * text.len]u8 {
     const repeated = comptime @as([count][text.len]u8, @splat(text[0..text.len].*));
-    return @as(*const [count * text.len]u8, @ptrCast(&repeated));
+    return @ptrCast(&repeated);
 }
 
 test "compressed frame shrinks zeros and round-trips through linked libzstd" {
