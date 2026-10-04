@@ -854,7 +854,7 @@ fn signForTest(
 ) ![]u8 {
     var prepared = try authenticode.prepareRsaSha256Alloc(allocator, unsigned);
     defer prepared.deinit(allocator);
-    const signature = [_]u8{0x5a} ** 256;
+    const signature = @as([256]u8, @splat(0x5a));
     return authenticode.finishRsaSha256Alloc(
         allocator,
         prepared,

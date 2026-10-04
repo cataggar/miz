@@ -90,7 +90,7 @@ pub const Header = struct {
     }
 
     pub fn hasIncompatible(self: Header, bit: IncompatibleBit) bool {
-        return (self.incompatible_features & (@as(u64, 1) << @intFromEnum(bit))) != 0;
+        return (self.incompatible_features & (@as(u64, 1) << @backingInt(bit))) != 0;
     }
 
     /// Parse a header from at least the first 104 bytes of an image.
@@ -1161,7 +1161,7 @@ test "writer: extended L2 requires cluster_bits >= 14" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const data = [_]u8{0} ** 16;
+    const data = @as([16]u8, @splat(0));
     try std.testing.expectError(error.BadClusterBits, writer.createFromRaw(
         a,
         io,
@@ -1705,7 +1705,7 @@ test "check(): a backing-file name inside the header cluster isn't double-counte
     defer tmp.cleanup();
 
     // A trivial backing image; content doesn't matter for this test.
-    const backing_data = [_]u8{0} ** 512;
+    const backing_data = @as([512]u8, @splat(0));
     try writer.createFromRaw(a, io, tmp.dir, "backing.qcow2", &backing_data, backing_data.len, .{});
 
     const cluster_bits: u32 = 14;

@@ -240,7 +240,7 @@ pub const Extractor = struct {
         try self.removePathAndDescendants(path);
         var parent = try self.openParent(path, true);
         defer parent.close(self.io);
-        const name = try self.allocator.dupeZ(u8, parent.basename);
+        const name = try self.allocator.dupeSentinel(u8, parent.basename, 0);
         defer self.allocator.free(name);
         const linux = std.os.linux;
         const kind_mode: u32 = switch (entry.kind) {
@@ -290,7 +290,7 @@ pub const Extractor = struct {
         if (builtin.os.tag != .linux) return error.UnsupportedXattr;
         const linux = std.os.linux;
         for (xattrs) |xattr| {
-            const name = try self.allocator.dupeZ(u8, xattr.name);
+            const name = try self.allocator.dupeSentinel(u8, xattr.name, 0);
             defer self.allocator.free(name);
             switch (linux.errno(linux.fsetxattr(
                 file.handle,
@@ -323,7 +323,7 @@ pub const Extractor = struct {
         defer self.allocator.free(proc_path);
         const linux = std.os.linux;
         for (xattrs) |xattr| {
-            const name = try self.allocator.dupeZ(u8, xattr.name);
+            const name = try self.allocator.dupeSentinel(u8, xattr.name, 0);
             defer self.allocator.free(name);
             switch (linux.errno(linux.setxattr(
                 proc_path.ptr,
@@ -487,7 +487,7 @@ pub const Extractor = struct {
             defer parent.close(self.io);
             if (self.options.preserve_ownership) {
                 if (builtin.os.tag != .linux) return error.UnsupportedSymlinkOwnership;
-                const name = try self.allocator.dupeZ(u8, parent.basename);
+                const name = try self.allocator.dupeSentinel(u8, parent.basename, 0);
                 defer self.allocator.free(name);
                 const linux = std.os.linux;
                 switch (linux.errno(linux.fchownat(
@@ -515,7 +515,7 @@ pub const Extractor = struct {
             var parent = try self.openParent(path, false);
             defer parent.close(self.io);
             if (self.options.preserve_ownership) {
-                const name = try self.allocator.dupeZ(u8, parent.basename);
+                const name = try self.allocator.dupeSentinel(u8, parent.basename, 0);
                 defer self.allocator.free(name);
                 const linux = std.os.linux;
                 switch (linux.errno(linux.fchownat(
@@ -808,7 +808,7 @@ test "extractor applies ordered layers whiteouts hardlinks and deferred director
     const linked = try root.statFile(io, "etc/new-link", .{});
     try std.testing.expectEqual(original.inode, linked.inode);
     const etc = try root.statFile(io, "etc", .{});
-    try std.testing.expectEqual(@as(u32, 0o555), @intFromEnum(etc.permissions) & 0o7777);
+    try std.testing.expectEqual(@as(u32, 0o555), @backingInt(etc.permissions) & 0o7777);
     try std.testing.expectEqual(@as(i96, 100 * std.time.ns_per_s), etc.mtime.nanoseconds);
 }
 

@@ -398,8 +398,8 @@ fn findFirmwareInDataDirAlloc(
 
 fn firmwareCodeNameIndicatesSecureBoot(path: []const u8) bool {
     const name = std.fs.path.basename(path);
-    return std.ascii.indexOfIgnoreCase(name, "secboot") != null or
-        std.ascii.indexOfIgnoreCase(name, ".ms.") != null;
+    return std.ascii.findIgnoreCase(name, "secboot") != null or
+        std.ascii.findIgnoreCase(name, ".ms.") != null;
 }
 
 fn readableEncodedPairAlloc(
@@ -1371,7 +1371,7 @@ test "concurrent pair materialization publishes one complete bundle" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const source_bytes = "firmware-source" ** 4096;
+    const source_bytes = repeatedBytes("firmware-source", 4096);
     try tmp.dir.writeFile(io, .{ .sub_path = "code-source.fd", .data = source_bytes });
     try tmp.dir.writeFile(io, .{ .sub_path = "vars-source.fd", .data = source_bytes });
 
@@ -1481,4 +1481,17 @@ test "firmware search returns null when no candidate is readable" {
         },
     );
     try std.testing.expect(pair == null);
+}
+
+fn repeatedBytes(comptime pattern: []const u8, comptime count: usize) *const [pattern.len * count:0]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1000 + count * 2);
+        var bytes: [pattern.len * count:0]u8 = undefined;
+        for (0..count) |i| {
+            @memcpy(bytes[i * pattern.len ..][0..pattern.len], pattern);
+        }
+        bytes[bytes.len] = 0;
+        const result = bytes;
+        break :blk &result;
+    };
 }

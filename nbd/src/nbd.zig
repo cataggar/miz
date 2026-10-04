@@ -809,7 +809,7 @@ test "structured read transcript: OFFSET_DATA + OFFSET_HOLE + DONE" {
     }
 
     try testing.expectEqualStrings("ABCDEFGH", out[0..8]);
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 8), out[8..16]);
+    try testing.expectEqualSlices(u8, &(@as([8]u8, @splat(0))), out[8..16]);
 }
 
 test "structured error chunk transcript" {

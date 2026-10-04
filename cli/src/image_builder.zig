@@ -863,7 +863,7 @@ fn testArgs(extra: []const []const u8, buffer: [][]const u8) []const []const u8 
         "--image-basename",    "image.vhd",
         "-O",                  "vhd",
         "--size",              "4G",
-        "--seed",              "00" ** 32,
+        "--seed",              repeatedBytes("00", 32),
         "--source-date-epoch", "0",
     };
     @memcpy(buffer[0..base.len], &base);
@@ -982,4 +982,17 @@ test "a registry password is a locator and never material" {
         "/run/secrets/registry",
         access.credential.?.password.host_path,
     );
+}
+
+fn repeatedBytes(comptime pattern: []const u8, comptime count: usize) *const [pattern.len * count:0]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1000 + count * 2);
+        var bytes: [pattern.len * count:0]u8 = undefined;
+        for (0..count) |i| {
+            @memcpy(bytes[i * pattern.len ..][0..pattern.len], pattern);
+        }
+        bytes[bytes.len] = 0;
+        const result = bytes;
+        break :blk &result;
+    };
 }

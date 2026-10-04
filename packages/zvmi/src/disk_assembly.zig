@@ -616,10 +616,10 @@ const test_determinism = Determinism{
     // Written as bytes rather than parsed: a GUID string is mixed-endian,
     // and repeating one byte sidesteps both that and the comptime cost of
     // parsing three of them.
-    .disk_guid = [_]u8{0x11} ** 16,
-    .esp_partition_guid = [_]u8{0x22} ** 16,
-    .root_partition_guid = [_]u8{0x33} ** 16,
-    .root_filesystem_uuid = [_]u8{0x44} ** 16,
+    .disk_guid = @as([16]u8, @splat(0x11)),
+    .esp_partition_guid = @as([16]u8, @splat(0x22)),
+    .root_partition_guid = @as([16]u8, @splat(0x33)),
+    .root_filesystem_uuid = @as([16]u8, @splat(0x44)),
     .esp_volume_id = 0xABCD_1234,
 };
 

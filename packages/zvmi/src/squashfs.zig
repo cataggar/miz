@@ -188,7 +188,7 @@ pub const Reader = struct {
         const fragment_meta_start = try firstIndexedMetadataStart(allocator, io, file, sb.fragment_table_start, sb.fragments, @sizeOf(FragmentEntry));
         const id_meta_start = try firstIndexedMetadataStart(allocator, io, file, sb.id_table_start, sb.no_ids, @sizeOf(u32));
 
-        const compression: Compression = @enumFromInt(sb.compression);
+        const compression: Compression = @fromBackingInt(@intCast(sb.compression));
 
         var inode_table = try readMetadataTable(allocator, io, file, compression, sb.inode_table_start, sb.directory_table_start);
         var inode_table_owned = true;
@@ -382,7 +382,7 @@ pub const Reader = struct {
         _ = try self.file.readPositionalAll(io, stored, file_offset);
 
         self.cache_stats.data_block_decompressions += 1;
-        const block = try decompressDataBlockAlloc(allocator, @enumFromInt(self.superblock.compression), stored, expected_size);
+        const block = try decompressDataBlockAlloc(allocator, @fromBackingInt(@intCast(self.superblock.compression)), stored, expected_size);
         if (block.len != expected_size) {
             allocator.free(block);
             return error.InvalidDataBlock;
@@ -406,7 +406,7 @@ pub const Reader = struct {
 
         if ((fragment.raw_size & data_uncompressed_bit) != 0) return allocator.dupe(u8, stored);
         self.cache_stats.fragment_block_decompressions += 1;
-        return decompressDataBlockAlloc(allocator, @enumFromInt(self.superblock.compression), stored, self.superblock.block_size);
+        return decompressDataBlockAlloc(allocator, @fromBackingInt(@intCast(self.superblock.compression)), stored, self.superblock.block_size);
     }
 
     fn lookupFrom(self: *const Reader, start_index: usize, path: []const u8, follow_final_symlink: bool, depth: u8) LookupError!usize {
@@ -743,7 +743,7 @@ fn parseSuperblock(buf: *const [96]u8) OpenError!Superblock {
 fn parseCompressorOptions(io: Io, file: Io.File, sb: Superblock) OpenError!?CompressorOptions {
     if ((sb.flags & compressor_options_flag) == 0) return null;
 
-    return switch (@as(Compression, @enumFromInt(sb.compression))) {
+    return switch (@as(Compression, @fromBackingInt(@intCast(sb.compression)))) {
         .xz => blk: {
             var buf: [8]u8 = undefined;
             _ = try file.readPositionalAll(io, &buf, 96);
@@ -1313,9 +1313,9 @@ pub fn buildSyntheticSquashfsImage(allocator: std.mem.Allocator, options: Synthe
     else
         @intCast(options.fragment_tail_size);
     const compression_id: u16 = switch (options.compression) {
-        .none => @intFromEnum(Compression.gzip),
-        .xz => @intFromEnum(Compression.xz),
-        .zstd => @intFromEnum(Compression.zstd),
+        .none => @backingInt(Compression.gzip),
+        .xz => @backingInt(Compression.xz),
+        .zstd => @backingInt(Compression.zstd),
     };
     const compressor_options_len: usize = if (options.compression == .xz) 8 else 0;
     const data_block_start: u64 = 96 + compressor_options_len;

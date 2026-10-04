@@ -927,7 +927,7 @@ pub const RootTree = struct {
         hashSubsecondTimes(&hash, self.root_metadata);
         for (self.nodes.items) |node| {
             hashString(&hash, node.path);
-            hashInt(&hash, @intFromEnum(node.kind));
+            hashInt(&hash, @backingInt(node.kind));
             hashInt(&hash, node.metadata.mode);
             hashInt(&hash, node.metadata.uid);
             hashInt(&hash, node.metadata.gid);

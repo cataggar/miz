@@ -37,7 +37,7 @@ pub const PartitionEntry = struct {
     fn encode(self: PartitionEntry, buf: *[entry_size]u8) void {
         buf[0] = if (self.bootable) 0x80 else 0x00;
         buf[1..4].* = self.start_chs;
-        buf[4] = @intFromEnum(self.partition_type);
+        buf[4] = @backingInt(self.partition_type);
         buf[5..8].* = self.end_chs;
         std.mem.writeInt(u32, buf[8..12], self.first_lba, .little);
         std.mem.writeInt(u32, buf[12..16], self.sector_count, .little);
@@ -47,7 +47,7 @@ pub const PartitionEntry = struct {
         return .{
             .bootable = buf[0] == 0x80,
             .start_chs = buf[1..4].*,
-            .partition_type = @enumFromInt(buf[4]),
+            .partition_type = @fromBackingInt(@intCast(buf[4])),
             .end_chs = buf[5..8].*,
             .first_lba = std.mem.readInt(u32, buf[8..12], .little),
             .sector_count = std.mem.readInt(u32, buf[12..16], .little),
@@ -56,12 +56,12 @@ pub const PartitionEntry = struct {
 };
 
 pub const Mbr = struct {
-    entries: [max_entries]PartitionEntry = [_]PartitionEntry{.{}} ** max_entries,
+    entries: [max_entries]PartitionEntry = @as([max_entries]PartitionEntry, @splat(.{})),
     /// 32-bit disk signature at offset 0x1B8; zero is valid (means "unset").
     disk_signature: u32 = 0,
 
     pub fn encode(self: Mbr) [sector_size]u8 {
-        var buf: [sector_size]u8 = [_]u8{0} ** sector_size;
+        var buf: [sector_size]u8 = @as([sector_size]u8, @splat(0));
         // Bootstrap code area (0..0x1B8) intentionally starts zeroed because
         // this codec only produces partition *tables*, not boot code.
         // Higher-level callers such as `build_image` may later overlay BIOS
@@ -250,18 +250,18 @@ test "singleLinuxPartitionMbr encode/decode round-trip" {
 }
 
 test "encodePartitionTableInto preserves BIOS bootstrap code" {
-    var sector0 = [_]u8{0xA5} ** sector_size;
+    var sector0 = @as([sector_size]u8, @splat(0xA5));
     const mb = singleLinuxPartitionMbr(2048, 1 * 1024 * 1024);
 
     mb.encodePartitionTableInto(&sector0);
 
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xA5} ** 0x1B8), sector0[0..0x1B8]);
+    try std.testing.expectEqualSlices(u8, &(@as([0x1B8]u8, @splat(0xA5))), sector0[0..0x1B8]);
     const decoded = try Mbr.decode(&sector0);
     try std.testing.expectEqual(mb.entries[0], decoded.entries[0]);
 }
 
 test "Mbr.decode rejects a bad boot signature" {
-    var buf = [_]u8{0} ** sector_size;
+    var buf = @as([sector_size]u8, @splat(0));
     try std.testing.expectError(error.BadBootSignature, Mbr.decode(&buf));
 }
 
