@@ -1451,7 +1451,7 @@ fn serialContains(
         else => return err,
     };
     defer allocator.free(serial);
-    return std.ascii.indexOfIgnoreCase(serial, marker) != null;
+    return std.ascii.findIgnoreCase(serial, marker) != null;
 }
 
 fn waitForSerialMarker(
@@ -1775,7 +1775,7 @@ test "EFI db parser finds the exact enrolled DER certificate" {
         0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
     };
     const certificate = "DER certificate";
-    var variable = [_]u8{0} ** (4 + 28 + 16 + certificate.len);
+    var variable = @as([(4 + 28 + 16 + certificate.len)]u8, @splat(0));
     const list_offset = 4;
     @memcpy(variable[list_offset..][0..efi_cert_x509_guid.len], &efi_cert_x509_guid);
     std.mem.writeInt(
@@ -1796,7 +1796,7 @@ test "EFI db parser finds the exact enrolled DER certificate" {
     try std.testing.expect(efiDbContainsCertificate(&variable, digest));
     try std.testing.expect(!efiDbContainsCertificate(
         &variable,
-        [_]u8{0xff} ** 32,
+        @as([32]u8, @splat(0xff)),
     ));
     try std.testing.expect(!efiDbContainsCertificate(variable[0 .. variable.len - 1], digest));
     variable[list_offset] = 0;

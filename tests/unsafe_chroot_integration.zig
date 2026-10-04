@@ -205,7 +205,7 @@ fn runIntegration(
             .acknowledge_unsafe = true,
         },
         .reproducibility = .{
-            .seed = .{ .bytes = [_]u8{0x48} ** 32 },
+            .seed = .{ .bytes = @as([32]u8, @splat(0x48)) },
             .source_date_epoch = 1_735_689_600,
         },
     };
@@ -1009,7 +1009,7 @@ fn createSourceDisk(
             .offset = partition_offset,
             .length = partition_length,
             .label = "unsafe-test",
-            .uuid = [_]u8{0x48} ** 16,
+            .uuid = @as([16]u8, @splat(0x48)),
             .timestamp = 1_735_689_600,
         },
     );

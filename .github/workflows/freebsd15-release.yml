@@ -103,7 +103,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Install image build dependencies
         run: |
@@ -138,7 +138,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$CANDIDATE_DIR"
-          zig build generalized-freebsd15 -- \
+          zig build generalized-freebsd15 -j2 -- \
             --architecture "$ARCHITECTURE" \
             --filesystem "$FILESYSTEM" \
             --flavor "$FLAVOR" \
@@ -159,7 +159,7 @@ jobs:
           test "$(jq -r '."virtual-size"' <<<"$image_info")" = "$VIRTUAL_SIZE"
           test "$(jq -r '."backing-filename" // ""' <<<"$image_info")" = ""
           test "$(jq -r '."format-specific".data."compression-type"' <<<"$image_info")" = zstd
-          zig build run -- check "$asset"
+          zig build run -j2 -- check "$asset"
 
       - name: Run dual-instance QEMU acceptance
         env:
@@ -168,7 +168,7 @@ jobs:
           ZVMI_FREEBSD15_FLAVOR: ${{ matrix.flavor }}
           ZVMI_FREEBSD15_IMAGE: ${{ github.workspace }}/${{ env.CANDIDATE_DIR }}/${{ env.ASSET_NAME }}
           ZVMI_FREEBSD15_QEMU: ${{ matrix.qemu }}
-        run: zig build test-freebsd15-boot
+        run: zig build test-freebsd15-boot -j2
 
       - name: Record validated candidate
         run: |

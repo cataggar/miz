@@ -656,7 +656,7 @@ const Node = struct {
     size_on_disk: u64 = 0,
     data_block_count: u32 = 0,
     extents: []Extent = &.{},
-    extent_root: [60]u8 = [_]u8{0} ** 60,
+    extent_root: [60]u8 = @as([60]u8, @splat(0)),
     extent_tree_blocks: []ExtentTreeBlock = &.{},
     xattr_block: ?u64 = null,
     link_count: u16 = 1,
@@ -684,7 +684,7 @@ const ExtentIndex = struct {
 
 const ExtentTreeBlock = struct {
     block_number: u64,
-    bytes: [default_block_size]u8 = [_]u8{0} ** default_block_size,
+    bytes: [default_block_size]u8 = @as([default_block_size]u8, @splat(0)),
 };
 
 const ExtentNodeRef = struct {
@@ -1233,7 +1233,7 @@ pub fn populate(
         file,
         prepared.layout,
         options.offset,
-        options.uuid orelse [_]u8{0} ** 16,
+        options.uuid orelse @as([16]u8, @splat(0)),
     );
     try writeSuperblocks(io, file, prepared.layout, prepared.writer, options);
 
@@ -1438,7 +1438,7 @@ pub fn resize(io: Io, file: Io.File, allocator: std.mem.Allocator, options: Resi
     if (new_group_count > old_group_count) {
         var group_index = old_group_count;
         while (group_index < new_group_count) : (group_index += 1) {
-            var zero_block: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+            var zero_block: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
             var block: u32 = 0;
             while (block < inode_table_blocks) : (block += 1) {
                 try file.writePositionalAll(io, &zero_block, options.offset + (@as(u64, new_layout.groups[group_index].inode_table_block) + block) * default_block_size);
@@ -1877,7 +1877,7 @@ pub const Reader = struct {
         const group = self.groups[group_index];
         const inode_offset = self.blockOffset(group.inode_table_block) + @as(u64, index_in_group) * self.inode_size;
 
-        var buf: [max_supported_reader_inode_size]u8 = [_]u8{0} ** max_supported_reader_inode_size;
+        var buf: [max_supported_reader_inode_size]u8 = @as([max_supported_reader_inode_size]u8, @splat(0));
         try self.readAll(io, buf[0..self.inode_size], inode_offset);
         return ParsedInode.fromBytes(inode_number, buf[0..self.inode_size]);
     }
@@ -2670,7 +2670,7 @@ pub const Editor = struct {
         writeInt(u32, buf[4..8], @truncate(content.len));
         writeInt(u32, buf[108..112], @as(u32, @truncate(@as(u64, content.len) >> 32)));
         writeInt(u32, buf[28..32], inodeBlockSectors(new_block_count, child_inode.file_acl_block != 0));
-        var extent_root: [60]u8 = [_]u8{0} ** 60;
+        var extent_root: [60]u8 = @as([60]u8, @splat(0));
         encodeExtentLeafNode(extent_root[0..], max_inline_extents, new_extents);
         @memcpy(buf[40..100], &extent_root);
         writeInt(u32, buf[32..36], readInt(u32, buf[32..36]) | inode_flag_extents);
@@ -5877,9 +5877,9 @@ const BlockAllocator = struct {
 };
 
 fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions) PopulateError!void {
-    var scratch: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    var scratch: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
     const block_len: usize = @intCast(options.block_size);
-    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const uuid = options.uuid orelse @as([16]u8, @splat(0));
     for (nodes) |node| {
         switch (node.kind) {
             // Nothing outside the inode itself, so nothing to write here.
@@ -5958,7 +5958,7 @@ fn writeNodeData(io: Io, file: Io.File, nodes: []Node, options: PopulateOptions)
 fn writeJournalData(io: Io, file: Io.File, journal: []const Node, options: PopulateOptions) PopulateError!void {
     if (journal.len == 0) return;
     const node = journal[0];
-    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const uuid = options.uuid orelse @as([16]u8, @splat(0));
     const block_len: usize = @intCast(options.block_size);
 
     var block: [default_block_size]u8 = undefined;
@@ -6011,7 +6011,7 @@ fn encodeJournalSuperblock(block: *[default_block_size]u8, block_count: u32, uui
 }
 
 fn zeroUnusedInodeTableBlocks(io: Io, file: Io.File, layout: Layout, offset: u64) PopulateError!void {
-    const zero_block: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    const zero_block: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
     for (layout.groups) |group| {
         var block: u32 = 0;
         while (block < layout.inode_table_blocks) : (block += 1) {
@@ -6055,13 +6055,13 @@ fn writeBitmaps(io: Io, file: Io.File, layout: Layout, offset: u64) PopulateErro
 }
 
 fn writeInodes(io: Io, file: Io.File, nodes: []Node, layout: Layout, options: PopulateOptions) PopulateError!void {
-    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const uuid = options.uuid orelse @as([16]u8, @splat(0));
     for (nodes) |node| {
         // A hardlink shares the target's inode, which the target already
         // wrote; writing it twice would be redundant at best and would
         // overwrite the target's own link count at worst.
         if (!node.owns_inode) continue;
-        var buf: [writer_inode_size]u8 = [_]u8{0} ** writer_inode_size;
+        var buf: [writer_inode_size]u8 = @as([writer_inode_size]u8, @splat(0));
         writeInt(u16, buf[0..2], inodeMode(node));
         writeInt(u16, buf[2..4], @truncate(node.uid));
         writeInt(u32, buf[4..8], @truncate(node.size_on_disk));
@@ -6163,9 +6163,9 @@ fn writeGroupDescriptorTables(io: Io, file: Io.File, layout: Layout, offset: u64
 }
 
 fn writeSuperblocks(io: Io, file: Io.File, layout: Layout, plan: WriterPlan, options: PopulateOptions) PopulateError!void {
-    var sb: [superblock_size]u8 = [_]u8{0} ** superblock_size;
+    var sb: [superblock_size]u8 = @as([superblock_size]u8, @splat(0));
     const label = encodeLabel(options.label);
-    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const uuid = options.uuid orelse @as([16]u8, @splat(0));
     const free_blocks = countFreeBlocks(layout.groups);
     const free_inodes = countFreeInodes(layout.groups, layout.inodes_per_group);
 
@@ -6904,7 +6904,7 @@ fn buildExtentTree(allocator: std.mem.Allocator, node: *Node, block_size: u32, d
 }
 
 fn encodeLabel(label: []const u8) [16]u8 {
-    var out: [16]u8 = [_]u8{0} ** 16;
+    var out: [16]u8 = @as([16]u8, @splat(0));
     @memcpy(out[0..label.len], label);
     return out;
 }
@@ -7116,7 +7116,7 @@ fn sortXattrEntries(entries: []XattrBlockEntry) void {
     }
 }
 
-const Ext4Crc32c = std.hash.crc.Crc(u32, .{
+const Ext4Crc32c = std.hash.crc.Generic(u32, .{
     .polynomial = 0x1edc6f41,
     .initial = 0xffff_ffff,
     .reflect_input = true,
@@ -7459,7 +7459,7 @@ test "populate ext4 and round-trip a small tree with a multi-extent file" {
     const info = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = fs_size,
         .label = "zvmi-ext4",
-        .uuid = [_]u8{0x10} ** 16,
+        .uuid = @as([16]u8, @splat(0x10)),
         .timestamp = 1_717_171_717,
     });
     try std.testing.expectEqual(writer_feature_compat, info.feature_compat);
@@ -7525,9 +7525,9 @@ test "symlink targets at the 60-byte fast-symlink boundary round-trip correctly"
     const path = "test-ext4-symlink-boundary.img";
     defer Io.Dir.cwd().deleteFile(io, path) catch {};
 
-    const target_59 = "a" ** 59;
-    const target_60 = "a" ** 60;
-    const target_61 = "a" ** 61;
+    const target_59 = &@as([59:0]u8, @splat("a"[0]));
+    const target_60 = &@as([60:0]u8, @splat("a"[0]));
+    const target_61 = &@as([61:0]u8, @splat("a"[0]));
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "link-59", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = target_59.len, .bytes = target_59 },
@@ -7542,7 +7542,7 @@ test "symlink targets at the 60-byte fast-symlink boundary round-trip correctly"
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = 64 * 1024 * 1024,
         .label = "zvmi-ext4",
-        .uuid = [_]u8{0x11} ** 16,
+        .uuid = @as([16]u8, @splat(0x11)),
         .timestamp = 1_717_171_717,
     });
 
@@ -7601,7 +7601,7 @@ test "populate round-trips files that require extent index blocks" {
         defer file.close(io);
         _ = try populate(io, file, std.testing.allocator, &tree.view, .{
             .length = fs_size,
-            .uuid = [_]u8{0x33} ** 16,
+            .uuid = @as([16]u8, @splat(0x33)),
             .timestamp = 1_717_171_717,
         });
 
@@ -7792,7 +7792,7 @@ test "strict writer-compatible scan exposes deterministic owned view" {
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = length,
         .label = "strict",
-        .uuid = [_]u8{0x5A} ** 16,
+        .uuid = @as([16]u8, @splat(0x5A)),
         .timestamp = 1_717_171_717,
     });
 
@@ -7804,7 +7804,7 @@ test "strict writer-compatible scan exposes deterministic owned view" {
     defer scanned.deinit();
     try std.testing.expectEqual(@as(usize, 3), scanned.nodeCount());
     try std.testing.expectEqual(@as(u32, 1_717_171_717), scanned.identity.global_timestamp);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x5A} ** 16), &scanned.identity.uuid);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x5A))), &scanned.identity.uuid);
 
     const view = scanned.fileTreeView();
     const first = (try view.next()).?;
@@ -7828,7 +7828,7 @@ test "strict writer-compatible scan rejects divergent inode timestamps" {
     defer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = length,
-        .uuid = [_]u8{0x33} ** 16,
+        .uuid = @as([16]u8, @splat(0x33)),
         .timestamp = 1_717_171_717,
     });
 
@@ -7904,8 +7904,8 @@ test "populate respects non-zero partition-relative offsets" {
     defer file.close(io);
     try file.setLength(io, suffix_off + default_block_size);
 
-    const prefix_guard: [32]u8 = [_]u8{0xA5} ** 32;
-    const suffix_guard: [32]u8 = [_]u8{0x5A} ** 32;
+    const prefix_guard: [32]u8 = @as([32]u8, @splat(0xA5));
+    const suffix_guard: [32]u8 = @as([32]u8, @splat(0x5A));
     try file.writePositionalAll(io, &prefix_guard, prefix_off - prefix_guard.len);
     try file.writePositionalAll(io, &suffix_guard, suffix_off);
 
@@ -7982,7 +7982,7 @@ test "populate round-trips xattrs and metadata checksums" {
 
         const info = try populate(io, file, std.testing.allocator, &tree.view, .{
             .length = 16 * 1024 * 1024,
-            .uuid = [_]u8{0x42} ** 16,
+            .uuid = @as([16]u8, @splat(0x42)),
             .timestamp = 1_717_171_717,
             .root_xattrs = &selinux,
         });
@@ -8058,7 +8058,7 @@ test "large directories use htree indexing" {
     defer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = 32 * 1024 * 1024,
-        .uuid = [_]u8{0x24} ** 16,
+        .uuid = @as([16]u8, @splat(0x24)),
         .timestamp = 1_717_171_717,
     });
 
@@ -8156,7 +8156,7 @@ test "very large directories use multi-level htree indexing" {
     defer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = 128 * 1024 * 1024,
-        .uuid = [_]u8{0x66} ** 16,
+        .uuid = @as([16]u8, @splat(0x66)),
         .timestamp = 1_717_171_717,
     });
 
@@ -8220,7 +8220,7 @@ test "resize grows ext4 filesystems in place" {
 
     const before = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = 64 * 1024 * 1024,
-        .uuid = [_]u8{0x55} ** 16,
+        .uuid = @as([16]u8, @splat(0x55)),
         .timestamp = 1_717_171_717,
     });
     const after = try resize(io, file, std.testing.allocator, .{ .length = 192 * 1024 * 1024 });
@@ -8253,7 +8253,7 @@ test "Editor.open loads live free-space state and a no-op flush leaves the image
     const fs_size: u64 = 16 * 1024 * 1024;
     const info = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = fs_size,
-        .uuid = [_]u8{0x21} ** 16,
+        .uuid = @as([16]u8, @splat(0x21)),
         .timestamp = 1_717_171_717,
     });
 
@@ -8328,7 +8328,7 @@ test "Editor frees an inode's extent-tree blocks (leaf, index, and xattr) and re
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
-    const info = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = [_]u8{0x30} ** 16 });
+    const info = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = @as([16]u8, @splat(0x30)) });
 
     var editor = try Editor.open(io, file, std.testing.allocator, .{});
     defer editor.deinit();
@@ -8409,7 +8409,7 @@ test "Editor removes directory entries by splicing, across a large htree-indexed
     defer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = 32 * 1024 * 1024,
-        .uuid = [_]u8{0x25} ** 16,
+        .uuid = @as([16]u8, @splat(0x25)),
     });
 
     var editor = try Editor.open(io, file, std.testing.allocator, .{});
@@ -8461,7 +8461,7 @@ test "Editor.deleteFile removes a regular file, frees its inode/blocks, and leav
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
-    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 768 * 1024 * 1024, .uuid = [_]u8{0x40} ** 16 });
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 768 * 1024 * 1024, .uuid = @as([16]u8, @splat(0x40)) });
 
     var editor = try Editor.open(io, file, std.testing.allocator, .{});
     defer editor.deinit();
@@ -8530,7 +8530,7 @@ test "Editor.deleteTree recursively removes a directory and adjusts the parent's
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
-    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = [_]u8{0x41} ** 16 });
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = @as([16]u8, @splat(0x41)) });
 
     const root_link_count_before = blk: {
         var reader = try open(io, file, std.testing.allocator, .{});
@@ -8593,7 +8593,7 @@ test "Editor.writeFile overwrites content, preserves xattrs, and handles growth/
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
-    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = [_]u8{0x42} ** 16 });
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = @as([16]u8, @splat(0x42)) });
 
     var editor = try Editor.open(io, file, std.testing.allocator, .{});
     defer editor.deinit();
@@ -8666,7 +8666,7 @@ test "Editor.writeFile rolls back and reports TooManyExtents when free space is 
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
-    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = [_]u8{0x43} ** 16 });
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = @as([16]u8, @splat(0x43)) });
 
     var editor = try Editor.open(io, file, std.testing.allocator, .{});
     defer editor.deinit();
@@ -8722,7 +8722,7 @@ test "Editor.flush keeps sparse-super backup superblocks and GDT copies in sync 
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
-    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = [_]u8{0x50} ** 16 });
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = @as([16]u8, @splat(0x50)) });
 
     var editor = try Editor.open(io, file, std.testing.allocator, .{});
     defer editor.deinit();
@@ -8860,7 +8860,7 @@ test "Editor edits (deletes, recursive tree removal, and overwrite) pass a real 
     {
         const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
         defer file.close(io);
-        _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = [_]u8{0x60} ** 16 });
+        _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = @as([16]u8, @splat(0x60)) });
 
         var editor = try Editor.open(io, file, std.testing.allocator, .{});
         defer editor.deinit();
@@ -8983,7 +8983,7 @@ test "the minimum size is the smallest one that populates, and it really populat
     const options: PopulateOptions = .{
         .length = 0,
         .label = "zvmi-min",
-        .uuid = [_]u8{0x44} ** 16,
+        .uuid = @as([16]u8, @splat(0x44)),
         .timestamp = 1_717_171_717,
     };
 
@@ -9046,7 +9046,7 @@ test "the minimum size is the smallest one that populates, and it really populat
 test "the minimum size grows by exactly the journal the ladder chose" {
     var tree = minimumSizeTestTree();
     tree.bind();
-    const plain: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x45} ** 16 };
+    const plain: PopulateOptions = .{ .length = 0, .uuid = @as([16]u8, @splat(0x45)) };
     var journalled = plain;
     journalled.journal = .{ .enabled = true };
 
@@ -9066,7 +9066,7 @@ test "an explicit journal size is bounded and honoured when solving for the mini
     var tree = minimumSizeTestTree();
     tree.bind();
     const explicit_blocks: u32 = 2048;
-    var options: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x46} ** 16 };
+    var options: PopulateOptions = .{ .length = 0, .uuid = @as([16]u8, @splat(0x46)) };
     options.journal = .{
         .enabled = true,
         .size_bytes = @as(u64, explicit_blocks) * default_block_size,
@@ -9108,7 +9108,7 @@ test "the minimum size counts the extent-tree blocks a large file needs" {
         .{ .path = "boot/rootfs.img", .kind = .file, .mode = 0o600, .uid = 0, .gid = 0, .size = 544 * 1024 * 1024, .generator = .pattern },
     });
     tree.bind();
-    const options: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x47} ** 16 };
+    const options: PopulateOptions = .{ .length = 0, .uuid = @as([16]u8, @splat(0x47)) };
 
     const minimum = try minimumPopulateLength(std.testing.allocator, &tree.view, options);
     try expectMinimalPopulateLength(&tree.view, options, minimum);
@@ -9118,7 +9118,7 @@ test "the minimum size counts the extent-tree blocks a large file needs" {
 test "an empty tree still needs a filesystem, and the minimum one is valid" {
     var tree = InMemoryTree.init(&[_]InMemoryEntry{});
     tree.bind();
-    const options: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x48} ** 16 };
+    const options: PopulateOptions = .{ .length = 0, .uuid = @as([16]u8, @splat(0x48)) };
 
     const minimum = try minimumPopulateLength(std.testing.allocator, &tree.view, options);
     try expectMinimalPopulateLength(&tree.view, options, minimum);
@@ -9151,7 +9151,7 @@ test "a tree of many small files is bound by its inodes, not by its bytes" {
     }
     var tree = InMemoryTree.init(entries);
     tree.bind();
-    const options: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x49} ** 16 };
+    const options: PopulateOptions = .{ .length = 0, .uuid = @as([16]u8, @splat(0x49)) };
 
     const minimum = try minimumPopulateLength(std.testing.allocator, &tree.view, options);
     try expectMinimalPopulateLength(&tree.view, options, minimum);
@@ -9162,7 +9162,7 @@ test "a tree of many small files is bound by its inodes, not by its bytes" {
 test "a floor raises the answer without giving up minimality above it" {
     var tree = minimumSizeTestTree();
     tree.bind();
-    const options: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x4A} ** 16 };
+    const options: PopulateOptions = .{ .length = 0, .uuid = @as([16]u8, @splat(0x4A)) };
 
     const minimum = try minimumPopulateLength(std.testing.allocator, &tree.view, options);
     // A floor the answer already clears changes nothing at all.
@@ -9206,7 +9206,7 @@ test "a floor lands past the block-group boundary that would have refused it" {
     // where the boundaries fall or how far past one it has to reach.
     var tree = minimumSizeTestTree();
     tree.bind();
-    const options: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x4B} ** 16 };
+    const options: PopulateOptions = .{ .length = 0, .uuid = @as([16]u8, @splat(0x4B)) };
 
     const minimum = try minimumPopulateLength(std.testing.allocator, &tree.view, options);
     const boundary = default_blocks_per_group;
@@ -9253,7 +9253,7 @@ test "a floor lands past the block-group boundary that would have refused it" {
 // against the one `mke2fs` writes for the same geometry.
 // ---------------------------------------------------------------------------
 
-const journal_test_uuid: [16]u8 = [_]u8{0x11} ** 16;
+const journal_test_uuid: [16]u8 = @as([16]u8, @splat(0x11));
 const journal_test_uuid_text = "11111111-1111-1111-1111-111111111111";
 
 fn journalTestTree() InMemoryTree {
@@ -10132,7 +10132,7 @@ test "a strict scan reports peaks and names the limit that stopped it" {
     defer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = length,
-        .uuid = [_]u8{0x21} ** 16,
+        .uuid = @as([16]u8, @splat(0x21)),
         .timestamp = 1_717_171_717,
     });
 
@@ -10274,7 +10274,7 @@ fn expectGeneralXattr(entry: GeneralEntry, name: []const u8, value: []const u8) 
 const stock_fixture_source = "test-ext4-general-src";
 const stock_fixture_image = "test-ext4-general.img";
 const stock_fixture_bytes: u64 = 16 * 1024 * 1024;
-const stock_long_symlink_target = "../" ++ ("deep/" ** 20) ++ "target";
+const stock_long_symlink_target = "../" ++ (repeatedBytes("deep/", 20)) ++ "target";
 
 /// Builds a filesystem with `mke2fs`'s own ext4 defaults from a populated
 /// directory, then adds through `debugfs` the things a directory cannot carry
@@ -10546,7 +10546,7 @@ fn writeGeneralFixture(io: Io, path: []const u8, length: u64) !Io.File {
     errdefer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = length,
-        .uuid = [_]u8{0x42} ** 16,
+        .uuid = @as([16]u8, @splat(0x42)),
         .timestamp = 1_717_171_717,
     });
     return file;
@@ -10662,7 +10662,7 @@ test "the writer emits hardlinks devices and FIFOs that fsck and the general imp
         defer file.close(io);
         _ = try populate(io, file, allocator, &tree.view, .{
             .length = length,
-            .uuid = [_]u8{0x5a} ** 16,
+            .uuid = @as([16]u8, @splat(0x5a)),
             .timestamp = 1_700_000_000,
         });
     }
@@ -10976,7 +10976,7 @@ test "strict writer-compatible scan rejects a tampered inode epoch" {
     defer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = length,
-        .uuid = [_]u8{0x44} ** 16,
+        .uuid = @as([16]u8, @splat(0x44)),
         .timestamp = 1_717_171_717,
     });
 
@@ -11005,4 +11005,17 @@ test "strict writer-compatible scan rejects a tampered inode epoch" {
             .expected_length = length,
         }),
     );
+}
+
+fn repeatedBytes(comptime pattern: []const u8, comptime count: usize) *const [pattern.len * count:0]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1000 + count * 2);
+        var bytes: [pattern.len * count:0]u8 = undefined;
+        for (0..count) |i| {
+            @memcpy(bytes[i * pattern.len ..][0..pattern.len], pattern);
+        }
+        bytes[bytes.len] = 0;
+        const result = bytes;
+        break :blk &result;
+    };
 }

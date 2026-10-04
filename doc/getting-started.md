@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Zig **0.16.0** or later.
+- Zig **0.17.0**; Linux 5.10+ or macOS 15+ for source builds.
 - `zvmi qemu` additionally requires [ghr](https://github.com/cataggar/ghr) for automatic known-image download. Install the packaged QEMU build with `ghr install cataggar/qemu`, or provide a system QEMU/UEFI installation.
 - The released `zvmi` binary includes bzip2 support for packaged compressed firmware and does not require a system decompression tool.
 

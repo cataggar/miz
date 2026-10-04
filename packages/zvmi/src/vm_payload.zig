@@ -617,7 +617,7 @@ fn findEspRegion(allocator: Allocator, io: Io, image: image_mod.Image) !?fat32.R
     } else false;
     if (!protective) {
         for (boot_record.entries) |entry| {
-            if (@intFromEnum(entry.partition_type) != mbr_efi_system or
+            if (@backingInt(entry.partition_type) != mbr_efi_system or
                 entry.sector_count == 0) continue;
             return .{
                 .offset = @as(u64, entry.first_lba) * mbr.sector_size,
@@ -926,7 +926,7 @@ test "a kernel and initramfs are extracted from a real ext4 boot directory" {
             .offset = partition_offset,
             .length = partition_length,
             .label = "vm-payload",
-            .uuid = [_]u8{0x51} ** 16,
+            .uuid = @as([16]u8, @splat(0x51)),
             .timestamp = 1_735_689_600,
         });
     }
@@ -981,7 +981,7 @@ test "extraction fails rather than booting an image with no kernel" {
         try file.setLength(io, 16 * 1024 * 1024);
         _ = try ext4.populate(io, file, allocator, try tree.ext4View(), .{
             .length = 16 * 1024 * 1024,
-            .uuid = [_]u8{0x52} ** 16,
+            .uuid = @as([16]u8, @splat(0x52)),
             .timestamp = 1_735_689_600,
         });
     }
@@ -1029,9 +1029,9 @@ test "a unified kernel image on the ESP is used when the root has no kernel" {
         try image.pwrite(io, &boot_record, 0);
 
         var placements: [1]gpt.Placement = undefined;
-        try gpt.writeGpt(&image, io, [_]u8{0x60} ** 16, &.{.{
+        try gpt.writeGpt(&image, io, @as([16]u8, @splat(0x60)), &.{.{
             .type_guid = guid.esp,
-            .unique_guid = [_]u8{0x61} ** 16,
+            .unique_guid = @as([16]u8, @splat(0x61)),
             .size_sectors = 48 * 1024 * 1024 / mbr.sector_size,
         }}, &placements);
 
@@ -1188,7 +1188,7 @@ fn writeDriverProbeImage(
         .offset = 0,
         .length = 16 * 1024 * 1024,
         .label = "drivers",
-        .uuid = [_]u8{0x57} ** 16,
+        .uuid = @as([16]u8, @splat(0x57)),
         .timestamp = 1_735_689_600,
     });
 }

@@ -293,7 +293,7 @@ const FsProbe = struct {
 };
 
 fn probeFilesystem(arena: std.mem.Allocator, img: Image, io: Io, offset_bytes: u64, length: u64) WriteError!FsProbe {
-    var boot_sector: [512]u8 = [_]u8{0} ** 512;
+    var boot_sector: [512]u8 = @as([512]u8, @splat(0));
     if (length >= boot_sector.len) {
         const got = try img.pread(io, &boot_sector, offset_bytes);
         if (got == boot_sector.len and isFatBootSector(&boot_sector)) {
@@ -308,7 +308,7 @@ fn probeFilesystem(arena: std.mem.Allocator, img: Image, io: Io, offset_bytes: u
         }
     }
 
-    var superblock: [2048]u8 = [_]u8{0} ** 2048;
+    var superblock: [2048]u8 = @as([2048]u8, @splat(0));
     if (length >= superblock.len) {
         const got = try img.pread(io, &superblock, offset_bytes);
         if (got == superblock.len and std.mem.readInt(u16, superblock[1024 + 0x38 .. 1024 + 0x3A], .little) == 0xEF53) {

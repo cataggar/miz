@@ -117,6 +117,6 @@ test "material is refused for the reasons a repository file would be misread" {
     try std.testing.expect(!validMaterial("bell\x07"));
     try std.testing.expect(!validMaterial("delete\x7f"));
 
-    const oversized = [_]u8{'x'} ** (customize.max_credential_material_bytes + 1);
+    const oversized = @as([(customize.max_credential_material_bytes + 1)]u8, @splat('x'));
     try std.testing.expect(!validMaterial(&oversized));
 }

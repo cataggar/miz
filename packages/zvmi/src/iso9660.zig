@@ -734,7 +734,7 @@ fn recordLength(name_len: usize, system_use_len: usize) u8 {
 }
 
 fn makeDirectoryRecord(name: []const u8, extent_lba: u32, size: u32, flags: u8, system_use: []const u8) [256]u8 {
-    var out: [256]u8 = [_]u8{0} ** 256;
+    var out: [256]u8 = @as([256]u8, @splat(0));
     const len = recordLength(name.len, system_use.len);
     out[0] = len;
     out[1] = 0;
@@ -772,7 +772,7 @@ fn buildRrSystemUse(flags: u8) [5]u8 {
 }
 
 fn buildPxSystemUse(mode: u32, uid: u32, gid: u32) [36]u8 {
-    var out: [36]u8 = [_]u8{0} ** 36;
+    var out: [36]u8 = @as([36]u8, @splat(0));
     out[0] = 'P';
     out[1] = 'X';
     out[2] = 36;
@@ -785,7 +785,7 @@ fn buildPxSystemUse(mode: u32, uid: u32, gid: u32) [36]u8 {
 }
 
 fn buildNmSystemUse(name: []const u8) [260]u8 {
-    var out: [260]u8 = [_]u8{0} ** 260;
+    var out: [260]u8 = @as([260]u8, @splat(0));
     out[0] = 'N';
     out[1] = 'M';
     out[2] = @intCast(5 + name.len);
@@ -796,7 +796,7 @@ fn buildNmSystemUse(name: []const u8) [260]u8 {
 }
 
 fn buildSlSystemUse(target: []const u8) [260]u8 {
-    var out: [260]u8 = [_]u8{0} ** 260;
+    var out: [260]u8 = @as([260]u8, @splat(0));
     var cursor: usize = 5;
     out[0] = 'S';
     out[1] = 'L';
@@ -851,14 +851,14 @@ test "iso9660 reader enumerates rock ridge names and resolves symlinks" {
     const dir_lba: u32 = 21;
     const file_lba: u32 = 22;
     const file_bytes = "hello from rock ridge\n";
-    const susp_prefix = [_]u8{0} ** 7;
+    const susp_prefix = @as([7]u8, @splat(0));
 
     var image = std.array_list.Managed(u8).init(allocator);
     defer image.deinit();
     try image.resize((file_lba + 1) * descriptor_size);
     @memset(image.items, 0);
 
-    var pvd: [descriptor_size]u8 = [_]u8{0} ** descriptor_size;
+    var pvd: [descriptor_size]u8 = @as([descriptor_size]u8, @splat(0));
     pvd[0] = 1;
     pvd[1..6].* = standard_id;
     pvd[6] = 1;
@@ -872,7 +872,7 @@ test "iso9660 reader enumerates rock ridge names and resolves symlinks" {
     @memcpy(pvd[156 .. 156 + root_record[0]], root_record[0..root_record[0]]);
     image.items[volume_descriptor_lba * descriptor_size .. (volume_descriptor_lba + 1) * descriptor_size].* = pvd;
 
-    var terminator: [descriptor_size]u8 = [_]u8{0} ** descriptor_size;
+    var terminator: [descriptor_size]u8 = @as([descriptor_size]u8, @splat(0));
     terminator[0] = 255;
     terminator[1..6].* = standard_id;
     terminator[6] = 1;
@@ -1002,7 +1002,7 @@ test "iso9660 reader falls back to joliet unicode names" {
     try image.resize((file_lba + 1) * descriptor_size);
     @memset(image.items, 0);
 
-    var pvd: [descriptor_size]u8 = [_]u8{0} ** descriptor_size;
+    var pvd: [descriptor_size]u8 = @as([descriptor_size]u8, @splat(0));
     pvd[0] = 1;
     pvd[1..6].* = standard_id;
     pvd[6] = 1;
@@ -1014,7 +1014,7 @@ test "iso9660 reader falls back to joliet unicode names" {
     @memcpy(pvd[156 .. 156 + root_record[0]], root_record[0..root_record[0]]);
     image.items[16 * descriptor_size .. 17 * descriptor_size].* = pvd;
 
-    var svd: [descriptor_size]u8 = [_]u8{0} ** descriptor_size;
+    var svd: [descriptor_size]u8 = @as([descriptor_size]u8, @splat(0));
     svd[0] = 2;
     svd[1..6].* = standard_id;
     svd[6] = 1;
@@ -1029,7 +1029,7 @@ test "iso9660 reader falls back to joliet unicode names" {
     @memcpy(svd[156 .. 156 + joliet_root[0]], joliet_root[0..joliet_root[0]]);
     image.items[17 * descriptor_size .. 18 * descriptor_size].* = svd;
 
-    var terminator: [descriptor_size]u8 = [_]u8{0} ** descriptor_size;
+    var terminator: [descriptor_size]u8 = @as([descriptor_size]u8, @splat(0));
     terminator[0] = 255;
     terminator[1..6].* = standard_id;
     terminator[6] = 1;

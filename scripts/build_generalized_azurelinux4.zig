@@ -4100,17 +4100,17 @@ test "safeLayerPath rejects .." {
 }
 
 test "parseDigestHex accepts sha256: prefix" {
-    const hex = try parseDigestHex("sha256:" ++ "a" ** 64);
-    try std.testing.expectEqualStrings("a" ** 64, hex);
+    const hex = try parseDigestHex("sha256:" ++ &@as([64:0]u8, @splat("a"[0])));
+    try std.testing.expectEqualStrings(&@as([64:0]u8, @splat("a"[0])), hex);
 }
 
 test "parseDigestHex accepts bare hex" {
-    try std.testing.expectEqualStrings("b" ** 64, try parseDigestHex("b" ** 64));
+    try std.testing.expectEqualStrings(&@as([64:0]u8, @splat("b"[0])), try parseDigestHex(&@as([64:0]u8, @splat("b"[0]))));
 }
 
 test "parseDigestHex rejects short and invalid chars" {
     try std.testing.expectError(error.InvalidDigest, parseDigestHex("sha256:short"));
-    try std.testing.expectError(error.InvalidDigest, parseDigestHex("sha256:" ++ "g" ** 64));
+    try std.testing.expectError(error.InvalidDigest, parseDigestHex("sha256:" ++ &@as([64:0]u8, @splat("g"[0]))));
     try std.testing.expectError(error.InvalidDigest, parseDigestHex("notahex"));
 }
 

@@ -679,7 +679,7 @@ pub fn verifyRecordedManifest(
 }
 
 test "the retained contract claims every clause exactly once per package" {
-    var claimed = std.EnumSet(Clause).initEmpty();
+    var claimed: std.EnumSet(Clause) = .{};
     for (&required_packages, 0..) |package, index| {
         try std.testing.expect(package.name.len != 0);
         try std.testing.expect(package.why.len != 0);

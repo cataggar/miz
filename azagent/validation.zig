@@ -159,7 +159,7 @@ pub fn validatePublicKey(key: []const u8) PublicKeyError!void {
 test "username policy accepts conservative Linux Azure names" {
     try validateUsername("g");
     try validateUsername("azure_user-01");
-    try validateUsername("a" ** max_username_len);
+    try validateUsername(&@as([max_username_len:0]u8, @splat("a"[0])));
 }
 
 test "username policy rejects unsafe invalid and overlong names" {
@@ -174,7 +174,7 @@ test "username policy rejects unsafe invalid and overlong names" {
         "admin:name",
         "admin\nextra",
         "admin\x00extra",
-        "a" ** (max_username_len + 1),
+        &@as([(max_username_len + 1):0]u8, @splat("a"[0])),
     }) |username| {
         try std.testing.expectError(error.InvalidUsername, validateUsername(username));
     }
@@ -201,7 +201,7 @@ test "public key policy rejects injection and malformed content" {
         "ssh-ed25519\tAAAA",
         "command=\"unterminated ssh-ed25519 AAAA",
         "ssh-ed25519 AA==AA",
-        "x" ** (max_public_key_len + 1),
+        &@as([(max_public_key_len + 1):0]u8, @splat("x"[0])),
     }) |key| {
         try std.testing.expectError(error.InvalidPublicKey, validatePublicKey(key));
     }

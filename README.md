@@ -1,9 +1,16 @@
 # zvmi
 
-A Zig 0.16 library and CLI for reading, writing, converting, and building VM
+A Zig 0.17 library and CLI for reading, writing, converting, and building VM
 disk images, including raw, VHD/VPC, VHDX, and qcow2 formats. It also provides
 filesystem, boot configuration, image customization, QEMU, and Azure-ready
 image workflows.
+
+This consumer compatibility branch ports `0e9f25f` without adopting the later
+vmiz/miz naming cutovers or unrelated image behavior. The `zvmi` build-helper
+and module names, preserved released ESP/signed UKI, artifact acquisition,
+customization requests, offline package inputs and execution deadlines remain
+unchanged. Source builds require Linux 5.10+ or macOS 15+. Released image
+versions and package inputs are not refreshed or published by this port.
 
 ## Install
 

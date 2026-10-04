@@ -1561,7 +1561,7 @@ pub const Source = struct {
         const body = try readResponseBodyAlloc(self.allocator, response, error_body_limit, true);
         defer self.allocator.free(body);
         if (self.last_error) |*value| value.deinit(self.allocator);
-        self.last_error = .{ .status = @intFromEnum(response.head.status) };
+        self.last_error = .{ .status = @backingInt(response.head.status) };
         if (body.len == 0) return;
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return;
         defer parsed.deinit();
@@ -2528,7 +2528,7 @@ fn acceptsStatus(spec: RequestSpec, status: std.http.Status) bool {
 }
 
 fn isRetryableStatus(status: std.http.Status) bool {
-    return switch (@intFromEnum(status)) {
+    return switch (@backingInt(status)) {
         408, 429, 500, 502, 503, 504 => true,
         else => false,
     };
@@ -2801,10 +2801,19 @@ fn sameOriginUrl(left_text: []const u8, right_text: []const u8) bool {
     if (!std.ascii.eqlIgnoreCase(left.scheme, right.scheme)) return false;
     var left_host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
     var right_host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const left_host = left.getHost(&left_host_buffer) catch return false;
-    const right_host = right.getHost(&right_host_buffer) catch return false;
+    const left_host = std.Io.net.HostName.fromUri(left, &left_host_buffer) catch return false;
+    const right_host = std.Io.net.HostName.fromUri(right, &right_host_buffer) catch return false;
     if (!std.ascii.eqlIgnoreCase(left_host.bytes, right_host.bytes)) return false;
     return uriPort(left) == uriPort(right);
+}
+
+test "credential origin comparison decodes hosts and preserves scheme and port boundaries" {
+    try std.testing.expect(sameOriginUrl("https://EXAMPLE.test/a", "https://example%2Etest:443/b"));
+    try std.testing.expect(!sameOriginUrl("https://example.test/a", "https://example.test:444/b"));
+    try std.testing.expect(!sameOriginUrl("https://example.test/a", "http://example.test:443/b"));
+    try std.testing.expect(!sameOriginUrl("https://example.test/a", "https://other.test/b"));
+    try std.testing.expect(!sameOriginUrl("https://bad%2fhost/a", "https://bad%2fhost/b"));
+    try std.testing.expect(!sameOriginUrl("https://example.test/a", "https:///b"));
 }
 
 fn sameRegistry(left: transport.RegistryIdentity, right: transport.RegistryIdentity) bool {
@@ -2926,7 +2935,7 @@ fn uriPort(uri: std.Uri) u16 {
 fn isPlainNonLoopback(uri: std.Uri) bool {
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return false;
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = uri.getHost(&host_buffer) catch return true;
+    const host = std.Io.net.HostName.fromUri(uri, &host_buffer) catch return true;
     return !isLoopbackHost(host.bytes);
 }
 

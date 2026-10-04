@@ -841,7 +841,7 @@ const unallocated_bat_entry: u32 = 0xFFFF_FFFF;
 fn vhdxBlockAllocated(file: Io.File, io: Io, v: VhdxState, block_index: u64) Io.File.ReadPositionalError!bool {
     const bat_index = vhdx.batIndexForBlock(block_index, v.chunk_ratio);
     const entry = try readBatEntryU64(file, io, v.bat_offset, bat_index);
-    const state: vhdx.BlockState = @enumFromInt(entry & vhdx.bat_state_mask);
+    const state: vhdx.BlockState = @fromBackingInt(@intCast(entry & vhdx.bat_state_mask));
     return state == .fully_present or state == .partially_present;
 }
 
@@ -865,7 +865,7 @@ fn writeBatEntry(file: Io.File, io: Io, bat_offset: u64, index: u32, value: u32)
 
 fn fillBatUnallocated(file: Io.File, io: Io, bat_offset: u64, max_table_entries: u32) Io.File.WritePositionalError!void {
     const bat_bytes_len: u64 = @as(u64, max_table_entries) * 4;
-    const chunk: [4096]u8 = [_]u8{0xFF} ** 4096;
+    const chunk: [4096]u8 = @as([4096]u8, @splat(0xFF));
     var written: u64 = 0;
     while (written < bat_bytes_len) {
         const n: usize = @intCast(@min(bat_bytes_len - written, chunk.len));
@@ -915,7 +915,7 @@ fn allocateBlock(file: Io.File, io: Io, d: *DynamicState, block_index: u32) (Io.
     const bitmap_offset = d.free_data_block_offset;
     const bat_value: u32 = @intCast(bitmap_offset / 512);
 
-    const bitmap_chunk: [512]u8 = [_]u8{0xFF} ** 512;
+    const bitmap_chunk: [512]u8 = @as([512]u8, @splat(0xFF));
     var written: u64 = 0;
     while (written < d.bitmap_size) {
         const n: usize = @intCast(@min(@as(u64, d.bitmap_size) - written, bitmap_chunk.len));
@@ -1010,7 +1010,7 @@ test "create raw image, then open and read back zeros" {
 
     var buf: [16]u8 = undefined;
     _ = try opened.pread(io, &buf, 0);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &buf);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), &buf);
 }
 
 test "invalid create options do not truncate an existing image" {
@@ -1192,7 +1192,7 @@ test "create dynamic vhd, write across blocks, reopen and read back" {
     // Reading from an untouched region returns zeros (sparse).
     var zero_buf: [64]u8 = undefined;
     _ = try opened.pread(io, &zero_buf, 0);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &zero_buf);
+    try std.testing.expectEqualSlices(u8, &(@as([64]u8, @splat(0))), &zero_buf);
 
     // The file on disk should be much smaller than the virtual size, since
     // only one block was ever allocated.
@@ -1324,7 +1324,7 @@ test "Image creates, writes, resizes, and reopens qcow2 images" {
     const distant_offset: u64 = 768 * 1024 * 1024 + 123;
     const payload0 = "image-qcow2-0";
     const payload1 = "image-qcow2-1";
-    const payload2 = [_]u8{0xA5} ** 256;
+    const payload2 = @as([256]u8, @splat(0xA5));
 
     var img = try Image.create(io, path, .qcow2, initial_size, .{});
     try img.pwrite(io, payload0, sparse_offset);
@@ -1394,7 +1394,7 @@ test "Image creates, writes, resizes, and reopens VHDX images" {
     const distant_offset: u64 = 130 * gib + 123;
     const payload0 = "image-vhdx-0";
     const payload1 = "image-vhdx-1";
-    const payload2 = [_]u8{0xC7} ** 256;
+    const payload2 = @as([256]u8, @splat(0xC7));
 
     var img = try Image.create(io, path, .vhdx, initial_size, .{});
     const initial_bat_length = img.vhdx.?.bat_length;
@@ -1442,7 +1442,7 @@ test "Image creates, writes, resizes, and reopens VHDX images" {
 
     var zero_buf: [64]u8 = undefined;
     _ = try opened.pread(io, &zero_buf, @as(u64, block_size));
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &zero_buf);
+    try std.testing.expectEqualSlices(u8, &(@as([64]u8, @splat(0))), &zero_buf);
 
     const result = try opened.check(io);
     try std.testing.expect(result.ok);
@@ -1590,7 +1590,7 @@ test "a device opened without the write opt-in refuses every write" {
 
         var buf: [16]u8 = undefined;
         _ = try img.pread(io, &buf, 0);
-        try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &buf);
+        try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), &buf);
     }
 }
 

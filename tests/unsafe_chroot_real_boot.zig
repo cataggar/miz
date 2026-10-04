@@ -288,7 +288,7 @@ fn runIntegration(
             .acknowledge_unsafe = true,
         },
         .reproducibility = .{
-            .seed = .{ .bytes = [_]u8{0x51} ** 32 },
+            .seed = .{ .bytes = @as([32]u8, @splat(0x51)) },
             .source_date_epoch = 1_735_689_600,
         },
     };

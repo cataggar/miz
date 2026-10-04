@@ -1,9 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -28,7 +25,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
             cataggar/qemu@v11.0.91-z.15
 
       - name: zig fmt --check
@@ -41,15 +38,15 @@ jobs:
         run: python3 -m unittest discover -s tests -p freebsd15_release_test.py
 
       - name: zig build
-        run: zig build
+        run: zig build -j2
 
       - name: zig build test
-        run: zig build test --summary all
+        run: zig build test -j2 --summary all
 
       - name: privileged unsafe-chroot integration
         env:
           ZVMI_RUN_PRIVILEGED_TEST: "1"
-        run: zig build test-unsafe-chroot-integration --summary all
+        run: zig build test-unsafe-chroot-integration -j2 --summary all
 
       # The VM backend boots the image's own kernel with `rdinit=`. Drivers it
       # built in are there already; the rest are inserted out of the image's
@@ -101,7 +98,7 @@ jobs:
           # relative to its own path, and an x86 direct-kernel boot still
           # loads a BIOS ROM.
           ZVMI_VM_QEMU="$(readlink -f "$(command -v "qemu-system-$(uname -m)")")" \
-            zig build test-vm-real-boot --summary all
+            zig build test-vm-real-boot -j2 --summary all
 
       # The same emulator package supplies every guest architecture, so the
       # cross-architecture run differs only in which one is asked for. This is
@@ -119,7 +116,7 @@ jobs:
           export ZVMI_VM_ACCEL=software
           ZVMI_VM_QEMU="$(readlink -f \
             "$(command -v "qemu-system-${ZVMI_VM_CROSS_ARCH}")")" \
-            zig build test-vm-real-boot --summary all
+            zig build test-vm-real-boot -j2 --summary all
 
       # Azure Linux proves the built-in path and can prove nothing else: it
       # builds every driver this backend needs in. Debian's generic kernel
@@ -155,4 +152,4 @@ jobs:
           export ZVMI_VM_BOOT_MODULES_BUILTIN="${ZVMI_VM_MODULAR_MODULES_BUILTIN}"
           export ZVMI_VM_BOOT_MODULE_TREE="${ZVMI_VM_MODULAR_MODULE_TREE}"
           ZVMI_VM_QEMU="$(readlink -f "$(command -v "qemu-system-$(uname -m)")")" \
-            zig build test-vm-real-boot --summary all
+            zig build test-vm-real-boot -j2 --summary all

@@ -1038,16 +1038,16 @@ fn isRootfsCandidate(path: []const u8) bool {
     const base = baseName(path);
     return std.ascii.endsWithIgnoreCase(base, ".squashfs") or
         std.ascii.endsWithIgnoreCase(base, ".sqsh") or
-        std.ascii.indexOfIgnoreCase(base, "squashfs") != null or
-        std.ascii.indexOfIgnoreCase(base, "rootfs") != null or
+        std.ascii.findIgnoreCase(base, "squashfs") != null or
+        std.ascii.findIgnoreCase(base, "rootfs") != null or
         std.ascii.endsWithIgnoreCase(base, ".img");
 }
 
 fn candidateScore(path: []const u8) u8 {
     const base = baseName(path);
     if (std.ascii.endsWithIgnoreCase(base, ".squashfs") or std.ascii.endsWithIgnoreCase(base, ".sqsh")) return 4;
-    if (std.ascii.indexOfIgnoreCase(base, "squashfs") != null) return 3;
-    if (std.ascii.indexOfIgnoreCase(base, "rootfs") != null) return 2;
+    if (std.ascii.findIgnoreCase(base, "squashfs") != null) return 3;
+    if (std.ascii.findIgnoreCase(base, "rootfs") != null) return 2;
     if (std.ascii.endsWithIgnoreCase(base, ".img")) return 1;
     return 0;
 }
@@ -3937,7 +3937,7 @@ test "build-image reports errors cleanly (no double-free) when squashfs open fai
     // Clear the inode table's metadata-block "uncompressed" bit and relabel
     // the filesystem as XZ-compressed so squashfs.Reader attempts to
     // decompress raw metadata bytes and fails after partition planning.
-    std.mem.writeInt(u16, squashfs_bytes[20..22], @intFromEnum(squashfs.Compression.xz), .little);
+    std.mem.writeInt(u16, squashfs_bytes[20..22], @backingInt(squashfs.Compression.xz), .little);
     const inode_table_start = std.mem.readInt(u64, squashfs_bytes[64..72], .little);
     const header_offset: usize = @intCast(inode_table_start);
     var header = std.mem.readInt(u16, squashfs_bytes[header_offset..][0..2], .little);
@@ -4587,7 +4587,7 @@ fn buildTarArchive(allocator: std.mem.Allocator, specs: []const TarSpec) ![]u8 {
 }
 
 fn appendTarSpec(out: *std.Io.Writer.Allocating, spec: TarSpec) !void {
-    var header: [512]u8 = [_]u8{0} ** 512;
+    var header: [512]u8 = @as([512]u8, @splat(0));
     if (spec.path.len > 100) return error.InvalidHeader;
     @memcpy(header[0..spec.path.len], spec.path);
     try writeOctalField(header[100..108], spec.mode);
@@ -4739,7 +4739,7 @@ fn writeMinimalIsoWithFile(
     try image.resize((file_lba + @as(u32, @intCast(std.math.divCeil(u64, bytes.len, iso9660.descriptor_size) catch unreachable))) * iso9660.descriptor_size);
     @memset(image.items, 0);
 
-    var pvd: [iso9660.descriptor_size]u8 = [_]u8{0} ** iso9660.descriptor_size;
+    var pvd: [iso9660.descriptor_size]u8 = @as([iso9660.descriptor_size]u8, @splat(0));
     pvd[0] = 1;
     pvd[1..6].* = iso9660.standard_id;
     pvd[6] = 1;
@@ -4751,7 +4751,7 @@ fn writeMinimalIsoWithFile(
     @memcpy(pvd[156 .. 156 + root_record[0]], root_record[0..root_record[0]]);
     image.items[iso9660.volume_descriptor_lba * iso9660.descriptor_size .. (iso9660.volume_descriptor_lba + 1) * iso9660.descriptor_size].* = pvd;
 
-    var terminator: [iso9660.descriptor_size]u8 = [_]u8{0} ** iso9660.descriptor_size;
+    var terminator: [iso9660.descriptor_size]u8 = @as([iso9660.descriptor_size]u8, @splat(0));
     terminator[0] = 255;
     terminator[1..6].* = iso9660.standard_id;
     terminator[6] = 1;
@@ -4811,7 +4811,7 @@ fn writeMinimalIsoWithBootPayloads(
     try image.resize(image_blocks * iso9660.descriptor_size);
     @memset(image.items, 0);
 
-    var pvd: [iso9660.descriptor_size]u8 = [_]u8{0} ** iso9660.descriptor_size;
+    var pvd: [iso9660.descriptor_size]u8 = @as([iso9660.descriptor_size]u8, @splat(0));
     pvd[0] = 1;
     pvd[1..6].* = iso9660.standard_id;
     pvd[6] = 1;
@@ -4823,7 +4823,7 @@ fn writeMinimalIsoWithBootPayloads(
     @memcpy(pvd[156 .. 156 + root_record[0]], root_record[0..root_record[0]]);
     image.items[iso9660.volume_descriptor_lba * iso9660.descriptor_size .. (iso9660.volume_descriptor_lba + 1) * iso9660.descriptor_size].* = pvd;
 
-    var terminator: [iso9660.descriptor_size]u8 = [_]u8{0} ** iso9660.descriptor_size;
+    var terminator: [iso9660.descriptor_size]u8 = @as([iso9660.descriptor_size]u8, @splat(0));
     terminator[0] = 255;
     terminator[1..6].* = iso9660.standard_id;
     terminator[6] = 1;
@@ -4888,7 +4888,7 @@ fn makeDirectoryRecord(
     flags: u8,
     system_use: []const u8,
 ) [256]u8 {
-    var record: [256]u8 = [_]u8{0} ** 256;
+    var record: [256]u8 = @as([256]u8, @splat(0));
     const identifier_len = file_identifier.len;
     const padding: usize = if (identifier_len % 2 == 0) 1 else 0;
     const record_len = 33 + identifier_len + padding + system_use.len;

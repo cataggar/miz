@@ -1276,7 +1276,7 @@ test "parse and format SHA-256" {
     try std.testing.expectError(error.InvalidSha256, parseSha256("short"));
     try std.testing.expectError(
         error.InvalidSha256,
-        parseSha256("z" ** 64),
+        parseSha256(&@as([64:0]u8, @splat("z"[0]))),
     );
 }
 
@@ -1532,7 +1532,7 @@ test "XZ decompression accepts concatenated streams" {
         io,
         testXzOptions(input_path, output_path, &input, 1024),
     );
-    const expected = "FreeBSD artifact pipeline\n" ** 2;
+    const expected = repeatedBytes("FreeBSD artifact pipeline\n", 2);
     try std.testing.expectEqual(@as(u64, expected.len), result.size);
     try expectFileContent(io, output_path, expected);
 }
@@ -1893,7 +1893,7 @@ test "fixed VHD derivation relocates mirrored GPT transactionally" {
             .max_virtual_size = 32 * 1024 * 1024,
             .output_path = output_path,
             .max_output_size = 32 * 1024 * 1024,
-            .unique_id = [_]u8{0x42} ** 16,
+            .unique_id = @as([16]u8, @splat(0x42)),
             .timestamp_unix = 0,
         },
     );
@@ -2192,3 +2192,16 @@ const TestDownloader = struct {
         try output.writeAll(context.payload);
     }
 };
+
+fn repeatedBytes(comptime pattern: []const u8, comptime count: usize) *const [pattern.len * count:0]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1000 + count * 2);
+        var bytes: [pattern.len * count:0]u8 = undefined;
+        for (0..count) |i| {
+            @memcpy(bytes[i * pattern.len ..][0..pattern.len], pattern);
+        }
+        bytes[bytes.len] = 0;
+        const result = bytes;
+        break :blk &result;
+    };
+}

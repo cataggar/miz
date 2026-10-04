@@ -65,7 +65,7 @@ test "etcHostnameContent rejects an empty hostname" {
 
 test "etcHostnameContent rejects an overlong hostname" {
     var buf: [max_hostname_len + 1]u8 = undefined;
-    const too_long = "a" ** (max_hostname_len + 1);
+    const too_long = &@as([(max_hostname_len + 1):0]u8, @splat("a"[0]));
     try std.testing.expectError(error.InvalidHostname, etcHostnameContent(&buf, too_long));
 }
 

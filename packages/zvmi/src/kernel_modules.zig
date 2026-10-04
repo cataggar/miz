@@ -439,7 +439,7 @@ test "dependency paths are read whether or not they are written with a leading s
 
 /// A minimal ELF header, which is all `moduleImage` checks for: it is looking
 /// for evidence that the tree holds an object, not parsing one.
-const elf_object = "\x7fELF" ++ "\x02\x01\x01" ++ ("\x00" ** 57);
+const elf_object = "\x7fELF" ++ "\x02\x01\x01" ++ (&@as([57:0]u8, @splat("\x00"[0])));
 
 test "an uncompressed module is passed through and a foreign file is not" {
     const allocator = std.testing.allocator;
