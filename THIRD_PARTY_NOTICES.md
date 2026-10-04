@@ -11,6 +11,14 @@ Copyright (c) Zig contributors.
 Licensed under the MIT License (Expat). See:
 https://github.com/cataggar/translate-c/blob/62d06a5d3e93c82727544e8113e4762a315ca0ed/LICENSE
 
+The tool uses the Aro C frontend from `cataggar/arocc` at immutable commit
+`d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b`.
+
+Copyright (c) 2021 Veikka Tuominen.
+
+Licensed under the MIT License. See:
+https://github.com/cataggar/arocc/blob/d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b/LICENSE
+
 ## rpmz
 
 The host-only RPM package-family adapter uses `cataggar/rpmz` at immutable
