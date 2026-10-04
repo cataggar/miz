@@ -599,7 +599,9 @@ pub fn build(b: *std.Build) void {
     native_smoke_step.dependOn(&b.addRunArtifact(native_vhd_tests).step);
     native_smoke_step.dependOn(zstd_test_step);
 
+    // Exercise native execution and filesystem behavior even with a warm cache.
     const smoke_version = b.addRunArtifact(cli_exe);
+    smoke_version.has_side_effects = true;
     smoke_version.addArg("version");
     smoke_version.expectStdOutEqual(b.fmt("miz {s}\n", .{version}));
     smoke_version.expectStdErrEqual("");
@@ -607,6 +609,7 @@ pub fn build(b: *std.Build) void {
     native_smoke_step.dependOn(&smoke_version.step);
 
     const smoke_help = b.addRunArtifact(cli_exe);
+    smoke_help.has_side_effects = true;
     smoke_help.addArg("--help");
     smoke_help.expectStdOutEqual("");
     smoke_help.expectStdErrMatch("Usage: miz <command> [options]");
@@ -614,12 +617,14 @@ pub fn build(b: *std.Build) void {
     native_smoke_step.dependOn(&smoke_help.step);
 
     const smoke_create = b.addRunArtifact(cli_exe);
+    smoke_create.has_side_effects = true;
     smoke_create.addArgs(&.{ "create", "-f", "vhd", "-o", "subformat=fixed" });
     const smoke_image = smoke_create.addOutputFileArg("native-smoke.vhd");
     smoke_create.addArg("1M");
     smoke_create.expectExitCode(0);
 
     const smoke_info = b.addRunArtifact(cli_exe);
+    smoke_info.has_side_effects = true;
     smoke_info.addArgs(&.{ "info", "--output=json" });
     smoke_info.addFileArg(smoke_image);
     smoke_info.expectExitCode(0);
@@ -630,6 +635,7 @@ pub fn build(b: *std.Build) void {
     native_smoke_step.dependOn(&smoke_info.step);
 
     const smoke_check = b.addRunArtifact(cli_exe);
+    smoke_check.has_side_effects = true;
     smoke_check.addArg("check");
     smoke_check.addFileArg(smoke_image);
     smoke_check.expectExitCode(0);
