@@ -11,8 +11,8 @@ const Dir = Io.Dir;
 pub const api_version: u32 = 4;
 pub const request_schema = "io.github.cataggar.miz.package-family.request.v4";
 pub const result_schema = "io.github.cataggar.miz.package-family.result.v4";
-pub const debz_api_commit = "beac3f20dd93fd98863af71e8fe621d47db663f6";
-pub const rpmz_api_commit = "15b5e1291a9fc3eb3980a4088d757b9d0254d468";
+pub const debz_api_commit = "56be0a32fac5293f20bde45d266b708e53321c73";
+pub const rpmz_api_commit = "c9b23a2103b9682434ab663841d00cd657647561";
 pub const rpm_lock_schema = "io.github.cataggar.miz.rpm-lock.v1";
 pub const rpm_provenance_schema = "io.github.cataggar.miz.rpm-provenance.v1";
 
