@@ -4,7 +4,7 @@ The public host adapter is the Zig module `miz-package-family-host`. It uses
 only the supported `@import("rpmz")` namespaces: `resolver` for deterministic
 planning, `bundle_export` for the closed input set, and `replay` for exact
 offline execution. rpmz is pinned to immutable commit
-`15b5e1291a9fc3eb3980a4088d757b9d0254d468`. The dependency key used by a
+`c9b23a2103b9682434ab663841d00cd657647561`. The dependency key used by a
 consumer is irrelevant, so a future repository rename does not change the
 module API.
 

@@ -22,14 +22,14 @@ https://github.com/cataggar/arocc/blob/d0c8c4d9c55daa7ef6e40cf0f630a5b5e900989b/
 ## rpmz
 
 The host-only RPM package-family adapter uses `cataggar/rpmz` at immutable
-commit `15b5e1291a9fc3eb3980a4088d757b9d0254d468`. rpmz is not imported by the
+commit `c9b23a2103b9682434ab663841d00cd657647561`. rpmz is not imported by the
 guest agent or init static modules.
 
 Copyright (c) rpmz contributors.
 
 rpmz library source is licensed under LGPL-2.1 and utility source under
 GPL-2.0. See:
-https://github.com/cataggar/rpmz/blob/15b5e1291a9fc3eb3980a4088d757b9d0254d468/COPYING
+https://github.com/cataggar/rpmz/blob/c9b23a2103b9682434ab663841d00cd657647561/COPYING
 
 ## ghr Authenticode parser
 
