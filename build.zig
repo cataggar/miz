@@ -858,6 +858,7 @@ pub fn build(b: *std.Build) void {
     const build_api_consumer_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
+        "-j2",
         "package-family",
     });
     build_api_consumer_check.setName("check external build.zig consumer");
@@ -866,6 +867,7 @@ pub fn build(b: *std.Build) void {
     const package_family_consumer_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
+        "-j2",
         "check",
     });
     package_family_consumer_check.setName(
@@ -877,6 +879,7 @@ pub fn build(b: *std.Build) void {
     const rename_compatibility_consumer_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
+        "-j2",
         "rename-compatibility",
     });
     rename_compatibility_consumer_check.setName(
@@ -889,6 +892,7 @@ pub fn build(b: *std.Build) void {
     const build_api_diagnostics_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
+        "-j2",
         "diagnostics",
     });
     build_api_diagnostics_check.setName("check external build.zig diagnostics");
@@ -897,6 +901,7 @@ pub fn build(b: *std.Build) void {
     const build_api_execution_diagnostics_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
+        "-j2",
         "execution-diagnostics",
     });
     build_api_execution_diagnostics_check.setName("check external build.zig execution diagnostics");
@@ -905,6 +910,7 @@ pub fn build(b: *std.Build) void {
     const build_api_preserved_diagnostics_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
+        "-j2",
         "preserved-diagnostics",
     });
     build_api_preserved_diagnostics_check.setName(
@@ -915,6 +921,7 @@ pub fn build(b: *std.Build) void {
     const build_api_preserved_vm_diagnostics_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
+        "-j2",
         "preserved-vm-diagnostics",
     });
     build_api_preserved_vm_diagnostics_check.setName(

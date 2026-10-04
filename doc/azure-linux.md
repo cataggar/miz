@@ -163,7 +163,7 @@ image digest and/or expected certificate fingerprint before enrollment.
 
 Create a dedicated Private Trust certificate profile named `vmiz-uki` in the existing `cataggar` Artifact Signing account. Configure the Entra federated credential for audience `api://AzureADTokenExchange`, issuer `https://token.actions.githubusercontent.com`, and subject `repo:cataggar/vmiz:environment:azurelinux4-signing`, then grant `Artifact Signing Certificate Profile Signer` at the `vmiz-uki` profile scope. The observed Private Trust chain terminates at a shared Microsoft Enterprise identity hierarchy, and UEFI cannot restrict trust with Artifact Signing's subscriber-unique EKU. Secure Boot therefore enrolls the exact short-lived signing leaf for each release, never the broad AOC intermediate or Microsoft root. The workflow fetches the current leaf immediately before signing and fails if the operation returns another leaf; release validation also fails if the leaf or provider identity changes across candidates. Artifact Signing leaves rotate daily and are valid for about three days. The raw digest API does not add an RFC 3161 timestamp; firmware and `sbverify` do not enforce signing-certificate wall-clock validity, but general long-term Authenticode validation requires a separately implemented timestamp policy.
 
-The builder requires Zig 0.16, `curl`, `dnf`, GNU tar, `qemu-img`, and
+The builder requires Zig 0.17.0, `curl`, `dnf`, GNU tar, `qemu-img`, and
 passwordless or interactive `sudo`. On a host that differs from the selected
 guest architecture, the matching enabled binfmt registration plus
 `qemu-x86_64-static` or `qemu-aarch64-static` is required so RPM scriptlets

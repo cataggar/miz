@@ -50,8 +50,8 @@ jobs:
 
       - name: Windows release builds
         run: |
-          zig build install-vmiz -Doptimize=ReleaseSafe -Dtarget=x86_64-windows
-          zig build install-vmiz -Doptimize=ReleaseSafe -Dtarget=aarch64-windows
+          zig build install-vmiz -Doptimize=safe -Dtarget=x86_64-windows
+          zig build install-vmiz -Doptimize=safe -Dtarget=aarch64-windows
 
       - name: zig build test
         run: zig build test --summary all

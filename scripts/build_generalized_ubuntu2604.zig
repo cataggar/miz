@@ -192,11 +192,11 @@ fn profileFor(architecture: Architecture) *const Profile {
 fn packageFamilyRequest(
     operation: package_family.Operation,
     profile: *const Profile,
-    package: []const u8,
+    packages: []const []const u8,
     root_stage: []const u8,
     published_root: []const u8,
-    source_config_path: []const u8,
-    keyring_path: []const u8,
+    config_paths: []const []const u8,
+    keyring_paths: []const []const u8,
     cache_path: []const u8,
     state_path: []const u8,
     lock_path: []const u8,
@@ -205,7 +205,7 @@ fn packageFamilyRequest(
         .family = .debian,
         .distribution = .ubuntu_26_04,
         .operation = operation,
-        .packages = &.{package},
+        .packages = packages,
         .inputs = .{
             .root_stage = root_stage,
             .published_root = published_root,
@@ -214,8 +214,8 @@ fn packageFamilyRequest(
                 .aarch64 => .arm64,
             },
             .source_paths = &.{},
-            .keyring_paths = &.{keyring_path},
-            .config_paths = &.{source_config_path},
+            .keyring_paths = keyring_paths,
+            .config_paths = config_paths,
             .cache_path = cache_path,
             .state_path = state_path,
             .lock_input_path = if (operation == .resolve_lock) null else lock_path,
@@ -788,7 +788,7 @@ fn verifyOpenPgpDetachedSignature(
     @memcpy(&signature, signature_mpi.bytes);
     try std.crypto.Certificate.rsa.PKCS1v1_5Signature.concatVerify(
         512,
-        signature,
+        &signature,
         &.{ content, body[0..hashed_end], &trailer },
         key.rsa,
         std.crypto.hash.sha2.Sha512,
@@ -1449,11 +1449,11 @@ fn customizeRootWithDebz(
         const resolved = try package_family.execute(allocator, io, .{}, packageFamilyRequest(
             .resolve_lock,
             profile,
-            package,
+            &.{package},
             absolute_resolve_root,
             absolute_dummy,
-            absolute_source_config,
-            absolute_keyring,
+            &.{absolute_source_config},
+            &.{absolute_keyring},
             absolute_cache,
             absolute_state,
             absolute_lock,
@@ -1487,11 +1487,11 @@ fn customizeRootWithDebz(
         const customized = try package_family.execute(allocator, io, .{}, packageFamilyRequest(
             .customize,
             profile,
-            package,
+            &.{package},
             absolute_stage,
             absolute_published,
-            absolute_source_config,
-            absolute_keyring,
+            &.{absolute_source_config},
+            &.{absolute_keyring},
             absolute_cache,
             absolute_state,
             absolute_lock,
@@ -2366,11 +2366,11 @@ test "package-family resolve and customize requests are exact-lock operations" {
     const amd64 = packageFamilyRequest(
         .resolve_lock,
         profileFor(.x86_64),
-        "linux-azure",
+        &.{"linux-azure"},
         "/root-stage",
         "/published",
-        "/inputs/ubuntu.sources",
-        "/inputs/ubuntu.gpg",
+        &.{"/inputs/ubuntu.sources"},
+        &.{"/inputs/ubuntu.gpg"},
         "/cache",
         "/state",
         "/state/linux-azure.lock",
@@ -2384,17 +2384,20 @@ test "package-family resolve and customize requests are exact-lock operations" {
         amd64.inputs.installed_baseline,
     );
     try std.testing.expectEqual(@as(usize, 0), amd64.inputs.source_paths.len);
+    try std.testing.expectEqualStrings("linux-azure", amd64.packages[0]);
     try std.testing.expectEqualStrings("/inputs/ubuntu.sources", amd64.inputs.config_paths[0]);
+    try std.testing.expectEqualStrings("/inputs/ubuntu.gpg", amd64.inputs.keyring_paths[0]);
+    try std.testing.expectEqual(@as(?u64, 30 * 60 * 1000), amd64.inputs.deadline_ms);
     try std.testing.expectEqualStrings("/state/linux-azure.lock", amd64.inputs.lock_output_path.?);
     try std.testing.expect(amd64.inputs.lock_input_path == null);
     const arm64 = packageFamilyRequest(
         .customize,
         profileFor(.aarch64),
-        "walinuxagent",
+        &.{"walinuxagent"},
         "/root-stage",
         "/published",
-        "/inputs/ubuntu.sources",
-        "/inputs/ubuntu.gpg",
+        &.{"/inputs/ubuntu.sources"},
+        &.{"/inputs/ubuntu.gpg"},
         "/cache",
         "/state",
         "/state/walinuxagent.lock",
@@ -2405,7 +2408,10 @@ test "package-family resolve and customize requests are exact-lock operations" {
         arm64.inputs.installed_baseline,
     );
     try std.testing.expectEqual(@as(usize, 0), arm64.inputs.source_paths.len);
+    try std.testing.expectEqualStrings("walinuxagent", arm64.packages[0]);
     try std.testing.expectEqualStrings("/inputs/ubuntu.sources", arm64.inputs.config_paths[0]);
+    try std.testing.expectEqualStrings("/inputs/ubuntu.gpg", arm64.inputs.keyring_paths[0]);
+    try std.testing.expectEqual(@as(?u64, 30 * 60 * 1000), arm64.inputs.deadline_ms);
     try std.testing.expectEqualStrings("/state/walinuxagent.lock", arm64.inputs.lock_input_path.?);
     try std.testing.expect(arm64.inputs.lock_output_path == null);
 }

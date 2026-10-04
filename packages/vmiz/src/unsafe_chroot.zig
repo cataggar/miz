@@ -4857,9 +4857,12 @@ test "no credential material reaches anything the run publishes" {
         .selinux = .relabel,
     };
 
-    const block = [_:null]?[*:0]const u8{
+    const variable_entry = try allocator.dupeSentinel(
+        u8,
         "VMIZ_TEST_SENTINEL=" ++ variable_material,
-    };
+        0,
+    );
+    const block = [_:null]?[*:0]const u8{variable_entry};
     var context = FakeExecutorContext{
         .allocator = allocator,
         .io = io,
@@ -4875,6 +4878,11 @@ test "no credential material reaches anything the run publishes" {
         .environ = .{ .block = .{ .slice = &block } },
     });
     try std.testing.expectEqual(RunOutcome.succeeded, result.outcome);
+    try std.testing.expect(std.mem.allEqual(
+        u8,
+        variable_entry["VMIZ_TEST_SENTINEL=".len..],
+        0,
+    ));
 
     // Not a vacuous absence: both secrets were read and both reached the file
     // tdnf is pointed at, which is the only place either is supposed to go.

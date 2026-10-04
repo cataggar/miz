@@ -547,7 +547,7 @@ fn waitpidFallback(
             var status: i32 = undefined;
             _ = std.os.linux.waitpid(pid, &status, 0);
             clearReapedChild(io, child);
-            return waitStatusTerm(status);
+            return waitStatusTerm(@bitCast(status));
         };
         if (remaining.raw.nanoseconds <= 0) return error.Timeout;
         var status: i32 = undefined;
@@ -556,7 +556,7 @@ fn waitpidFallback(
             .SUCCESS => {
                 if (result != 0) {
                     clearReapedChild(io, child);
-                    return waitStatusTerm(status);
+                    return waitStatusTerm(@bitCast(status));
                 }
             },
             .INTR => continue,
