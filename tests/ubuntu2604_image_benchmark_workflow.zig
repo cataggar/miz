@@ -232,7 +232,9 @@ test "the compiler is exact and extracted packages survive staging cleanup" {
     try expectContains(source, "test \"$(zig version)\" = 0.17.0");
     try expectExcludes(source, "cataggar/zig@v0.16.0");
     try std.testing.expectEqual(@as(usize, 2), count(source, "export ZIG_LOCAL_PKG_DIR=\"$ZIG_GLOBAL_CACHE_DIR/zig-pkg\""));
-    try expectContains(source, "bash scripts/zig_fetch_retry.sh --global-cache-dir \"$ZIG_GLOBAL_CACHE_DIR\"");
+    try expectContains(source, "export ZIG_GLOBAL_CACHE_DIR=\"$INPUT_ROOT/zig-global-cache\"");
+    try expectContains(source, "bash scripts/zig_fetch_retry.sh\n");
+    try expectExcludes(source, "--global-cache-dir");
     try expectExcludes(source, "ZIG_LOCAL_PKG_DIR=\"$STAGING_ROOT/");
 }
 

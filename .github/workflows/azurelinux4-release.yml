@@ -500,7 +500,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch=all --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build --fetch=all
           zig build install-azurelinux4-release -Doptimize=safe
           test -x "$AZURELINUX4_RELEASE"
 
@@ -510,8 +510,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch=all \
-            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build --fetch=all
           zig build -Doptimize=safe
           test -x zig-out/bin/miz
 
@@ -627,7 +626,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch=all --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build --fetch=all
           zig build install-azurelinux4-release -Doptimize=safe
           test -x "$AZURELINUX4_RELEASE"
 

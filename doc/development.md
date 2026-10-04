@@ -564,6 +564,11 @@ Release workflows explicitly keep it under their isolated global-cache tree,
 including when building an accepted-source checkout or running under sudo.
 The benchmark keeps it with its staged inputs, so deleting the staging
 compilation cache cannot delete packages needed by the offline measured runs.
+`zig build` no longer accepts `--global-cache-dir`; export
+`ZIG_GLOBAL_CACHE_DIR` instead. The benchmark's `--zig-global-cache` option
+sets that environment variable for its child builds. The retry helper retains
+its legacy `--global-cache-dir` option only by translating it to the environment;
+it never forwards the removed flag to Zig.
 
 Git and GitHub archive fetch hashes are not interchangeable, even for the
 same commit. Keep each immutable URL paired with its verified fetch hash and

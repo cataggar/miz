@@ -680,8 +680,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch=all \
-            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build --fetch=all
           zig build install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
 
@@ -761,8 +760,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch=all \
-            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build --fetch=all
           zig build \
             -Dubuntu2604-arch="$ARCHITECTURE" \
             -Dubuntu2604-flavor="$FLAVOR" \
@@ -949,8 +947,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch=all \
-            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build --fetch=all
           zig build -Doptimize=safe
           test -x zig-out/bin/miz
 
@@ -964,8 +961,7 @@ jobs:
             -O small \
             -static \
             tests/binder_probe.zig \
-            -femit-bin="$BINDER_PROBE" \
-            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+            -femit-bin="$BINDER_PROBE"
           test -x "$BINDER_PROBE"
 
       - name: Build the guest runtime contract probe
@@ -1102,8 +1098,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch=all \
-            --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
+          zig build --fetch=all
           zig build -Doptimize=safe install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
 
