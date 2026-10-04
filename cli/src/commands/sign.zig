@@ -281,7 +281,7 @@ fn acquireAzureAccessTokenAlloc(
         oidc_request_url,
     );
     defer allocator.free(audience_url);
-    const oidc_authorization = try std.fmt.allocPrint(
+    const oidc_authorization = try Allocator.print(
         allocator,
         "Bearer {s}",
         .{oidc_request_token},
@@ -309,7 +309,7 @@ fn acquireAzureAccessTokenAlloc(
     defer oidc.deinit();
     if (oidc.value.value.len == 0) return error.EmptyGithubOidcToken;
 
-    const token_url = try std.fmt.allocPrint(
+    const token_url = try Allocator.print(
         allocator,
         "https://login.microsoftonline.com/{s}/oauth2/v2.0/token",
         .{tenant_id},
@@ -710,7 +710,7 @@ fn artifactRequestAlloc(
     accept: []const u8,
     payload: ?[]u8,
 ) !ArtifactHttpResponse {
-    const authorization = try std.fmt.allocPrint(
+    const authorization = try Allocator.print(
         allocator,
         "Bearer {s}",
         .{access_token},
@@ -722,7 +722,7 @@ fn artifactRequestAlloc(
         .{ .name = "client-version", .value = "miz/1" },
         .{ .name = "Authorization", .value = authorization },
     };
-    // Zig 0.16 does not emit privileged_headers on the initial request.
+    // Zig 0.17 does not emit privileged_headers on the initial request.
     // Redirects are forbidden, so Authorization cannot cross origins here.
     var request = try client.request(method, uri, .{
         .redirect_behavior = .not_allowed,
@@ -809,7 +809,7 @@ fn artifactSigningUrlAlloc(
     config: ArtifactSigningConfig,
     suffix: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
+    return Allocator.print(
         allocator,
         "{s}/codesigningaccounts/{s}/certificateprofiles/{s}{s}?api-version={s}",
         .{
@@ -827,7 +827,7 @@ fn expectedArtifactSigningPollUrlAlloc(
     config: ArtifactSigningConfig,
     operation_id: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
+    return Allocator.print(
         allocator,
         "{s}/codesigningaccounts/{s}/certificateprofiles/{s}/sign/{s}?api-version={s}",
         .{
@@ -933,7 +933,7 @@ fn tokenHttpStatusError(
     request_kind: TokenHttpRequest,
     status: std.http.Status,
 ) anyerror {
-    const status_code = @intFromEnum(status);
+    const status_code = @backingInt(status);
     return switch (request_kind) {
         .github_oidc => switch (status_code) {
             400 => error.GithubOidcBadRequest,
@@ -964,7 +964,7 @@ fn appendOidcAudienceAlloc(
         '?'
     else
         '&';
-    return std.fmt.allocPrint(
+    return Allocator.print(
         allocator,
         "{s}{c}audience={s}",
         .{ request_url, separator, oidc_audience },
@@ -1430,6 +1430,7 @@ fn runMockArtifactSigningServerFallible(
     while (handled < mockArtifactSigningRequestCount(context.scenario)) : (handled += 1) {
         var request = try server.receiveHead();
         var accepts_identity = false;
+        var authorization_count: usize = 0;
         var request_headers = request.iterateHeaders();
         while (request_headers.next()) |header| {
             if (std.ascii.eqlIgnoreCase(header.name, "Accept-Encoding") and
@@ -1437,9 +1438,16 @@ fn runMockArtifactSigningServerFallible(
             {
                 accepts_identity = true;
             }
+            if (std.ascii.eqlIgnoreCase(header.name, "Authorization")) {
+                if (!std.mem.eql(u8, header.value, "Bearer test-token"))
+                    return error.UnexpectedMockArtifactSigningAuthorization;
+                authorization_count += 1;
+            }
         }
         if (!accepts_identity)
             return error.UnexpectedMockArtifactSigningEncoding;
+        if (authorization_count != 1)
+            return error.UnexpectedMockArtifactSigningAuthorization;
         if (handled == 0) {
             if (request.head.method != .POST)
                 return error.UnexpectedMockArtifactSigningRequest;
@@ -1491,7 +1499,7 @@ fn runMockArtifactSigningScenario(
     io: Io,
     scenario: MockArtifactSigningScenario,
 ) !ArtifactSigningResult {
-    const port: u16 = 28910 + @as(u16, @intFromEnum(scenario));
+    const port: u16 = 28910 + @as(u16, @backingInt(scenario));
     var listen_address: std.Io.net.IpAddress = .{
         .ip4 = .{
             .bytes = .{ 127, 0, 0, 1 },
@@ -1500,7 +1508,7 @@ fn runMockArtifactSigningScenario(
     };
     var listener = try listen_address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
-    const endpoint = try std.fmt.allocPrint(
+    const endpoint = try Allocator.print(
         allocator,
         "http://127.0.0.1:{d}",
         .{port},
@@ -1517,7 +1525,7 @@ fn runMockArtifactSigningScenario(
         "00000000-0000-4000-8000-000000000000",
     );
     defer allocator.free(poll_url);
-    const signature = [_]u8{0x5a} ** 256;
+    const signature: [256]u8 = @splat(0x5a);
     const signature_text = try allocator.alloc(
         u8,
         std.base64.standard.Encoder.calcSize(signature.len),
@@ -1556,7 +1564,7 @@ fn runMockArtifactSigningScenario(
         &client,
         config,
         "test-token",
-        [_]u8{0xa5} ** 32,
+        @splat(0xa5),
         .{ .max_attempts = 2, .sleep = false },
     ) catch |err| {
         thread.join();

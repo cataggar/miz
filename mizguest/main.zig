@@ -458,7 +458,7 @@ const Session = struct {
     fn loadModules(self: *Session, members: []const []const u8) !void {
         for (members) |member| {
             if (!control_mod.validModuleMember(member)) return error.InvalidModuleMember;
-            const path = try self.allocator.dupeZ(u8, member);
+            const path = try self.allocator.dupeSentinel(u8, member, 0);
             defer self.allocator.free(path);
 
             const fd_rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
@@ -479,7 +479,7 @@ const Session = struct {
     fn mountTarget(self: *Session, device: []const u8, filesystem: control_mod.RootFilesystemKind) !void {
         try mkdirPath("/mnt");
         try mkdirPath(guest_root);
-        const device_z = try self.allocator.dupeZ(u8, device);
+        const device_z = try self.allocator.dupeSentinel(u8, device, 0);
         // Block-device probing finishes on a kernel workqueue that can outlast
         // the jump to `rdinit`, so the node may not exist yet even though the
         // driver is built in and the disk is present.
@@ -661,7 +661,7 @@ const Session = struct {
             if (!control_mod.knownKernelModuleConfigPath(file.path)) {
                 return error.UnknownTargetFile;
             }
-            const path = try std.fmt.allocPrint(
+            const path = try Allocator.print(
                 self.allocator,
                 guest_root ++ "/{s}",
                 .{file.path},
@@ -902,7 +902,7 @@ const Session = struct {
     }
 
     fn guestFileExists(self: *Session, guest_path: []const u8) bool {
-        const host_path = std.fmt.allocPrintSentinel(
+        const host_path = Allocator.printSentinel(
             self.allocator,
             guest_root ++ "{s}",
             .{guest_path},
@@ -912,7 +912,7 @@ const Session = struct {
     }
 
     fn guestDirectoryExists(self: *Session, guest_path: []const u8) bool {
-        const host_path = std.fmt.allocPrintSentinel(
+        const host_path = Allocator.printSentinel(
             self.allocator,
             guest_root ++ "{s}",
             .{guest_path},
@@ -922,7 +922,7 @@ const Session = struct {
     }
 
     fn readGuestFile(self: *Session, guest_path: []const u8, limit: usize) ![]u8 {
-        const host_path = try std.fmt.allocPrint(
+        const host_path = try Allocator.print(
             self.allocator,
             guest_root ++ "{s}",
             .{guest_path},
@@ -990,7 +990,7 @@ const Session = struct {
     /// bounding only the hook would state a guarantee this backend does not
     /// have. #312 covers the whole execution.
     fn runHook(self: *Session, hook: control_mod.Hook, index: usize) !void {
-        const guest_path = try std.fmt.allocPrint(
+        const guest_path = try Allocator.print(
             self.allocator,
             "/run/miz-hook-{d}",
             .{index},
@@ -1087,7 +1087,7 @@ const Session = struct {
         bytes: []const u8,
         mode: linux.mode_t,
     ) !void {
-        const host_path = try std.fmt.allocPrint(
+        const host_path = try Allocator.print(
             self.allocator,
             guest_root ++ "{s}",
             .{guest_path},
@@ -1106,12 +1106,12 @@ const Session = struct {
         guest_path: []const u8,
         bytes: []const u8,
     ) !void {
-        const host_path = try std.fmt.allocPrint(
+        const host_path = try Allocator.print(
             self.allocator,
             guest_root ++ "{s}",
             .{guest_path},
         );
-        const path_z = try self.allocator.dupeZ(u8, host_path);
+        const path_z = try self.allocator.dupeSentinel(u8, host_path, 0);
         const fd_raw = linux.open(
             path_z,
             .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true },
@@ -1124,7 +1124,7 @@ const Session = struct {
     }
 
     fn deleteGuestFile(self: *Session, guest_path: []const u8) void {
-        const host_path = std.fmt.allocPrintSentinel(
+        const host_path = Allocator.printSentinel(
             self.allocator,
             guest_root ++ "{s}",
             .{guest_path},
@@ -1163,7 +1163,7 @@ const Session = struct {
                 self.allocator,
                 repository.id,
             ) catch continue;
-            const path = std.fmt.allocPrintSentinel(
+            const path = Allocator.printSentinel(
                 self.allocator,
                 guest_root ++ "{s}",
                 .{guest_path},
@@ -1223,7 +1223,7 @@ fn discoverKernels(
     modules_path: []const u8,
     skipped: *std.array_list.Managed(control_mod.SkippedKernel),
 ) ![]const []const u8 {
-    const modules_z = try allocator.dupeZ(u8, modules_path);
+    const modules_z = try allocator.dupeSentinel(u8, modules_path, 0);
     defer allocator.free(modules_z);
     const fd_raw = linux.open(modules_z, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
     switch (linux.errno(fd_raw)) {
@@ -1307,7 +1307,7 @@ fn discoverKernels(
 // have regenerated.
 fn hasDepmodOutput(allocator: Allocator, modules_path: []const u8, release: []const u8) !bool {
     for (initramfs_mod.module_dependency_markers) |marker| {
-        const path = try std.fmt.allocPrintSentinel(
+        const path = try Allocator.printSentinel(
             allocator,
             "{s}/{s}/{s}",
             .{ modules_path, release, marker },
@@ -1353,7 +1353,7 @@ const Captured = struct {
 fn runInChroot(allocator: Allocator, argv: []const []const u8) !Captured {
     const argv_z = try allocator.allocSentinel(?[*:0]const u8, argv.len, null);
     for (argv, 0..) |argument, index| {
-        argv_z[index] = (try allocator.dupeZ(u8, argument)).ptr;
+        argv_z[index] = (try allocator.dupeSentinel(u8, argument, 0)).ptr;
     }
     const envp = [_:null]?[*:0]const u8{
         "HOME=/root",
@@ -1404,17 +1404,18 @@ fn runInChroot(allocator: Allocator, argv: []const []const u8) !Captured {
     }
     _ = linux.close(fds[0]);
 
-    var status: u32 = 0;
+    var status: i32 = 0;
     while (true) {
         const rc = linux.wait4(pid, &status, 0, null);
         if (linux.errno(rc) != .INTR) break;
     }
-    const exit_code: u8 = if (linux.W.IFEXITED(status))
-        linux.W.EXITSTATUS(status)
+    const status_bits: u32 = @bitCast(status);
+    const exit_code: u8 = if (linux.W.IFEXITED(status_bits))
+        linux.W.EXITSTATUS(status_bits)
     else
         // A signalled command has no exit status of its own; 128+n is the shell
         // convention and keeps the field meaningful rather than merely nonzero.
-        @truncate(128 +% @intFromEnum(linux.W.TERMSIG(status)));
+        @truncate(128 +% @backingInt(linux.W.TERMSIG(status_bits)));
     return .{ .exit_code = exit_code, .output = output.items };
 }
 
@@ -1452,8 +1453,11 @@ const rtf_up: u16 = 0x0001;
 const rtf_gateway: u16 = 0x0002;
 
 fn sockaddrIn(address: [4]u8) linux.sockaddr {
-    const in: linux.sockaddr.in = .{ .port = 0, .addr = @bitCast(address) };
-    return @bitCast(in);
+    // sockaddr's data starts with the network-order port and IPv4 octets.
+    // Copy octets directly: array bitCast uses logical, not native-memory order.
+    var result: linux.sockaddr = .{ .family = linux.AF.INET, .data = @splat(0) };
+    @memcpy(result.data[2..6], &address);
+    return result;
 }
 
 fn interfaceUp(socket: i32, name: []const u8) void {
@@ -1480,7 +1484,7 @@ fn addDefaultRoute(
     gateway: []const u8,
 ) !void {
     const address = control_mod.parseIpv4(gateway) orelse return error.InvalidGateway;
-    const interface_z = try allocator.dupeZ(u8, interface);
+    const interface_z = try allocator.dupeSentinel(u8, interface, 0);
     var route: rtentry = .{
         .rt_dst = sockaddrIn(.{ 0, 0, 0, 0 }),
         .rt_genmask = sockaddrIn(.{ 0, 0, 0, 0 }),
@@ -1511,7 +1515,7 @@ fn publish(allocator: Allocator, device: []const u8, result: control_mod.Result)
 }
 
 fn writeDevice(allocator: Allocator, device: []const u8, bytes: []const u8) void {
-    const device_z = allocator.dupeZ(u8, device) catch return;
+    const device_z = allocator.dupeSentinel(u8, device, 0) catch return;
     const fd_raw = linux.open(device_z, .{ .ACCMODE = .WRONLY }, 0);
     if (linux.errno(fd_raw) != .SUCCESS) {
         log("[miz-guest] result device could not be opened\n");
@@ -1584,7 +1588,7 @@ fn mkdirPath(path: [*:0]const u8) !void {
 /// Sets a file's mode outright, which a truncating open does not do for a
 /// file that already exists.
 fn setMode(allocator: Allocator, path: []const u8, mode: linux.mode_t) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     const err = linux.errno(linux.chmod(path_z, mode));
     if (err != .SUCCESS) return error.ChmodFailed;
@@ -1596,7 +1600,7 @@ fn setMode(allocator: Allocator, path: []const u8, mode: linux.mode_t) !void {
 fn mkdirParents(allocator: Allocator, path: []const u8) !void {
     var index: usize = 0;
     while (std.mem.indexOfScalarPos(u8, path, index + 1, '/')) |separator| {
-        const directory = try allocator.dupeZ(u8, path[0..separator]);
+        const directory = try allocator.dupeSentinel(u8, path[0..separator], 0);
         defer allocator.free(directory);
         try mkdirPath(directory);
         index = separator;
@@ -1661,7 +1665,7 @@ fn sleepMilliseconds(milliseconds: u32) void {
 /// agent's arena is never reset, so abandoned is not the same as gone. One
 /// allocation read into directly is one thing to scrub.
 fn readDeviceAlloc(allocator: Allocator, device: []const u8, size: u64) ![]u8 {
-    const device_z = try allocator.dupeZ(u8, device);
+    const device_z = try allocator.dupeSentinel(u8, device, 0);
     defer allocator.free(device_z);
     const fd_raw = linux.open(device_z, .{ .ACCMODE = .RDONLY }, 0);
     switch (linux.errno(fd_raw)) {
@@ -1700,7 +1704,7 @@ fn readDeviceAlloc(allocator: Allocator, device: []const u8, size: u64) ![]u8 {
 /// Streamed rather than read whole: an initramfs is tens of megabytes and this
 /// runs in a guest sized for the transaction, not for a copy of its output.
 fn measureGuestFile(allocator: Allocator, guest_path: []const u8) !MeasuredFile {
-    const host_path = try std.fmt.allocPrintSentinel(
+    const host_path = try Allocator.printSentinel(
         allocator,
         guest_root ++ "{s}",
         .{guest_path},
@@ -1747,7 +1751,7 @@ const MeasuredFile = struct {
 };
 
 fn readFileAlloc(allocator: Allocator, path: []const u8, limit: usize) ![]u8 {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     const fd_raw = linux.open(path_z, .{ .ACCMODE = .RDONLY }, 0);
     switch (linux.errno(fd_raw)) {
         .SUCCESS => {},
@@ -1859,7 +1863,7 @@ fn pathExistsNoFollow(path: [*:0]const u8) bool {
 /// Creates a file that must not already exist. `EXCL` refuses a symlink at the
 /// path outright, so this cannot write through one into somewhere else.
 fn writeNewFileBytes(allocator: Allocator, path: []const u8, bytes: []const u8) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     const fd_raw = linux.open(
         path_z,
         .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true },
@@ -1877,7 +1881,7 @@ fn writeFileBytes(
     bytes: []const u8,
     mode: linux.mode_t,
 ) !void {
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     const fd_raw = linux.open(
         path_z,
         .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
@@ -1898,6 +1902,19 @@ fn writeAll(fd: i32, bytes: []const u8) !void {
         if (count == 0) return error.WriteFailed;
         written += count;
     }
+}
+
+test "IPv4 socket addresses preserve Linux ABI bytes without structural bit casts" {
+    const address = sockaddrIn(.{ 192, 0, 2, 1 });
+    var expected: [16]u8 = .{ 0, 0, 0, 0, 192, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0 };
+    std.mem.writeInt(u16, expected[0..2], linux.AF.INET, @import("builtin").target.cpu.arch.endian());
+    try std.testing.expectEqualSlices(u8, &expected, std.mem.asBytes(&address));
+
+    const in: linux.sockaddr.in = .{
+        .port = 0,
+        .addr = std.mem.nativeToBig(u32, 0xc0000201),
+    };
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&in), std.mem.asBytes(&address));
 }
 
 test "the generated repository file enables exactly the declared repository" {

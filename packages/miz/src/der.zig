@@ -1,6 +1,6 @@
 //! Bounds-checked DER parsing.
 //!
-//! Zig 0.16's `std.crypto.Certificate` parses DER without bounds checking:
+//! Zig 0.17's `std.crypto.Certificate` still parses DER without bounds checking:
 //! `der.Element.parse` indexes the identifier and length octets and computes
 //! `slice.end` without ever comparing them against `bytes.len`, and
 //! `Certificate.parse` then walks siblings at offsets such as
@@ -115,8 +115,9 @@ pub const CertificateParseError = ParseError ||
 
 /// Bounds-checked replacement for `Certificate.parse`.
 ///
-/// A faithful copy of `std.crypto.Certificate.parse` (Zig 0.16) with two
-/// changes: every `der.Element.parse` becomes `parseElement`, and the local
+/// A faithful copy of `std.crypto.Certificate.parse` (Zig 0.16, rechecked
+/// against Zig 0.17) with two changes: every `der.Element.parse` becomes
+/// `parseElement`, and the local
 /// `parseBitString` below rejects an empty BIT STRING instead of indexing past
 /// the end of the buffer. Every other helper is the `pub` standard-library one,
 /// which is safe to reuse once its element argument is bounds-checked.
