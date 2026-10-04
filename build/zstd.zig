@@ -3,10 +3,8 @@ const std = @import("std");
 pub fn addHeaders(module: *std.Build.Module, dependency: *std.Build.Dependency) void {
     const b = module.owner;
     const Translator = @import("translate_c").Translator;
-    const translator = Translator.init(b.dependency("translate_c", .{
-        .target = b.graph.host,
-        .optimize = .safe,
-    }), .{
+    // Share the helper modules from the package instance used by debz and rpmz.
+    const translator = Translator.init(b.dependency("translate_c", .{}), .{
         .name = "zstd",
         .c_source_file = b.path("build/zstd.h"),
         .target = module.resolved_target.?,
