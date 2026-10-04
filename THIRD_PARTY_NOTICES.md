@@ -92,3 +92,19 @@ debz links its statically configured Debian-semantics libsolv dependency and
 system libc, liblzma, and libzstd through its Zig package build conventions.
 See debz's notices for the corresponding BSD-3-Clause and 0BSD terms:
 https://github.com/cataggar/debz/blob/beac3f20dd93fd98863af71e8fe621d47db663f6/THIRD_PARTY_NOTICES
+
+## zerde (transitive dependency)
+
+The zlua transitive package graph uses `cataggar/zerde` at immutable commit
+`48d215aab4d351c199dd4f164c2926f433c7f296`. It is not a direct root dependency.
+
+Package URL:
+`git+https://github.com/cataggar/zerde#48d215aab4d351c199dd4f164c2926f433c7f296`
+
+Zig package hash:
+`zerde-0.3.1-r7zGa1fnDABoOl0E1S4iXOE4C-sBPoqG7kkJYszzvRiB`
+
+Copyright (c) 2026 Grant Wade.
+
+Licensed under the MIT License. See:
+https://github.com/cataggar/zerde/blob/48d215aab4d351c199dd4f164c2926f433c7f296/LICENSE
