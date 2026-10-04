@@ -94,10 +94,7 @@ pub const Phase = enum {
     }
 
     pub fn parse(text: []const u8) ?Phase {
-        inline for (@typeInfo(Phase).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @fromBackingInt(@intCast(field.value));
-        }
-        return null;
+        return std.meta.stringToEnum(Phase, text);
     }
 };
 
@@ -430,10 +427,7 @@ pub const PathKind = enum {
     }
 
     pub fn parse(text: []const u8) ?PathKind {
-        inline for (@typeInfo(PathKind).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @fromBackingInt(@intCast(field.value));
-        }
-        return null;
+        return std.meta.stringToEnum(PathKind, text);
     }
 
     fn accepts(self: PathKind, observed: std.Io.File.Kind) bool {
@@ -477,10 +471,7 @@ pub const UnownedCategory = enum {
     }
 
     pub fn parse(text: []const u8) ?UnownedCategory {
-        inline for (@typeInfo(UnownedCategory).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @fromBackingInt(@intCast(field.value));
-        }
-        return null;
+        return std.meta.stringToEnum(UnownedCategory, text);
     }
 };
 
@@ -500,10 +491,7 @@ pub const UnownedSource = enum {
     }
 
     pub fn parse(text: []const u8) ?UnownedSource {
-        inline for (@typeInfo(UnownedSource).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @fromBackingInt(@intCast(field.value));
-        }
-        return null;
+        return std.meta.stringToEnum(UnownedSource, text);
     }
 };
 
@@ -875,10 +863,7 @@ pub const ContentDisposition = enum {
     }
 
     pub fn parse(text: []const u8) ?ContentDisposition {
-        inline for (@typeInfo(ContentDisposition).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @fromBackingInt(@intCast(field.value));
-        }
-        return null;
+        return std.meta.stringToEnum(ContentDisposition, text);
     }
 };
 

@@ -1213,7 +1213,7 @@ fn verifyPkcs1Sha256(
             @memcpy(&buffer, signature[0..candidate]);
             rsa.PKCS1v1_5Signature.concatVerify(
                 candidate,
-                buffer,
+                &buffer,
                 &.{ &set_tag, signed_attributes_after_tag },
                 public_key,
                 Sha256,

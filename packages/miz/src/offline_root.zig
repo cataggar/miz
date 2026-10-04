@@ -727,7 +727,7 @@ fn superviseGuest(guest_pid: i32, timeout_ms: u64, kill_grace_ms: u64) u8 {
                 .SUCCESS => {
                     if (rc == 0) break;
                     if (@as(i32, @intCast(rc)) == guest_pid) {
-                        guest_status = status;
+                        guest_status = @bitCast(status);
                         guest_reaped = true;
                     }
                 },
@@ -896,7 +896,7 @@ fn waitpidFallback(io: Io, pid: i32, deadline: Io.Timeout) !std.process.Child.Te
         const result = linux.waitpid(pid, &status, linux.W.NOHANG);
         switch (linux.errno(result)) {
             .SUCCESS => {
-                if (result != 0) return waitStatusTerm(status);
+                if (result != 0) return waitStatusTerm(@bitCast(status));
             },
             .INTR => continue,
             else => return error.WaitpidFailed,
@@ -916,7 +916,7 @@ fn reapTerm(pid: i32) std.process.Child.Term {
         if (linux.errno(rc) == .INTR) continue;
         break;
     }
-    return waitStatusTerm(status);
+    return waitStatusTerm(@bitCast(status));
 }
 
 fn waitStatusTerm(status: u32) std.process.Child.Term {

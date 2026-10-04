@@ -3346,7 +3346,7 @@ pub fn benchmarkCommand(
     try command.appendSlice(allocator, &.{
         args.zig,
         "build",
-        "-Doptimize=ReleaseSafe",
+        "-Doptimize=safe",
         "-Dubuntu2604-arch=aarch64",
         "-Dubuntu2604-flavor=baremetal",
         "generalized-ubuntu2604",
@@ -3631,7 +3631,7 @@ fn preflight(
     try runLogged(io, &.{
         args.zig,
         "build",
-        "-Doptimize=ReleaseSafe",
+        "-Doptimize=safe",
         "-Dubuntu2604-arch=aarch64",
         "-Dubuntu2604-flavor=baremetal",
         "install-miz",

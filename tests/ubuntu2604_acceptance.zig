@@ -5058,9 +5058,7 @@ test "rejected cloud-init status documents are reported trimmed and bounded" {
 }
 
 test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    errdefer |err| {
+    finalizedQcow2Acceptance() catch |err| {
         std.debug.print(
             "Ubuntu 26.04 same-architecture QEMU acceptance failed: {s}\n",
             .{@errorName(err)},
@@ -5068,7 +5066,13 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         if (@errorReturnTrace()) |trace| {
             std.debug.dumpErrorReturnTrace(trace);
         }
-    }
+        return err;
+    };
+}
+
+fn finalizedQcow2Acceptance() !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
     const candidate = try selectedCandidate();
 
     const image_path = try requireImageAlloc(allocator, io, candidate);

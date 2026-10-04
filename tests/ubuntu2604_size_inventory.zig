@@ -1615,11 +1615,11 @@ test "the full flavor keeps its broad rules and its own policy" {
     }
 }
 
-fn repeatedBytes(comptime pattern: []const u8, comptime count: usize) *const [pattern.len * count:0]u8 {
+fn repeatedBytes(comptime pattern: []const u8, comptime repetitions: usize) *const [pattern.len * repetitions:0]u8 {
     return comptime blk: {
-        @setEvalBranchQuota(1000 + count * 2);
-        var bytes: [pattern.len * count:0]u8 = undefined;
-        for (0..count) |i| {
+        @setEvalBranchQuota(1000 + repetitions * 2);
+        var bytes: [pattern.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| {
             @memcpy(bytes[i * pattern.len ..][0..pattern.len], pattern);
         }
         bytes[bytes.len] = 0;

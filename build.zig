@@ -248,7 +248,43 @@ fn addUbuntu2604BinderProbe(
     });
 }
 
+const EnvironmentToolPath = struct {
+    name: []const u8,
+    path: std.Build.LazyPath,
+};
+
+fn addEnvironmentTest(
+    b: *std.Build,
+    helper: *std.Build.Step.Compile,
+    executable: *std.Build.Step.Compile,
+    paths: []const EnvironmentToolPath,
+) *std.Build.Step.Run {
+    const run = b.addRunArtifact(executable);
+    const argv = run.argv.toOwnedSlice(b.allocator) catch @panic("OOM");
+    run.addArtifactArg(helper);
+    for (paths) |entry| {
+        run.addArg(entry.name);
+        run.addFileArg(entry.path);
+    }
+    run.addArg("--");
+    run.argv.appendSlice(b.allocator, argv) catch @panic("OOM");
+    return run;
+}
+
 pub fn build(b: *std.Build) void {
+    const source_root = b.root.root_dir.handle.realPathFileAlloc(
+        b.graph.io,
+        if (b.root.sub_path.len == 0) "." else b.root.sub_path,
+        b.allocator,
+    ) catch |err| std.debug.panic("resolve miz source root: {s}", .{@errorName(err)});
+    const environment_test_helper = b.addExecutable(.{
+        .name = "miz-test-environment",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build/test_environment.zig"),
+            .target = b.graph.host,
+            .optimize = .safe,
+        }),
+    });
     const target = b.standardTargetOptions(.{});
     // `std.Build.standardOptimizeOption` with no explicit flag, except the
     // fallback is ReleaseSafe rather than Debug. What this repository builds
@@ -256,7 +292,7 @@ pub fn build(b: *std.Build) void {
     // and QCOW2 writes -- and Debug makes that an order of magnitude slower:
     // a bare-metal aarch64 Ubuntu image takes about 36 minutes at Debug
     // against about 6 optimized, on one machine with one warm package cache.
-    // Every release workflow already passes `-Doptimize=ReleaseSafe`, so the
+    // Every release workflow already passes `-Doptimize=safe`, so the
     // Debug default only ever applied to invocations that had no reason to
     // want it, including `zig build generalized-ubuntu2604`. Safety checks
     // stay on: this parses archives it did not write and produces filesystem
@@ -1069,7 +1105,7 @@ pub fn build(b: *std.Build) void {
     run_azurelinux4_contract_tests.has_side_effects = true;
     run_azurelinux4_contract_tests.setEnvironmentVariable(
         "MIZ_AZURELINUX4_CONTRACT_ROOT",
-        b.build_root.path orelse ".",
+        source_root,
     );
     const azurelinux4_release_test_step = b.step(
         "test-azurelinux4-release",
@@ -1146,7 +1182,7 @@ pub fn build(b: *std.Build) void {
     run_ubuntu2604_image_benchmark_workflow_tests.has_side_effects = true;
     run_ubuntu2604_image_benchmark_workflow_tests.setEnvironmentVariable(
         "MIZ_REPOSITORY_ROOT",
-        b.build_root.path orelse ".",
+        source_root,
     );
     const ubuntu2604_image_benchmark_workflow_test_step = b.step(
         "test-ubuntu2604-image-benchmark-workflow",
@@ -1239,7 +1275,7 @@ pub fn build(b: *std.Build) void {
     run_freebsd15_contract_tests.has_side_effects = true;
     run_freebsd15_contract_tests.setEnvironmentVariable(
         "MIZ_FREEBSD15_ROOT",
-        b.build_root.path orelse ".",
+        source_root,
     );
     const freebsd15_contract_test_step = b.step(
         "test-freebsd15-release-contract",
@@ -1258,26 +1294,32 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_freebsd15_acceptance_tests = b.addRunArtifact(freebsd15_acceptance_tests);
+    const run_freebsd15_acceptance_tests = addEnvironmentTest(
+        b,
+        environment_test_helper,
+        freebsd15_acceptance_tests,
+        &.{
+            .{
+                .name = "MIZ_FREEBSD15_AZURE_METADATA_TOOL",
+                .path = .{ .relative = .{ .base = .install_bin, .sub_path = "freebsd15_azure_metadata" } },
+            },
+            .{
+                .name = "MIZ_FREEBSD15_RELEASE_TOOL",
+                .path = .{ .relative = .{ .base = .install_bin, .sub_path = "freebsd15_release" } },
+            },
+            .{
+                .name = "MIZ_AZURE_VHD_TOOL",
+                .path = .{ .relative = .{ .base = .install_bin, .sub_path = "azure_vhd" } },
+            },
+        },
+    );
     run_freebsd15_acceptance_tests.has_side_effects = true;
     run_freebsd15_acceptance_tests.setEnvironmentVariable(
         "MIZ_FREEBSD15_ROOT",
-        b.build_root.path orelse ".",
+        source_root,
     );
     // The harness tests drive the real tools the shell calls, so the binaries
     // have to exist before they run.
-    run_freebsd15_acceptance_tests.setEnvironmentVariable(
-        "MIZ_FREEBSD15_AZURE_METADATA_TOOL",
-        b.getInstallPath(.bin, "freebsd15_azure_metadata"),
-    );
-    run_freebsd15_acceptance_tests.setEnvironmentVariable(
-        "MIZ_FREEBSD15_RELEASE_TOOL",
-        b.getInstallPath(.bin, "freebsd15_release"),
-    );
-    run_freebsd15_acceptance_tests.setEnvironmentVariable(
-        "MIZ_AZURE_VHD_TOOL",
-        b.getInstallPath(.bin, "azure_vhd"),
-    );
     run_freebsd15_acceptance_tests.step.dependOn(
         &b.addInstallArtifact(freebsd15_azure_metadata_exe, .{}).step,
     );
@@ -1546,19 +1588,23 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        const run_guard = b.addRunArtifact(guard_tests);
+        const run_guard = addEnvironmentTest(
+            b,
+            environment_test_helper,
+            guard_tests,
+            &.{.{
+                .name = "MIZ_UBUNTU2604_RELEASE_TOOL",
+                .path = .{ .relative = .{ .base = .install_bin, .sub_path = "ubuntu2604_release" } },
+            }},
+        );
         run_guard.has_side_effects = true;
         run_guard.setEnvironmentVariable(
             "MIZ_UBUNTU2604_SOURCE_ROOT",
-            b.build_root.path orelse ".",
+            source_root,
         );
         // The harness guards run the real release tool the shell calls, so
         // the installed artifact is a declared dependency rather than
         // something a previous `zig build` is assumed to have left behind.
-        run_guard.setEnvironmentVariable(
-            "MIZ_UBUNTU2604_RELEASE_TOOL",
-            b.getInstallPath(.bin, "ubuntu2604_release"),
-        );
         run_guard.step.dependOn(&install_ubuntu2604_release.step);
         run_ubuntu2604_guards[guard_index] = run_guard;
         ubuntu2604_guard_step.dependOn(&run_guard.step);
@@ -1590,7 +1636,7 @@ pub fn build(b: *std.Build) void {
     // brand guard.
     run_python_inventory_tests.setEnvironmentVariable(
         "MIZ_PYTHON_INVENTORY_ROOT",
-        b.build_root.path orelse ".",
+        source_root,
     );
     const python_inventory_step = b.step(
         "test-python-inventory",
@@ -1841,7 +1887,7 @@ pub fn build(b: *std.Build) void {
     // directory the test binary happens to be started in.
     run_stale_brand_tests.setEnvironmentVariable(
         "MIZ_STALE_BRAND_ROOT",
-        b.build_root.path orelse ".",
+        source_root,
     );
     const stale_brand_test_step = b.step(
         "test-stale-brand",
@@ -1866,6 +1912,7 @@ pub fn build(b: *std.Build) void {
     const build_api_consumer_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
+        "-j2",
         "package-family",
     });
     build_api_consumer_check.setName("check external build.zig consumer");
@@ -1874,6 +1921,7 @@ pub fn build(b: *std.Build) void {
     const package_family_consumer_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
+        "-j2",
         "check",
     });
     package_family_consumer_check.setName(
@@ -1886,6 +1934,7 @@ pub fn build(b: *std.Build) void {
     const build_api_diagnostics_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
+        "-j2",
         "diagnostics",
     });
     build_api_diagnostics_check.setName("check external build.zig diagnostics");
@@ -1894,6 +1943,7 @@ pub fn build(b: *std.Build) void {
     const build_api_execution_diagnostics_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
+        "-j2",
         "execution-diagnostics",
     });
     build_api_execution_diagnostics_check.setName("check external build.zig execution diagnostics");
@@ -1902,6 +1952,7 @@ pub fn build(b: *std.Build) void {
     const build_api_preserved_diagnostics_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
+        "-j2",
         "preserved-diagnostics",
     });
     build_api_preserved_diagnostics_check.setName(
@@ -1912,6 +1963,7 @@ pub fn build(b: *std.Build) void {
     const build_api_preserved_vm_diagnostics_check = b.addSystemCommand(&.{
         b.graph.zig_exe,
         "build",
+        "-j2",
         "preserved-vm-diagnostics",
     });
     build_api_preserved_vm_diagnostics_check.setName(

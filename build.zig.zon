@@ -22,8 +22,8 @@
             .hash = "debz-0.3.0-Mmw8sPaHJwCeDhWgL8Cv19D1betvEzquRmIaO9t6gL3K",
         },
         .rpmz = .{
-            .url = "git+https://github.com/cataggar/rpmz#15b5e1291a9fc3eb3980a4088d757b9d0254d468",
-            .hash = "rpmz-0.1.0-5KEwN2CRkQA-qHdelei8dHxBU3le6kPBVZt10YEqN1Ov",
+            .url = "git+https://github.com/cataggar/rpmz#c9b23a2103b9682434ab663841d00cd657647561",
+            .hash = "rpmz-0.1.0-5KEwN846kgBJRYGnEK_CMamIT-5AmavY-bJ07aA5Sg-Z",
         },
         .zstd = .{
             .url = "git+https://github.com/cataggar/zstd#71502da18ccdacac0c2049c033dedbbf25a40b93",

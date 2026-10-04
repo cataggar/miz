@@ -122,6 +122,14 @@ pub const Recorder = struct {
         return record.phase;
     }
 
+    /// Names unwind failures after the enclosing caller catches their error.
+    pub fn recordFailure(self: *Recorder, err: anyerror) void {
+        for (self.records[0..self.record_count]) |*record| {
+            if (record.outcome == .failure and record.error_name == null)
+                record.error_name = @errorName(err);
+        }
+    }
+
     /// Atomically replaces the requested timing file. Every serialization,
     /// write, and rename error is returned to the caller.
     pub fn write(self: *const Recorder, status: Status) !void {
@@ -294,14 +302,14 @@ test "failure is recorded and timing output errors propagate" {
         fn run(timing: *Recorder) !void {
             var aggregate = timing.begin(.debz_aggregate, null);
             defer aggregate.end();
-            errdefer |err| aggregate.fail(@errorName(err));
             var transaction = timing.begin(.debz_transaction, "linux-azure");
             defer transaction.end();
-            errdefer |err| transaction.fail(@errorName(err));
             return error.DebzFailed;
         }
     };
-    try std.testing.expectError(error.DebzFailed, FailureHarness.run(&recorder));
+    const result = FailureHarness.run(&recorder);
+    if (result) |_| {} else |err| recorder.recordFailure(err);
+    try std.testing.expectError(error.DebzFailed, result);
     try recorder.write(.failure);
     const json = try Dir.cwd().readFileAlloc(
         io,
@@ -340,4 +348,23 @@ test "failure is recorded and timing output errors propagate" {
         .error_name = "BuildFailed",
     });
     try std.testing.expectError(error.FileNotFound, unwritable.write(.failure));
+}
+
+test "caught failures retain previously named causes and nested phase order" {
+    var recorder = Recorder.init(std.testing.allocator, std.testing.io, "unused.json");
+    var transaction = recorder.begin(.debz_transaction, "linux-azure");
+    transaction.fail("SignatureRejected");
+    var aggregate = recorder.begin(.debz_aggregate, null);
+    aggregate.end();
+    recorder.recordFailure(error.PackageFailed);
+
+    const json = try recorder.serializeAlloc(.failure);
+    defer std.testing.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("debz_transaction", parsed.value.object.get("failed_phase").?.string);
+    try std.testing.expectEqualStrings("linux-azure", parsed.value.object.get("failed_item").?.string);
+    try std.testing.expectEqualStrings("SignatureRejected", parsed.value.object.get("error_name").?.string);
+    const phases = parsed.value.object.get("phases").?.array.items;
+    try std.testing.expectEqualStrings("PackageFailed", phases[1].object.get("error_name").?.string);
 }

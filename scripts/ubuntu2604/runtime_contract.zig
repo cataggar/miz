@@ -1120,8 +1120,8 @@ pub const Status = enum {
     }
 
     pub fn parse(text: []const u8) ?Status {
-        inline for (@typeInfo(Status).@"enum".fields) |info| {
-            const candidate: Status = @fromBackingInt(@intCast(info.value));
+        inline for (@typeInfo(Status).@"enum".field_values) |field_value| {
+            const candidate: Status = @fromBackingInt(@intCast(field_value));
             if (std.mem.eql(u8, text, candidate.key())) return candidate;
         }
         return null;
@@ -1289,8 +1289,8 @@ pub const EfivarStatus = enum {
     }
 
     pub fn parse(text: []const u8) ?EfivarStatus {
-        inline for (@typeInfo(EfivarStatus).@"enum".fields) |info| {
-            const candidate: EfivarStatus = @fromBackingInt(@intCast(info.value));
+        inline for (@typeInfo(EfivarStatus).@"enum".field_values) |field_value| {
+            const candidate: EfivarStatus = @fromBackingInt(@intCast(field_value));
             if (std.mem.eql(u8, text, candidate.key())) return candidate;
         }
         return null;
@@ -1569,8 +1569,8 @@ test "requirements are sorted, unique, and fully attributed" {
 }
 
 test "every behavior named by issue 677 has at least one guest requirement" {
-    inline for (@typeInfo(Behavior).@"enum".fields) |field_info| {
-        const behavior: Behavior = @fromBackingInt(@intCast(field_info.value));
+    inline for (@typeInfo(Behavior).@"enum".field_values) |field_value| {
+        const behavior: Behavior = @fromBackingInt(@intCast(field_value));
         var found = false;
         for (core_requirements) |entry| {
             if (entry.behavior == behavior and entry.required()) found = true;

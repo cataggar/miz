@@ -459,7 +459,7 @@ const SparseExtent = struct {
 const linux_seek_data = 3;
 const linux_seek_hole = 4;
 
-fn linuxSparseSeek(file: Io.File, offset: u64, whence: usize) Error!?u64 {
+fn linuxSparseSeek(file: Io.File, offset: u64, whence: u32) Error!?u64 {
     if (comptime builtin.os.tag != .linux or @sizeOf(usize) != 8) {
         return error.SparseExtentUnsupported;
     }

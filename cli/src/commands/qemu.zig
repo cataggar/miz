@@ -318,6 +318,7 @@ const Options = struct {
     ovmf_code_path: ?[]const u8 = null,
     ovmf_vars_path: ?[]const u8 = null,
     secure_boot: bool = false,
+    include_system_firmware: bool = true,
     secure_boot_certificate_path: ?[]const u8 = null,
     secure_boot_certificate_sha256: ?miz.artifact_pipeline.Digest = null,
     admin_username: ?[]const u8 = null,
@@ -2369,6 +2370,7 @@ fn findGhrQemuAtToolsPathAlloc(
         .explicit_vars_path = options.ovmf_vars_path,
         .qemu_path = package_paths.binary_path,
         .data_dirs = &.{package_paths.data_dir},
+        .include_system_candidates = options.include_system_firmware,
     }) catch |err| {
         package_paths.deinit(allocator);
         return err;
@@ -5260,7 +5262,7 @@ test "qemu resolves AArch64 from a ghr package containing both emulators" {
         allocator,
         io,
         tools_buf[0..tools_len],
-        .{},
+        .{ .include_system_firmware = false },
         .aarch64,
     )).?;
     defer resolved.deinit(allocator);

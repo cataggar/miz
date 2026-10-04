@@ -333,7 +333,7 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
-Use `.container = .{ .archive = ... }` for a docker/podman save tarball. OCI layout directories are validated and snapshotted into the Zig build cache so adding, removing, or changing a blob invalidates the image step. Layouts containing symlinks or special files are rejected because Zig 0.16's cached directory-copy step cannot preserve them. The helper runs the dedicated `miz-image-builder` artifact for the build host even when the consuming project targets another architecture.
+Use `.container = .{ .archive = ... }` for a docker/podman save tarball. OCI layout directories are validated and snapshotted into the Zig build cache so adding, removing, or changing a blob invalidates the image step. Layouts containing symlinks or special files are rejected because the cached directory-copy step cannot preserve them. The helper runs the dedicated `miz-image-builder` artifact for the build host even when the consuming project targets another architecture.
 
 To acquire a registry image as a tracked OCI layout, construct a digest-pinned pull and pass its output directly to `addImage`:
 

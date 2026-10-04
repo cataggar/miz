@@ -419,7 +419,7 @@ test "the benchmark command fixes the profile and its offline inputs" {
     );
 
     const required = [_][]const u8{
-        "-Doptimize=ReleaseSafe",
+        "-Doptimize=safe",
         "-Dubuntu2604-arch=aarch64",
         "-Dubuntu2604-flavor=baremetal",
         "--debz-lock-dir",

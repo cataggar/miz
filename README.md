@@ -1,11 +1,11 @@
 # miz
 
-A Zig 0.16 library and CLI for reading, writing, converting, and building disk
+A Zig 0.17 library and CLI for reading, writing, converting, and building disk
 images for bare-metal systems and virtual machines, including raw, VHD/VPC,
 VHDX, and qcow2 formats. It also provides filesystem, boot configuration,
 image customization, QEMU, and cloud-ready image workflows.
 
-## Zig 0.17 compatibility work (not consumer-ready)
+**Zig 0.17 source compatibility.**
 
 This branch preserves the exact `b243969` consumer generation, including
 released ESP/UKI preservation, root customization, artifact acquisition,
@@ -15,9 +15,13 @@ adopt subsequent default-branch image changes or refresh released assets.
 The debz, TLS, bzip2 and zstd source prerequisites are exact tested
 compatibility revisions. C translation uses GitHub `cataggar/translate-c`
 at `62d06a5`; libc-free module graphs retain their existing policy.
-Validation remains blocked by the pinned RPM backend, root configurer
-path/environment APIs, and captured `errdefer` in Ubuntu phase diagnostics.
-Do not use this branch as a compatible consumer pin yet. The source target
+The exact-generation RPM port at `c9b23a2`, lazy tool-path environment
+wrapper and retained phase-failure diagnostics address those source
+prerequisites. The full safe source graph passes (239 steps), along with
+native tooling and static x86_64/AArch64 payload builds. Tool-path tests
+also pass with spaces and apostrophes in a real install prefix. Native
+macOS/AArch64 execution and real image/privileged acceptance remain open.
+The source target
 is Zig 0.17.0, Linux 5.10+ and macOS 15+; image/hardware acceptance and
 publication are not claimed.
 The compatibility branch's native source CI is manual-only and selects

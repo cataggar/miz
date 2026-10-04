@@ -1548,10 +1548,10 @@ fn formatSignaturesText(
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var first = true;
-    inline for (std.meta.fields(miz.block_device.Signatures)) |field| {
-        if (@field(signatures, field.name)) {
+    inline for (@typeInfo(miz.block_device.Signatures).@"struct".field_names) |field_name| {
+        if (@field(signatures, field_name)) {
             if (!first) try out.appendSlice(",");
-            try out.appendSlice(field.name);
+            try out.appendSlice(field_name);
             first = false;
         }
     }
@@ -3059,10 +3059,10 @@ fn writeFilesystemIdentity(
 
 fn writeSignatures(writer: *std.Io.Writer, signatures: miz.block_device.Signatures) !void {
     var first = true;
-    inline for (std.meta.fields(miz.block_device.Signatures)) |field| {
-        if (@field(signatures, field.name)) {
+    inline for (@typeInfo(miz.block_device.Signatures).@"struct".field_names) |field_name| {
+        if (@field(signatures, field_name)) {
             if (!first) try writer.writeByte(',');
-            try writer.writeAll(field.name);
+            try writer.writeAll(field_name);
             first = false;
         }
     }

@@ -88,10 +88,7 @@ pub const Status = enum {
     }
 
     pub fn parse(text: []const u8) ?Status {
-        inline for (@typeInfo(Status).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @fromBackingInt(@intCast(field.value));
-        }
-        return null;
+        return std.meta.stringToEnum(Status, text);
     }
 };
 
@@ -104,10 +101,7 @@ pub const Direction = enum {
     }
 
     pub fn parse(text: []const u8) ?Direction {
-        inline for (@typeInfo(Direction).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @fromBackingInt(@intCast(field.value));
-        }
-        return null;
+        return std.meta.stringToEnum(Direction, text);
     }
 };
 
@@ -1486,8 +1480,8 @@ pub const Result = enum {
     }
 
     pub fn parse(text: []const u8) ?Result {
-        inline for (@typeInfo(Result).@"enum".fields) |field| {
-            const value: Result = @fromBackingInt(@intCast(field.value));
+        inline for (@typeInfo(Result).@"enum".field_values) |field_value| {
+            const value: Result = @fromBackingInt(@intCast(field_value));
             if (std.mem.eql(u8, text, value.key())) return value;
         }
         return null;
