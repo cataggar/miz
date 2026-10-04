@@ -24,7 +24,7 @@
 const std = @import("std");
 
 const Crc32 = std.hash.Crc32;
-const Crc64 = std.hash.crc.Crc64Xz;
+const Crc64 = std.hash.crc.@"CRC-64/XZ";
 
 pub const stream_magic = [6]u8{ 0xFD, '7', 'z', 'X', 'Z', 0x00 };
 pub const footer_magic = [2]u8{ 'Y', 'Z' };
@@ -34,7 +34,10 @@ const sample_line = "miz xz fixture: entropy-coded lzma2 payload line for tests 
 /// Plaintext of `compressed_sample_stream`: an ELF-ish header followed by
 /// repeated lines, sized to exactly one 1 KiB SquashFS block.
 pub const compressed_sample_plaintext: []const u8 =
-    "\x7fELF\x02\x01\x01" ++ ("\x00" ** 57) ++ (sample_line ** 15);
+    "\x7fELF\x02\x01\x01" ++ (&@as([57:0]u8, @splat("\x00"[0]))) ++
+    sample_line ++ sample_line ++ sample_line ++ sample_line ++ sample_line ++
+    sample_line ++ sample_line ++ sample_line ++ sample_line ++ sample_line ++
+    sample_line ++ sample_line ++ sample_line ++ sample_line ++ sample_line;
 
 /// A genuinely entropy-coded xz stream: the output of
 /// `xz --format=xz --check=crc32 -9e` for `compressed_sample_plaintext`.
@@ -112,7 +115,7 @@ pub fn writeStream(w: *std.Io.Writer, payload: []const u8, options: Options) std
     const chunk_size = @max(@as(usize, 1), @min(options.chunk_size, max_chunk_size));
     const check_size = options.check.size();
 
-    const stream_flags = [2]u8{ 0, @intFromEnum(options.check) };
+    const stream_flags = [2]u8{ 0, @backingInt(options.check) };
     try w.writeAll(&stream_magic);
     try w.writeAll(&stream_flags);
     try w.writeInt(u32, Crc32.hash(&stream_flags), .little);
@@ -475,7 +478,7 @@ test "every check kind is framed and validated" {
         const stream = try allocStream(gpa, payload, .{ .check = check });
         defer gpa.free(stream);
 
-        try testing.expectEqual(@as(u8, @intFromEnum(check)), stream[7]);
+        try testing.expectEqual(@as(u8, @backingInt(check)), stream[7]);
         try verifyStream(stream, payload);
         const decoded = try decompressAlloc(gpa, stream);
         defer gpa.free(decoded);

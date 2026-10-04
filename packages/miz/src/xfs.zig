@@ -238,7 +238,7 @@ const bigtime_epoch_offset: i64 = 2147483648;
 /// use the ordinary Castagnoli CRC32C. What differs is how the final value is
 /// stored: XFS complements it and always writes it little-endian, even though
 /// every other XFS field is big-endian (see `xfs_end_cksum()` upstream).
-const Crc32c = std.hash.crc.Crc(u32, .{
+const Crc32c = std.hash.crc.Generic(u32, .{
     .polynomial = 0x1edc6f41,
     .initial = 0xffffffff,
     .reflect_input = true,
@@ -3025,13 +3025,13 @@ const TestSuperblockOptions = struct {
     features_incompat: u32 = incompat_ftype,
     version_num: u16 = sb_version_5,
     uuid: [16]u8 = test_fs_uuid,
-    meta_uuid: [16]u8 = [_]u8{0} ** 16,
-    label: [12]u8 = [_]u8{0} ** 12,
+    meta_uuid: [16]u8 = @as([16]u8, @splat(0)),
+    label: [12]u8 = @as([12]u8, @splat(0)),
     corrupt_crc: bool = false,
 };
 
 fn buildTestSuperblock(o: TestSuperblockOptions) [superblock_size]u8 {
-    var buf: [superblock_size]u8 = [_]u8{0} ** superblock_size;
+    var buf: [superblock_size]u8 = @as([superblock_size]u8, @splat(0));
     beU32(&buf, 0, magic);
     beU32(&buf, 4, o.block_size);
     beU64(&buf, 8, o.data_blocks);
@@ -3062,7 +3062,7 @@ fn buildTestSuperblock(o: TestSuperblockOptions) [superblock_size]u8 {
 }
 
 test "parseSuperblock accepts a v5 superblock and exposes uuid/label" {
-    var label = [_]u8{0} ** 12;
+    var label = @as([12]u8, @splat(0));
     @memcpy(label[0..9], "TESTLABEL");
     const buf = buildTestSuperblock(.{ .label = label });
     const sb = try parseSuperblock(&buf);
@@ -3355,7 +3355,7 @@ const ShortformDirBuilder = struct {
 /// array, and a zero-count leaf/tail area (no leaf entries are needed since
 /// this reader linear-scans the data area directly).
 const BlockFormatDirBuilder = struct {
-    buf: [512]u8 = [_]u8{0} ** 512,
+    buf: [512]u8 = @as([512]u8, @splat(0)),
     len: usize = dir3_data_header_size,
     block_size: usize = 512,
 
@@ -3574,7 +3574,7 @@ const ShortformXattrBuilder = struct {
 /// Builds a regular-file inode whose attribute fork (`forkoff == 1`, so the
 /// data fork is the first 8 bytes of the literal area) holds `xattr_data`.
 fn buildXattrTestInode(allocator: std.mem.Allocator, sb: Superblock, xattr_data: []const u8) !struct { raw: []u8, inode: ParsedInode } {
-    var literal: [336]u8 = [_]u8{0} ** 336;
+    var literal: [336]u8 = @as([336]u8, @splat(0));
     @memcpy(literal[8..][0..xattr_data.len], xattr_data);
     const raw = try buildTestInode(allocator, sb.inode_size, .{
         .ino = 7,
@@ -3638,7 +3638,7 @@ test "readXattrs rejects an out-of-line (non-LOCAL) attribute fork format" {
         .mode = s_ifreg | 0o644,
         .forkoff = 1,
         .attr_format = fmt_extents,
-    }, &[_]u8{0} ** 336);
+    }, &@as([336]u8, @splat(0)));
     defer testing.allocator.free(raw);
     var inode = try parseInode(sb, 7, raw, testing.allocator);
     defer inode.deinit(testing.allocator);
@@ -3708,9 +3708,9 @@ pub const file_txt_content = "hello from file.txt, read back through a single EX
 pub const hardlinked_content = "shared content, visible under two names via one inode\n";
 const attrs_txt_content = "attrs.txt content, alongside a populated shortform xattr fork\n";
 pub const in_sub_txt_content = "in_sub.txt content: this block is real, the next is a hole\n";
-pub const rlink_target = "0123456789" ** 20; // 200 bytes: exercises the *remote* EXTENTS symlink path.
-pub const big_bin_block0 = [_]u8{'A'} ** integration_block_size;
-pub const big_bin_block1 = [_]u8{'B'} ** integration_block_size;
+pub const rlink_target = repeatedBytes("0123456789", 20); // 200 bytes: exercises the *remote* EXTENTS symlink path.
+pub const big_bin_block0 = @as([integration_block_size]u8, @splat('A'));
+pub const big_bin_block1 = @as([integration_block_size]u8, @splat('B'));
 pub const in_sub_txt_size: u64 = integration_block_size + 100;
 /// `unwritten.bin`'s single extent is marked unwritten (allocated, never
 /// written) rather than left as a hole, so a consumer can tell the two
@@ -3821,7 +3821,7 @@ pub fn buildIntegrationVolume(allocator: std.mem.Allocator) ![]u8 {
     var xb = ShortformXattrBuilder{};
     xb.append("foo", "bar", 0);
     xb.append("baz", "qux", attr_root_bit);
-    var attrs_literal: [integration_block_size - dinode_v3_core_size]u8 = [_]u8{0} ** (integration_block_size - dinode_v3_core_size);
+    var attrs_literal: [integration_block_size - dinode_v3_core_size]u8 = @as([(integration_block_size - dinode_v3_core_size)]u8, @splat(0));
     encodeBmbtRec(attrs_literal[0..bmbt_rec_size], 0, 22, 1, false);
     const xattr_bytes = xb.finish();
     @memcpy(attrs_literal[16..][0..xattr_bytes.len], xattr_bytes);
@@ -3854,7 +3854,7 @@ pub fn buildIntegrationVolume(allocator: std.mem.Allocator) ![]u8 {
     }, &unwritten_extent);
     defer allocator.free(unwritten_inode);
     putBlock(volume, integration_block_size, 8, unwritten_inode);
-    const unwritten_marker = [_]u8{0xEE} ** integration_block_size;
+    const unwritten_marker = @as([integration_block_size]u8, @splat(0xEE));
     putBlock(volume, integration_block_size, 23, &unwritten_marker);
 
     // --- sub (ino 40, AG1): EXTENTS single-block "block" format dir ---
@@ -3902,7 +3902,7 @@ pub fn buildIntegrationVolume(allocator: std.mem.Allocator) ![]u8 {
     const big_bin_literal_area_len = integration_block_size - dinode_v3_core_size;
     const big_bin_root_maxrecs = (big_bin_literal_area_len - bmdr_header_size) / (bmbt_key_size + bmbt_ptr_size);
     const big_bin_root_ptr_offset = bmdr_header_size + big_bin_root_maxrecs * bmbt_key_size;
-    var big_bin_root: [big_bin_root_ptr_offset + 8]u8 = [_]u8{0} ** (big_bin_root_ptr_offset + 8);
+    var big_bin_root: [big_bin_root_ptr_offset + 8]u8 = @as([(big_bin_root_ptr_offset + 8)]u8, @splat(0));
     beU16(&big_bin_root, 0, 1); // level: 1 above the leaf
     beU16(&big_bin_root, 2, 1); // numrecs
     beU64(&big_bin_root, big_bin_root_ptr_offset, 53); // ptr: child fsblock
@@ -3916,7 +3916,7 @@ pub fn buildIntegrationVolume(allocator: std.mem.Allocator) ![]u8 {
     defer allocator.free(big_bin_inode);
     putBlock(volume, integration_block_size, 50, big_bin_inode);
 
-    var leaf: [integration_block_size]u8 = [_]u8{0} ** integration_block_size;
+    var leaf: [integration_block_size]u8 = @as([integration_block_size]u8, @splat(0));
     beU32(&leaf, 0, bmap_btree_magic);
     beU16(&leaf, 4, 0); // level 0 (leaf)
     beU16(&leaf, 6, 2); // numrecs
@@ -3941,7 +3941,7 @@ pub fn buildIntegrationVolume(allocator: std.mem.Allocator) ![]u8 {
     defer allocator.free(rlink_inode);
     putBlock(volume, integration_block_size, 51, rlink_inode);
 
-    var symlink_block: [integration_block_size]u8 = [_]u8{0} ** integration_block_size;
+    var symlink_block: [integration_block_size]u8 = @as([integration_block_size]u8, @splat(0));
     beU32(&symlink_block, 0, symlink_magic);
     beU32(&symlink_block, 4, 0); // sl_offset
     beU32(&symlink_block, 8, rlink_target.len); // sl_bytes
@@ -4386,7 +4386,7 @@ test "readExtents walks a non-full, three-level BTREE chain using maxrecs-based 
     const literal_area_len = integration_block_size - dinode_v3_core_size;
     const root_maxrecs = (literal_area_len - bmdr_header_size) / (bmbt_key_size + bmbt_ptr_size);
     const root_ptr_offset = bmdr_header_size + root_maxrecs * bmbt_key_size;
-    var root_literal: [root_ptr_offset + 8]u8 = [_]u8{0} ** (root_ptr_offset + 8);
+    var root_literal: [root_ptr_offset + 8]u8 = @as([(root_ptr_offset + 8)]u8, @splat(0));
     beU16(&root_literal, 0, 2); // level: 2 (root -> internal node -> leaf)
     beU16(&root_literal, 2, 1); // numrecs: 1, far below root_maxrecs
     beU64(&root_literal, root_ptr_offset, 10); // ptr: internal node at fsblock 10
@@ -4406,7 +4406,7 @@ test "readExtents walks a non-full, three-level BTREE chain using maxrecs-based 
     const node_body_len = integration_block_size - bmbt_long_header_size;
     const node_maxrecs = node_body_len / (bmbt_key_size + bmbt_ptr_size);
     const node_ptr_offset = bmbt_long_header_size + node_maxrecs * bmbt_key_size;
-    var node: [integration_block_size]u8 = [_]u8{0} ** integration_block_size;
+    var node: [integration_block_size]u8 = @as([integration_block_size]u8, @splat(0));
     beU32(&node, 0, bmap_btree_magic);
     beU16(&node, 4, 1); // level 1 (internal node, one above the leaf)
     beU16(&node, 6, 1); // numrecs: 1, far below node_maxrecs
@@ -4416,7 +4416,7 @@ test "readExtents walks a non-full, three-level BTREE chain using maxrecs-based 
     putBlock(volume, integration_block_size, 10, &node);
 
     // Level 0: the leaf, holding the two real extent records.
-    var leaf: [integration_block_size]u8 = [_]u8{0} ** integration_block_size;
+    var leaf: [integration_block_size]u8 = @as([integration_block_size]u8, @splat(0));
     beU32(&leaf, 0, bmap_btree_magic);
     beU16(&leaf, 4, 0); // level 0 (leaf)
     beU16(&leaf, 6, 2); // numrecs
@@ -4426,8 +4426,8 @@ test "readExtents walks a non-full, three-level BTREE chain using maxrecs-based 
     writeCrc(&leaf, bmbt_long_crc_offset);
     putBlock(volume, integration_block_size, 11, &leaf);
 
-    const block0 = [_]u8{'A'} ** integration_block_size;
-    const block1 = [_]u8{'B'} ** integration_block_size;
+    const block0 = @as([integration_block_size]u8, @splat('A'));
+    const block1 = @as([integration_block_size]u8, @splat('B'));
     putBlock(volume, integration_block_size, 20, &block0);
     putBlock(volume, integration_block_size, 21, &block1);
 
@@ -4457,7 +4457,7 @@ test "readExtents rejects a BTREE root whose numrecs exceeds its maxrecs capacit
     var reader: Reader = .{ .allocator = allocator, .file = undefined, .superblock = sb };
     const literal_area_len = integration_block_size - dinode_v3_core_size;
     const root_maxrecs = (literal_area_len - bmdr_header_size) / (bmbt_key_size + bmbt_ptr_size);
-    var root_literal: [literal_area_len]u8 = [_]u8{0} ** literal_area_len;
+    var root_literal: [literal_area_len]u8 = @as([literal_area_len]u8, @splat(0));
     beU16(&root_literal, 0, 1); // level
     beU16(&root_literal, 2, @intCast(root_maxrecs + 1)); // numrecs > maxrecs: must be rejected
     try testing.expectError(error.UnsupportedExtentLayout, readExtents(
@@ -4520,4 +4520,17 @@ test "Reader.readFileAlloc reads /etc/os-release without a full tree scan" {
 
     try testing.expectError(error.NotFile, reader.readFileAlloc(io, allocator, "/etc"));
     try testing.expectError(error.NotFound, reader.readFileAlloc(io, allocator, "/etc/missing"));
+}
+
+fn repeatedBytes(comptime pattern: []const u8, comptime count: usize) *const [pattern.len * count:0]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1000 + count * 2);
+        var bytes: [pattern.len * count:0]u8 = undefined;
+        for (0..count) |i| {
+            @memcpy(bytes[i * pattern.len ..][0..pattern.len], pattern);
+        }
+        bytes[bytes.len] = 0;
+        const result = bytes;
+        break :blk &result;
+    };
 }

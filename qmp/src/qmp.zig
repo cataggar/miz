@@ -766,8 +766,8 @@ test "spawnAndConnect bounds an exited child without a QMP socket" {
 test "qapi: generated module fully type-checks" {
     comptime {
         @setEvalBranchQuota(100_000);
-        for (@typeInfo(qapi).@"struct".decls) |decl| {
-            _ = @field(qapi, decl.name);
+        for (@typeInfo(qapi).@"struct".decl_names) |decl| {
+            _ = @field(qapi, decl);
         }
     }
 }

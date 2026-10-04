@@ -47,7 +47,7 @@ fn writeStr(s: []const u8) void {
 
 fn writeErrno(prefix: []const u8, e: linux.E) void {
     var buf: [96]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "{s}: errno={d}\r\n", .{ prefix, @intFromEnum(e) }) catch "errno format failed\r\n";
+    const msg = std.fmt.bufPrint(&buf, "{s}: errno={d}\r\n", .{ prefix, @backingInt(e) }) catch "errno format failed\r\n";
     writeStr(msg);
 }
 
@@ -66,7 +66,7 @@ fn mountIgnoreBusy(special: ?[*:0]const u8, dir: [*:0]const u8, fstype: ?[*:0]co
     const e = linux.errno(rc);
     if (e != .SUCCESS and e != .BUSY) {
         var buf: [80]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "mount {s} failed: errno={d}\r\n", .{ dir, @intFromEnum(e) }) catch "mount failed\r\n";
+        const msg = std.fmt.bufPrint(&buf, "mount {s} failed: errno={d}\r\n", .{ dir, @backingInt(e) }) catch "mount failed\r\n";
         writeStr(msg);
     }
 }
@@ -473,7 +473,7 @@ fn discoverSerialConsolePath(path_buf: *[80:0]u8) [*:0]const u8 {
     var active_buf: [257]u8 = undefined;
     const active = readBoundedFile("/sys/class/tty/console/active", &active_buf) orelse "";
     const name = selectSerialConsole(cmdline, active, @import("builtin").cpu.arch);
-    return std.fmt.bufPrintZ(path_buf, "/dev/{s}", .{name}) catch blk: {
+    return std.fmt.bufPrintSentinel(path_buf, "/dev/{s}", .{name}, 0) catch blk: {
         const fallback = if (@import("builtin").cpu.arch == .aarch64) "/dev/ttyAMA0" else "/dev/ttyS0";
         @memcpy(path_buf[0..fallback.len], fallback);
         path_buf[fallback.len] = 0;
@@ -755,7 +755,7 @@ fn decompressXzAlloc(gpa: std.mem.Allocator, compressed: []const u8) ?[]u8 {
 // "kernel/drivers/net/hyperv/hv_netvsc.ko.xz".
 fn loadModuleAt(gpa: std.mem.Allocator, release: []const u8, rel_path: []const u8) void {
     var path_buf: [256:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/lib/modules/{s}/{s}", .{ release, rel_path }) catch return;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/lib/modules/{s}/{s}", .{ release, rel_path }, 0) catch return;
 
     const compressed = readWholeFileAlloc(gpa, path) orelse {
         var buf: [128]u8 = undefined;
@@ -780,7 +780,7 @@ fn loadModuleAt(gpa: std.mem.Allocator, release: []const u8, rel_path: []const u
         const msg = std.fmt.bufPrint(&buf, "[mizinit] loaded module {s}\r\n", .{rel_path}) catch "[mizinit] module loaded\r\n";
         writeStr(msg);
     } else {
-        const msg = std.fmt.bufPrint(&buf, "[mizinit] init_module {s} failed: errno={d}\r\n", .{ rel_path, @intFromEnum(e) }) catch "[mizinit] init_module failed\r\n";
+        const msg = std.fmt.bufPrint(&buf, "[mizinit] init_module {s} failed: errno={d}\r\n", .{ rel_path, @backingInt(e) }) catch "[mizinit] init_module failed\r\n";
         writeStr(msg);
     }
 }
@@ -926,7 +926,7 @@ fn binderModuleAlreadyLoaded() bool {
 
 fn finitModuleAt(release: []const u8, rel_path: []const u8, flags: u32) linux.E {
     var path_buf: [256:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/lib/modules/{s}/{s}", .{ release, rel_path }) catch return .NAMETOOLONG;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/lib/modules/{s}/{s}", .{ release, rel_path }, 0) catch return .NAMETOOLONG;
 
     const fd_rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
     const open_error = linux.errno(fd_rc);
@@ -1046,12 +1046,16 @@ fn ifUp(fd: i32, name: []const u8) void {
 
 fn sockaddrIn(addr_be: u32) linux.sockaddr {
     const in: linux.sockaddr.in = .{ .port = 0, .addr = addr_be };
-    return @bitCast(in);
+    var result: linux.sockaddr = undefined;
+    @memcpy(std.mem.asBytes(&result), std.mem.asBytes(&in));
+    return result;
 }
 
 fn sockaddrInPort(addr_be: u32, port_be: u16) linux.sockaddr {
     const in: linux.sockaddr.in = .{ .port = port_be, .addr = addr_be };
-    return @bitCast(in);
+    var result: linux.sockaddr = undefined;
+    @memcpy(std.mem.asBytes(&result), std.mem.asBytes(&in));
+    return result;
 }
 
 fn setIfaceAddr(fd: i32, name: []const u8, request: u32, addr_be: u32) void {
@@ -1074,7 +1078,7 @@ const carrier_settle_seconds: u32 = 5;
 /// The non-loopback interfaces this machine currently has, in a stable order.
 const InterfaceList = struct {
     names: [max_candidate_interfaces][linux.IFNAMESIZE]u8 = undefined,
-    lens: [max_candidate_interfaces]u8 = [_]u8{0} ** max_candidate_interfaces,
+    lens: [max_candidate_interfaces]u8 = @as([max_candidate_interfaces]u8, @splat(0)),
     count: usize = 0,
 
     fn name(self: *const InterfaceList, index: usize) []const u8 {
@@ -1139,7 +1143,7 @@ fn collectInterfaces(list: *InterfaceList) void {
 /// some synthetic NICs never report carrier at all.
 fn readCarrier(iface: []const u8) ?bool {
     var path_buf: [linux.IFNAMESIZE + 32]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/sys/class/net/{s}/carrier", .{iface}) catch return null;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/sys/class/net/{s}/carrier", .{iface}, 0) catch return null;
     var value: [8]u8 = undefined;
     const contents = readBoundedFile(path.ptr, &value) orelse return null;
     if (contents.len == 0) return null;
@@ -1157,7 +1161,7 @@ fn interfaceMasterName(target: []const u8) ?[]const u8 {
 /// child devices of the synthetic netvsc interface, where IPs and routes belong.
 fn readInterfaceMaster(iface: []const u8, out: *[linux.IFNAMESIZE]u8) ?[]const u8 {
     var path_buf: [linux.IFNAMESIZE + 32]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/sys/class/net/{s}/master", .{iface}) catch return null;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/sys/class/net/{s}/master", .{iface}, 0) catch return null;
     var target_buf: [128]u8 = undefined;
     const rc = linux.readlink(path.ptr, &target_buf, target_buf.len);
     if (linux.errno(rc) != .SUCCESS) return null;
@@ -1665,7 +1669,7 @@ fn setupNetworking() NetworkResult {
     var index: usize = 0;
     while (index < list.count) : (index += 1) ifUp(ctl, list.name(index));
 
-    var carriers: [max_candidate_interfaces]?bool = [_]?bool{null} ** max_candidate_interfaces;
+    var carriers: [max_candidate_interfaces]?bool = @as([max_candidate_interfaces]?bool, @splat(null));
     var waited: u32 = 0;
     while (true) {
         var any_carrier = false;
@@ -1946,11 +1950,11 @@ fn nextAccessBackoff(current: u32) u32 {
     return @min(current * 2, access_max_backoff_seconds);
 }
 
-fn childSucceeded(status: u32) bool {
-    return linux.W.IFEXITED(status) and linux.W.EXITSTATUS(status) == 0;
+fn childSucceeded(status: i32) bool {
+    return linux.W.IFEXITED(@bitCast(status)) and linux.W.EXITSTATUS(@bitCast(status)) == 0;
 }
 
-fn noteChildExit(supervisor: *Supervisor, pid: linux.pid_t, status: u32) void {
+fn noteChildExit(supervisor: *Supervisor, pid: linux.pid_t, status: i32) void {
     if (pid == supervisor.azagent_pid) {
         supervisor.azagent_pid = 0;
         if (childSucceeded(status)) {
@@ -1976,7 +1980,7 @@ fn noteChildExit(supervisor: *Supervisor, pid: linux.pid_t, status: u32) void {
 
 fn reapChildren(supervisor: *Supervisor) void {
     while (true) {
-        var status: u32 = 0;
+        var status: i32 = 0;
         const wait_rc = linux.waitpid(-1, &status, linux.W.NOHANG);
         const wait_error = linux.errno(wait_rc);
         if (wait_error == .INTR) continue;
@@ -2012,7 +2016,7 @@ fn phaseAfterDrain(phase: ShutdownPhase, state: ChildDrainState) ShutdownPhase {
 
 fn drainExitedChildren(supervisor: *Supervisor) ChildDrainState {
     while (true) {
-        var status: u32 = 0;
+        var status: i32 = 0;
         const wait_rc = linux.waitpid(-1, &status, linux.W.NOHANG);
         const wait_error = linux.errno(wait_rc);
         if (wait_error == .INTR) continue;
@@ -2038,7 +2042,7 @@ fn boundedChildDrain(supervisor: *Supervisor, attempts: u32) ChildDrainState {
 
 fn reapUntilNoChildren(supervisor: *Supervisor) void {
     while (true) {
-        var status: u32 = 0;
+        var status: i32 = 0;
         const wait_rc = linux.waitpid(-1, &status, 0);
         const wait_error = linux.errno(wait_rc);
         if (wait_error == .INTR) continue;
@@ -2543,7 +2547,7 @@ test "parsePersistedHostname trims line endings and rejects invalid content" {
     try std.testing.expectEqual(@as(?[]const u8, null), parsePersistedHostname(" \r\n"));
     try std.testing.expectEqual(@as(?[]const u8, null), parsePersistedHostname("invalid\x00hostname"));
 
-    const too_long = "a" ** (linux.HOST_NAME_MAX + 1);
+    const too_long = &@as([(linux.HOST_NAME_MAX + 1):0]u8, @splat("a"[0]));
     try std.testing.expectEqual(@as(?[]const u8, null), parsePersistedHostname(too_long));
 }
 

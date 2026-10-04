@@ -908,7 +908,7 @@ test "a variable with no room for attribute bytes is reported malformed" {
     };
     for ([_]usize{ 0, 1, 2, 3 }) |length| {
         resetOutput();
-        const raw = [_]u8{0} ** 4;
+        const raw = @as([4]u8, @splat(0));
         try std.testing.expect(
             !emitEfivarValue(contract.secure_boot_variable, mounted, raw[0..length]),
         );
@@ -962,7 +962,7 @@ test "a variable too large for the report is refused rather than truncated" {
     };
     // Two variables of the maximum size cannot both fit, and the second must
     // set the truncation flag rather than emit a half-written database.
-    const raw = [_]u8{0} ** efivar_max_bytes;
+    const raw = @as([efivar_max_bytes]u8, @splat(0));
     _ = emitEfivarValue(contract.signature_database_variable, mounted, &raw);
     try std.testing.expect(!output_truncated);
     _ = emitEfivarValue(contract.secure_boot_variable, mounted, &raw);

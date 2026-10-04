@@ -279,7 +279,7 @@ const agfl_reserve: u32 = 4;
 // big-endian; the four CRC bytes count as zero while hashing).
 // ---------------------------------------------------------------------------
 
-const Crc32c = std.hash.crc.Crc(u32, .{
+const Crc32c = std.hash.crc.Generic(u32, .{
     .polynomial = 0x1edc6f41,
     .initial = 0xffffffff,
     .reflect_input = true,
@@ -2480,7 +2480,7 @@ test "populate rejects unsupported shapes before writing" {
         try testing.expectError(error.LabelTooLong, res);
     }
     {
-        const xa = [_]tree_cursor.Xattr{.{ .name = "user.k", .value = &[_]u8{'v'} ** 300 }};
+        const xa = [_]tree_cursor.Xattr{.{ .name = "user.k", .value = &@as([300]u8, @splat('v')) }};
         var e = [_]FixtureEntry{.{ .path = "f", .kind = .file, .size = 1, .content = "x", .xattrs = &xa }};
         try expectReject(&e, .{}, big_len, error.XattrValueTooLarge);
     }
@@ -2795,7 +2795,7 @@ fn convertBigBinToBtree(path: []const u8) !u64 {
     _ = try file.readPositionalAll(io, &bnobt_root, try fsblockOffsetFromSuperblock(sb, 1));
     const leaf_fsblock = std.mem.readInt(u32, bnobt_root[56..60], .big);
 
-    var leaf: [block_size]u8 = [_]u8{0} ** block_size;
+    var leaf: [block_size]u8 = @as([block_size]u8, @splat(0));
     beU32(&leaf, 0, 0x424d_4133);
     beU16(&leaf, 4, 0);
     beU16(&leaf, 6, 1);
@@ -2855,7 +2855,7 @@ test "rewriteFilesystemUuid rewrites writer metadata across allocation groups an
     try testing.expectEqualSlices(u8, &xfs.test_fs_uuid, &report.old_identity.uuid);
     try testing.expectEqualSlices(u8, &rewrite_new_uuid, &report.new_identity.uuid);
     try testing.expect(!report.old_identity.uses_meta_uuid);
-    try testing.expectEqualSlices(u8, &([_]u8{0} ** 16), &report.new_identity.meta_uuid);
+    try testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), &report.new_identity.meta_uuid);
 
     const rewritten = try readWholeFileAlloc(allocator, path);
     defer allocator.free(rewritten);

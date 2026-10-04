@@ -184,7 +184,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Install image build dependencies
         run: |
@@ -482,7 +482,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Require Azure acceptance tools
         run: |
@@ -500,7 +500,7 @@ jobs:
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           zig build --fetch --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-          zig build install-azurelinux4-release -Doptimize=ReleaseSafe
+          zig build install-azurelinux4-release -Doptimize=safe
           test -x "$AZURELINUX4_RELEASE"
 
       - name: Build accepted-source miz
@@ -511,7 +511,7 @@ jobs:
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           zig build --fetch \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-          zig build -Doptimize=ReleaseSafe
+          zig build -Doptimize=safe
           test -x zig-out/bin/miz
 
       - name: Run exact-artifact Azure acceptance
@@ -619,7 +619,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build publication release tool
         run: |
@@ -627,7 +627,7 @@ jobs:
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           zig build --fetch --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-          zig build install-azurelinux4-release -Doptimize=ReleaseSafe
+          zig build install-azurelinux4-release -Doptimize=safe
           test -x "$AZURELINUX4_RELEASE"
 
       - name: Download all build-validated candidates

@@ -588,10 +588,10 @@ const manifest_json =
     \\  "bytes": 44}]}
 ;
 
-const expected_table = "AzureLinux-4.0-x86_64.qcow2\t" ++ "1" ** 64 ++ "\t11\n" ++
-    "AzureLinux-4.0-aarch64.qcow2\t" ++ "2" ** 64 ++ "\t22\n" ++
-    "AzureLinux-4.0-x86_64.core.qcow2\t" ++ "3" ** 64 ++ "\t33\n" ++
-    "AzureLinux-4.0-aarch64.core.qcow2\t" ++ "4" ** 64 ++ "\t44\n";
+const expected_table = "AzureLinux-4.0-x86_64.qcow2\t" ++ &@as([64:0]u8, @splat("1"[0])) ++ "\t11\n" ++
+    "AzureLinux-4.0-aarch64.qcow2\t" ++ &@as([64:0]u8, @splat("2"[0])) ++ "\t22\n" ++
+    "AzureLinux-4.0-x86_64.core.qcow2\t" ++ &@as([64:0]u8, @splat("3"[0])) ++ "\t33\n" ++
+    "AzureLinux-4.0-aarch64.core.qcow2\t" ++ &@as([64:0]u8, @splat("4"[0])) ++ "\t44\n";
 
 test "the expected asset table round-trips the publish manifest" {
     var diagnostic: Diagnostic = .{};
@@ -609,7 +609,7 @@ test "the expected asset table round-trips the publish manifest" {
     try std.testing.expectEqual(@as(usize, 4), rows.len);
     try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.qcow2", rows[0].name);
     try std.testing.expectEqual(@as(u64, 11), rows[0].bytes);
-    try std.testing.expectEqualStrings("4" ** 64, rows[3].sha256);
+    try std.testing.expectEqualStrings(&@as([64:0]u8, @splat("4"[0])), rows[3].sha256);
 }
 
 test "a manifest that lost its shape never becomes a table" {
@@ -681,18 +681,18 @@ test "the expected table refuses malformed and duplicate rows" {
     ));
     try std.testing.expectError(error.InvalidExpectedTable, parseExpected(
         allocator,
-        "name\t" ++ "1" ** 64 ++ "\tnot-a-number\n",
+        "name\t" ++ &@as([64:0]u8, @splat("1"[0])) ++ "\tnot-a-number\n",
         &diagnostic,
     ));
     try std.testing.expectError(error.InvalidExpectedTable, parseExpected(
         allocator,
-        "name\t" ++ "1" ** 64 ++ "\t1\n",
+        "name\t" ++ &@as([64:0]u8, @splat("1"[0])) ++ "\t1\n",
         &diagnostic,
     ));
-    const duplicated = "a\t" ++ "1" ** 64 ++ "\t1\n" ++
-        "a\t" ++ "1" ** 64 ++ "\t1\n" ++
-        "c\t" ++ "1" ** 64 ++ "\t1\n" ++
-        "d\t" ++ "1" ** 64 ++ "\t1\n";
+    const duplicated = "a\t" ++ &@as([64:0]u8, @splat("1"[0])) ++ "\t1\n" ++
+        "a\t" ++ &@as([64:0]u8, @splat("1"[0])) ++ "\t1\n" ++
+        "c\t" ++ &@as([64:0]u8, @splat("1"[0])) ++ "\t1\n" ++
+        "d\t" ++ &@as([64:0]u8, @splat("1"[0])) ++ "\t1\n";
     try std.testing.expectError(error.InvalidExpectedTable, parseExpected(
         allocator,
         duplicated,
@@ -719,7 +719,7 @@ test "an exact tag ref is reported and a duplicate is refused" {
     );
     defer refs.deinit();
     try writeTagRef(refs.value, "AzureLinux-4.0-20260814", &text.writer, &diagnostic);
-    try std.testing.expectEqualStrings("commit\n" ++ "a" ** 40 ++ "\n", text.written());
+    try std.testing.expectEqualStrings("commit\n" ++ &@as([40:0]u8, @splat("a"[0])) ++ "\n", text.written());
 
     text.clearRetainingCapacity();
     var absent = try parse("[]");
@@ -754,7 +754,7 @@ test "a peeled tag object must name a real object identity" {
     );
     defer annotated.deinit();
     try writeTagObject(&annotated.value.object, &text.writer, &diagnostic);
-    try std.testing.expectEqualStrings("commit\n" ++ "c" ** 40 ++ "\n", text.written());
+    try std.testing.expectEqualStrings("commit\n" ++ &@as([40:0]u8, @splat("c"[0])) ++ "\n", text.written());
 
     var injected = try parse(
         \\{"object": {"type": "commit; rm -rf /", "sha": "x"}}

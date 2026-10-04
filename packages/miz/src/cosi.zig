@@ -293,7 +293,7 @@ const FsProbe = struct {
 };
 
 fn probeFilesystem(arena: std.mem.Allocator, img: Image, io: Io, offset_bytes: u64, length: u64) WriteError!FsProbe {
-    var boot_sector: [512]u8 = [_]u8{0} ** 512;
+    var boot_sector: [512]u8 = @as([512]u8, @splat(0));
     if (length >= boot_sector.len) {
         const got = try img.pread(io, &boot_sector, offset_bytes);
         if (got == boot_sector.len and isFatBootSector(&boot_sector)) {
@@ -308,7 +308,7 @@ fn probeFilesystem(arena: std.mem.Allocator, img: Image, io: Io, offset_bytes: u
         }
     }
 
-    var superblock: [2048]u8 = [_]u8{0} ** 2048;
+    var superblock: [2048]u8 = @as([2048]u8, @splat(0));
     if (length >= superblock.len) {
         const got = try img.pread(io, &superblock, offset_bytes);
         if (got == superblock.len and std.mem.readInt(u16, superblock[1024 + 0x38 .. 1024 + 0x3A], .little) == 0xEF53) {
@@ -1000,7 +1000,7 @@ test "detectOsRelease treats an XFS partition it cannot open as having no os-rel
     // superblock is garbage, well short of a valid v5 filesystem. This
     // proves a malformed/unsupported XFS partition falls through to "no
     // os-release" rather than being misreported as a valid one.
-    var garbage: [512]u8 = [_]u8{0xAA} ** 512;
+    var garbage: [512]u8 = @as([512]u8, @splat(0xAA));
     @memcpy(garbage[0..4], "XFSB");
     try img.pwrite(io, &garbage, 0);
 

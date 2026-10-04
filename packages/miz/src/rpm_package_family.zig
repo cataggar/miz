@@ -605,10 +605,10 @@ test "bundle tamper rpmdb drift and inventory mismatch remain distinct" {
 }
 
 test "ambient repository configuration has no adapter input" {
-    const fields = @typeInfo(rpmz.resolver.ResolveInput).@"struct".fields;
-    inline for (fields) |field| {
-        try std.testing.expect(!std.mem.eql(u8, field.name, "config_path"));
-        try std.testing.expect(!std.mem.eql(u8, field.name, "repos_dir"));
+    const field_names = @typeInfo(rpmz.resolver.ResolveInput).@"struct".field_names;
+    inline for (field_names) |field_name| {
+        try std.testing.expect(!std.mem.eql(u8, field_name, "config_path"));
+        try std.testing.expect(!std.mem.eql(u8, field_name, "repos_dir"));
     }
 }
 

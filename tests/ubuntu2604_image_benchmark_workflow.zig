@@ -230,7 +230,7 @@ test "staging uses the production builder and verified exact inputs" {
     const stage = try section(source, staging_step, measured_step);
 
     try expectContains(stage, "generalized-ubuntu2604 --");
-    try expectContains(stage, "-Doptimize=ReleaseSafe");
+    try expectContains(stage, "-Doptimize=safe");
     try expectContains(stage, "-Dubuntu2604-arch=aarch64");
     try expectContains(stage, "-Dubuntu2604-flavor=baremetal");
     try expectContains(stage, "--debz-cache \"$cache\"");

@@ -185,12 +185,12 @@ pub const Info = struct {
     snapshot_count: u32,
     snapshots_offset: u64,
     source_path_len: u16 = 0,
-    source_path: [std.fs.max_path_bytes]u8 = [_]u8{0} ** std.fs.max_path_bytes,
+    source_path: [std.fs.max_path_bytes]u8 = @as([std.fs.max_path_bytes]u8, @splat(0)),
     data_file_len: u16 = 0,
-    data_file_path: [std.fs.max_path_bytes]u8 = [_]u8{0} ** std.fs.max_path_bytes,
+    data_file_path: [std.fs.max_path_bytes]u8 = @as([std.fs.max_path_bytes]u8, @splat(0)),
     data_file_size: u64 = 0,
     backing_file_len: u16 = 0,
-    backing_file_path: [std.fs.max_path_bytes]u8 = [_]u8{0} ** std.fs.max_path_bytes,
+    backing_file_path: [std.fs.max_path_bytes]u8 = @as([std.fs.max_path_bytes]u8, @splat(0)),
     backing_depth: u8 = 0,
     backing_chain: [max_backing_chain_depth]BackingLayer = undefined,
 };
@@ -277,22 +277,22 @@ const LayerInfo = struct {
     snapshot_count: u32,
     snapshots_offset: u64,
     data_file_len: u16 = 0,
-    data_file_path: [std.fs.max_path_bytes]u8 = [_]u8{0} ** std.fs.max_path_bytes,
+    data_file_path: [std.fs.max_path_bytes]u8 = @as([std.fs.max_path_bytes]u8, @splat(0)),
     data_file_size: u64 = 0,
 };
 
 const BackingLayer = struct {
     info: LayerInfo,
     path_len: u16 = 0,
-    path: [std.fs.max_path_bytes]u8 = [_]u8{0} ** std.fs.max_path_bytes,
+    path: [std.fs.max_path_bytes]u8 = @as([std.fs.max_path_bytes]u8, @splat(0)),
 };
 
 const ParsedLayer = struct {
     info: LayerInfo,
     data_file_len: u16 = 0,
-    data_file_path: [std.fs.max_path_bytes]u8 = [_]u8{0} ** std.fs.max_path_bytes,
+    data_file_path: [std.fs.max_path_bytes]u8 = @as([std.fs.max_path_bytes]u8, @splat(0)),
     backing_file_len: u16 = 0,
-    backing_file_path: [std.fs.max_path_bytes]u8 = [_]u8{0} ** std.fs.max_path_bytes,
+    backing_file_path: [std.fs.max_path_bytes]u8 = @as([std.fs.max_path_bytes]u8, @splat(0)),
 };
 
 const ClusterKind = enum {
@@ -1875,7 +1875,7 @@ fn adjustL2EntryRefcounts(file: Io.File, io: Io, info: Info, guest_cluster_index
 }
 
 fn writeInitialHeader(file: Io.File, io: Io, info: Info) Io.File.WritePositionalError!void {
-    var header: [header_buffer_size]u8 = [_]u8{0} ** header_buffer_size;
+    var header: [header_buffer_size]u8 = @as([header_buffer_size]u8, @splat(0));
     header[0..4].* = file_signature;
     std.mem.writeInt(u32, header[4..8], info.version, .big);
     std.mem.writeInt(u32, header[20..24], info.cluster_bits, .big);
@@ -1918,7 +1918,7 @@ fn copyRange(file: Io.File, io: Io, src_offset: u64, dst_offset: u64, byte_lengt
 }
 
 fn zeroRange(file: Io.File, io: Io, offset: u64, byte_length: u64) Io.File.WritePositionalError!void {
-    const zeroes: [4096]u8 = [_]u8{0} ** 4096;
+    const zeroes: [4096]u8 = @as([4096]u8, @splat(0));
     var written: u64 = 0;
     while (written < byte_length) {
         const n: usize = @intCast(@min(byte_length - written, zeroes.len));
@@ -2414,7 +2414,7 @@ test "pread zero-fills sparse clusters" {
 
     var zeroes: [64]u8 = undefined;
     _ = try pread(file, io, info, &zeroes, info.cluster_size);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &zeroes);
+    try std.testing.expectEqualSlices(u8, &(@as([64]u8, @splat(0))), &zeroes);
 }
 
 test "openAtPath resolves recursive backing files" {
@@ -2505,10 +2505,10 @@ test "pread zero-fills beyond a shorter backing image" {
     defer overlay_file.close(io);
     const overlay = try openAtPath(io, overlay_file, overlay_path);
 
-    var inherited: [64]u8 = [_]u8{0xaa} ** 64;
+    var inherited: [64]u8 = @as([64]u8, @splat(0xaa));
     const got = try pread(overlay_file, io, overlay, &inherited, overlay_fixture.cluster_size);
     try std.testing.expectEqual(inherited.len, got);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** inherited.len), &inherited);
+    try std.testing.expectEqualSlices(u8, &(@as([inherited.len]u8, @splat(0))), &inherited);
 }
 
 test "pwrite copy-on-write preserves backing-file contents" {
@@ -2572,11 +2572,11 @@ test "pread inflates deflate-compressed clusters" {
 
     var buf: [256]u8 = undefined;
     _ = try pread(file, io, info, &buf, 512);
-    try std.testing.expectEqualSlices(u8, &([_]u8{'A'} ** 256), &buf);
+    try std.testing.expectEqualSlices(u8, &(@as([256]u8, @splat('A'))), &buf);
 
     var tail: [64]u8 = undefined;
     _ = try pread(file, io, info, &tail, cluster_size - tail.len);
-    try std.testing.expectEqualSlices(u8, &([_]u8{'A'} ** 64), &tail);
+    try std.testing.expectEqualSlices(u8, &(@as([64]u8, @splat('A'))), &tail);
 }
 
 test "pwrite inflates compressed clusters into standard data clusters" {
@@ -2596,7 +2596,7 @@ test "pwrite inflates compressed clusters into standard data clusters" {
 
     var buf: [16]u8 = undefined;
     _ = try pread(file, io, info, &buf, 1016);
-    var expected = [_]u8{'A'} ** 16;
+    var expected = @as([16]u8, @splat('A'));
     @memcpy(expected[8..12], "BLOB");
     try std.testing.expectEqualSlices(u8, &expected, &buf);
 }
@@ -2617,11 +2617,11 @@ test "pread decompresses zstd-compressed clusters" {
 
     var buf: [256]u8 = undefined;
     _ = try pread(file, io, info, &buf, 512);
-    try std.testing.expectEqualSlices(u8, &([_]u8{'A'} ** 256), &buf);
+    try std.testing.expectEqualSlices(u8, &(@as([256]u8, @splat('A'))), &buf);
 
     var tail: [64]u8 = undefined;
     _ = try pread(file, io, info, &tail, cluster_size - tail.len);
-    try std.testing.expectEqualSlices(u8, &([_]u8{'A'} ** 64), &tail);
+    try std.testing.expectEqualSlices(u8, &(@as([64]u8, @splat('A'))), &tail);
 }
 
 test "pwrite decompresses zstd-compressed clusters into standard data clusters" {
@@ -2641,7 +2641,7 @@ test "pwrite decompresses zstd-compressed clusters into standard data clusters" 
 
     var buf: [16]u8 = undefined;
     _ = try pread(file, io, info, &buf, 1016);
-    var expected = [_]u8{'A'} ** 16;
+    var expected = @as([16]u8, @splat('A'));
     @memcpy(expected[8..12], "BLOB");
     try std.testing.expectEqualSlices(u8, &expected, &buf);
 }
@@ -2654,7 +2654,7 @@ test "open() rejects an unknown compression_type" {
     // Reuse the zstd fixture layout, but with an unrecognized compression
     // algorithm ID (2) instead of zstd (1). The data doesn't matter since
     // open() should reject this before any cluster is ever decompressed.
-    const uncompressed = [_]u8{'A'} ** 4096;
+    const uncompressed = @as([4096]u8, @splat('A'));
     const compressed = try zstdCompress(std.testing.allocator, &uncompressed);
     defer std.testing.allocator.free(compressed);
     _ = try writeCompressedClusterFixture(io, path, 2, compressed);
@@ -2840,9 +2840,9 @@ test "pread and mapExtents handle extended L2 entries" {
 
     var mixed: [1536]u8 = undefined;
     _ = try pread(file, io, info, &mixed, 0);
-    try std.testing.expectEqualSlices(u8, &([_]u8{'A'} ** 512), mixed[0..512]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 512), mixed[512..1024]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{'B'} ** 512), mixed[1024..1536]);
+    try std.testing.expectEqualSlices(u8, &(@as([512]u8, @splat('A'))), mixed[0..512]);
+    try std.testing.expectEqualSlices(u8, &(@as([512]u8, @splat(0))), mixed[512..1024]);
+    try std.testing.expectEqualSlices(u8, &(@as([512]u8, @splat('B'))), mixed[1024..1536]);
 
     const extents = try mapExtents(file, io, info, std.testing.allocator);
     defer std.testing.allocator.free(extents);
@@ -2975,21 +2975,21 @@ test "pwrite zero-fills allocated zero clusters before partial writes" {
     const data_entry_offset = l2_offset;
     const data_offset = (try readU64(file, io, data_entry_offset)) & host_offset_mask;
 
-    const stale = [_]u8{0x7B} ** 64;
+    const stale = @as([64]u8, @splat(0x7B));
     try file.writePositionalAll(io, &stale, data_offset);
     try writeU64(file, io, data_entry_offset, data_offset | copied_mask | zero_mask);
 
     var zeros_before: [64]u8 = undefined;
     _ = try pread(file, io, info, &zeros_before, 0);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &zeros_before);
+    try std.testing.expectEqualSlices(u8, &(@as([64]u8, @splat(0))), &zeros_before);
 
     try pwrite(file, io, &info, "hi", 32);
 
     var buf: [64]u8 = undefined;
     _ = try pread(file, io, info, &buf, 0);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), buf[0..32]);
+    try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0))), buf[0..32]);
     try std.testing.expectEqualSlices(u8, "hi", buf[32..34]);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 30), buf[34..64]);
+    try std.testing.expectEqualSlices(u8, &(@as([30]u8, @splat(0))), buf[34..64]);
 }
 
 test "resize clears newly exposed in-place L1 entries" {
@@ -3007,7 +3007,7 @@ test "resize clears newly exposed in-place L1 entries" {
 
     var buf: [64]u8 = undefined;
     _ = try pread(file, io, info, &buf, 512 * 1024 * 1024);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 64), &buf);
+    try std.testing.expectEqualSlices(u8, &(@as([64]u8, @splat(0))), &buf);
 }
 
 test "create, write, resize, and validate refcounts" {
@@ -3022,7 +3022,7 @@ test "create, write, resize, and validate refcounts" {
     const distant_offset: u64 = 768 * 1024 * 1024 + 123;
     const payload0 = "qcow2-direct-0";
     const payload1 = "qcow2-direct-1";
-    const payload2 = [_]u8{0x5A} ** 256;
+    const payload2 = @as([256]u8, @splat(0x5A));
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
@@ -3132,7 +3132,7 @@ fn writeTestFixture(io: Io, path: []const u8, options: TestFixtureOptions) !Test
     defer file.close(io);
     try file.setLength(io, total_file_size);
 
-    var header: [header_buffer_size]u8 = [_]u8{0} ** header_buffer_size;
+    var header: [header_buffer_size]u8 = @as([header_buffer_size]u8, @splat(0));
     header[0..4].* = file_signature;
     std.mem.writeInt(u32, header[4..8], 3, .big);
     std.mem.writeInt(u32, header[20..24], cluster_bits, .big);
@@ -3149,22 +3149,22 @@ fn writeTestFixture(io: Io, path: []const u8, options: TestFixtureOptions) !Test
     std.mem.writeInt(u32, header[100..104], header_length_v3, .big);
     try file.writePositionalAll(io, &header, 0);
 
-    var refcount_table: [4096]u8 = [_]u8{0} ** 4096;
+    var refcount_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, refcount_table[0..8], refcount_block_offset, .big);
     try file.writePositionalAll(io, &refcount_table, refcount_table_offset);
 
-    var refcount_block: [4096]u8 = [_]u8{0} ** 4096;
+    var refcount_block: [4096]u8 = @as([4096]u8, @splat(0));
     var cluster_index: usize = 0;
     while (cluster_index < 7) : (cluster_index += 1) {
         std.mem.writeInt(u16, refcount_block[cluster_index * 2 ..][0..2], 1, .big);
     }
     try file.writePositionalAll(io, &refcount_block, refcount_block_offset);
 
-    var l1_table: [4096]u8 = [_]u8{0} ** 4096;
+    var l1_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, l1_table[0..8], l2_table_offset | copied_mask, .big);
     try file.writePositionalAll(io, &l1_table, l1_table_offset);
 
-    var l2_table: [4096]u8 = [_]u8{0} ** 4096;
+    var l2_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, l2_table[0..8], data0_offset | copied_mask, .big);
     std.mem.writeInt(u64, l2_table[16..24], data2_offset | copied_mask, .big);
     try file.writePositionalAll(io, &l2_table, l2_table_offset);
@@ -3199,7 +3199,7 @@ fn writeSingleClusterFixture(io: Io, path: []const u8, options: SingleClusterFix
     defer file.close(io);
     try file.setLength(io, total_file_size);
 
-    var header: [header_buffer_size]u8 = [_]u8{0} ** header_buffer_size;
+    var header: [header_buffer_size]u8 = @as([header_buffer_size]u8, @splat(0));
     header[0..4].* = file_signature;
     std.mem.writeInt(u32, header[4..8], 3, .big);
     if (options.backing_file) |backing_file| {
@@ -3219,22 +3219,22 @@ fn writeSingleClusterFixture(io: Io, path: []const u8, options: SingleClusterFix
         try file.writePositionalAll(io, backing_file, header_length_v3);
     }
 
-    var refcount_table: [4096]u8 = [_]u8{0} ** 4096;
+    var refcount_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, refcount_table[0..8], refcount_block_offset, .big);
     try file.writePositionalAll(io, &refcount_table, refcount_table_offset);
 
-    var refcount_block: [4096]u8 = [_]u8{0} ** 4096;
+    var refcount_block: [4096]u8 = @as([4096]u8, @splat(0));
     var cluster_index: usize = 0;
     while (cluster_index < 6) : (cluster_index += 1) {
         std.mem.writeInt(u16, refcount_block[cluster_index * 2 ..][0..2], 1, .big);
     }
     try file.writePositionalAll(io, &refcount_block, refcount_block_offset);
 
-    var l1_table: [4096]u8 = [_]u8{0} ** 4096;
+    var l1_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, l1_table[0..8], l2_table_offset | copied_mask, .big);
     try file.writePositionalAll(io, &l1_table, l1_table_offset);
 
-    var l2_table: [4096]u8 = [_]u8{0} ** 4096;
+    var l2_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, l2_table[options.guest_cluster_index * 8 ..][0..8], data_offset | copied_mask, .big);
     try file.writePositionalAll(io, &l2_table, l2_table_offset);
     try file.writePositionalAll(io, options.payload, data_offset + options.payload_offset);
@@ -3243,7 +3243,7 @@ fn writeSingleClusterFixture(io: Io, path: []const u8, options: SingleClusterFix
 }
 
 fn writeCompressedFixture(io: Io, path: []const u8) !u64 {
-    const uncompressed = [_]u8{'A'} ** 4096;
+    const uncompressed = @as([4096]u8, @splat('A'));
     var out = try std.Io.Writer.Allocating.initCapacity(std.testing.allocator, 128);
     defer out.deinit();
     var history: [std.compress.flate.max_window_len]u8 = undefined;
@@ -3266,7 +3266,7 @@ fn zstdCompress(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
 }
 
 fn writeZstdCompressedFixture(io: Io, path: []const u8) !u64 {
-    const uncompressed = [_]u8{'A'} ** 4096;
+    const uncompressed = @as([4096]u8, @splat('A'));
     const compressed = try zstdCompress(std.testing.allocator, &uncompressed);
     defer std.testing.allocator.free(compressed);
 
@@ -3290,7 +3290,7 @@ fn writeCompressedClusterFixture(io: Io, path: []const u8, compression_type: u8,
     defer file.close(io);
     try file.setLength(io, data_offset + stored_bytes);
 
-    var header: [header_buffer_size]u8 = [_]u8{0} ** header_buffer_size;
+    var header: [header_buffer_size]u8 = @as([header_buffer_size]u8, @splat(0));
     header[0..4].* = file_signature;
     std.mem.writeInt(u32, header[4..8], 3, .big);
     std.mem.writeInt(u32, header[20..24], cluster_bits, .big);
@@ -3311,25 +3311,25 @@ fn writeCompressedClusterFixture(io: Io, path: []const u8, compression_type: u8,
     }
     try file.writePositionalAll(io, &header, 0);
 
-    var refcount_table: [4096]u8 = [_]u8{0} ** 4096;
+    var refcount_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, refcount_table[0..8], refcount_block_offset, .big);
     try file.writePositionalAll(io, &refcount_table, refcount_table_offset);
 
-    var refcount_block: [4096]u8 = [_]u8{0} ** 4096;
+    var refcount_block: [4096]u8 = @as([4096]u8, @splat(0));
     var cluster_index: usize = 0;
     while (cluster_index < 6) : (cluster_index += 1) {
         std.mem.writeInt(u16, refcount_block[cluster_index * 2 ..][0..2], 1, .big);
     }
     try file.writePositionalAll(io, &refcount_block, refcount_block_offset);
 
-    var l1_table: [4096]u8 = [_]u8{0} ** 4096;
+    var l1_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, l1_table[0..8], l2_table_offset | copied_mask, .big);
     try file.writePositionalAll(io, &l1_table, l1_table_offset);
 
     const additional_sectors: u64 = stored_bytes / 512 - 1;
     const offset_bits = 62 - (cluster_bits - 8);
     const l2_entry = compressed_mask | data_offset | (additional_sectors << @intCast(offset_bits));
-    var l2_table: [4096]u8 = [_]u8{0} ** 4096;
+    var l2_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, l2_table[0..8], l2_entry, .big);
     try file.writePositionalAll(io, &l2_table, l2_table_offset);
     try file.writePositionalAll(io, compressed, data_offset);
@@ -3341,7 +3341,7 @@ fn appendSnapshotEntry(out: *std.array_list.Managed(u8), spec: SnapshotEntrySpec
     const entry_start = out.items.len;
     const extra_data_size: u32 = 24;
 
-    var header: [40]u8 = [_]u8{0} ** 40;
+    var header: [40]u8 = @as([40]u8, @splat(0));
     std.mem.writeInt(u64, header[0..8], spec.l1_table_offset, .big);
     std.mem.writeInt(u32, header[8..12], 1, .big);
     std.mem.writeInt(u16, header[12..14], @intCast(spec.id.len), .big);
@@ -3353,7 +3353,7 @@ fn appendSnapshotEntry(out: *std.array_list.Managed(u8), spec: SnapshotEntrySpec
     std.mem.writeInt(u32, header[36..40], extra_data_size, .big);
     try out.appendSlice(&header);
 
-    var extra: [24]u8 = [_]u8{0} ** 24;
+    var extra: [24]u8 = @as([24]u8, @splat(0));
     std.mem.writeInt(u64, extra[0..8], spec.vm_state_size, .big);
     std.mem.writeInt(u64, extra[8..16], spec.virtual_size, .big);
     std.mem.writeInt(i64, extra[16..24], spec.icount, .big);
@@ -3363,7 +3363,7 @@ fn appendSnapshotEntry(out: *std.array_list.Managed(u8), spec: SnapshotEntrySpec
 
     const padding = std.mem.alignForward(usize, out.items.len - entry_start, 8) - (out.items.len - entry_start);
     if (padding != 0) {
-        const zeroes: [8]u8 = [_]u8{0} ** 8;
+        const zeroes: [8]u8 = @as([8]u8, @splat(0));
         try out.appendSlice(zeroes[0..padding]);
     }
 }
@@ -3391,7 +3391,7 @@ fn writeSnapshotFixture(io: Io, path: []const u8) !void {
     defer file.close(io);
     try file.setLength(io, total_file_size);
 
-    var header: [header_buffer_size]u8 = [_]u8{0} ** header_buffer_size;
+    var header: [header_buffer_size]u8 = @as([header_buffer_size]u8, @splat(0));
     header[0..4].* = file_signature;
     std.mem.writeInt(u32, header[4..8], 3, .big);
     std.mem.writeInt(u32, header[20..24], cluster_bits, .big);
@@ -3406,40 +3406,40 @@ fn writeSnapshotFixture(io: Io, path: []const u8) !void {
     std.mem.writeInt(u32, header[100..104], header_length_v3, .big);
     try file.writePositionalAll(io, &header, 0);
 
-    var refcount_table: [4096]u8 = [_]u8{0} ** 4096;
+    var refcount_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, refcount_table[0..8], refcount_block_offset, .big);
     try file.writePositionalAll(io, &refcount_table, refcount_table_offset);
 
-    var refcount_block: [4096]u8 = [_]u8{0} ** 4096;
+    var refcount_block: [4096]u8 = @as([4096]u8, @splat(0));
     var cluster_index: usize = 0;
     while (cluster_index < 14) : (cluster_index += 1) {
         std.mem.writeInt(u16, refcount_block[cluster_index * 2 ..][0..2], 1, .big);
     }
     try file.writePositionalAll(io, &refcount_block, refcount_block_offset);
 
-    var active_l1: [4096]u8 = [_]u8{0} ** 4096;
+    var active_l1: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, active_l1[0..8], active_l2_offset | copied_mask, .big);
     try file.writePositionalAll(io, &active_l1, l1_table_offset);
 
-    var snapshot_l1_0: [4096]u8 = [_]u8{0} ** 4096;
+    var snapshot_l1_0: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, snapshot_l1_0[0..8], snapshot_l2_offset_0 | copied_mask, .big);
     try file.writePositionalAll(io, &snapshot_l1_0, snapshot_l1_offset_0);
 
-    var snapshot_l1_1: [4096]u8 = [_]u8{0} ** 4096;
+    var snapshot_l1_1: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, snapshot_l1_1[0..8], snapshot_l2_offset_1 | copied_mask, .big);
     try file.writePositionalAll(io, &snapshot_l1_1, snapshot_l1_offset_1);
 
-    var active_l2: [4096]u8 = [_]u8{0} ** 4096;
+    var active_l2: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, active_l2[0..8], active_data_offset | copied_mask, .big);
     std.mem.writeInt(u64, active_l2[8..16], shared_data_offset | copied_mask, .big);
     try file.writePositionalAll(io, &active_l2, active_l2_offset);
 
-    var snapshot_l2_0: [4096]u8 = [_]u8{0} ** 4096;
+    var snapshot_l2_0: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, snapshot_l2_0[0..8], snapshot_data_offset_0 | copied_mask, .big);
     std.mem.writeInt(u64, snapshot_l2_0[8..16], shared_data_offset | copied_mask, .big);
     try file.writePositionalAll(io, &snapshot_l2_0, snapshot_l2_offset_0);
 
-    var snapshot_l2_1: [4096]u8 = [_]u8{0} ** 4096;
+    var snapshot_l2_1: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, snapshot_l2_1[0..8], snapshot_data_offset_1 | copied_mask, .big);
     std.mem.writeInt(u64, snapshot_l2_1[8..16], shared_data_offset | copied_mask, .big);
     try file.writePositionalAll(io, &snapshot_l2_1, snapshot_l2_offset_1);
@@ -3494,7 +3494,7 @@ fn writeExternalDataFixture(io: Io, meta_path: []const u8, data_path: []const u8
     defer file.close(io);
     try file.setLength(io, total_file_size);
 
-    var header: [header_buffer_size]u8 = [_]u8{0} ** header_buffer_size;
+    var header: [header_buffer_size]u8 = @as([header_buffer_size]u8, @splat(0));
     header[0..4].* = file_signature;
     std.mem.writeInt(u32, header[4..8], 3, .big);
     std.mem.writeInt(u32, header[20..24], cluster_bits, .big);
@@ -3508,28 +3508,28 @@ fn writeExternalDataFixture(io: Io, meta_path: []const u8, data_path: []const u8
     std.mem.writeInt(u32, header[100..104], header_length_v3, .big);
     try file.writePositionalAll(io, &header, 0);
 
-    var ext: [64]u8 = [_]u8{0} ** 64;
+    var ext: [64]u8 = @as([64]u8, @splat(0));
     std.mem.writeInt(u32, ext[0..4], header_extension_external_data_file_magic, .big);
     std.mem.writeInt(u32, ext[4..8], @intCast(data_path.len), .big);
     @memcpy(ext[8 .. 8 + data_path.len], data_path);
     try file.writePositionalAll(io, &ext, header_length_v3);
 
-    var refcount_table: [4096]u8 = [_]u8{0} ** 4096;
+    var refcount_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, refcount_table[0..8], refcount_block_offset, .big);
     try file.writePositionalAll(io, &refcount_table, refcount_table_offset);
 
-    var refcount_block: [4096]u8 = [_]u8{0} ** 4096;
+    var refcount_block: [4096]u8 = @as([4096]u8, @splat(0));
     var cluster_index: usize = 0;
     while (cluster_index < 5) : (cluster_index += 1) {
         std.mem.writeInt(u16, refcount_block[cluster_index * 2 ..][0..2], 1, .big);
     }
     try file.writePositionalAll(io, &refcount_block, refcount_block_offset);
 
-    var l1_table: [4096]u8 = [_]u8{0} ** 4096;
+    var l1_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, l1_table[0..8], l2_table_offset | copied_mask, .big);
     try file.writePositionalAll(io, &l1_table, l1_table_offset);
 
-    var l2_table: [4096]u8 = [_]u8{0} ** 4096;
+    var l2_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, l2_table[0..8], copied_mask, .big);
     std.mem.writeInt(u64, l2_table[8..16], cluster_size | copied_mask, .big);
     try file.writePositionalAll(io, &l2_table, l2_table_offset);
@@ -3553,7 +3553,7 @@ fn writeExtendedL2Fixture(io: Io, path: []const u8) !ExtendedL2Fixture {
     defer file.close(io);
     try file.setLength(io, total_file_size);
 
-    var header: [header_buffer_size]u8 = [_]u8{0} ** header_buffer_size;
+    var header: [header_buffer_size]u8 = @as([header_buffer_size]u8, @splat(0));
     header[0..4].* = file_signature;
     std.mem.writeInt(u32, header[4..8], 3, .big);
     std.mem.writeInt(u32, header[20..24], cluster_bits, .big);
@@ -3596,8 +3596,8 @@ fn writeExtendedL2Fixture(io: Io, path: []const u8) !ExtendedL2Fixture {
     std.mem.writeInt(u64, l2_table[8..16], bitmap, .big);
     try file.writePositionalAll(io, l2_table, l2_table_offset);
 
-    const a_buf = [_]u8{'A'} ** 512;
-    const b_buf = [_]u8{'B'} ** 512;
+    const a_buf = @as([512]u8, @splat('A'));
+    const b_buf = @as([512]u8, @splat('B'));
     try file.writePositionalAll(io, &a_buf, data_offset);
     try file.writePositionalAll(io, &b_buf, data_offset + 2 * subcluster_size);
 
@@ -3616,7 +3616,7 @@ fn writeEncryptedFixture(io: Io, path: []const u8, crypt_method: u32) !void {
     defer file.close(io);
     try file.setLength(io, total_file_size);
 
-    var header: [header_buffer_size]u8 = [_]u8{0} ** header_buffer_size;
+    var header: [header_buffer_size]u8 = @as([header_buffer_size]u8, @splat(0));
     header[0..4].* = file_signature;
     std.mem.writeInt(u32, header[4..8], 3, .big);
     std.mem.writeInt(u32, header[20..24], cluster_bits, .big);
@@ -3630,7 +3630,7 @@ fn writeEncryptedFixture(io: Io, path: []const u8, crypt_method: u32) !void {
     std.mem.writeInt(u32, header[100..104], header_length_v3, .big);
     try file.writePositionalAll(io, &header, 0);
 
-    var refcount_table: [4096]u8 = [_]u8{0} ** 4096;
+    var refcount_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, refcount_table[0..8], refcount_block_offset, .big);
     try file.writePositionalAll(io, &refcount_table, refcount_table_offset);
 }
@@ -3652,7 +3652,7 @@ fn writeFullCoverage4kFixture(file: Io.File, io: Io) !void {
 
     try file.setLength(io, total_file_size);
 
-    var header: [header_buffer_size]u8 = [_]u8{0} ** header_buffer_size;
+    var header: [header_buffer_size]u8 = @as([header_buffer_size]u8, @splat(0));
     header[0..4].* = file_signature;
     std.mem.writeInt(u32, header[4..8], 3, .big);
     std.mem.writeInt(u32, header[20..24], cluster_bits, .big);
@@ -3665,18 +3665,18 @@ fn writeFullCoverage4kFixture(file: Io.File, io: Io) !void {
     std.mem.writeInt(u32, header[100..104], header_length_v3, .big);
     try file.writePositionalAll(io, &header, 0);
 
-    var refcount_table: [4096]u8 = [_]u8{0} ** 4096;
+    var refcount_table: [4096]u8 = @as([4096]u8, @splat(0));
     std.mem.writeInt(u64, refcount_table[0..8], refcount_block_offset, .big);
     try file.writePositionalAll(io, &refcount_table, refcount_table_offset);
 
-    var refcount_block: [4096]u8 = [_]u8{0} ** 4096;
+    var refcount_block: [4096]u8 = @as([4096]u8, @splat(0));
     var cluster_index: usize = 0;
     while (cluster_index < total_clusters) : (cluster_index += 1) {
         std.mem.writeInt(u16, refcount_block[cluster_index * 2 ..][0..2], 1, .big);
     }
     try file.writePositionalAll(io, &refcount_block, refcount_block_offset);
 
-    var l1_table: [4096]u8 = [_]u8{0} ** 4096;
+    var l1_table: [4096]u8 = @as([4096]u8, @splat(0));
     var l1_index: u32 = 0;
     while (l1_index < l1_size) : (l1_index += 1) {
         std.mem.writeInt(u64, l1_table[l1_index * 8 ..][0..8], l2_tables_offset + @as(u64, l1_index) * cluster_size | copied_mask, .big);
@@ -3877,7 +3877,7 @@ test "writeStandaloneCompressed rejects unsupported options" {
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
 
-    const data = [_]u8{0} ** 512;
+    const data = @as([512]u8, @splat(0));
     var src = SliceSource{ .data = &data };
 
     try std.testing.expectError(error.UnsupportedCompressionType, writeStandaloneCompressed(

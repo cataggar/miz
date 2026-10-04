@@ -116,8 +116,8 @@ fn writeMeasuredRoot(fixture: *Fixture) !void {
         "/var/lib/dpkg/info/beta.list",
         "/usr\n/usr/bin\n/usr/bin/beta\n/usr/lib/beta.so\n",
     );
-    try fixture.write("/usr/bin/alpha", "alpha" ** 8);
-    try fixture.write("/usr/bin/beta", "beta" ** 4);
+    try fixture.write("/usr/bin/alpha", repeatedBytes("alpha", 8));
+    try fixture.write("/usr/bin/beta", repeatedBytes("beta", 4));
     try fixture.write("/usr/lib/beta.so", "shared object");
     try fixture.write("/usr/sbin/mizinit", "injected pid 1");
     try fixture.write("/etc/unexpected.conf", "no package owns this");
@@ -701,7 +701,7 @@ test "comparison reports closure, package, and phase deltas" {
 
     // The candidate drops `beta` and grows `alpha`.
     try fixture.write(size_inventory.package_lock_path, "alpha\t1.0-1\tamd64\n");
-    try fixture.write("/usr/bin/alpha", "alpha" ** 16);
+    try fixture.write("/usr/bin/alpha", repeatedBytes("alpha", 16));
     var candidate = try buildReport(&fixture, .core);
     defer candidate.deinit();
     try candidate.addPhase(
@@ -1529,7 +1529,7 @@ test "a document whose allowlist policy digest does not match is refused" {
     const arena = parsed.arena.allocator();
     const unowned = field(parsed.value, &.{ "root_build", "unowned" }).object;
     var mutable = unowned;
-    try mutable.put(arena, "policy_sha256", .{ .string = "0" ** 64 });
+    try mutable.put(arena, "policy_sha256", .{ .string = &@as([64:0]u8, @splat("0"[0])) });
     var root_build = field(parsed.value, &.{"root_build"}).object;
     try root_build.put(arena, "unowned", .{ .object = mutable });
     var document = parsed.value.object;
@@ -1613,4 +1613,17 @@ test "the full flavor keeps its broad rules and its own policy" {
         try std.testing.expect(!std.mem.eql(u8, rule.pattern, "/usr/lib/modules/**"));
         try std.testing.expect(!std.mem.eql(u8, rule.pattern, "/etc/systemd/system/**"));
     }
+}
+
+fn repeatedBytes(comptime pattern: []const u8, comptime repetitions: usize) *const [pattern.len * repetitions:0]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1000 + repetitions * 2);
+        var bytes: [pattern.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| {
+            @memcpy(bytes[i * pattern.len ..][0..pattern.len], pattern);
+        }
+        bytes[bytes.len] = 0;
+        const result = bytes;
+        break :blk &result;
+    };
 }

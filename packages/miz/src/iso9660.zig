@@ -170,7 +170,7 @@ pub const UnsupportedDetail = struct {
 const BuildDiagnostic = struct {
     feature: UnsupportedFeature,
     entry_index: ?usize = null,
-    note_buf: [8]u8 = [_]u8{0} ** 8,
+    note_buf: [8]u8 = @as([8]u8, @splat(0)),
     note_len: u8 = 0,
 
     fn note(self: *const BuildDiagnostic) []const u8 {
@@ -541,7 +541,7 @@ const RockRidgeInfo = struct {
     /// A rewrite-blocking SUSP/RRIP construct was seen on this record.
     unsupported: ?UnsupportedFeature = null,
     /// Signature of the offending record (for diagnostics), when applicable.
-    unsupported_tag: [4]u8 = [_]u8{0} ** 4,
+    unsupported_tag: [4]u8 = @as([4]u8, @splat(0)),
     unsupported_tag_len: u8 = 0,
 
     fn deinit(self: *RockRidgeInfo, allocator: std.mem.Allocator) void {
@@ -1203,7 +1203,7 @@ fn recordLength(name_len: usize, system_use_len: usize) usize {
 }
 
 fn makeDirectoryRecord(name: []const u8, extent_lba: u32, size: u32, flags: u8, system_use: []const u8) [256]u8 {
-    var out: [256]u8 = [_]u8{0} ** 256;
+    var out: [256]u8 = @as([256]u8, @splat(0));
     const len = recordLength(name.len, system_use.len);
     out[0] = @intCast(len);
     out[1] = 0;
@@ -1241,7 +1241,7 @@ fn buildRrSystemUse(flags: u8) [5]u8 {
 }
 
 fn buildPxSystemUse(mode: u32, uid: u32, gid: u32) [36]u8 {
-    var out: [36]u8 = [_]u8{0} ** 36;
+    var out: [36]u8 = @as([36]u8, @splat(0));
     out[0] = 'P';
     out[1] = 'X';
     out[2] = 36;
@@ -1254,7 +1254,7 @@ fn buildPxSystemUse(mode: u32, uid: u32, gid: u32) [36]u8 {
 }
 
 fn buildNmSystemUse(name: []const u8) [260]u8 {
-    var out: [260]u8 = [_]u8{0} ** 260;
+    var out: [260]u8 = @as([260]u8, @splat(0));
     out[0] = 'N';
     out[1] = 'M';
     out[2] = @intCast(5 + name.len);
@@ -1265,7 +1265,7 @@ fn buildNmSystemUse(name: []const u8) [260]u8 {
 }
 
 fn buildSlSystemUse(target: []const u8) [260]u8 {
-    var out: [260]u8 = [_]u8{0} ** 260;
+    var out: [260]u8 = @as([260]u8, @splat(0));
     var cursor: usize = 5;
     out[0] = 'S';
     out[1] = 'L';
@@ -1320,14 +1320,14 @@ test "iso9660 reader enumerates rock ridge names and resolves symlinks" {
     const dir_lba: u32 = 21;
     const file_lba: u32 = 22;
     const file_bytes = "hello from rock ridge\n";
-    const susp_prefix = [_]u8{0} ** 7;
+    const susp_prefix = @as([7]u8, @splat(0));
 
     var image = std.array_list.Managed(u8).init(allocator);
     defer image.deinit();
     try image.resize((file_lba + 1) * descriptor_size);
     @memset(image.items, 0);
 
-    var pvd: [descriptor_size]u8 = [_]u8{0} ** descriptor_size;
+    var pvd: [descriptor_size]u8 = @as([descriptor_size]u8, @splat(0));
     pvd[0] = 1;
     pvd[1..6].* = standard_id;
     pvd[6] = 1;
@@ -1341,7 +1341,7 @@ test "iso9660 reader enumerates rock ridge names and resolves symlinks" {
     @memcpy(pvd[156 .. 156 + root_record[0]], root_record[0..root_record[0]]);
     image.items[volume_descriptor_lba * descriptor_size .. (volume_descriptor_lba + 1) * descriptor_size].* = pvd;
 
-    var terminator: [descriptor_size]u8 = [_]u8{0} ** descriptor_size;
+    var terminator: [descriptor_size]u8 = @as([descriptor_size]u8, @splat(0));
     terminator[0] = 255;
     terminator[1..6].* = standard_id;
     terminator[6] = 1;
@@ -1471,7 +1471,7 @@ test "iso9660 reader falls back to joliet unicode names" {
     try image.resize((file_lba + 1) * descriptor_size);
     @memset(image.items, 0);
 
-    var pvd: [descriptor_size]u8 = [_]u8{0} ** descriptor_size;
+    var pvd: [descriptor_size]u8 = @as([descriptor_size]u8, @splat(0));
     pvd[0] = 1;
     pvd[1..6].* = standard_id;
     pvd[6] = 1;
@@ -1483,7 +1483,7 @@ test "iso9660 reader falls back to joliet unicode names" {
     @memcpy(pvd[156 .. 156 + root_record[0]], root_record[0..root_record[0]]);
     image.items[16 * descriptor_size .. 17 * descriptor_size].* = pvd;
 
-    var svd: [descriptor_size]u8 = [_]u8{0} ** descriptor_size;
+    var svd: [descriptor_size]u8 = @as([descriptor_size]u8, @splat(0));
     svd[0] = 2;
     svd[1..6].* = standard_id;
     svd[6] = 1;
@@ -1498,7 +1498,7 @@ test "iso9660 reader falls back to joliet unicode names" {
     @memcpy(svd[156 .. 156 + joliet_root[0]], joliet_root[0..joliet_root[0]]);
     image.items[17 * descriptor_size .. 18 * descriptor_size].* = svd;
 
-    var terminator: [descriptor_size]u8 = [_]u8{0} ** descriptor_size;
+    var terminator: [descriptor_size]u8 = @as([descriptor_size]u8, @splat(0));
     terminator[0] = 255;
     terminator[1..6].* = standard_id;
     terminator[6] = 1;
@@ -1754,13 +1754,13 @@ fn parseBootEntry(entry: []const u8, platform: u8, kind: BootEntryKind, file_siz
         .bootable = boot_indicator == 0x88,
         .boot_indicator = boot_indicator,
         .media_type = media_byte,
-        .media = @enumFromInt(media_byte & 0x0F),
+        .media = @fromBackingInt(@intCast(media_byte & 0x0F)),
         .load_segment = std.mem.readInt(u16, entry[2..4], .little),
         .system_type = entry[4],
         .load_sectors = std.mem.readInt(u16, entry[6..8], .little),
         .image_lba = image_lba,
         .selection_criteria_type = 0,
-        .selection_criteria = [_]u8{0} ** 19,
+        .selection_criteria = @as([19]u8, @splat(0)),
         // A section entry declares a following extension record via bit 5
         // (0x20) of the media byte.
         .has_extension = kind == .section and (media_byte & 0x20 != 0),
@@ -2065,7 +2065,7 @@ pub const BootCatalogSection = struct {
     /// follow" header (0x90). Reproduces the source's final-vs-more indicator.
     final: bool = true,
     /// 28-byte section header id string, emitted verbatim.
-    id_string: [28]u8 = [_]u8{0} ** 28,
+    id_string: [28]u8 = @as([28]u8, @splat(0)),
     /// Section entries, in catalog order.
     entries: []const BootImageEntry,
 };
@@ -2083,7 +2083,7 @@ pub const BootCatalogLayout = struct {
     /// Validation entry platform id; the default entry inherits it.
     validation_platform: u8,
     /// Validation entry 24-byte developer id string, emitted verbatim.
-    validation_id: [24]u8 = [_]u8{0} ** 24,
+    validation_id: [24]u8 = @as([24]u8, @splat(0)),
     /// The initial/default boot entry (immediately follows the validation
     /// entry and inherits `validation_platform`).
     default_entry: BootImageEntry,
@@ -2807,7 +2807,7 @@ const IsoWriter = struct {
     }
 
     fn emitPrimaryVolumeDescriptor(self: *IsoWriter) anyerror!void {
-        var pvd = [_]u8{0} ** sector_size;
+        var pvd = @as([sector_size]u8, @splat(0));
         pvd[0] = 1;
         pvd[1..6].* = standard_id;
         pvd[6] = 1;
@@ -2834,7 +2834,7 @@ const IsoWriter = struct {
     }
 
     fn makeRootRecord(self: *IsoWriter) [34]u8 {
-        var out = [_]u8{0} ** 34;
+        var out = @as([34]u8, @splat(0));
         const root = &self.nodes[0];
         out[0] = 34;
         write733(out[2..10], root.extent_lba);
@@ -2848,7 +2848,7 @@ const IsoWriter = struct {
     }
 
     fn emitBootRecord(self: *IsoWriter) anyerror!void {
-        var br = [_]u8{0} ** sector_size;
+        var br = @as([sector_size]u8, @splat(0));
         br[0] = 0;
         br[1..6].* = standard_id;
         br[6] = 1;
@@ -2859,7 +2859,7 @@ const IsoWriter = struct {
     }
 
     fn emitTerminator(self: *IsoWriter) anyerror!void {
-        var term = [_]u8{0} ** sector_size;
+        var term = @as([sector_size]u8, @splat(0));
         term[0] = 255;
         term[1..6].* = standard_id;
         term[6] = 1;
@@ -3007,7 +3007,7 @@ const IsoWriter = struct {
     }
 
     fn emitBootCatalog(self: *IsoWriter) anyerror!void {
-        var cat = [_]u8{0} ** sector_size;
+        var cat = @as([sector_size]u8, @splat(0));
         if (self.options.boot_catalog) |layout| {
             self.emitBootCatalogLayout(&cat, layout);
         } else {
@@ -3035,12 +3035,12 @@ const IsoWriter = struct {
         }
         const default = default_entry.?;
 
-        writeValidationEntry(cat, @intFromEnum(default.platform), &.{});
+        writeValidationEntry(cat, @backingInt(default.platform), &.{});
         self.writeBootImageEntry(cat[32..64], toImageEntry(default));
 
         if (section_entry) |entry| {
             cat[64] = 0x91; // final section header
-            cat[65] = @intFromEnum(entry.platform);
+            cat[65] = @backingInt(entry.platform);
             std.mem.writeInt(u16, cat[66..68], 1, .little);
             self.writeBootImageEntry(cat[96..128], toImageEntry(entry));
         }
@@ -3116,7 +3116,7 @@ const IsoWriter = struct {
         const end = @as(u64, self.total_sectors) * sector_size;
         const got = try self.file.readPositionalAll(self.io, probe[0..], end - 1);
         if (got == 0) {
-            var zero = [_]u8{0} ** sector_size;
+            var zero = @as([sector_size]u8, @splat(0));
             try self.writeSector(last, &zero);
         }
     }
@@ -4033,7 +4033,7 @@ test "iso writer emits BIOS-only el torito catalog" {
 
     const nodes = [_]TestNode{
         .{ .path = "boot", .kind = .directory, .mode = 0o755 },
-        .{ .path = "boot/isolinux.bin", .kind = .file, .mode = 0o644, .bytes = "BIOSBOOT" ** 100 },
+        .{ .path = "boot/isolinux.bin", .kind = .file, .mode = 0o644, .bytes = repeatedBytes("BIOSBOOT", 100) },
     };
     const ts = TestSource{ .nodes = &nodes };
     _ = try writeImagePath(allocator, io, path, ts.source(), .{
@@ -4067,7 +4067,7 @@ test "iso writer emits UEFI-only el torito catalog" {
     const nodes = [_]TestNode{
         .{ .path = "EFI", .kind = .directory, .mode = 0o755 },
         .{ .path = "EFI/BOOT", .kind = .directory, .mode = 0o755 },
-        .{ .path = "EFI/BOOT/bootx64.efi", .kind = .file, .mode = 0o644, .bytes = "EFIBOOT!" ** 300 },
+        .{ .path = "EFI/BOOT/bootx64.efi", .kind = .file, .mode = 0o644, .bytes = repeatedBytes("EFIBOOT!", 300) },
     };
     const ts = TestSource{ .nodes = &nodes };
     _ = try writeImagePath(allocator, io, path, ts.source(), .{
@@ -4093,9 +4093,9 @@ test "iso writer emits dual BIOS and UEFI el torito catalog" {
 
     const nodes = [_]TestNode{
         .{ .path = "boot", .kind = .directory, .mode = 0o755 },
-        .{ .path = "boot/bios.img", .kind = .file, .mode = 0o644, .bytes = "BIOS" ** 200 },
+        .{ .path = "boot/bios.img", .kind = .file, .mode = 0o644, .bytes = repeatedBytes("BIOS", 200) },
         .{ .path = "EFI", .kind = .directory, .mode = 0o755 },
-        .{ .path = "EFI/efiboot.img", .kind = .file, .mode = 0o644, .bytes = "UEFI" ** 200 },
+        .{ .path = "EFI/efiboot.img", .kind = .file, .mode = 0o644, .bytes = repeatedBytes("UEFI", 200) },
     };
     const ts = TestSource{ .nodes = &nodes };
     _ = try writeImagePath(allocator, io, path, ts.source(), .{
@@ -4129,9 +4129,9 @@ test "iso writer reproduces an exact boot catalog layout: UEFI validation/defaul
     defer Io.Dir.cwd().deleteFile(io, path) catch {};
 
     const ts = dualBootTestSource();
-    var validation_id = [_]u8{0} ** 24;
+    var validation_id = @as([24]u8, @splat(0));
     @memcpy(validation_id[0.."MIZ-VALID.".len], "MIZ-VALID.");
-    var section_id = [_]u8{0} ** 28;
+    var section_id = @as([28]u8, @splat(0));
     @memcpy(section_id[0.."MIZ-SECTION.".len], "MIZ-SECTION.");
 
     // Exact layout the default `boot_entries` convention could never emit: the
@@ -4271,7 +4271,7 @@ fn synthIsoAlloc(allocator: std.mem.Allocator, opts: SynthOptions, child_records
     errdefer allocator.free(image);
     @memset(image, 0);
 
-    var pvd = [_]u8{0} ** descriptor_size;
+    var pvd = @as([descriptor_size]u8, @splat(0));
     pvd[0] = 1;
     pvd[1..6].* = standard_id;
     pvd[6] = 1;
@@ -4290,7 +4290,7 @@ fn synthIsoAlloc(allocator: std.mem.Allocator, opts: SynthOptions, child_records
     // one sector to keep the descriptor sequence contiguous.
     var terminator_lba = volume_descriptor_lba + 1;
     if (opts.boot) |boot| {
-        var brvd = [_]u8{0} ** descriptor_size;
+        var brvd = @as([descriptor_size]u8, @splat(0));
         brvd[0] = 0; // boot record volume descriptor
         brvd[1..6].* = standard_id;
         brvd[6] = 1;
@@ -4299,18 +4299,18 @@ fn synthIsoAlloc(allocator: std.mem.Allocator, opts: SynthOptions, child_records
         @memcpy(image[terminator_lba * descriptor_size ..][0..descriptor_size], &brvd);
         terminator_lba += 1;
 
-        var cat = [_]u8{0} ** descriptor_size;
+        var cat = @as([descriptor_size]u8, @splat(0));
         writeBootCatalog(&cat, boot.image_lba, boot.load_sectors);
         @memcpy(image[boot.catalog_lba * descriptor_size ..][0..descriptor_size], &cat);
     }
 
-    var term = [_]u8{0} ** descriptor_size;
+    var term = @as([descriptor_size]u8, @splat(0));
     term[0] = 255;
     term[1..6].* = standard_id;
     term[6] = 1;
     @memcpy(image[terminator_lba * descriptor_size ..][0..descriptor_size], &term);
 
-    var pt = [_]u8{0} ** 8;
+    var pt = @as([8]u8, @splat(0));
     pt[0] = 1;
     write731(pt[2..6], synth_root_lba);
     write721(pt[6..8], 1);
@@ -4335,7 +4335,7 @@ fn synthIsoAlloc(allocator: std.mem.Allocator, opts: SynthOptions, child_records
 }
 
 fn buildClSystemUse(child_lba: u32) [12]u8 {
-    var out: [12]u8 = [_]u8{0} ** 12;
+    var out: [12]u8 = @as([12]u8, @splat(0));
     out[0] = 'C';
     out[1] = 'L';
     out[2] = 12;
@@ -4619,7 +4619,7 @@ test "iso9660 reader flags rock ridge relocation and requireRewriteSupported rep
     var su = std.array_list.Managed(u8).init(allocator);
     defer su.deinit();
     // Non-dot records carry the 7-byte SUSP skip prefix declared by the root SP.
-    try su.appendSlice(&[_]u8{0} ** 7);
+    try su.appendSlice(&@as([7]u8, @splat(0)));
     try su.appendSlice(&buildRrSystemUse(0x80)); // RR flags: CL present
     try su.appendSlice(&buildClSystemUse(23));
 
@@ -4727,9 +4727,9 @@ fn dualBootTestSource() TestSource {
     const nodes = struct {
         const list = [_]TestNode{
             .{ .path = "boot", .kind = .directory, .mode = 0o755 },
-            .{ .path = "boot/bios.img", .kind = .file, .mode = 0o644, .bytes = "BIOS" ** 200 },
+            .{ .path = "boot/bios.img", .kind = .file, .mode = 0o644, .bytes = repeatedBytes("BIOS", 200) },
             .{ .path = "EFI", .kind = .directory, .mode = 0o755 },
-            .{ .path = "EFI/efiboot.img", .kind = .file, .mode = 0o644, .bytes = "UEFI" ** 200 },
+            .{ .path = "EFI/efiboot.img", .kind = .file, .mode = 0o644, .bytes = repeatedBytes("UEFI", 200) },
         };
     };
     return .{ .nodes = &nodes.list };
@@ -4743,7 +4743,7 @@ test "el torito reader preserves entry fields and maps boot images to paths" {
 
     const nodes = [_]TestNode{
         .{ .path = "boot", .kind = .directory, .mode = 0o755 },
-        .{ .path = "boot/isolinux.bin", .kind = .file, .mode = 0o644, .bytes = "BIOSBOOT" ** 100 },
+        .{ .path = "boot/isolinux.bin", .kind = .file, .mode = 0o644, .bytes = repeatedBytes("BIOSBOOT", 100) },
     };
     const ts = TestSource{ .nodes = &nodes };
     _ = try writeImagePath(allocator, io, path, ts.source(), .{
@@ -5048,7 +5048,7 @@ test "iso9660 reader flags an unmodeled SUSP record for rewrite" {
 
     var su = std.array_list.Managed(u8).init(allocator);
     defer su.deinit();
-    try su.appendSlice(&[_]u8{0} ** 7); // SUSP skip prefix declared by the root SP
+    try su.appendSlice(&@as([7]u8, @splat(0))); // SUSP skip prefix declared by the root SP
     try su.appendSlice(&[_]u8{ 'X', 'Z', 4, 1 }); // an unmodeled system-use record
 
     var children = std.array_list.Managed(u8).init(allocator);
@@ -5065,4 +5065,17 @@ test "iso9660 reader flags an unmodeled SUSP record for rewrite" {
     var inspection = try reader.inspectForRewrite(allocator, io);
     defer inspection.deinit();
     try std.testing.expect(inspectionHasFeature(inspection, .unknown_susp_record));
+}
+
+fn repeatedBytes(comptime pattern: []const u8, comptime count: usize) *const [pattern.len * count:0]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1000 + count * 2);
+        var bytes: [pattern.len * count:0]u8 = undefined;
+        for (0..count) |i| {
+            @memcpy(bytes[i * pattern.len ..][0..pattern.len], pattern);
+        }
+        bytes[bytes.len] = 0;
+        const result = bytes;
+        break :blk &result;
+    };
 }

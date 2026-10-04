@@ -804,7 +804,7 @@ pub const Writer = struct {
                 try writePaxRecord(self.out, key, xattr.value);
             }
             if (padLen(pax_size) > 0) {
-                const zeros = [_]u8{0} ** block_size;
+                const zeros = @as([block_size]u8, @splat(0));
                 try self.out.writeAll(zeros[0..padLen(pax_size)]);
             }
         }
@@ -835,7 +835,7 @@ pub const Writer = struct {
         if (self.bytes_remaining != 0) return error.SizeMismatch;
 
         if (self.pad_bytes > 0) {
-            const zeros = [_]u8{0} ** block_size;
+            const zeros = @as([block_size]u8, @splat(0));
             try self.out.writeAll(zeros[0..self.pad_bytes]);
         }
         self.pad_bytes = 0;
@@ -860,7 +860,7 @@ pub const Writer = struct {
 
     pub fn finish(self: *Writer) Error!void {
         if (self.entry_open) return error.EntryStillOpen;
-        const zeros = [_]u8{0} ** block_size;
+        const zeros = @as([block_size]u8, @splat(0));
         try self.out.writeAll(&zeros);
         try self.out.writeAll(&zeros);
         try self.out.flush();
@@ -974,7 +974,7 @@ fn makeEntryHeader(
 }
 
 fn makeRawHeader(raw: RawHeader) Error![block_size]u8 {
-    var header: [block_size]u8 = [_]u8{0} ** block_size;
+    var header: [block_size]u8 = @as([block_size]u8, @splat(0));
 
     splitPath(raw.path, header[0..100], header[345..500]) catch
         return error.PathTooLong;
@@ -1192,7 +1192,7 @@ fn buildTar(allocator: std.mem.Allocator, specs: []const ReaderTarSpec) ![]u8 {
 }
 
 fn appendTarEntry(out: *std.Io.Writer.Allocating, spec: ReaderTarSpec) !void {
-    var header: [block_size]u8 = [_]u8{0} ** block_size;
+    var header: [block_size]u8 = @as([block_size]u8, @splat(0));
     if (spec.path.len > 100) return error.InvalidHeader;
     @memcpy(header[0..spec.path.len], spec.path);
     try writeOctalField(header[100..108], spec.mode);

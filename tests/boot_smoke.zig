@@ -644,7 +644,7 @@ test "native-edit boot-smokes a kernel argument appended to an already-built ima
         },
         .boot_security = .{ .extra_kernel_options = "miz.smoke=applied" },
         .reproducibility = .{
-            .seed = .{ .bytes = [_]u8{0x5B} ** 32 },
+            .seed = .{ .bytes = @as([32]u8, @splat(0x5B)) },
             .source_date_epoch = 1_735_689_600,
         },
     };

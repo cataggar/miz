@@ -457,9 +457,16 @@ cover both halves of that sentence:
 `.github/workflows/boot-smoke.yml` runs `zig build test-boot-smoke` for every release tag and when manually dispatched. It installs `qemu-system-x86`/`ovmf`, downloads and caches the [Azure Linux 4.0 ISO](https://aka.ms/azurelinux-4.0-x86_64.iso), and builds the OCI fixtures used by the real-QEMU tests with `zig build oci-fixture -- <minimal|uki-stub|verity-initramfs> ...`. The job is required (not `continue-on-error`) for release tags but is not part of universal pull-request CI.
 
 
-## Notes on Zig 0.16
+## Notes on Zig 0.17
 
-This codebase targets Zig 0.16's new `std.Io` interface: every filesystem,
-clock, and randomness operation takes an explicit `io: std.Io` parameter
+This codebase targets Zig 0.17.0 and its explicit `std.Io` interface: every
+filesystem, clock, and randomness operation takes an explicit `io: std.Io` parameter
 (via `std.process.Init.io` in the CLI, or `std.testing.io` in tests) rather
 than relying on implicit global state.
+
+The exact-generation compatibility branch requires Linux 5.10+ or macOS
+15+. It uses the pinned GitHub `cataggar/translate-c` dependency rather than
+the removed built-in C translator. Maker-time installed tool paths are
+resolved through lazy paths; the test environment wrapper preserves test
+arguments, protocol streams and exit status even with quoted install
+prefixes. Source ports do not refresh image assets or package locks.

@@ -171,7 +171,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Install complete Ubuntu image-builder dependencies
         run: |
@@ -565,7 +565,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build accepted-source release tooling
         run: |
@@ -574,7 +574,7 @@ jobs:
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           bash scripts/zig_fetch_retry.sh \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-          zig build -Doptimize=ReleaseSafe install-ubuntu2604-release
+          zig build -Doptimize=safe install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
 
       - name: Resolve per-key candidate attempts
@@ -753,7 +753,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Install same-architecture QEMU, firmware, and vTPM tooling
         run: |
@@ -1075,7 +1075,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Require Azure acceptance tools
         run: |
@@ -1094,7 +1094,7 @@ jobs:
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           bash scripts/zig_fetch_retry.sh \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-          zig build -Doptimize=ReleaseSafe
+          zig build -Doptimize=safe
           test -x zig-out/bin/miz
 
       - name: Build Binder device usability probe
@@ -1253,7 +1253,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build accepted-source release tooling
         run: |
@@ -1262,7 +1262,7 @@ jobs:
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           bash scripts/zig_fetch_retry.sh \
             --global-cache-dir "$ZIG_GLOBAL_CACHE_DIR"
-          zig build -Doptimize=ReleaseSafe install-ubuntu2604-release
+          zig build -Doptimize=safe install-ubuntu2604-release
           test -x "$RELEASE_TOOL"
 
       # Resolve again in the publication job itself. A "Re-run failed jobs"

@@ -88,10 +88,7 @@ pub const Status = enum {
     }
 
     pub fn parse(text: []const u8) ?Status {
-        inline for (@typeInfo(Status).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
-        }
-        return null;
+        return std.meta.stringToEnum(Status, text);
     }
 };
 
@@ -104,10 +101,7 @@ pub const Direction = enum {
     }
 
     pub fn parse(text: []const u8) ?Direction {
-        inline for (@typeInfo(Direction).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
-        }
-        return null;
+        return std.meta.stringToEnum(Direction, text);
     }
 };
 
@@ -988,7 +982,7 @@ pub const Evaluation = struct {
     }
 
     pub fn has(self: *const Evaluation, phase: Phase) bool {
-        return self.phases[@intFromEnum(phase)];
+        return self.phases[@backingInt(phase)];
     }
 };
 
@@ -1486,8 +1480,8 @@ pub const Result = enum {
     }
 
     pub fn parse(text: []const u8) ?Result {
-        inline for (@typeInfo(Result).@"enum".fields) |field| {
-            const value: Result = @enumFromInt(field.value);
+        inline for (@typeInfo(Result).@"enum".field_values) |field_value| {
+            const value: Result = @fromBackingInt(@intCast(field_value));
             if (std.mem.eql(u8, text, value.key())) return value;
         }
         return null;
@@ -1761,14 +1755,14 @@ pub fn validateDocument(
             "size budget names unknown phase {s}",
             .{text},
         );
-        const position: i32 = @intFromEnum(phase);
+        const position: i32 = @backingInt(phase);
         if (position <= last) return fail(
             diagnostic,
             "size budget phases are out of order at {s}",
             .{text},
         );
         last = position;
-        present[@intFromEnum(phase)] = true;
+        present[@backingInt(phase)] = true;
     }
 
     const budget = budgetFor(flavor, architecture);
@@ -1807,7 +1801,7 @@ pub fn validateDocument(
             index += 1;
             var id_buffer: [128]u8 = undefined;
             if (!std.mem.eql(u8, candidate.measure.id(&id_buffer), id)) {
-                if (present[@intFromEnum(candidate.measure.phase())]) return fail(
+                if (present[@backingInt(candidate.measure.phase())]) return fail(
                     diagnostic,
                     "size budget omits metric {s}, which its phases cover",
                     .{candidate.measure.id(&id_buffer)},
@@ -1820,7 +1814,7 @@ pub fn validateDocument(
             "size budget names metric {s}, which the reviewed budget does not",
             .{id},
         );
-        if (!present[@intFromEnum(limit.measure.phase())]) return fail(
+        if (!present[@backingInt(limit.measure.phase())]) return fail(
             diagnostic,
             "size budget reports metric {s} from the unevaluated {s} phase",
             .{ id, limit.measure.phase().key() },
@@ -1894,7 +1888,7 @@ pub fn validateDocument(
     while (index < limits.len) : (index += 1) {
         const candidate = limits[index];
         var id_buffer: [128]u8 = undefined;
-        if (present[@intFromEnum(candidate.measure.phase())]) return fail(
+        if (present[@backingInt(candidate.measure.phase())]) return fail(
             diagnostic,
             "size budget omits metric {s}, which its phases cover",
             .{candidate.measure.id(&id_buffer)},

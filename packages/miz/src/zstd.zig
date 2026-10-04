@@ -8,9 +8,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const c = @cImport({
-    @cInclude("zstd.h");
-});
+const c = @import("zstd_c");
 const Context = if (builtin.link_libc) ?*c.ZSTD_CCtx else ?*anyopaque;
 
 pub const zstd_magic: u32 = 0xFD2F_B528;
@@ -20,7 +18,7 @@ pub const max_block_size: usize = 128 * 1024;
 
 const compression_level: c_int = 3;
 const window_log: c_int = 21;
-const zero_chunk = [_]u8{0} ** 4096;
+const zero_chunk = @as([4096]u8, @splat(0));
 
 pub const ZstdError = error{
     ZstdGeneric,
@@ -656,7 +654,7 @@ test "compressed frame shrinks zeros and round-trips through linked libzstd" {
 }
 
 test "compressed frame shrinks repeated text and round-trips" {
-    const input = ("The quick brown fox jumps over the lazy dog.\n" ** 2048);
+    const input = (repeatedBytes("The quick brown fox jumps over the lazy dog.\n", 2048));
     const encoded = try writeAndCheck(input[0..], null);
     defer std.testing.allocator.free(encoded);
 
@@ -672,7 +670,7 @@ test "compressed frame shrinks mixed repeated and noisy data" {
         byte.* = @truncate(x >> 24);
     }
 
-    const repeated = "root=/dev/dm-0 ro quiet splash console=ttyS0\n" ** 512;
+    const repeated = repeatedBytes("root=/dev/dm-0 ro quiet splash console=ttyS0\n", 512);
     var input: [repeated.len + noise.len + repeated.len]u8 = undefined;
     @memcpy(input[0..repeated.len], repeated[0..]);
     @memcpy(input[repeated.len .. repeated.len + noise.len], &noise);
@@ -686,7 +684,7 @@ test "compressed frame shrinks mixed repeated and noisy data" {
 }
 
 test "pinned compression is repeatable" {
-    const input = ("repeatable zstd output\n" ** 4096);
+    const input = (repeatedBytes("repeatable zstd output\n", 4096));
     const first = try writeAndCheck(input, null);
     defer std.testing.allocator.free(first);
     const second = try writeAndCheck(input, null);
@@ -696,7 +694,7 @@ test "pinned compression is repeatable" {
 }
 
 test "compressed frame advertises content size without checksum or dictionary id" {
-    const input = "pinned frame metadata" ** 32;
+    const input = repeatedBytes("pinned frame metadata", 32);
     const encoded = try writeAndCheck(input, null);
     defer std.testing.allocator.free(encoded);
 
@@ -718,7 +716,7 @@ test "empty input emits a valid empty frame" {
 }
 
 test "native raw frame interoperates with linked libzstd decoder" {
-    const input = "hello zstd raw blocks" ** 4096;
+    const input = repeatedBytes("hello zstd raw blocks", 4096);
 
     var out = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer out.deinit();
@@ -809,4 +807,17 @@ test "compression bound includes optional skippable frame" {
         plain + 8 + skippable_payload_len,
         with_payload,
     );
+}
+
+fn repeatedBytes(comptime pattern: []const u8, comptime count: usize) *const [pattern.len * count:0]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1000 + count * 2);
+        var bytes: [pattern.len * count:0]u8 = undefined;
+        for (0..count) |i| {
+            @memcpy(bytes[i * pattern.len ..][0..pattern.len], pattern);
+        }
+        bytes[bytes.len] = 0;
+        const result = bytes;
+        break :blk &result;
+    };
 }

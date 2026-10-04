@@ -35,9 +35,32 @@ fn toolPath(allocator: Allocator, name: []const u8) ![]u8 {
     };
 }
 
+fn quotedToolPath(allocator: Allocator, name: []const u8) ![]u8 {
+    const path = try toolPath(allocator, name);
+    defer allocator.free(path);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try output.writer.writeByte('\'');
+    for (path) |byte| {
+        if (byte == '\'') {
+            try output.writer.writeAll("'\\''");
+        } else {
+            try output.writer.writeByte(byte);
+        }
+    }
+    try output.writer.writeByte('\'');
+    return output.toOwnedSlice();
+}
+
 /// The three ported tools the harness resolves, spelled as shell assignments a
 /// generated fragment can prepend.
 fn toolEnvironment(allocator: Allocator) ![]const u8 {
+    const release = try quotedToolPath(allocator, "MIZ_FREEBSD15_RELEASE_TOOL");
+    defer allocator.free(release);
+    const metadata = try quotedToolPath(allocator, "MIZ_FREEBSD15_AZURE_METADATA_TOOL");
+    defer allocator.free(metadata);
+    const vhd = try quotedToolPath(allocator, "MIZ_AZURE_VHD_TOOL");
+    defer allocator.free(vhd);
     return std.fmt.allocPrint(
         allocator,
         \\export MIZ_FREEBSD15_RELEASE_TOOL={s}
@@ -46,9 +69,9 @@ fn toolEnvironment(allocator: Allocator) ![]const u8 {
         \\
     ,
         .{
-            try toolPath(allocator, "MIZ_FREEBSD15_RELEASE_TOOL"),
-            try toolPath(allocator, "MIZ_FREEBSD15_AZURE_METADATA_TOOL"),
-            try toolPath(allocator, "MIZ_AZURE_VHD_TOOL"),
+            release,
+            metadata,
+            vhd,
         },
     );
 }

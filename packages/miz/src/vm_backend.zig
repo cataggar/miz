@@ -678,7 +678,7 @@ test "guest agent validation requires an executable bounded static image" {
 }
 
 fn testGuestAgentElf(machine: u16) [120]u8 {
-    var bytes = [_]u8{0} ** 120;
+    var bytes = @as([120]u8, @splat(0));
     @memcpy(bytes[0..4], "\x7fELF");
     bytes[4] = 2;
     bytes[5] = 1;
@@ -698,7 +698,7 @@ fn testGuestAgentElf(machine: u16) [120]u8 {
 }
 
 fn testGuestAgentElfWithDynamicDependency(machine: u16) [224]u8 {
-    var bytes = [_]u8{0} ** 224;
+    var bytes = @as([224]u8, @splat(0));
     @memcpy(bytes[0..4], "\x7fELF");
     bytes[4] = 2;
     bytes[5] = 1;
@@ -856,7 +856,7 @@ const CredentialDevice = struct {
     /// frees the pages anyway, but a zeroed page is zeroed at a moment this
     /// code chose rather than one the allocator did.
     fn close(self: CredentialDevice) void {
-        const zeros = [_]u8{0} ** 4096;
+        const zeros = @as([4096]u8, @splat(0));
         var offset: u64 = 0;
         while (offset < vm_control.credential_device_bytes) : (offset += zeros.len) {
             const rc = std.os.linux.pwrite(self.fd, &zeros, zeros.len, @intCast(offset));
@@ -2899,15 +2899,15 @@ test "the guest's hook bounds are exactly the library's" {
     // And the phases must agree in order, because both sides decide "may not
     // move earlier than" by comparing tag values.
     try std.testing.expectEqual(
-        @typeInfo(customize.HookPhase).@"enum".fields.len,
-        @typeInfo(vm_control.HookPhase).@"enum".fields.len,
+        @typeInfo(customize.HookPhase).@"enum".field_names.len,
+        @typeInfo(vm_control.HookPhase).@"enum".field_names.len,
     );
     inline for (
-        @typeInfo(customize.HookPhase).@"enum".fields,
-        @typeInfo(vm_control.HookPhase).@"enum".fields,
+        @typeInfo(customize.HookPhase).@"enum".field_names,
+        @typeInfo(vm_control.HookPhase).@"enum".field_names,
     ) |library, guest| {
-        try std.testing.expectEqualStrings(library.name, guest.name);
-        try std.testing.expectEqual(library.value, guest.value);
+        try std.testing.expectEqualStrings(library, guest);
+        try std.testing.expectEqual(@backingInt(@field(customize.HookPhase, library)), @backingInt(@field(vm_control.HookPhase, guest)));
     }
 }
 
@@ -2959,8 +2959,8 @@ test "a hook source is read on the host and carried to the guest verbatim" {
     // not carried at all: the guest names the file from the hook's position,
     // so the document has no way to say where a script lands.
     try std.testing.expectEqualStrings("--first", built.carried[0].arguments[0]);
-    inline for (@typeInfo(vm_control.Hook).@"struct".fields) |field| {
-        try std.testing.expect(!std.mem.eql(u8, field.name, "path"));
+    inline for (@typeInfo(vm_control.Hook).@"struct".field_names) |field_name| {
+        try std.testing.expect(!std.mem.eql(u8, field_name, "path"));
     }
 }
 
