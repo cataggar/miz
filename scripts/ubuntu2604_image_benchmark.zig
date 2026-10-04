@@ -2765,7 +2765,7 @@ const Statfs = extern struct {
 
 /// `shutil.disk_usage(path).free`: available bytes for an unprivileged writer.
 fn freeDiskBytes(allocator: Allocator, path: []const u8) !u64 {
-    if (builtin.os.tag != .linux) return error.Unsupported;
+    if (builtin.target.os.tag != .linux) return error.Unsupported;
     const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     var buffer: Statfs = undefined;
@@ -3068,7 +3068,7 @@ fn runMeasuredCommand(
         .io = io,
     };
     const pid: u32 = @intCast(spawned.child.id orelse 0);
-    if (builtin.os.tag == .linux and pid != 0) {
+    if (builtin.target.os.tag == .linux and pid != 0) {
         const opened = std.os.linux.pidfd_open(@intCast(pid), 0);
         if (std.os.linux.errno(opened) == .SUCCESS) {
             const pidfd: i32 = @intCast(opened);
