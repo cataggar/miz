@@ -10,7 +10,7 @@
             .hash = "translate_c-2.0.0-Q_BUWlpOBwBWvgGBM20tJq-GXgPio3v3UD39rXEn70KN",
         },
         .bzip2z = .{
-            .url = "git+https://github.com/cataggar/bzip2z#761f0b05126922637f84afb9ad764bd520076634",
+            .url = "git+https://github.com/cataggar/bzip2z#b1ee15f320f53a8f9794d4440fd43798c28f276d",
             .hash = "bzip2z-0.1.0-m5NdlpirCwBFHH_3t0zvBLPeA0rNwqFU21SbRa6CPCDR",
         },
         .tls = .{
