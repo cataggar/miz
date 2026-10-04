@@ -580,6 +580,57 @@ pub fn build(b: *std.Build) void {
     const cli_test_step = b.step("test-cli", "Run miz CLI tests");
     cli_test_step.dependOn(&run_cli_tests.step);
 
+    const native_smoke_step = b.step(
+        "test-native-smoke",
+        "Run portable image codecs and native CLI smoke checks",
+    );
+    const native_vhd_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("packages/miz/src/vhd.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    native_smoke_step.dependOn(&b.addRunArtifact(native_vhd_tests).step);
+    native_smoke_step.dependOn(zstd_test_step);
+
+    const smoke_version = b.addRunArtifact(cli_exe);
+    smoke_version.addArg("version");
+    smoke_version.expectStdOutEqual(b.fmt("miz {s}\n", .{version}));
+    smoke_version.expectStdErrEqual("");
+    smoke_version.expectExitCode(0);
+    native_smoke_step.dependOn(&smoke_version.step);
+
+    const smoke_help = b.addRunArtifact(cli_exe);
+    smoke_help.addArg("--help");
+    smoke_help.expectStdOutEqual("");
+    smoke_help.expectStdErrMatch("Usage: miz <command> [options]");
+    smoke_help.expectExitCode(0);
+    native_smoke_step.dependOn(&smoke_help.step);
+
+    const smoke_create = b.addRunArtifact(cli_exe);
+    smoke_create.addArgs(&.{ "create", "-f", "vhd", "-o", "subformat=fixed" });
+    const smoke_image = smoke_create.addOutputFileArg("native-smoke.vhd");
+    smoke_create.addArg("1M");
+    smoke_create.expectExitCode(0);
+
+    const smoke_info = b.addRunArtifact(cli_exe);
+    smoke_info.addArgs(&.{ "info", "--output=json" });
+    smoke_info.addFileArg(smoke_image);
+    smoke_info.expectStdOutMatch("\"format\":\"vhd\"");
+    smoke_info.expectStdOutMatch("\"virtual-size\":1048576");
+    smoke_info.expectStdOutMatch("\"subformat\":\"fixed\"");
+    smoke_info.expectStdErrEqual("");
+    smoke_info.expectExitCode(0);
+    native_smoke_step.dependOn(&smoke_info.step);
+
+    const smoke_check = b.addRunArtifact(cli_exe);
+    smoke_check.addArg("check");
+    smoke_check.addFileArg(smoke_image);
+    smoke_check.expectStdErrMatch("No errors were found on the image.");
+    smoke_check.expectExitCode(0);
+    native_smoke_step.dependOn(&smoke_check.step);
+
     // Host-only image builders used by the exported build helpers. They remain
     // executable even when the dependency is configured for a foreign target.
     const image_builder_exe = b.addExecutable(.{
