@@ -1113,17 +1113,17 @@ fn validPlatformComponent(value: []const u8) bool {
 }
 
 fn hostOs() []const u8 {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .macos => "darwin",
-        else => @tagName(builtin.os.tag),
+        else => @tagName(builtin.target.os.tag),
     };
 }
 
 fn hostArchitecture() []const u8 {
-    return switch (builtin.cpu.arch) {
+    return switch (builtin.target.cpu.arch) {
         .x86_64 => "amd64",
         .aarch64 => "arm64",
-        else => @tagName(builtin.cpu.arch),
+        else => @tagName(builtin.target.cpu.arch),
     };
 }
 

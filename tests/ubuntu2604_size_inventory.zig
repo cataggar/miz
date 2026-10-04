@@ -40,8 +40,7 @@ const Fixture = struct {
         errdefer scratch_state.deinit();
 
         const arena = arena_state.allocator();
-        const relative = try std.fmt.allocPrint(
-            arena,
+        const relative = try arena.print(
             ".zig-cache/tmp/{s}",
             .{tmp.sub_path},
         );
@@ -116,30 +115,27 @@ fn writeMeasuredRoot(fixture: *Fixture) !void {
         "/var/lib/dpkg/info/beta.list",
         "/usr\n/usr/bin\n/usr/bin/beta\n/usr/lib/beta.so\n",
     );
-    try fixture.write("/usr/bin/alpha", "alpha" ** 8);
-    try fixture.write("/usr/bin/beta", "beta" ** 4);
+    try fixture.write("/usr/bin/alpha", (@as([8 * "alpha".len]u8, @bitCast(@as([8]["alpha".len]u8, @splat("alpha".*)))) ++ ""));
+    try fixture.write("/usr/bin/beta", (@as([4 * "beta".len]u8, @bitCast(@as([4]["beta".len]u8, @splat("beta".*)))) ++ ""));
     try fixture.write("/usr/lib/beta.so", "shared object");
     try fixture.write("/usr/sbin/mizinit", "injected pid 1");
     try fixture.write("/etc/unexpected.conf", "no package owns this");
     try fixture.write(
-        try std.fmt.allocPrint(
-            fixture.allocator(),
+        try fixture.allocator().print(
             "/boot/vmlinuz-{s}",
             .{kernel_release},
         ),
         "kernel image",
     );
     try fixture.write(
-        try std.fmt.allocPrint(
-            fixture.allocator(),
+        try fixture.allocator().print(
             "/boot/initrd.img-{s}",
             .{kernel_release},
         ),
         "initramfs",
     );
     try fixture.write(
-        try std.fmt.allocPrint(
-            fixture.allocator(),
+        try fixture.allocator().print(
             "/usr/lib/modules/{s}/modules.dep",
             .{kernel_release},
         ),
@@ -701,7 +697,7 @@ test "comparison reports closure, package, and phase deltas" {
 
     // The candidate drops `beta` and grows `alpha`.
     try fixture.write(size_inventory.package_lock_path, "alpha\t1.0-1\tamd64\n");
-    try fixture.write("/usr/bin/alpha", "alpha" ** 16);
+    try fixture.write("/usr/bin/alpha", (@as([16 * "alpha".len]u8, @bitCast(@as([16]["alpha".len]u8, @splat("alpha".*)))) ++ ""));
     var candidate = try buildReport(&fixture, .core);
     defer candidate.deinit();
     try candidate.addPhase(
@@ -1056,13 +1052,11 @@ const GeneratedRoot = struct {
         choice: []const u8,
     ) !void {
         try self.fixture.write(
-            try std.fmt.allocPrint(
-                self.fixture.allocator(),
+            try self.fixture.allocator().print(
                 "/var/lib/dpkg/alternatives/{s}",
                 .{group},
             ),
-            try std.fmt.allocPrint(
-                self.fixture.allocator(),
+            try self.fixture.allocator().print(
                 "auto\n{s}\n\n{s}\n10\n\n",
                 .{ master, choice },
             ),
@@ -1073,8 +1067,7 @@ const GeneratedRoot = struct {
     /// an empty marker file under a mirrored `<unit>.wants` directory.
     fn enabled(self: *GeneratedRoot, farm: []const u8, unit: []const u8) !void {
         try self.fixture.write(
-            try std.fmt.allocPrint(
-                self.fixture.allocator(),
+            try self.fixture.allocator().print(
                 "/var/lib/systemd/deb-systemd-helper-enabled/{s}/{s}",
                 .{ farm, unit },
             ),
@@ -1401,8 +1394,7 @@ test "the depmod index is named file by file, not by its directory" {
 
     for ([_][]const u8{ "modules.dep", "modules.dep.bin", "modules.alias" }) |name| {
         try root.fixture.write(
-            try std.fmt.allocPrint(
-                root.fixture.allocator(),
+            try root.fixture.allocator().print(
                 "/usr/lib/modules/" ++ kernel_release ++ "/{s}",
                 .{name},
             ),
@@ -1529,7 +1521,7 @@ test "a document whose allowlist policy digest does not match is refused" {
     const arena = parsed.arena.allocator();
     const unowned = field(parsed.value, &.{ "root_build", "unowned" }).object;
     var mutable = unowned;
-    try mutable.put(arena, "policy_sha256", .{ .string = "0" ** 64 });
+    try mutable.put(arena, "policy_sha256", .{ .string = &@as([64:0]u8, @splat('0')) });
     var root_build = field(parsed.value, &.{"root_build"}).object;
     try root_build.put(arena, "unowned", .{ .object = mutable });
     var document = parsed.value.object;

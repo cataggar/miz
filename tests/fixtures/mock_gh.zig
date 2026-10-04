@@ -453,11 +453,10 @@ fn writeRelease(
         bad_after_publish)
         "foreign title"
     else
-        try std.fmt.allocPrint(allocator, "miz {s}", .{version});
+        try allocator.print("miz {s}", .{version});
     defer if (!std.mem.eql(u8, title, "foreign title")) allocator.free(title);
     const body = if (std.mem.eql(u8, scenario, "malformed-body"))
-        try std.fmt.allocPrint(
-            allocator,
+        try allocator.print(
             "**Install:**\n\n```console\nghr install cataggar/miz@{s}\n```\n",
             .{tag},
         )
@@ -600,8 +599,7 @@ fn writeAssets(
         if (std.mem.eql(u8, scenario, "race-stale-changed") and
             fetch_count >= 3 and std.mem.eql(u8, name, "stale.bin"))
         {
-            const expected_name = try std.fmt.allocPrint(
-                allocator,
+            const expected_name = try allocator.print(
                 "miz-{s}-linux-musl-x64.tar.gz",
                 .{version},
             );
@@ -783,8 +781,7 @@ fn expectedReleaseBody(
     tag: []const u8,
     scenario: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "**Install:**\n\n```console\nghr install cataggar/miz@{s}\n```\n\n\n{s}",
         .{ tag, generatedNotes(scenario) },
     );

@@ -82,7 +82,7 @@ pub fn capture(
     try entries.append(.{
         .path = "",
         .kind = .directory,
-        .mode = @intFromEnum(root_stat.permissions) & 0o7777,
+        .mode = @backingInt(root_stat.permissions) & 0o7777,
         .uid = root_system.uid,
         .gid = root_system.gid,
         .mtime = timestamp(root_stat.mtime),
@@ -103,7 +103,7 @@ pub fn capture(
         var entry = Entry{
             .path = path,
             .kind = kind,
-            .mode = @intFromEnum(stat.permissions) & 0o7777,
+            .mode = @backingInt(stat.permissions) & 0o7777,
             .mtime = timestamp(stat.mtime),
             .size = if (kind == .file) stat.size else 0,
             .inode = @intCast(stat.inode),
@@ -141,7 +141,7 @@ const SystemMetadata = struct {
 };
 
 fn systemMetadata(dir: Io.Dir, path: [:0]const u8) !SystemMetadata {
-    if (builtin.os.tag != .linux) return .{};
+    if (builtin.target.os.tag != .linux) return .{};
     const linux = std.os.linux;
     var statx = std.mem.zeroes(linux.Statx);
     while (true) switch (linux.errno(linux.statx(
@@ -164,7 +164,7 @@ fn systemMetadata(dir: Io.Dir, path: [:0]const u8) !SystemMetadata {
 }
 
 fn systemMetadataRoot(dir: Io.Dir) !SystemMetadata {
-    if (builtin.os.tag != .linux) return .{};
+    if (builtin.target.os.tag != .linux) return .{};
     const linux = std.os.linux;
     var statx = std.mem.zeroes(linux.Statx);
     while (true) switch (linux.errno(linux.statx(
@@ -245,9 +245,8 @@ fn readXattrs(
     dir: Io.Dir,
     path: []const u8,
 ) ![]const Xattr {
-    if (builtin.os.tag != .linux) return &.{};
-    const proc_path = try std.fmt.allocPrintSentinel(
-        allocator,
+    if (builtin.target.os.tag != .linux) return &.{};
+    const proc_path = try allocator.printSentinel(
         "/proc/self/fd/{d}/{s}",
         .{ dir.handle, path },
         0,
@@ -271,7 +270,7 @@ fn readXattrs(
             return error.ReadXattrFailed;
         if (end == offset) return error.ReadXattrFailed;
         const name = names[offset..end];
-        const name_z = try allocator.dupeZ(u8, name);
+        const name_z = try allocator.dupeSentinel(u8, name, 0);
         const value_size_result = linux.lgetxattr(proc_path.ptr, name_z.ptr, &empty, 0);
         if (linux.errno(value_size_result) != .SUCCESS or value_size_result > 1024 * 1024) {
             return error.ReadXattrFailed;

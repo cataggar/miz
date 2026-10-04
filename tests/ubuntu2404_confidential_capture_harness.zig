@@ -156,8 +156,7 @@ const Result = struct {
 fn fixtureRoot(allocator: Allocator, tmp: std.testing.TmpDir) ![]u8 {
     const repository = try rootAlloc(allocator);
     defer allocator.free(repository);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}/.zig-cache/tmp/{s}",
         .{ repository, tmp.sub_path },
     );
@@ -169,7 +168,7 @@ fn runShellSource(
     name: []const u8,
     source: []const u8,
 ) !Result {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, name });
+    const path = try allocator.print("{s}/{s}", .{ root, name });
     defer allocator.free(path);
     try Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = path,
@@ -197,10 +196,9 @@ fn writeState(
     run_succeeded: bool,
     resources: []const u8,
 ) ![]u8 {
-    const state = try std.fmt.allocPrint(allocator, "{s}/state.json", .{root});
+    const state = try allocator.print("{s}/state.json", .{root});
     errdefer allocator.free(state);
-    const text = try std.fmt.allocPrint(
-        allocator,
+    const text = try allocator.print(
         \\{{"schema":5,"stage":"prepared",
         \\"repository":"cataggar/miz","origin_run_id":"123",
         \\"origin_run_attempt":"4","source_commit":"{s}",
@@ -259,8 +257,7 @@ fn writeState(
 }
 
 fn shellIdentityPreamble(allocator: Allocator, state: []const u8) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         \\STATE_FILE='{s}'
         \\command_name=prepare
         \\EXPECTED_PUBLICATION_LOCK={s}
@@ -437,8 +434,7 @@ test "prepared recovery state is resumable identity-bound and corruption-failing
     defer allocator.free(state);
     const preamble = try shellIdentityPreamble(allocator, state);
     defer allocator.free(preamble);
-    const fixture_source = try std.fmt.allocPrint(
-        allocator,
+    const fixture_source = try allocator.print(
         \\#!/usr/bin/env bash
         \\set -Eeuo pipefail
         \\chmod 0700 '{s}'
@@ -670,15 +666,14 @@ test "publication dispatch is one upsert and ambiguity is quarantined" {
     defer allocator.free(state);
     const preamble = try shellIdentityPreamble(allocator, state);
     defer allocator.free(preamble);
-    const release_tool = try std.fmt.allocPrint(allocator, "{s}/release", .{root});
+    const release_tool = try allocator.print("{s}/release", .{root});
     defer allocator.free(release_tool);
     try Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = release_tool,
         .data = "#!/usr/bin/env bash\nexit 0\n",
         .flags = .{ .permissions = .fromMode(0o755) },
     });
-    const fixture_source = try std.fmt.allocPrint(
-        allocator,
+    const fixture_source = try allocator.print(
         \\#!/usr/bin/env bash
         \\set -Eeuo pipefail
         \\{s}
@@ -808,8 +803,7 @@ test "durable dispatch recovery quarantines before expanded target inspection an
     defer allocator.free(state);
     const preamble = try shellIdentityPreamble(allocator, state);
     defer allocator.free(preamble);
-    const fixture_source = try std.fmt.allocPrint(
-        allocator,
+    const fixture_source = try allocator.print(
         \\#!/usr/bin/env bash
         \\set -Eeuo pipefail
         \\{s}
@@ -895,8 +889,8 @@ test "durable dispatch recovery quarantines before expanded target inspection an
             group_name,
             subscription,
             root,
-            "b" ** 64,
-            "c" ** 64,
+            &@as([64:0]u8, @splat('b')),
+            &@as([64:0]u8, @splat('c')),
             state_source,
             dispatch_source,
             get_source,
@@ -947,15 +941,14 @@ test "parent missing and drift fail before any mutation" {
     defer tmp.cleanup();
     const root = try fixtureRoot(allocator, tmp);
     defer allocator.free(root);
-    const release_tool = try std.fmt.allocPrint(allocator, "{s}/release", .{root});
+    const release_tool = try allocator.print("{s}/release", .{root});
     defer allocator.free(release_tool);
     try Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = release_tool,
         .data = "#!/usr/bin/env bash\nexit 0\n",
         .flags = .{ .permissions = .fromMode(0o755) },
     });
-    const fixture_source = try std.fmt.allocPrint(
-        allocator,
+    const fixture_source = try allocator.print(
         \\#!/usr/bin/env bash
         \\set -Eeuo pipefail
         \\TARGET_RESOURCE_GROUP=target-rg
@@ -1065,8 +1058,7 @@ test "preexisting target version and second-check race are hard conflicts" {
     defer tmp.cleanup();
     const root = try fixtureRoot(allocator, tmp);
     defer allocator.free(root);
-    const fixture_source = try std.fmt.allocPrint(
-        allocator,
+    const fixture_source = try allocator.print(
         \\#!/usr/bin/env bash
         \\set -Eeuo pipefail
         \\RESULT_DIR='{s}'
@@ -1158,8 +1150,7 @@ test "failed scratch reservation claim is quarantined and never deleted" {
     defer allocator.free(state);
     const preamble = try shellIdentityPreamble(allocator, state);
     defer allocator.free(preamble);
-    const fixture_source = try std.fmt.allocPrint(
-        allocator,
+    const fixture_source = try allocator.print(
         \\#!/usr/bin/env bash
         \\set -Eeuo pipefail
         \\{s}
@@ -1249,8 +1240,7 @@ test "interrupted prepare cleanup enforces exact resource allowlist" {
     defer allocator.free(state);
     const preamble = try shellIdentityPreamble(allocator, state);
     defer allocator.free(preamble);
-    const fixture_source = try std.fmt.allocPrint(
-        allocator,
+    const fixture_source = try allocator.print(
         \\#!/usr/bin/env bash
         \\set -Eeuo pipefail
         \\{s}
@@ -1357,10 +1347,10 @@ test "state replacement remains atomic" {
     defer allocator.free(state);
     const preamble = try shellIdentityPreamble(allocator, state);
     defer allocator.free(preamble);
-    const bin = try std.fmt.allocPrint(allocator, "{s}/bin", .{root});
+    const bin = try allocator.print("{s}/bin", .{root});
     defer allocator.free(bin);
     try Dir.cwd().createDirPath(std.testing.io, bin);
-    const jq_mock = try std.fmt.allocPrint(allocator, "{s}/jq", .{bin});
+    const jq_mock = try allocator.print("{s}/jq", .{bin});
     defer allocator.free(jq_mock);
     try Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = jq_mock,
@@ -1379,8 +1369,7 @@ test "state replacement remains atomic" {
         ,
         .flags = .{ .permissions = .fromMode(0o755) },
     });
-    const fixture_source = try std.fmt.allocPrint(
-        allocator,
+    const fixture_source = try allocator.print(
         \\#!/usr/bin/env bash
         \\set -Eeuo pipefail
         \\{s}

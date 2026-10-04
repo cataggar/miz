@@ -108,7 +108,7 @@ pub fn main(init: std.process.Init) !void {
             argv[1..],
         );
     }
-    if (builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .linux) {
         std.debug.print("skipping vm backend integration: Linux is required\n", .{});
         return;
     }
@@ -116,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn runIntegration(allocator: Allocator, io: Io, self_exe: []const u8) !void {
-    const architecture: miz.customize.Architecture = switch (builtin.cpu.arch) {
+    const architecture: miz.customize.Architecture = switch (builtin.target.cpu.arch) {
         .x86_64 => .x86_64,
         .aarch64 => .aarch64,
         else => {
@@ -629,7 +629,7 @@ fn runCredential(
     // because the argv the backend builds is not otherwise observable from
     // here, and it is the one place a naive implementation would put a path to
     // a file holding the material.
-    const argv_path = try std.fmt.allocPrint(allocator, "{s}.argv", .{workspace.emulator_path});
+    const argv_path = try allocator.print("{s}.argv", .{workspace.emulator_path});
     defer allocator.free(argv_path);
     const argv_text = try Io.Dir.cwd().readFileAlloc(io, argv_path, allocator, .limited(1 << 20));
     defer allocator.free(argv_text);
@@ -707,8 +707,7 @@ const Workspace = struct {
         var random: [8]u8 = undefined;
         Io.random(io, &random);
         const random_hex = std.fmt.bytesToHex(random, .lower);
-        const path = try std.fmt.allocPrint(
-            allocator,
+        const path = try allocator.print(
             "/tmp/miz-vm-backend-{s}",
             .{&random_hex},
         );
@@ -719,8 +718,7 @@ const Workspace = struct {
         const spool_path = try std.fs.path.join(allocator, &.{ path, "root.spool" });
         const emulator_path = try std.fs.path.join(allocator, &.{
             path,
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "qemu-system-{s}",
                 .{@tagName(architecture)},
             ),
@@ -735,8 +733,7 @@ const Workspace = struct {
             .source_path = source_path,
             .output_path = output_path,
             .emulator_path = emulator_path,
-            .mode_path = try std.fmt.allocPrint(
-                allocator,
+            .mode_path = try allocator.print(
                 "{s}.mode",
                 .{emulator_path},
             ),
@@ -834,7 +831,7 @@ const Workspace = struct {
                 },
             },
             .reproducibility = .{
-                .seed = .{ .bytes = [_]u8{0x56} ** 32 },
+                .seed = .{ .bytes = @as([32]u8, @splat(0x56)) },
                 .source_date_epoch = 1_735_689_600,
             },
         };
@@ -917,7 +914,7 @@ fn runVm(
 }
 
 fn testGuestAgentElf(architecture: miz.customize.Architecture) [120]u8 {
-    var bytes = [_]u8{0} ** 120;
+    var bytes = @as([120]u8, @splat(0));
     @memcpy(bytes[0..4], "\x7fELF");
     bytes[4] = 2;
     bytes[5] = 1;
@@ -967,7 +964,7 @@ fn runStubEmulator(
         try stdout.interface.flush();
         return;
     }
-    const mode_path = try std.fmt.allocPrint(allocator, "{s}.mode", .{self_path});
+    const mode_path = try allocator.print("{s}.mode", .{self_path});
     const mode_text = try Io.Dir.cwd().readFileAlloc(
         io,
         mode_path,
@@ -1171,7 +1168,7 @@ fn recordArgv(
         try text.appendSlice(allocator, arg);
         try text.append(allocator, '\n');
     }
-    const path = try std.fmt.allocPrint(allocator, "{s}.argv", .{self_path});
+    const path = try allocator.print("{s}.argv", .{self_path});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text.items });
 }
 
@@ -1437,7 +1434,7 @@ fn createSourceDisk(
         .offset = partition_offset,
         .length = partition_length,
         .label = "vm-test",
-        .uuid = [_]u8{0x56} ** 16,
+        .uuid = @as([16]u8, @splat(0x56)),
         .timestamp = 1_735_689_600,
     });
 }
@@ -1490,7 +1487,7 @@ fn expectedModules(transport: miz.vm_payload.DiskTransport) []const []const u8 {
 /// distinct per module so the initramfs member, the digest in provenance and
 /// the file in the image can be shown to be the same bytes.
 fn moduleObject(allocator: Allocator, name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "\x7fELF\x02\x01\x01\x00integration:{s}", .{name});
+    return allocator.print("\x7fELF\x02\x01\x01\x00integration:{s}", .{name});
 }
 
 fn writeModuleTree(

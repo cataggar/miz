@@ -816,8 +816,7 @@ test "qemu-img document validation accepts both allowed reported sizes" {
     const rounded: u64 = @as(u64, 62415) * 16 * 63 * 512;
 
     for ([_]u64{ current_size, rounded }) |reported| {
-        const text = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const text = try std.testing.allocator.print(
             "{{\"format\": \"vpc\", \"virtual-size\": {d}}}",
             .{reported},
         );
@@ -983,8 +982,7 @@ test "inspect validates a real file pair and reports its sizes" {
     try Dir.cwd().writeFile(io, .{ .sub_path = vhd_path, .data = payload });
 
     const geometry = fixedVhdGeometry(current_size);
-    const info = try std.fmt.allocPrint(
-        allocator,
+    const info = try allocator.print(
         "{{\"format\": \"vpc\", \"virtual-size\": {d}}}",
         .{geometry.totalSectors() * 512},
     );
@@ -1009,7 +1007,7 @@ fn expectMessage(
     comptime fmt: []const u8,
     args: anytype,
 ) !void {
-    const expected = try std.fmt.allocPrint(std.testing.allocator, fmt, args);
+    const expected = try std.testing.allocator.print(fmt, args);
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, context.message());
 }

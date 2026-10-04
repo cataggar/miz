@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
     {
         return miz.unsafe_chroot.workerMain(init, argv[2]);
     }
-    if (builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .linux) {
         std.debug.print("skipping unsafe-chroot integration: Linux is required\n", .{});
         return;
     }
@@ -105,8 +105,7 @@ fn runIntegration(
     var random: [8]u8 = undefined;
     Io.random(io, &random);
     const random_hex = std.fmt.bytesToHex(random, .lower);
-    const work_path = try std.fmt.allocPrint(
-        allocator,
+    const work_path = try allocator.print(
         "/tmp/miz-unsafe-chroot-integration-{s}",
         .{&random_hex},
     );
@@ -159,7 +158,7 @@ fn runIntegration(
         .urls = &.{"https://packages.example.invalid"},
         .trust = &.{.{ .inline_bytes = "integration trust\n" }},
     }};
-    const architecture: miz.customize.Architecture = switch (builtin.cpu.arch) {
+    const architecture: miz.customize.Architecture = switch (builtin.target.cpu.arch) {
         .x86_64 => .x86_64,
         .aarch64 => .aarch64,
         else => return error.UnsupportedArchitecture,
@@ -171,7 +170,7 @@ fn runIntegration(
     const lock = [_]miz.customize.PackageVersionLock{.{
         .name = "integration-package",
         .evr = "0:1.0-1",
-        .architecture = @tagName(builtin.cpu.arch),
+        .architecture = @tagName(builtin.target.cpu.arch),
     }};
     // One request shape, two cache policies: the offline rebuild below differs
     // from this run only in where its packages came from, which is what makes
@@ -206,7 +205,7 @@ fn runIntegration(
             .acknowledge_unsafe = true,
         },
         .reproducibility = .{
-            .seed = .{ .bytes = [_]u8{0x48} ** 32 },
+            .seed = .{ .bytes = @as([32]u8, @splat(0x48)) },
             .source_date_epoch = 1_735_689_600,
         },
     };
@@ -334,7 +333,7 @@ fn runIntegration(
     const emitted = preserved.emitted_package_lock[0];
     try ensure(std.mem.eql(u8, emitted.name, "integration-package"));
     try ensure(std.mem.eql(u8, emitted.evr, "0:1.0-1"));
-    try ensure(std.mem.eql(u8, emitted.architecture, @tagName(builtin.cpu.arch)));
+    try ensure(std.mem.eql(u8, emitted.architecture, @tagName(builtin.target.cpu.arch)));
 
     // The generator ran as the target's own program, against the file this
     // run edited, and produced entries carrying the options.
@@ -1018,7 +1017,7 @@ fn createSourceDisk(
             .offset = partition_offset,
             .length = partition_length,
             .label = "unsafe-test",
-            .uuid = [_]u8{0x48} ** 16,
+            .uuid = @as([16]u8, @splat(0x48)),
             .timestamp = 1_735_689_600,
         },
     );
@@ -1067,8 +1066,7 @@ fn runGuestSetfiles(allocator: Allocator, io: Io, args: []const []const u8) !voi
     }
     const command = try std.mem.join(allocator, " ", args);
     defer allocator.free(command);
-    const full = try std.fmt.allocPrint(
-        allocator,
+    const full = try allocator.print(
         "/usr/sbin/setfiles {s}",
         .{command},
     );
@@ -1371,12 +1369,12 @@ fn writeGuestMarker(io: Io, path: []const u8, value: []const u8) !void {
 /// `NAME-EPOCH:VERSION-RELEASE.ARCH` form the real command is asked for.
 /// A constant rather than a function so the pinned spec the lock produces can
 /// be spelled out at compile time beside it.
-const installed_nevra = "integration-package-0:1.0-1." ++ @tagName(builtin.cpu.arch);
+const installed_nevra = "integration-package-0:1.0-1." ++ @tagName(builtin.target.cpu.arch);
 
 /// What the root already carried. Present in both inventories, so it must not
 /// appear in the emitted lock: a lock naming what the run did not choose says
 /// nothing about the run.
-const preexisting_nevra = "base-files-0:2.0-3.azl3." ++ @tagName(builtin.cpu.arch);
+const preexisting_nevra = "base-files-0:2.0-3.azl3." ++ @tagName(builtin.target.cpu.arch);
 
 /// The pseudo-package rpm records for the repository key this run declares,
 /// reported from the moment `rpm --import` has run.

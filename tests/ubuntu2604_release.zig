@@ -212,7 +212,7 @@ test "gallery metadata rejects independent image and security substitutions" {
                 .{ .key = "image" },
                 .{ .key = "source_commit" },
             },
-            .value = "b" ** 40,
+            .value = &@as([40:0]u8, @splat('b')),
         },
         .{
             .path = &.{
@@ -236,7 +236,7 @@ test "gallery metadata rejects independent image and security substitutions" {
                 .{ .key = "fallback_uki" },
                 .{ .key = "sha256" },
             },
-            .value = "b" ** 64,
+            .value = &@as([64:0]u8, @splat('b')),
         },
         .{
             .path = &.{
@@ -244,7 +244,7 @@ test "gallery metadata rejects independent image and security substitutions" {
                 .{ .key = "artifact_signing" },
                 .{ .key = "certificate_sha256" },
             },
-            .value = "b" ** 64,
+            .value = &@as([64:0]u8, @splat('b')),
         },
         .{
             .path = &.{
@@ -252,7 +252,7 @@ test "gallery metadata rejects independent image and security substitutions" {
                 .{ .key = "uefi_db" },
                 .{ .key = "certificate_sha256" },
             },
-            .value = "b" ** 64,
+            .value = &@as([64:0]u8, @splat('b')),
         },
         .{
             .path = &.{
@@ -275,7 +275,7 @@ test "gallery metadata rejects independent image and security substitutions" {
                 .{ .key = "provenance" },
                 .{ .key = "digest" },
             },
-            .value = "b" ** 64,
+            .value = &@as([64:0]u8, @splat('b')),
         },
     };
     for (cases) |case| {
@@ -397,20 +397,18 @@ fn artifactJobName(
     key: []const u8,
 ) ![]u8 {
     return switch (kind) {
-        .candidate => std.fmt.allocPrint(
-            subject_allocator,
+        .candidate => subject_allocator.print(
             "build/native {s}",
             .{key},
         ),
-        .native => std.fmt.allocPrint(
-            subject_allocator,
+        .native => subject_allocator.print(
             "same-architecture QEMU ({s}) {s}",
             .{
                 if (std.mem.startsWith(u8, key, "x86_64")) "kvm" else "tcg",
                 key,
             },
         ),
-        .azure => std.fmt.allocPrint(subject_allocator, "Azure {s}", .{key}),
+        .azure => subject_allocator.print("Azure {s}", .{key}),
     };
 }
 
@@ -425,8 +423,7 @@ fn writeSelection(
     const builder = support.Builder.init(arena.allocator());
     var artifacts = builder.object();
     for (contracts.release_order, 0..) |key, index| {
-        const artifact_name = try std.fmt.allocPrint(
-            allocator,
+        const artifact_name = try allocator.print(
             "{s}-{s}-{s}-{s}",
             .{ artifactPrefix(kind), key, fixture.source_commit, attempts[index] },
         );
@@ -443,7 +440,7 @@ fn writeSelection(
         try builder.putString(
             &entry,
             "artifact_digest",
-            "sha256:" ++ "a" ** 64,
+            "sha256:" ++ &@as([64:0]u8, @splat('a')),
         );
         try builder.putInteger(
             &entry,
@@ -553,11 +550,10 @@ fn resolveEvidenceWithAttempts(
         else
             key;
         const artifact_source = if (fault == .wrong_source and index == target_index)
-            "b" ** 40
+            &@as([40:0]u8, @splat('b'))
         else
             fixture.source_commit;
-        const artifact_name = try std.fmt.allocPrint(
-            allocator,
+        const artifact_name = try allocator.print(
             "{s}-{s}-{s}-{s}",
             .{ artifactPrefix(kind), artifact_key, artifact_source, attempts[index] },
         );
@@ -568,7 +564,7 @@ fn resolveEvidenceWithAttempts(
             &workflow_identity,
             "head_sha",
             if (fault == .wrong_workflow and index == target_index)
-                "b" ** 40
+                &@as([40:0]u8, @splat('b'))
             else
                 fixture.source_commit,
         );
@@ -592,7 +588,7 @@ fn resolveEvidenceWithAttempts(
         try builder.putString(
             &artifact,
             "digest",
-            "sha256:" ++ "a" ** 64,
+            "sha256:" ++ &@as([64:0]u8, @splat('a')),
         );
         try builder.put(
             &artifact,
@@ -739,10 +735,10 @@ fn addLegacySmokeEvidence(path: []const u8) !void {
     defer arena.deinit();
     const builder = support.Builder.init(arena.allocator());
     var smoke = builder.object();
-    try builder.putString(&smoke, "provenance_sha256", "5" ** 64);
-    try builder.putString(&smoke, "runtime_sha256", "6" ** 64);
-    try builder.putString(&smoke, "bundle_sha256", "7" ** 64);
-    try builder.putString(&smoke, "config_sha256", "8" ** 64);
+    try builder.putString(&smoke, "provenance_sha256", &@as([64:0]u8, @splat('5')));
+    try builder.putString(&smoke, "runtime_sha256", &@as([64:0]u8, @splat('6')));
+    try builder.putString(&smoke, "bundle_sha256", &@as([64:0]u8, @splat('7')));
+    try builder.putString(&smoke, "config_sha256", &@as([64:0]u8, @splat('8')));
     try builder.putString(&smoke, "architecture", "aarch64");
     try builder.putString(&smoke, "candidate_key", "aarch64-core");
     try fixture.patch(
@@ -965,8 +961,7 @@ test "Azure SKU storage policy distinguishes conventional, NVMe-only, and absent
     for (cases) |case| {
         var subject = try tree();
         defer subject.deinit();
-        const document = try std.fmt.allocPrint(
-            allocator,
+        const document = try allocator.print(
             "[{{\"name\":\"Standard_D2pds_v6\",\"restrictions\":[]," ++
                 "\"capabilities\":[{s}]}}]",
             .{case.capabilities},
@@ -1371,7 +1366,7 @@ test "the release gate rejects stale or invalid native evidence" {
     }{
         .{
             .steps = &.{.{ .key = "source_commit" }},
-            .change = .{ .set = .{ .string = "b" ** 40 } },
+            .change = .{ .set = .{ .string = &@as([40:0]u8, @splat('b')) } },
         },
         .{
             .steps = &.{ .{ .key = "workflow" }, .{ .key = "run_attempt" } },
@@ -1383,17 +1378,17 @@ test "the release gate rejects stale or invalid native evidence" {
         },
         .{
             .steps = &.{.{ .key = "candidate_sha256" }},
-            .change = .{ .set = .{ .string = "0" ** 64 } },
+            .change = .{ .set = .{ .string = &@as([64:0]u8, @splat('0')) } },
         },
         .{ .steps = &.{.{ .key = "schema" }}, .change = .{ .set = .{ .integer = 1 } } },
         .{ .steps = &.{.{ .key = "contracts" }}, .change = .pop },
         .{
             .steps = &.{.{ .key = "certificate_sha256" }},
-            .change = .{ .set = .{ .string = "0" ** 64 } },
+            .change = .{ .set = .{ .string = &@as([64:0]u8, @splat('0')) } },
         },
         .{
             .steps = &.{.{ .key = "fallback_uki_sha256" }},
-            .change = .{ .set = .{ .string = "0" ** 64 } },
+            .change = .{ .set = .{ .string = &@as([64:0]u8, @splat('0')) } },
         },
         .{
             .steps = &.{.{ .key = "status" }},
@@ -1445,8 +1440,7 @@ test "the release gate rejects wrong QEMU accelerator and runner architecture" {
             error.Failed,
             releaseGateWithDiagnostic(&subject, &diagnostic),
         );
-        const expected = try std.fmt.allocPrint(
-            allocator,
+        const expected = try allocator.print(
             "{s}: QEMU execution identity is invalid",
             .{case.key},
         );
@@ -1686,7 +1680,7 @@ test "a successful stage publishes four full and core image metadata pairs" {
         notes,
         "No checksum sidecar assets are published",
     ) != null);
-    try std.testing.expect(std.ascii.indexOfIgnoreCase(notes, "android container") == null);
+    try std.testing.expect(std.ascii.findIgnoreCase(notes, "android container") == null);
 }
 
 test "staged publication records each candidate attempt exactly" {
@@ -2042,7 +2036,7 @@ test "the full native result binds complete candidate and workflow identity" {
         },
         .{
             .steps = &.{.{ .key = "source_commit" }},
-            .change = .{ .set = .{ .string = "b" ** 40 } },
+            .change = .{ .set = .{ .string = &@as([40:0]u8, @splat('b')) } },
         },
         .{
             .steps = &.{.{ .key = "virtual_size" }},
@@ -2050,15 +2044,15 @@ test "the full native result binds complete candidate and workflow identity" {
         },
         .{
             .steps = &.{.{ .key = "candidate_sha256" }},
-            .change = .{ .set = .{ .string = "0" ** 64 } },
+            .change = .{ .set = .{ .string = &@as([64:0]u8, @splat('0')) } },
         },
         .{
             .steps = &.{.{ .key = "certificate_sha256" }},
-            .change = .{ .set = .{ .string = "0" ** 64 } },
+            .change = .{ .set = .{ .string = &@as([64:0]u8, @splat('0')) } },
         },
         .{
             .steps = &.{.{ .key = "fallback_uki_sha256" }},
-            .change = .{ .set = .{ .string = "0" ** 64 } },
+            .change = .{ .set = .{ .string = &@as([64:0]u8, @splat('0')) } },
         },
         .{ .steps = &.{.{ .key = "contracts" }}, .change = .pop },
         .{
@@ -2210,7 +2204,7 @@ test "the core native result binds the candidate identity and contracts" {
         },
         .{
             .steps = &.{.{ .key = "source_commit" }},
-            .change = .{ .set = .{ .string = "b" ** 40 } },
+            .change = .{ .set = .{ .string = &@as([40:0]u8, @splat('b')) } },
         },
         .{
             .steps = &.{.{ .key = "virtual_size" }},
@@ -2218,7 +2212,7 @@ test "the core native result binds the candidate identity and contracts" {
         },
         .{
             .steps = &.{.{ .key = "candidate_sha256" }},
-            .change = .{ .set = .{ .string = "0" ** 64 } },
+            .change = .{ .set = .{ .string = &@as([64:0]u8, @splat('0')) } },
         },
         .{ .steps = &.{.{ .key = "contracts" }}, .change = .pop },
         .{
@@ -2540,16 +2534,16 @@ test "an Azure result whose contracts are not the candidate's is rejected" {
 test "the core Azure result rejects every candidate binding change" {
     const key = "x86_64-core";
     const mutations = [_]struct { field: []const u8, replacement: []const u8 }{
-        .{ .field = "source_commit", .replacement = "b" ** 40 },
+        .{ .field = "source_commit", .replacement = &@as([40:0]u8, @splat('b')) },
         .{ .field = "architecture", .replacement = "aarch64" },
         .{
             .field = "asset_name",
             .replacement = "Ubuntu-26.04-aarch64.core.qcow2",
         },
-        .{ .field = "qcow_sha256", .replacement = "0" ** 64 },
-        .{ .field = "certificate_sha256", .replacement = "1" ** 64 },
-        .{ .field = "signing_certificate_sha256", .replacement = "2" ** 64 },
-        .{ .field = "fallback_uki_sha256", .replacement = "9" ** 64 },
+        .{ .field = "qcow_sha256", .replacement = &@as([64:0]u8, @splat('0')) },
+        .{ .field = "certificate_sha256", .replacement = &@as([64:0]u8, @splat('1')) },
+        .{ .field = "signing_certificate_sha256", .replacement = &@as([64:0]u8, @splat('2')) },
+        .{ .field = "fallback_uki_sha256", .replacement = &@as([64:0]u8, @splat('9')) },
     };
     for (mutations) |mutation| {
         var subject = try tree();
@@ -2641,10 +2635,9 @@ fn rerunAzureResult(
     defer allocator.free(response);
     const output = try subject.path("azure/{s}/rerun.json", .{key});
     defer allocator.free(output);
-    const resource_group = try std.fmt.allocPrint(allocator, "ubuntu-{s}", .{key});
+    const resource_group = try allocator.print("ubuntu-{s}", .{key});
     defer allocator.free(resource_group);
-    const image_version_id = try std.fmt.allocPrint(
-        allocator,
+    const image_version_id = try allocator.print(
         "/subscriptions/test/gallery/ubuntu/{s}/versions/1.0.0",
         .{key},
     );
@@ -2716,7 +2709,7 @@ test "candidate rejects a build-validation digest that is not the asset's" {
         .architecture = entry.architecture,
         .flavor = entry.flavor,
         .asset = asset,
-        .validated_sha256 = "0" ** 64,
+        .validated_sha256 = &@as([64:0]u8, @splat('0')),
         .virtual_size = fixture.virtual_size,
         .source_commit = fixture.source_commit,
         .provenance_dir = provenance_dir,
@@ -2854,7 +2847,7 @@ test "stage rejects an extra QCOW2 and a checksum sidecar" {
 
     const sidecar = try subject.path("azure/forbidden.sha256", .{});
     defer allocator.free(sidecar);
-    try Dir.cwd().writeFile(io, .{ .sub_path = sidecar, .data = "0" ** 64 });
+    try Dir.cwd().writeFile(io, .{ .sub_path = sidecar, .data = &@as([64:0]u8, @splat('0')) });
     try expectStageRejected(&subject);
 }
 
@@ -2915,7 +2908,7 @@ test "stage rejects source commit and identity changes" {
         io,
         manifest,
         &.{.{ .key = "source_commit" }},
-        "b" ** 40,
+        &@as([40:0]u8, @splat('b')),
     );
     try expectStageRejected(&subject);
 
@@ -3646,7 +3639,7 @@ test "Ubuntu provenance binds the debz lock and transaction together" {
         .{ .index = 0 },
         .{ .key = "transaction_provenance" },
         .{ .key = "lock_sha256" },
-    }, "0" ** 64);
+    }, &@as([64:0]u8, @splat('0')));
     try expectUbuntuRejected(&subject, "x86_64-full", "x86_64", .full, null);
 }
 
@@ -3910,7 +3903,7 @@ test "stage rejects acceptance digest and contract changes" {
         io,
         path,
         &.{.{ .key = "azure_accepted_sha256" }},
-        "0" ** 64,
+        &@as([64:0]u8, @splat('0')),
     );
     try expectStageRejected(&subject);
 
@@ -3949,7 +3942,7 @@ test "azure-result rejects a malformed derived VHD structure" {
     const file = try Dir.cwd().openFile(io, vhd, .{ .mode = .read_write });
     defer file.close(io);
     const size = (try file.stat(io)).size;
-    const zeros = [_]u8{0} ** 512;
+    const zeros = @as([512]u8, @splat(0));
     try file.writePositionalAll(io, &zeros, size - zeros.len);
     try std.testing.expectError(
         error.Failed,
@@ -4008,7 +4001,7 @@ test "azure-result rejects a conversion parameter mismatch" {
         io,
         attestation,
         &.{ .{ .key = "parameters" }, .{ .key = "input_sha256" } },
-        "0" ** 64,
+        &@as([64:0]u8, @splat('0')),
     );
     try std.testing.expectError(
         error.Failed,
@@ -4027,7 +4020,7 @@ test "stage rejects mixed UKI and Artifact Signing identities" {
 
     try subject.removeBundle("aarch64-full");
     try fixture.makeBundle(&subject, "aarch64-full", .{
-        .signing_certificate_sha256 = "5" ** 64,
+        .signing_certificate_sha256 = &@as([64:0]u8, @splat('5')),
     });
     try expectStageRejected(&subject);
 }
@@ -4043,7 +4036,7 @@ test "stage rejects a changed Azure signing binding" {
         io,
         path,
         &.{.{ .key = "certificate_sha256" }},
-        "0" ** 64,
+        &@as([64:0]u8, @splat('0')),
     );
     try expectStageRejected(&subject);
 }
@@ -4308,10 +4301,10 @@ noinline fn clobberStack() void {
 }
 
 const publication_allowlist =
-    "Ubuntu-26.04-x86_64.qcow2\t" ++ "a" ** 64 ++ "\t2048\n" ++
-    "Ubuntu-26.04-aarch64.qcow2\t" ++ "b" ** 64 ++ "\t4096\n" ++
-    "Ubuntu-26.04-x86_64.core.qcow2\t" ++ "c" ** 64 ++ "\t6144\n" ++
-    "Ubuntu-26.04-aarch64.core.qcow2\t" ++ "d" ** 64 ++ "\t8192\n";
+    "Ubuntu-26.04-x86_64.qcow2\t" ++ &@as([64:0]u8, @splat('a')) ++ "\t2048\n" ++
+    "Ubuntu-26.04-aarch64.qcow2\t" ++ &@as([64:0]u8, @splat('b')) ++ "\t4096\n" ++
+    "Ubuntu-26.04-x86_64.core.qcow2\t" ++ &@as([64:0]u8, @splat('c')) ++ "\t6144\n" ++
+    "Ubuntu-26.04-aarch64.core.qcow2\t" ++ &@as([64:0]u8, @splat('d')) ++ "\t8192\n";
 
 fn expectAssetsAccepted(
     subject: *const Tree,
@@ -4418,7 +4411,7 @@ test "github-release-assets binds each remote asset to one allowlist entry" {
         u8,
         allocator,
         exact,
-        "\"digest\":\"sha256:" ++ "a" ** 64 ++ "\"",
+        "\"digest\":\"sha256:" ++ &@as([64:0]u8, @splat('a')) ++ "\"",
         "\"digest\":null",
     );
     defer allocator.free(null_digest);
@@ -4436,18 +4429,18 @@ test "github-release-assets binds each remote asset to one allowlist entry" {
         u8,
         allocator,
         exact,
-        "sha256:" ++ "a" ** 64,
-        "sha256:" ++ "f" ** 64,
+        "sha256:" ++ &@as([64:0]u8, @splat('a')),
+        "sha256:" ++ &@as([64:0]u8, @splat('f')),
     );
     defer allocator.free(wrong_digest);
     try expectAssetsRejected(&subject, wrong_digest, "draft", draft_mismatch);
 
     // Order is not part of the contract; the binding is.
     const reordered_allowlist =
-        "Ubuntu-26.04-aarch64.core.qcow2\t" ++ "d" ** 64 ++ "\t8192\n" ++
-        "Ubuntu-26.04-x86_64.core.qcow2\t" ++ "c" ** 64 ++ "\t6144\n" ++
-        "Ubuntu-26.04-aarch64.qcow2\t" ++ "b" ** 64 ++ "\t4096\n" ++
-        "Ubuntu-26.04-x86_64.qcow2\t" ++ "a" ** 64 ++ "\t2048\n";
+        "Ubuntu-26.04-aarch64.core.qcow2\t" ++ &@as([64:0]u8, @splat('d')) ++ "\t8192\n" ++
+        "Ubuntu-26.04-x86_64.core.qcow2\t" ++ &@as([64:0]u8, @splat('c')) ++ "\t6144\n" ++
+        "Ubuntu-26.04-aarch64.qcow2\t" ++ &@as([64:0]u8, @splat('b')) ++ "\t4096\n" ++
+        "Ubuntu-26.04-x86_64.qcow2\t" ++ &@as([64:0]u8, @splat('a')) ++ "\t2048\n";
     const reordered = try remoteReleaseForExpected(reordered_allowlist, true);
     defer allocator.free(reordered);
     try expectAssetsAccepted(&subject, reordered, "draft");
@@ -4598,8 +4591,8 @@ test "the publication allowlist refuses a repeated asset name" {
         \\]}
     ;
     const repeated =
-        "ubuntu-26.04-x86_64.qcow2\t" ++ "a" ** 64 ++ "\t2048\n" ++
-        "ubuntu-26.04-x86_64.qcow2\t" ++ "a" ** 64 ++ "\t2048\n";
+        "ubuntu-26.04-x86_64.qcow2\t" ++ &@as([64:0]u8, @splat('a')) ++ "\t2048\n" ++
+        "ubuntu-26.04-x86_64.qcow2\t" ++ &@as([64:0]u8, @splat('a')) ++ "\t2048\n";
     var diagnostic: support.Diagnostic = .{};
     if (try checkReleaseAssets(
         &subject,

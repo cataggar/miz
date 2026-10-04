@@ -87,8 +87,7 @@ test "canonical commands are generated from Confidential VM builders" {
         "<!-- BEGIN GENERATED AZURE CONFIDENTIAL VM COMMANDS -->\n",
         "<!-- END GENERATED AZURE CONFIDENTIAL VM COMMANDS -->",
     );
-    const expected = try std.fmt.allocPrint(
-        allocator,
+    const expected = try allocator.print(
         "```console\n{s}```\n",
         .{rendered},
     );
@@ -135,8 +134,7 @@ test "builders encode every independent Confidential VM resource contract" {
         "azure_confidential_vm_vm_instance_security_args",
     };
     for (builders) |builder| {
-        const declaration = try std.fmt.allocPrint(
-            allocator,
+        const declaration = try allocator.print(
             "{s}() {{",
             .{builder},
         );
@@ -160,8 +158,7 @@ test "builders encode every independent Confidential VM resource contract" {
         "azure_confidential_vm_capture_gallery_version_get_args",
     };
     for (capture_builders) |builder| {
-        const declaration = try std.fmt.allocPrint(
-            allocator,
+        const declaration = try allocator.print(
             "{s}() {{",
             .{builder},
         );

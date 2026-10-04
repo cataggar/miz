@@ -178,7 +178,7 @@ fn deleteSshHostKeys(allocator: std.mem.Allocator, editor: *ext4.Editor, io: Io)
     for (entries) |entry| {
         if (entry.kind != .file) continue;
         if (!isSshHostKeyFile(entry.name)) continue;
-        const path = try std.fmt.allocPrint(allocator, "/etc/ssh/{s}", .{entry.name});
+        const path = try allocator.print("/etc/ssh/{s}", .{entry.name});
         defer allocator.free(path);
         try editor.deleteFile(io, path);
     }
@@ -221,7 +221,7 @@ fn removeUser(allocator: std.mem.Allocator, editor: *ext4.Editor, io: Io, userna
     try removeUserFromFile(allocator, editor, io, "/etc/shadow", username);
     try removeUserFromFile(allocator, editor, io, "/etc/group", username);
 
-    const home_path = try std.fmt.allocPrint(allocator, "/home/{s}", .{username});
+    const home_path = try allocator.print("/home/{s}", .{username});
     defer allocator.free(home_path);
     try deleteTreeIfExists(editor, io, home_path);
 }
@@ -347,7 +347,7 @@ test "findRootExt4Offset and deprovision work end to end on a partitioned disk i
     _ = try ext4.populate(io, img.file, allocator, &tree.view, .{
         .offset = partition_offset,
         .length = partition_length,
-        .uuid = [_]u8{0x33} ** 16,
+        .uuid = @as([16]u8, @splat(0x33)),
         .timestamp = 1_717_171_717,
     });
 
@@ -422,7 +422,7 @@ test "deprovision leaves a resolv.conf symlink pointing at the resolver in place
     _ = try ext4.populate(io, img.file, allocator, &tree.view, .{
         .offset = 0,
         .length = partition_length,
-        .uuid = [_]u8{0x44} ** 16,
+        .uuid = @as([16]u8, @splat(0x44)),
         .timestamp = 1_717_171_717,
     });
 

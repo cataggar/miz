@@ -163,7 +163,7 @@ const Instance = struct {
         errdefer allocator.free(seed_path);
         const private_key_path = try std.fs.path.join(allocator, &.{ work_path, "id_ed25519" });
         errdefer allocator.free(private_key_path);
-        const public_key_path = try std.fmt.allocPrint(allocator, "{s}.pub", .{private_key_path});
+        const public_key_path = try allocator.print("{s}.pub", .{private_key_path});
         errdefer allocator.free(public_key_path);
         const serial_path = try std.fs.path.join(allocator, &.{ work_path, "serial.log" });
         errdefer allocator.free(serial_path);
@@ -298,15 +298,15 @@ fn validateNativeKvmPrerequisites(
 }
 
 fn requireNativeKvm(io: Io, candidate: Candidate) !void {
-    const host_is_linux = builtin.os.tag == .linux;
-    const host_is_native = builtin.cpu.arch == candidate.architecture.nativeCpu();
+    const host_is_linux = builtin.target.os.tag == .linux;
+    const host_is_native = builtin.target.cpu.arch == candidate.architecture.nativeCpu();
     const kvm_available = if (host_is_linux and host_is_native)
         try qemu_host.pathAccessible(io, "/dev/kvm", .{ .read = true, .write = true })
     else
         false;
     try validateNativeKvmPrerequisites(
         host_is_linux,
-        builtin.cpu.arch,
+        builtin.target.cpu.arch,
         kvm_available,
         candidate,
     );
@@ -543,12 +543,11 @@ fn verifyUkiSignatures(
         {
             continue;
         }
-        const path = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{entry.name});
+        const path = try allocator.print("EFI/Linux/{s}", .{entry.name});
         defer allocator.free(path);
         const bytes = try esp.readFileAlloc(io, allocator, path);
         defer allocator.free(bytes);
-        const extracted = try std.fmt.allocPrint(
-            allocator,
+        const extracted = try allocator.print(
             "{s}/uki-{d}.efi",
             .{ scratch_path, index },
         );
@@ -575,8 +574,7 @@ fn verifyUkiSignatures(
         candidate.architecture.fallbackUkiPath(),
     );
     defer allocator.free(fallback);
-    const fallback_path = try std.fmt.allocPrint(
-        allocator,
+    const fallback_path = try allocator.print(
         "{s}/uki-fallback.efi",
         .{scratch_path},
     );
@@ -650,8 +648,7 @@ fn requireRejectedUkiSignature(
     index: usize,
     bytes: []const u8,
 ) !void {
-    const path = try std.fmt.allocPrint(
-        allocator,
+    const path = try allocator.print(
         "{s}/tampered-{d}.efi",
         .{ scratch_path, index },
     );
@@ -719,7 +716,7 @@ fn createTamperedOverlay(
         {
             continue;
         }
-        const path = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{entry.name});
+        const path = try allocator.print("EFI/Linux/{s}", .{entry.name});
         defer allocator.free(path);
         const signed = try esp.readFileAlloc(io, allocator, path);
         defer allocator.free(signed);
@@ -902,8 +899,7 @@ fn validateFinalizedImage(
         &root_guid_text,
         root_partition.unique_partition_guid,
     );
-    const expected_prefix = try std.fmt.allocPrint(
-        allocator,
+    const expected_prefix = try allocator.print(
         "root=PARTUUID={s} ",
         .{root_guid},
     );
@@ -913,8 +909,7 @@ fn validateFinalizedImage(
 
     switch (candidate.flavor) {
         .core => {
-            const expected = try std.fmt.allocPrint(
-                allocator,
+            const expected = try allocator.print(
                 "{s}init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto console=tty0 {s}",
                 .{ expected_prefix, candidate.architecture.serialConsole() },
             );
@@ -923,8 +918,7 @@ fn validateFinalizedImage(
                 return error.UnexpectedCoreUkiCmdline;
         },
         .full => {
-            const expected = try std.fmt.allocPrint(
-                allocator,
+            const expected = try allocator.print(
                 "{s}{s}",
                 .{ expected_prefix, candidate.architecture.serialConsole() },
             );
@@ -947,8 +941,7 @@ fn validateFinalizedImage(
             continue;
         }
         named_count += 1;
-        const named_path = try std.fmt.allocPrint(
-            allocator,
+        const named_path = try allocator.print(
             "EFI/Linux/{s}",
             .{entry.name},
         );
@@ -990,15 +983,13 @@ fn createSeed(
     defer allocator.free(public_key_file);
     const public_key = std.mem.trim(u8, public_key_file, " \t\r\n");
 
-    const metadata = try std.fmt.allocPrint(
-        allocator,
+    const metadata = try allocator.print(
         "instance-id: miz-azurelinux4-acceptance-{s}\n" ++
             "local-hostname: miz-azurelinux4-{s}\n",
         .{ instance.label, instance.label },
     );
     defer allocator.free(metadata);
-    const user_data = try std.fmt.allocPrint(
-        allocator,
+    const user_data = try allocator.print(
         \\#cloud-config
         \\users:
         \\  - default
@@ -1015,8 +1006,7 @@ fn createSeed(
         .{public_key},
     );
     defer allocator.free(user_data);
-    const ovf_env = try std.fmt.allocPrint(
-        allocator,
+    const ovf_env = try allocator.print(
         \\<?xml version="1.0" encoding="utf-8"?>
         \\<Environment xmlns="http://schemas.dmtf.org/ovf/environment/1" xmlns:wa="http://schemas.microsoft.com/windowsazure">
         \\  <wa:ProvisioningSection>
@@ -1076,34 +1066,29 @@ fn startInstance(
     });
     try createSeed(allocator, io, ssh_keygen_path, instance);
 
-    const hostfwd = try std.fmt.allocPrint(
-        allocator,
+    const hostfwd = try allocator.print(
         "user,id=net0,hostfwd=tcp:127.0.0.1:{d}-:22",
         .{instance.port},
     );
     defer allocator.free(hostfwd);
-    const serial_arg = try std.fmt.allocPrint(allocator, "file:{s}", .{instance.serial_path});
+    const serial_arg = try allocator.print("file:{s}", .{instance.serial_path});
     defer allocator.free(serial_arg);
-    const code_drive = try std.fmt.allocPrint(
-        allocator,
+    const code_drive = try allocator.print(
         "if=pflash,unit=0,format=raw,readonly=on,file={s}",
         .{firmware.code_path},
     );
     defer allocator.free(code_drive);
-    const vars_drive = try std.fmt.allocPrint(
-        allocator,
+    const vars_drive = try allocator.print(
         "if=pflash,unit=1,format=raw,file={s}",
         .{instance.vars_path},
     );
     defer allocator.free(vars_drive);
-    const image_drive = try std.fmt.allocPrint(
-        allocator,
+    const image_drive = try allocator.print(
         "file={s},format=qcow2,if=virtio",
         .{instance.overlay_path},
     );
     defer allocator.free(image_drive);
-    const seed_drive = try std.fmt.allocPrint(
-        allocator,
+    const seed_drive = try allocator.print(
         "file={s},if=none,id=seed,media=cdrom,readonly=on,format=raw",
         .{instance.seed_path},
     );
@@ -1192,7 +1177,7 @@ fn sshSucceeded(
     instance: *const Instance,
     command: []const u8,
 ) !bool {
-    const port_text = try std.fmt.allocPrint(allocator, "{d}", .{instance.port});
+    const port_text = try allocator.print("{d}", .{instance.port});
     defer allocator.free(port_text);
     return commandSucceeded(allocator, io, &.{
         ssh_path,
@@ -1232,7 +1217,7 @@ fn sshOutputAlloc(
     instance: *const Instance,
     command: []const u8,
 ) ![]u8 {
-    const port_text = try std.fmt.allocPrint(allocator, "{d}", .{instance.port});
+    const port_text = try allocator.print("{d}", .{instance.port});
     defer allocator.free(port_text);
     const result = try std.process.run(allocator, io, .{
         .argv = &.{
@@ -1376,8 +1361,7 @@ fn verifyGuestSecureBoot(
         \\done
         ,
     };
-    const command = try std.fmt.allocPrint(
-        allocator,
+    const command = try allocator.print(
         \\set -eu
         \\secure_boot=$(od -An -t u1 -j 4 -N 1 /sys/firmware/efi/efivars/SecureBoot-* | tr -d ' ')
         \\test "$secure_boot" = 1
@@ -1428,7 +1412,7 @@ fn serialContains(
         else => return err,
     };
     defer allocator.free(serial);
-    return std.ascii.indexOfIgnoreCase(serial, marker) != null;
+    return std.ascii.findIgnoreCase(serial, marker) != null;
 }
 
 fn waitForSerialMarker(
@@ -1610,8 +1594,7 @@ fn verifyCoreSshdRestart(
     instance: *const Instance,
 ) !void {
     const initial_pid = try readCoreSshdPid(allocator, io, ssh_path, instance);
-    const kill_command = try std.fmt.allocPrint(
-        allocator,
+    const kill_command = try allocator.print(
         "sudo -n /usr/bin/kill -KILL {d}",
         .{initial_pid},
     );
@@ -1752,7 +1735,7 @@ test "EFI db parser finds the exact enrolled DER certificate" {
         0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
     };
     const certificate = "DER certificate";
-    var variable = [_]u8{0} ** (4 + 28 + 16 + certificate.len);
+    var variable = @as([(4 + 28 + 16 + certificate.len)]u8, @splat(0));
     const list_offset = 4;
     @memcpy(variable[list_offset..][0..efi_cert_x509_guid.len], &efi_cert_x509_guid);
     std.mem.writeInt(
@@ -1773,7 +1756,7 @@ test "EFI db parser finds the exact enrolled DER certificate" {
     try std.testing.expect(efiDbContainsCertificate(&variable, digest));
     try std.testing.expect(!efiDbContainsCertificate(
         &variable,
-        [_]u8{0xff} ** 32,
+        @as([32]u8, @splat(0xff)),
     ));
     try std.testing.expect(!efiDbContainsCertificate(variable[0 .. variable.len - 1], digest));
     variable[list_offset] = 0;

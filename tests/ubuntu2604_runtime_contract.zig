@@ -30,7 +30,7 @@ const Tree = struct {
     root: []u8,
 
     fn init(allocator: Allocator, io: Io, name: []const u8) !Tree {
-        const root = try std.fmt.allocPrint(allocator, ".scratch/runtime-contract/{s}", .{name});
+        const root = try allocator.print(".scratch/runtime-contract/{s}", .{name});
         errdefer allocator.free(root);
         Dir.cwd().deleteTree(io, root) catch {};
         try Dir.cwd().createDirPath(io, root);
@@ -151,8 +151,7 @@ fn populateSatisfyingRoot(tree: *const Tree) !void {
             .directory => try tree.createDir(requirement.target),
             .symlink => try tree.symlink(requirement.target, requirement.expect),
             .config, .trust_store => {
-                const contents = try std.fmt.allocPrint(
-                    tree.allocator,
+                const contents = try tree.allocator.print(
                     "preamble\n{s}\ntrailer\n",
                     .{requirement.expect},
                 );

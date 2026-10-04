@@ -154,7 +154,7 @@ const RedirectTarget = struct {
         var address = Io.net.IpAddress{ .ip4 = .loopback(0) };
         var listener = try address.listen(io, .{ .reuse_address = true });
         errdefer listener.deinit(io);
-        const authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{try listenerPort(&listener)});
+        const authority = try allocator.print("127.0.0.1:{d}", .{try listenerPort(&listener)});
         return .{
             .allocator = allocator,
             .io = io,
@@ -245,7 +245,7 @@ const TlsFixture = struct {
         errdefer listener.deinit(io);
         // Zig 0.16's TLS verifier matches dNSName SANs only; OpenSSL verifies
         // this fixture's IP SAN separately with -verify_ip.
-        const authority = try std.fmt.allocPrint(allocator, "localhost:{d}", .{try listenerPort(&listener)});
+        const authority = try allocator.print("localhost:{d}", .{try listenerPort(&listener)});
         return .{
             .allocator = allocator,
             .io = io,
@@ -347,7 +347,7 @@ const TlsRedirectTarget = struct {
         var address = Io.net.IpAddress{ .ip4 = .loopback(0) };
         var listener = try address.listen(io, .{ .reuse_address = true });
         errdefer listener.deinit(io);
-        const authority = try std.fmt.allocPrint(allocator, "localhost:{d}", .{try listenerPort(&listener)});
+        const authority = try allocator.print("localhost:{d}", .{try listenerPort(&listener)});
         return .{
             .allocator = allocator,
             .io = io,
@@ -442,7 +442,7 @@ const TlsRegistryFixture = struct {
         var address = Io.net.IpAddress{ .ip4 = .loopback(0) };
         var listener = try address.listen(io, .{ .reuse_address = true });
         errdefer listener.deinit(io);
-        const authority = try std.fmt.allocPrint(allocator, "localhost:{d}", .{try listenerPort(&listener)});
+        const authority = try allocator.print("localhost:{d}", .{try listenerPort(&listener)});
         errdefer allocator.free(authority);
         const config = try allocator.dupe(u8, "{\"architecture\":\"amd64\",\"os\":\"linux\"}");
         errdefer allocator.free(config);
@@ -452,8 +452,7 @@ const TlsRegistryFixture = struct {
         errdefer allocator.free(config_digest);
         const layer_digest = try digestText(allocator, layer);
         errdefer allocator.free(layer_digest);
-        const manifest = try std.fmt.allocPrint(
-            allocator,
+        const manifest = try allocator.print(
             "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
             .{
                 oci.model.media_type_oci_manifest,
@@ -484,7 +483,7 @@ const TlsRegistryFixture = struct {
 
     fn setBlobRedirect(self: *TlsRegistryFixture, target_authority: []const u8) !void {
         std.debug.assert(self.redirect_blob_url == null);
-        self.redirect_blob_url = try std.fmt.allocPrint(self.allocator, "https://{s}/blob", .{target_authority});
+        self.redirect_blob_url = try self.allocator.print("https://{s}/blob", .{target_authority});
     }
 
     fn start(self: *TlsRegistryFixture) !void {
@@ -569,19 +568,19 @@ const TlsRegistryFixture = struct {
             try expectTlsBasic(request);
             return self.respondDocument(request, self.manifest, self.manifest_digest, oci.model.media_type_oci_manifest);
         }
-        const manifest_target = try std.fmt.allocPrint(self.allocator, "/v2/team/image/manifests/{s}", .{self.manifest_digest});
+        const manifest_target = try self.allocator.print("/v2/team/image/manifests/{s}", .{self.manifest_digest});
         defer self.allocator.free(manifest_target);
         if (std.mem.eql(u8, target, manifest_target)) {
             try expectTlsBasic(request);
             return self.respondDocument(request, self.manifest, self.manifest_digest, oci.model.media_type_oci_manifest);
         }
-        const config_target = try std.fmt.allocPrint(self.allocator, "/v2/team/image/blobs/{s}", .{self.config_digest});
+        const config_target = try self.allocator.print("/v2/team/image/blobs/{s}", .{self.config_digest});
         defer self.allocator.free(config_target);
         if (std.mem.eql(u8, target, config_target)) {
             try expectTlsBasic(request);
             return self.respondDocument(request, self.config, self.config_digest, oci.model.media_type_oci_config);
         }
-        const layer_target = try std.fmt.allocPrint(self.allocator, "/v2/team/image/blobs/{s}", .{self.layer_digest});
+        const layer_target = try self.allocator.print("/v2/team/image/blobs/{s}", .{self.layer_digest});
         defer self.allocator.free(layer_target);
         if (std.mem.eql(u8, target, layer_target)) {
             try expectTlsBasic(request);
@@ -666,7 +665,7 @@ const Fixture = struct {
         var listener = try address.listen(io, .{ .reuse_address = true });
         errdefer listener.deinit(io);
         const port = try listenerPort(&listener);
-        const authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{port});
+        const authority = try allocator.print("127.0.0.1:{d}", .{port});
         errdefer allocator.free(authority);
         const config = try allocator.dupe(
             u8,
@@ -685,8 +684,7 @@ const Fixture = struct {
         errdefer allocator.free(config_digest);
         const layer_digest = try digestText(allocator, layer);
         errdefer allocator.free(layer_digest);
-        const manifest = try std.fmt.allocPrint(
-            allocator,
+        const manifest = try allocator.print(
             "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
             .{
                 if (scenario == .manifest_media_type_mismatch or scenario == .nested_manifest_media_type_mismatch)
@@ -713,8 +711,7 @@ const Fixture = struct {
                 ",\"variant\":\"v8\""
             else
                 "";
-            break :blk try std.fmt.allocPrint(
-                allocator,
+            break :blk try allocator.print(
                 "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"platform\":{{\"os\":\"linux\",\"architecture\":\"amd64\"{s}}}}}]}}",
                 .{
                     oci.model.media_type_oci_index,
@@ -883,8 +880,7 @@ const Fixture = struct {
     }
 
     fn isLayerRequest(self: *Fixture, target: []const u8) !bool {
-        const expected = try std.fmt.allocPrint(
-            self.allocator,
+        const expected = try self.allocator.print(
             "/v2/team/image/blobs/{s}",
             .{self.layer_digest},
         );
@@ -940,7 +936,7 @@ const Fixture = struct {
             try std.testing.expectEqualStrings(expected, target);
             self.token_requests += 1;
             const token = if (self.token_requests == 1) "first-token" else "refreshed-token";
-            const body = try std.fmt.allocPrint(self.allocator, "{{\"token\":\"{s}\",\"expires_in\":3600}}", .{token});
+            const body = try self.allocator.print("{{\"token\":\"{s}\",\"expires_in\":3600}}", .{token});
             defer self.allocator.free(body);
             return request.respond(body, .{});
         }
@@ -981,31 +977,31 @@ const Fixture = struct {
             return self.respondTagManifest(request);
         }
         if (self.index_digest) |index_digest| {
-            const index_target = try std.fmt.allocPrint(self.allocator, "/v2/team/image/manifests/{s}", .{index_digest});
+            const index_target = try self.allocator.print("/v2/team/image/manifests/{s}", .{index_digest});
             defer self.allocator.free(index_target);
             if (std.mem.eql(u8, target, index_target)) {
                 try self.expectRegistryAuthorization(request);
                 return self.respondManifest(request, self.index.?, index_digest);
             }
         }
-        const manifest_target = try std.fmt.allocPrint(self.allocator, "/v2/team/image/manifests/{s}", .{self.manifest_digest});
+        const manifest_target = try self.allocator.print("/v2/team/image/manifests/{s}", .{self.manifest_digest});
         defer self.allocator.free(manifest_target);
         if (std.mem.eql(u8, target, manifest_target)) {
             try self.expectRegistryAuthorization(request);
             return self.respondManifest(request, self.manifest, self.manifest_digest);
         }
-        const config_manifest_target = try std.fmt.allocPrint(self.allocator, "/v2/team/image/manifests/{s}", .{self.config_digest});
+        const config_manifest_target = try self.allocator.print("/v2/team/image/manifests/{s}", .{self.config_digest});
         defer self.allocator.free(config_manifest_target);
         if (std.mem.eql(u8, target, config_manifest_target)) {
             self.config_manifest_requests += 1;
             return request.respond("", .{ .status = .not_found });
         }
-        const layer_blob_target = try std.fmt.allocPrint(self.allocator, "/v2/team/image/blobs/{s}", .{self.layer_digest});
+        const layer_blob_target = try self.allocator.print("/v2/team/image/blobs/{s}", .{self.layer_digest});
         defer self.allocator.free(layer_blob_target);
         if (std.mem.eql(u8, target, layer_blob_target)) {
             return self.respondBlob(request);
         }
-        const config_blob_target = try std.fmt.allocPrint(self.allocator, "/v2/team/image/blobs/{s}", .{self.config_digest});
+        const config_blob_target = try self.allocator.print("/v2/team/image/blobs/{s}", .{self.config_digest});
         defer self.allocator.free(config_blob_target);
         if (std.mem.eql(u8, target, config_blob_target)) {
             return self.respondConfigBlob(request);
@@ -1031,10 +1027,9 @@ const Fixture = struct {
             },
             .bearer_refresh, .bearer_blob_rejected => {
                 if (header(request, "Authorization") == null) {
-                    const realm = try std.fmt.allocPrint(self.allocator, "http://{s}/token?existing=1", .{self.authority});
+                    const realm = try self.allocator.print("http://{s}/token?existing=1", .{self.authority});
                     defer self.allocator.free(realm);
-                    const challenge = try std.fmt.allocPrint(
-                        self.allocator,
+                    const challenge = try self.allocator.print(
                         "Basic realm=\"unused\", Bearer realm=\"{s}\", service=\"registry service\", scope=\"repository:team/image:pull\", scope=\"repository:other:pull\"",
                         .{realm},
                     );
@@ -1071,10 +1066,9 @@ const Fixture = struct {
             .bearer_refresh => {
                 const value = header(request, "Authorization") orelse return error.MissingAuthorization;
                 if (std.mem.eql(u8, value, "Bearer first-token")) {
-                    const realm = try std.fmt.allocPrint(self.allocator, "http://{s}/token?existing=1", .{self.authority});
+                    const realm = try self.allocator.print("http://{s}/token?existing=1", .{self.authority});
                     defer self.allocator.free(realm);
-                    const challenge = try std.fmt.allocPrint(
-                        self.allocator,
+                    const challenge = try self.allocator.print(
                         "Bearer realm=\"{s}\", service=\"registry service\", scope=\"repository:team/image:pull\", error=\"invalid_token\"",
                         .{realm},
                     );
@@ -1100,10 +1094,9 @@ const Fixture = struct {
                 } });
             },
             .bearer_blob_rejected => {
-                const realm = try std.fmt.allocPrint(self.allocator, "http://{s}/token?existing=1", .{self.authority});
+                const realm = try self.allocator.print("http://{s}/token?existing=1", .{self.authority});
                 defer self.allocator.free(realm);
-                const challenge = try std.fmt.allocPrint(
-                    self.allocator,
+                const challenge = try self.allocator.print(
                     "Bearer realm=\"{s}\", service=\"registry service\", scope=\"repository:team/image:pull\", error=\"invalid_token\"",
                     .{realm},
                 );
@@ -1220,7 +1213,7 @@ fn digestText(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
 }
 
 fn listenerPort(listener: *Io.net.Server) !u16 {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .linux) return error.SkipZigTest;
     var address: std.os.linux.sockaddr.in = undefined;
     var length: std.os.linux.socklen_t = @sizeOf(@TypeOf(address));
     switch (std.os.linux.errno(std.os.linux.getsockname(listener.socket.handle, @ptrCast(&address), &length))) {
@@ -1266,7 +1259,7 @@ fn deleteLayout(io: Io, path: []const u8) void {
 }
 
 fn writeAuthfile(allocator: std.mem.Allocator, io: Io, path: []const u8, authority: []const u8) !void {
-    const content = try std.fmt.allocPrint(allocator, "{{\"auths\":{{\"{s}\":{{\"auth\":\"dXNlcjpzZWNyZXQ=\"}}}}}}", .{authority});
+    const content = try allocator.print("{{\"auths\":{{\"{s}\":{{\"auth\":\"dXNlcjpzZWNyZXQ=\"}}}}}}", .{authority});
     defer allocator.free(content);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = content });
 }
@@ -1274,7 +1267,7 @@ fn writeAuthfile(allocator: std.mem.Allocator, io: Io, path: []const u8, authori
 /// Writes an authfile naming a credential the fixture rejects, so that any
 /// consultation of it is a test failure rather than an invisible fallback.
 fn writeRejectedAuthfile(allocator: std.mem.Allocator, io: Io, path: []const u8, authority: []const u8) !void {
-    const content = try std.fmt.allocPrint(allocator, "{{\"auths\":{{\"{s}\":{{\"auth\":\"d3Jvbmc6d3Jvbmc=\"}}}}}}", .{authority});
+    const content = try allocator.print("{{\"auths\":{{\"{s}\":{{\"auth\":\"d3Jvbmc6d3Jvbmc=\"}}}}}}", .{authority});
     defer allocator.free(content);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = content });
 }
@@ -1356,8 +1349,7 @@ test "pinning names the digest a tag points at now, and the platform it resolves
     });
     defer result.deinit();
     try fixture.finish();
-    const expected = try std.fmt.allocPrint(
-        allocator,
+    const expected = try allocator.print(
         "docker://{s}/team/image@{s}",
         .{ fixture.authority, fixture.manifest_digest },
     );
@@ -1387,8 +1379,7 @@ test "pinning a digest confirms it and reports the variant the configuration sta
     });
     defer result.deinit();
     try fixture.finish();
-    const expected = try std.fmt.allocPrint(
-        allocator,
+    const expected = try allocator.print(
         "docker://{s}/team/image@{s}",
         .{ fixture.authority, fixture.manifest_digest },
     );
@@ -1728,7 +1719,7 @@ test "cross-origin blob redirects strip registry Authorization" {
     defer fixture.deinit();
     var target = try RedirectTarget.init(allocator, io, fixture.layer, fixture.layer_digest, .blob);
     defer target.deinit();
-    fixture.redirect_blob_url = try std.fmt.allocPrint(allocator, "http://{s}/blob", .{target.authority});
+    fixture.redirect_blob_url = try allocator.print("http://{s}/blob", .{target.authority});
     try writeAuthfile(allocator, io, authfile, fixture.authority);
     try target.start();
     try fixture.start();
@@ -1762,7 +1753,7 @@ test "cross-origin blob authentication challenges cannot nominate token realms" 
         .bearer_challenge,
     );
     defer target.deinit();
-    fixture.redirect_blob_url = try std.fmt.allocPrint(allocator, "http://{s}/blob", .{target.authority});
+    fixture.redirect_blob_url = try allocator.print("http://{s}/blob", .{target.authority});
     try writeAuthfile(allocator, io, authfile, fixture.authority);
     try target.start();
     try fixture.start();
@@ -1796,7 +1787,7 @@ test "cross-origin config metadata challenges are rejected in bounded requests" 
         .bearer_challenge,
     );
     defer target.deinit();
-    fixture.redirect_blob_url = try std.fmt.allocPrint(allocator, "http://{s}/blob", .{target.authority});
+    fixture.redirect_blob_url = try allocator.print("http://{s}/blob", .{target.authority});
     try writeAuthfile(allocator, io, authfile, fixture.authority);
     try target.start();
     try fixture.start();
@@ -2393,7 +2384,7 @@ const PublishFixture = struct {
         var address = Io.net.IpAddress{ .ip4 = .loopback(0) };
         var listener = try address.listen(io, .{ .reuse_address = true });
         errdefer listener.deinit(io);
-        const authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{try listenerPort(&listener)});
+        const authority = try allocator.print("127.0.0.1:{d}", .{try listenerPort(&listener)});
         return .{
             .allocator = allocator,
             .io = io,
@@ -2410,7 +2401,7 @@ const PublishFixture = struct {
         var address = Io.net.IpAddress{ .ip4 = .unspecified(0) };
         var listener = try address.listen(io, .{ .reuse_address = true });
         errdefer listener.deinit(io);
-        const authority = try std.fmt.allocPrint(allocator, "0.0.0.0:{d}", .{try listenerPort(&listener)});
+        const authority = try allocator.print("0.0.0.0:{d}", .{try listenerPort(&listener)});
         return .{
             .allocator = allocator,
             .io = io,
@@ -2428,12 +2419,12 @@ const PublishFixture = struct {
         var listener = try address.listen(io, .{ .reuse_address = true });
         errdefer listener.deinit(io);
         const port = try listenerPort(&listener);
-        const authority = try std.fmt.allocPrint(allocator, "localhost:{d}", .{port});
+        const authority = try allocator.print("localhost:{d}", .{port});
         errdefer allocator.free(authority);
         var upload_listener = try address.listen(io, .{ .reuse_address = true });
         errdefer upload_listener.deinit(io);
         const upload_port = try listenerPort(&upload_listener);
-        const upload_authority = try std.fmt.allocPrint(allocator, "localhost:{d}", .{upload_port});
+        const upload_authority = try allocator.print("localhost:{d}", .{upload_port});
         return .{
             .allocator = allocator,
             .io = io,
@@ -2546,8 +2537,7 @@ const PublishFixture = struct {
             .{},
         );
         defer self.allocator.free(media_type_json);
-        const index = try std.fmt.allocPrint(
-            self.allocator,
+        const index = try self.allocator.print(
             "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"manifests\":[{{\"mediaType\":{s},\"digest\":\"{s}\",\"size\":{d}}}]}}",
             .{
                 oci.model.media_type_oci_index,
@@ -4174,8 +4164,7 @@ fn addIndexRootWithChildMediaType(
     child_size: usize,
     name: []const u8,
 ) !AddedIndex {
-    const bytes = try std.fmt.allocPrint(
-        allocator,
+    const bytes = try allocator.print(
         "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ oci.model.media_type_oci_index, child_media_type, child_digest, child_size },
     );
@@ -4187,8 +4176,7 @@ fn addIndexRootWithChildMediaType(
     var blob_path_buffer: [80]u8 = undefined;
     const blob_path = try std.fmt.bufPrint(&blob_path_buffer, "blobs/sha256/{s}", .{digest["sha256:".len..]});
     try directory.writeFile(io, .{ .sub_path = blob_path, .data = bytes });
-    const index = try std.fmt.allocPrint(
-        allocator,
+    const index = try allocator.print(
         "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"{s}\"}}}}]}}",
         .{ oci.model.media_type_oci_index, digest, bytes.len, name },
     );
@@ -4211,8 +4199,7 @@ fn makeSmallPublishLayout(
     errdefer allocator.free(config_digest);
     const layer_digest = try digestText(allocator, layer);
     errdefer allocator.free(layer_digest);
-    const manifest = try std.fmt.allocPrint(
-        allocator,
+    const manifest = try allocator.print(
         "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{
             oci.model.media_type_oci_manifest,
@@ -4239,8 +4226,7 @@ fn makeSmallPublishLayout(
     try writePublishLayoutBlob(io, directory, config_digest, config);
     try writePublishLayoutBlob(io, directory, layer_digest, layer);
     try writePublishLayoutBlob(io, directory, manifest_digest, manifest);
-    const index = try std.fmt.allocPrint(
-        allocator,
+    const index = try allocator.print(
         "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"{s}\"}}}}]}}\n",
         .{ oci.model.media_type_oci_manifest, manifest_digest, manifest.len, name },
     );
@@ -4288,8 +4274,7 @@ fn addIndexRootWithOpaque(
         .{opaque_digest["sha256:".len..]},
     );
     try directory.writeFile(io, .{ .sub_path = opaque_path, .data = opaque_bytes });
-    const bytes = try std.fmt.allocPrint(
-        allocator,
+    const bytes = try allocator.print(
         "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},{{\"mediaType\":\"application/example.opaque\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{
             oci.model.media_type_oci_index,
@@ -4310,8 +4295,7 @@ fn addIndexRootWithOpaque(
         .{digest["sha256:".len..]},
     );
     try directory.writeFile(io, .{ .sub_path = root_path, .data = bytes });
-    const index = try std.fmt.allocPrint(
-        allocator,
+    const index = try allocator.print(
         "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"{s}\"}}}}]}}",
         .{ oci.model.media_type_oci_index, digest, bytes.len, name },
     );
@@ -4341,8 +4325,7 @@ fn lastPublishEvent(fixture: *const PublishFixture, expected: PublishEvent) ?usi
 /// A `docker://` reference naming the exact manifest the fixture serves. The
 /// customize path refuses anything but a digest, so a tag will not do here.
 fn pinnedReferenceFor(allocator: std.mem.Allocator, fixture: *const Fixture) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "docker://{s}/team/image@{s}",
         .{ fixture.authority, fixture.manifest_digest },
     );
@@ -4598,7 +4581,7 @@ const SignatureFixture = struct {
         var listener = try address.listen(io, .{ .reuse_address = true });
         errdefer listener.deinit(io);
         const port = try listenerPort(&listener);
-        const authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{port});
+        const authority = try allocator.print("127.0.0.1:{d}", .{port});
         errdefer allocator.free(authority);
         const payload_digest = try digestText(allocator, cosign_payload);
         errdefer allocator.free(payload_digest);
@@ -4650,8 +4633,7 @@ const SignatureFixture = struct {
             ),
         }
 
-        const manifest = try std.fmt.allocPrint(
-            allocator,
+        const manifest = try allocator.print(
             "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{s}]}}",
             .{ oci.model.media_type_oci_manifest, payload_digest, cosign_payload.len, layers.written() },
         );
@@ -4661,14 +4643,12 @@ const SignatureFixture = struct {
 
         const image = try oci.content.Digest.parse(cosign_image_digest);
         const tag = miz.oci.cosign_discovery.signatureTag(image);
-        const signature_target = try std.fmt.allocPrint(
-            allocator,
+        const signature_target = try allocator.print(
             "/v2/team/image/manifests/{s}",
             .{&tag},
         );
         errdefer allocator.free(signature_target);
-        const payload_target = try std.fmt.allocPrint(
-            allocator,
+        const payload_target = try allocator.print(
             "/v2/team/image/blobs/{s}",
             .{payload_digest},
         );
@@ -5008,7 +4988,7 @@ const PolicyFixture = struct {
         var listener = try address.listen(io, .{ .reuse_address = true });
         errdefer listener.deinit(io);
         const port = try listenerPort(&listener);
-        const authority = try std.fmt.allocPrint(allocator, "127.0.0.1:{d}", .{port});
+        const authority = try allocator.print("127.0.0.1:{d}", .{port});
         errdefer allocator.free(authority);
 
         const config = try allocator.dupe(u8, "{\"architecture\":\"amd64\",\"os\":\"linux\"}");
@@ -5019,8 +4999,7 @@ const PolicyFixture = struct {
         errdefer allocator.free(config_digest);
         const layer_digest = try digestText(allocator, layer);
         errdefer allocator.free(layer_digest);
-        const manifest = try std.fmt.allocPrint(
-            allocator,
+        const manifest = try allocator.print(
             "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}," ++
                 "\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
             .{
@@ -5039,8 +5018,7 @@ const PolicyFixture = struct {
 
         // A simple-signing payload naming this fixture's own image, in the
         // shape cosign writes.
-        const payload = try std.fmt.allocPrint(
-            allocator,
+        const payload = try allocator.print(
             "{{\"critical\":{{\"identity\":{{\"docker-reference\":\"127.0.0.1/team/image\"}}," ++
                 "\"image\":{{\"docker-manifest-digest\":\"{s}\"}},\"type\":\"cosign container image signature\"}},\"optional\":null}}",
             .{manifest_digest},
@@ -5051,8 +5029,7 @@ const PolicyFixture = struct {
 
         const encoded = try signPayload(allocator, payload, signature);
         defer allocator.free(encoded);
-        const signature_manifest = try std.fmt.allocPrint(
-            allocator,
+        const signature_manifest = try allocator.print(
             "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}," ++
                 "\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"{s}\":\"{s}\"}}}}]}}",
             .{
@@ -5072,8 +5049,7 @@ const PolicyFixture = struct {
         errdefer allocator.free(signature_manifest_digest);
         const image = try oci.content.Digest.parse(manifest_digest);
         const tag = miz.oci.cosign_discovery.signatureTag(image);
-        const signature_target = try std.fmt.allocPrint(
-            allocator,
+        const signature_target = try allocator.print(
             "/v2/team/image/manifests/{s}",
             .{&tag},
         );
@@ -5112,7 +5088,7 @@ const PolicyFixture = struct {
             .by_declared_key => policy_signing_scalar,
             // Any other valid scalar produces a signature that is perfectly
             // well formed and simply is not this key's.
-            .by_other_key => [_]u8{0x11} ** 32,
+            .by_other_key => @as([32]u8, @splat(0x11)),
             .none => return allocator.dupe(u8, ""),
         };
         const secret = try Ecdsa.SecretKey.fromBytes(scalar);
@@ -5252,8 +5228,7 @@ const PolicyFixture = struct {
     }
 
     fn reference(self: *PolicyFixture, allocator: std.mem.Allocator) ![]u8 {
-        return std.fmt.allocPrint(
-            allocator,
+        return allocator.print(
             "docker://{s}/team/image@{s}",
             .{ self.authority, self.manifest_digest },
         );

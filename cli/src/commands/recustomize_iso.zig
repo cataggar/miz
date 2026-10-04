@@ -336,8 +336,7 @@ fn describeFailure(
         var message_buffer: [miz.limits.Exceeded.max_message_bytes]u8 = undefined;
         var remediation_buffer: [miz.limits.Exceeded.max_remediation_bytes]u8 = undefined;
         if (breach.limit.err() == err) {
-            return std.fmt.allocPrint(
-                allocator,
+            return allocator.print(
                 "recustomize-iso: failed: {s}\n{s}, or import less content.",
                 .{
                     breach.describe(&message_buffer) catch unreachable,
@@ -360,7 +359,7 @@ fn describeFailure(
             u8,
             "recustomize-iso: failed: no LiveOS rootfs payload was found in the source ISO. Pass --rootfs-path naming the squashfs/rootfs payload.",
         ),
-        else => return std.fmt.allocPrint(allocator, "recustomize-iso: failed: {s}", .{@errorName(err)}),
+        else => return allocator.print("recustomize-iso: failed: {s}", .{@errorName(err)}),
     }
 }
 
@@ -369,23 +368,22 @@ fn describeRefusal(
     diagnostic: miz.recustomize_iso.RecustomizeDiagnostic,
 ) std.mem.Allocator.Error![]u8 {
     const at_path: []u8 = if (diagnostic.path.len > 0)
-        try std.fmt.allocPrint(allocator, " at '{s}'", .{diagnostic.path})
+        try allocator.print(" at '{s}'", .{diagnostic.path})
     else
         try allocator.dupe(u8, "");
     defer allocator.free(at_path);
     const at_index: []u8 = if (diagnostic.catalog_index) |index|
-        try std.fmt.allocPrint(allocator, " (boot catalog entry #{d})", .{index})
+        try allocator.print(" (boot catalog entry #{d})", .{index})
     else
         try allocator.dupe(u8, "");
     defer allocator.free(at_index);
     const detail: []u8 = if (diagnostic.detail.len > 0)
-        try std.fmt.allocPrint(allocator, " [{s}]", .{diagnostic.detail})
+        try allocator.print(" [{s}]", .{diagnostic.detail})
     else
         try allocator.dupe(u8, "");
     defer allocator.free(detail);
 
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "recustomize-iso: refused: the source ISO uses {s}{s}{s}{s}, which the native writer cannot losslessly preserve. " ++
             "recustomize-iso preserves the source or refuses; it does not produce a lossy ISO.",
         .{ diagnostic.kind.describe(), at_path, at_index, detail },

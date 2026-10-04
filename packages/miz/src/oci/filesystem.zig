@@ -236,11 +236,11 @@ pub const Extractor = struct {
         path: []const u8,
         entry: tar.StreamEntry,
     ) !void {
-        if (builtin.os.tag != .linux) return error.UnsupportedEntryKind;
+        if (builtin.target.os.tag != .linux) return error.UnsupportedEntryKind;
         try self.removePathAndDescendants(path);
         var parent = try self.openParent(path, true);
         defer parent.close(self.io);
-        const name = try self.allocator.dupeZ(u8, parent.basename);
+        const name = try self.allocator.dupeSentinel(u8, parent.basename, 0);
         defer self.allocator.free(name);
         const linux = std.os.linux;
         const kind_mode: u32 = switch (entry.kind) {
@@ -287,10 +287,10 @@ pub const Extractor = struct {
         xattrs: []const tar.Xattr,
     ) !void {
         if (xattrs.len == 0) return;
-        if (builtin.os.tag != .linux) return error.UnsupportedXattr;
+        if (builtin.target.os.tag != .linux) return error.UnsupportedXattr;
         const linux = std.os.linux;
         for (xattrs) |xattr| {
-            const name = try self.allocator.dupeZ(u8, xattr.name);
+            const name = try self.allocator.dupeSentinel(u8, xattr.name, 0);
             defer self.allocator.free(name);
             switch (linux.errno(linux.fsetxattr(
                 file.handle,
@@ -313,9 +313,8 @@ pub const Extractor = struct {
         xattrs: []const tar.Xattr,
     ) !void {
         if (xattrs.len == 0) return;
-        if (builtin.os.tag != .linux) return error.UnsupportedXattr;
-        const proc_path = try std.fmt.allocPrintSentinel(
-            self.allocator,
+        if (builtin.target.os.tag != .linux) return error.UnsupportedXattr;
+        const proc_path = try self.allocator.printSentinel(
             "/proc/self/fd/{d}/{s}",
             .{ dir.handle, path },
             0,
@@ -323,7 +322,7 @@ pub const Extractor = struct {
         defer self.allocator.free(proc_path);
         const linux = std.os.linux;
         for (xattrs) |xattr| {
-            const name = try self.allocator.dupeZ(u8, xattr.name);
+            const name = try self.allocator.dupeSentinel(u8, xattr.name, 0);
             defer self.allocator.free(name);
             switch (linux.errno(linux.setxattr(
                 proc_path.ptr,
@@ -486,8 +485,8 @@ pub const Extractor = struct {
             var parent = try self.openParent(path, false);
             defer parent.close(self.io);
             if (self.options.preserve_ownership) {
-                if (builtin.os.tag != .linux) return error.UnsupportedSymlinkOwnership;
-                const name = try self.allocator.dupeZ(u8, parent.basename);
+                if (builtin.target.os.tag != .linux) return error.UnsupportedSymlinkOwnership;
+                const name = try self.allocator.dupeSentinel(u8, parent.basename, 0);
                 defer self.allocator.free(name);
                 const linux = std.os.linux;
                 switch (linux.errno(linux.fchownat(
@@ -512,11 +511,11 @@ pub const Extractor = struct {
             node.kind == .character_device or
             node.kind == .block_device)
         {
-            if (builtin.os.tag != .linux) return error.UnsupportedEntryKind;
+            if (builtin.target.os.tag != .linux) return error.UnsupportedEntryKind;
             var parent = try self.openParent(path, false);
             defer parent.close(self.io);
             if (self.options.preserve_ownership) {
-                const name = try self.allocator.dupeZ(u8, parent.basename);
+                const name = try self.allocator.dupeSentinel(u8, parent.basename, 0);
                 defer self.allocator.free(name);
                 const linux = std.os.linux;
                 switch (linux.errno(linux.fchownat(
@@ -629,14 +628,14 @@ pub const Extractor = struct {
 };
 
 fn directoryPermissions(mode: u16) Io.File.Permissions {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows => .default_dir,
         else => .fromMode(mode),
     };
 }
 
 fn filePermissions(mode: u16) Io.File.Permissions {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows => .default_file,
         else => .fromMode(mode),
     };
@@ -719,7 +718,7 @@ fn joinPath(
     child: []const u8,
 ) ![]u8 {
     if (parent.len == 0) return allocator.dupe(u8, child);
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ parent, child });
+    return allocator.print("{s}/{s}", .{ parent, child });
 }
 
 fn isDescendant(candidate: []const u8, parent: []const u8) bool {
@@ -829,7 +828,7 @@ test "extractor applies ordered layers whiteouts hardlinks and deferred director
     const linked = try root.statFile(io, "etc/new-link", .{});
     try std.testing.expectEqual(original.inode, linked.inode);
     const etc = try root.statFile(io, "etc", .{});
-    try std.testing.expectEqual(@as(u32, 0o555), @intFromEnum(etc.permissions) & 0o7777);
+    try std.testing.expectEqual(@as(u32, 0o555), @backingInt(etc.permissions) & 0o7777);
     try std.testing.expectEqual(@as(i96, 100 * std.time.ns_per_s), etc.mtime.nanoseconds);
 }
 
@@ -874,7 +873,7 @@ test "extractor replaces symlink parents instead of following them" {
 }
 
 test "extractor preserves FIFOs and regular-file xattrs" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const root_path = "test-oci-filesystem-metadata-root";

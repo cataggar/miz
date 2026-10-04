@@ -80,7 +80,7 @@ pub fn unpackLayout(
         error.FileNotFound => {},
         else => return err,
     }
-    if (bundle_exists and builtin.os.tag != .linux) return error.AtomicReplaceUnsupported;
+    if (bundle_exists and builtin.target.os.tag != .linux) return error.AtomicReplaceUnsupported;
 
     const staging_path = try createUniqueDirectory(io, allocator, parent, base);
     defer allocator.free(staging_path);
@@ -178,11 +178,11 @@ pub fn unpackLayout(
 }
 
 fn currentUid() u32 {
-    return if (@import("builtin").os.tag == .linux) std.os.linux.geteuid() else 0;
+    return if (@import("builtin").target.os.tag == .linux) std.os.linux.geteuid() else 0;
 }
 
 fn currentGid() u32 {
-    return if (@import("builtin").os.tag == .linux) std.os.linux.getegid() else 0;
+    return if (@import("builtin").target.os.tag == .linux) std.os.linux.getegid() else 0;
 }
 
 fn openPublicationLock(
@@ -193,7 +193,7 @@ fn openPublicationLock(
 ) !Io.File {
     var parent_dir = try Io.Dir.cwd().openDir(io, parent, .{});
     defer parent_dir.close(io);
-    const name = try std.fmt.allocPrint(allocator, ".{s}.miz-bundle.lock", .{base});
+    const name = try allocator.print(".{s}.miz-bundle.lock", .{base});
     defer allocator.free(name);
     return parent_dir.createFile(io, name, .{
         .read = true,
@@ -207,10 +207,10 @@ fn exchangeDirectories(
     staging_path: []const u8,
     bundle_path: []const u8,
 ) !void {
-    if (builtin.os.tag != .linux) return error.AtomicReplaceUnsupported;
-    const staging_z = try allocator.dupeZ(u8, staging_path);
+    if (builtin.target.os.tag != .linux) return error.AtomicReplaceUnsupported;
+    const staging_z = try allocator.dupeSentinel(u8, staging_path, 0);
     defer allocator.free(staging_z);
-    const bundle_z = try allocator.dupeZ(u8, bundle_path);
+    const bundle_z = try allocator.dupeSentinel(u8, bundle_path, 0);
     defer allocator.free(bundle_z);
     const linux = std.os.linux;
     switch (linux.errno(linux.renameat2(
@@ -230,7 +230,7 @@ fn makeTreeWritable(
     allocator: std.mem.Allocator,
     path: []const u8,
 ) !void {
-    if (builtin.os.tag != .linux) return error.AtomicReplaceUnsupported;
+    if (builtin.target.os.tag != .linux) return error.AtomicReplaceUnsupported;
     var root = try Io.Dir.cwd().openDir(io, path, .{
         .iterate = true,
         .follow_symlinks = false,
@@ -272,8 +272,7 @@ fn createUniqueDirectory(
     for (0..64) |_| {
         try io.randomSecure(&random);
         const suffix = std.fmt.bytesToHex(random, .lower);
-        const name = try std.fmt.allocPrint(
-            allocator,
+        const name = try allocator.print(
             ".{s}.miz-bundle-staging-{s}",
             .{ base, suffix },
         );

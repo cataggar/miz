@@ -248,7 +248,7 @@ fn runWithOperations(
             .{},
         );
     }
-    if (builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .linux) {
         return fail("write: direct block-device writes are supported only on Linux", .{});
     }
 
@@ -994,7 +994,7 @@ const PartitionRewrite = struct {
     role: PartitionRole = .other,
     mount_point: ?[]const u8 = null,
     mode: PartitionRewriteMode = .none,
-    new_uuid: [16]u8 = [_]u8{0} ** 16,
+    new_uuid: [16]u8 = @as([16]u8, @splat(0)),
     new_fat_volume_id: u32 = 0,
     source: PartitionSource = .none,
 };
@@ -1548,10 +1548,10 @@ fn formatSignaturesText(
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     var first = true;
-    inline for (std.meta.fields(miz.block_device.Signatures)) |field| {
-        if (@field(signatures, field.name)) {
+    inline for (@typeInfo(miz.block_device.Signatures).@"struct".field_names) |name| {
+        if (@field(signatures, name)) {
             if (!first) try out.appendSlice(",");
-            try out.appendSlice(field.name);
+            try out.appendSlice(name);
             first = false;
         }
     }
@@ -1716,14 +1716,12 @@ fn describeStaleReferenceRefusal(
         std.mem.endsWith(u8, path, "core.img") or
         std.mem.endsWith(u8, path, "grubenv");
     return if (immutable)
-        std.fmt.allocPrint(
-            allocator,
+        allocator.print(
             "{s}; safe in-place rewriting of signed or immutable boot artifacts is unsupported",
             .{description},
         )
     else
-        std.fmt.allocPrint(
-            allocator,
+        allocator.print(
             "{s}; correct the source or omit --new-uuids",
             .{description},
         );
@@ -2108,8 +2106,7 @@ fn initializeFreshIdentityState(
             defer allocator.free(signatures);
             return freshRefusal(
                 source_report_text,
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "partition {d} carries unsupported signatures ({s}); --new-uuids supports only GPT plus FAT/ext4/XFS filesystem identities",
                     .{ inventory_partition.table_index + 1, signatures },
                 ),
@@ -2123,8 +2120,7 @@ fn initializeFreshIdentityState(
         ensurePartitionScanned(allocator, io, source, partition) catch |err| {
             return freshRefusal(
                 source_report_text,
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "partition {d} could not be scanned safely for --new-uuids: {s}",
                     .{ partition.table_index + 1, @errorName(err) },
                 ),
@@ -2137,8 +2133,7 @@ fn initializeFreshIdentityState(
     state.root_partition_index = selectRootPartitionIndex(state.partitions) catch |err| {
         return freshRefusal(
             source_report_text,
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "--new-uuids could not locate a unique ext4/XFS root filesystem: {s}",
                 .{@errorName(err)},
             ),
@@ -2185,8 +2180,7 @@ fn initializeFreshIdentityState(
         else => {
             return freshRefusal(
                 source_report_text,
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "failed to read /etc/fstab from the source root: {s}",
                     .{@errorName(err)},
                 ),
@@ -2215,8 +2209,7 @@ fn initializeFreshIdentityState(
         const resolved = resolveEspMountFromFstab(allocator, bytes, state.partitions) catch |err| {
             return freshRefusal(
                 source_report_text,
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "failed to resolve the ESP mount from /etc/fstab: {s}",
                     .{@errorName(err)},
                 ),
@@ -2235,8 +2228,7 @@ fn initializeFreshIdentityState(
         ) catch |err| {
             return freshRefusal(
                 source_report_text,
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "failed to inspect a candidate EFI system partition: {s}",
                     .{@errorName(err)},
                 ),
@@ -2268,8 +2260,7 @@ fn initializeFreshIdentityState(
             scanFatPartition(allocator, io, source, &state.partitions[mount.partition_index]) catch |err| {
                 return freshRefusal(
                     source_report_text,
-                    try std.fmt.allocPrint(
-                        allocator,
+                    try allocator.print(
                         "the EFI system partition could not be scanned safely: {s}",
                         .{@errorName(err)},
                     ),
@@ -2341,8 +2332,7 @@ fn initializeFreshIdentityState(
     preflightPreparedTrees(allocator, state) catch |err| {
         return freshRefusal(
             report_text,
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "the rewritten filesystems could not be validated before mutation: {s}",
                 .{@errorName(err)},
             ),
@@ -3059,10 +3049,10 @@ fn writeFilesystemIdentity(
 
 fn writeSignatures(writer: *std.Io.Writer, signatures: miz.block_device.Signatures) !void {
     var first = true;
-    inline for (std.meta.fields(miz.block_device.Signatures)) |field| {
-        if (@field(signatures, field.name)) {
+    inline for (@typeInfo(miz.block_device.Signatures).@"struct".field_names) |name| {
+        if (@field(signatures, name)) {
             if (!first) try writer.writeByte(',');
-            try writer.writeAll(field.name);
+            try writer.writeAll(name);
             first = false;
         }
     }
@@ -3549,7 +3539,7 @@ fn createRootGptTestImageWithFilesystemLength(
             .offset = first_lba * miz.gpt.sector_size,
             .length = filesystem_length,
             .label = "miz-root",
-            .uuid = [_]u8{0x55} ** 16,
+            .uuid = @as([16]u8, @splat(0x55)),
         },
     );
 }
@@ -3562,7 +3552,7 @@ const WriteIdentityTestFile = struct {
 const old_root_partition_guid = miz.guid.parse("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee");
 const old_esp_partition_guid = miz.guid.parse("11111111-1111-1111-1111-111111111111");
 const old_disk_guid = miz.guid.parse("99999999-8888-7777-6666-555555555555");
-const old_root_filesystem_uuid = [_]u8{0x55} ** 16;
+const old_root_filesystem_uuid = @as([16]u8, @splat(0x55));
 const old_esp_volume_id: u32 = 0x5A56_4D49;
 const old_root_filesystem_uuid_text = "55555555-5555-5555-5555-555555555555";
 const old_esp_volume_id_text = "5A56-4D49";
@@ -3831,7 +3821,7 @@ test "write expect-serial parser rejects missing and empty values" {
 }
 
 test "write passes expect-serial to the writable destination open" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-expect-serial-source.raw";
     const target = "test-write-expect-serial-target.raw";
@@ -3862,7 +3852,7 @@ test "write passes expect-serial to the writable destination open" {
 }
 
 test "write accepts every supported source image format" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const target = "test-write-command-target.raw";
     defer std.Io.Dir.cwd().deleteFile(io, target) catch {};
@@ -3904,7 +3894,7 @@ test "write accepts every supported source image format" {
 }
 
 test "write refuses target and preflight failures before copying" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-preflight-source.raw";
     defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
@@ -3934,7 +3924,7 @@ test "write refuses target and preflight failures before copying" {
 }
 
 test "write production path refuses a regular-file target without mutation" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-regular-source.raw";
     const target = "test-write-command-regular-target.raw";
@@ -3965,7 +3955,7 @@ test "write production path refuses a regular-file target without mutation" {
 }
 
 test "write confirmation can cancel before the copy" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-confirm-source.raw";
     const target = "test-write-command-confirm-target.raw";
@@ -3993,7 +3983,7 @@ test "write confirmation can cancel before the copy" {
 }
 
 test "write reports refresh failures as partial success" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-outcome-source.raw";
     const target = "test-write-command-outcome-target.raw";
@@ -4026,7 +4016,7 @@ test "write reports refresh failures as partial success" {
 }
 
 test "write fails copy or flush errors after warning about partial mutation" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-flush-source.raw";
     const target = "test-write-command-flush-target.raw";
@@ -4055,7 +4045,7 @@ test "write fails copy or flush errors after warning about partial mutation" {
 }
 
 test "write orders confirmation, invalidation, copy, and one final refresh" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-order-source.raw";
     const target = "test-write-command-order-target.raw";
@@ -4080,7 +4070,7 @@ test "write orders confirmation, invalidation, copy, and one final refresh" {
 }
 
 test "write passes through non-GPT sources while clearing stale destination metadata" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-non-gpt-source.raw";
     const target = "test-write-command-non-gpt-target.raw";
@@ -4096,7 +4086,7 @@ test "write passes through non-GPT sources while clearing stale destination meta
     {
         var image = try miz.Image.create(io, target, .raw, target_size, .{});
         defer image.close(io);
-        try image.pwrite(io, &([_]u8{0xa5} ** 512), target_size - 512);
+        try image.pwrite(io, &(@as([512]u8, @splat(0xa5))), target_size - 512);
     }
     var report = testReport();
     var fake = FakeOperations{ .report = &report, .real_pipeline = true };
@@ -4128,7 +4118,7 @@ test "write passes through non-GPT sources while clearing stale destination meta
 }
 
 test "write relocates or visibly accepts same-size GPT and preserves its opaque array" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source_size: u64 = 16 * 1024 * 1024;
     const cases = [_]struct {
@@ -4140,14 +4130,12 @@ test "write relocates or visibly accepts same-size GPT and preserves its opaque 
     };
 
     for (cases) |case| {
-        const source = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const source = try std.testing.allocator.print(
             "test-write-command-gpt-source-{s}.raw",
             .{case.suffix},
         );
         defer std.testing.allocator.free(source);
-        const target = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const target = try std.testing.allocator.print(
             "test-write-command-gpt-target-{s}.raw",
             .{case.suffix},
         );
@@ -4211,7 +4199,7 @@ test "write relocates or visibly accepts same-size GPT and preserves its opaque 
 }
 
 test "write rejects malformed GPT before destination mutation" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-malformed-gpt-source.raw";
     const target = "test-write-command-malformed-gpt-target.raw";
@@ -4257,7 +4245,7 @@ test "write rejects malformed GPT before destination mutation" {
 }
 
 test "write stops at invalidation and finalization errors in the correct phase" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-phase-error-source.raw";
     const target = "test-write-command-phase-error-target.raw";
@@ -4299,7 +4287,7 @@ test "write stops at invalidation and finalization errors in the correct phase" 
 }
 
 test "write does not finalize an unverified relocated GPT" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-gpt-error-source.raw";
     const target = "test-write-command-gpt-error-target.raw";
@@ -4345,7 +4333,7 @@ test "write does not finalize an unverified relocated GPT" {
 }
 
 test "write grow-root preflights before confirmation and mutates in order" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-grow-order-source.raw";
     const target = "test-write-command-grow-order-target.raw";
@@ -4370,7 +4358,7 @@ test "write grow-root preflights before confirmation and mutates in order" {
 }
 
 test "write grow-root grows GPT and ext4 offline on a larger file stand-in" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const source = "test-write-command-grow-source.raw";
@@ -4423,7 +4411,7 @@ test "write grow-root grows GPT and ext4 offline on a larger file stand-in" {
 }
 
 test "write grow-root accepts an already-full partition and filesystem as a no-op" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-grow-full-source.raw";
     const target = "test-write-command-grow-full-target.raw";
@@ -4450,7 +4438,7 @@ test "write grow-root accepts an already-full partition and filesystem as a no-o
 }
 
 test "write grow-root fills a smaller filesystem in a same-size full partition" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-grow-filesystem-source.raw";
     const target = "test-write-command-grow-filesystem-target.raw";
@@ -4507,7 +4495,7 @@ test "write grow-root fills a smaller filesystem in a same-size full partition" 
 }
 
 test "write grow-root rejects selection and ext4 preflight failures before mutation" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-grow-preflight-source.raw";
     const target = "test-write-command-grow-preflight-target.raw";
@@ -4545,7 +4533,7 @@ test "write grow-root rejects selection and ext4 preflight failures before mutat
 }
 
 test "write grow-root failures after mutation are made durable without finalizing" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-grow-errors-source.raw";
     const target = "test-write-command-grow-errors-target.raw";
@@ -4592,7 +4580,7 @@ test "write grow-root failures after mutation are made durable without finalizin
 }
 
 test "write grow-root preserves refresh partial success" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-grow-refresh-source.raw";
     const target = "test-write-command-grow-refresh-target.raw";
@@ -4753,7 +4741,7 @@ test "write source identity output reports visible collisions" {
 }
 
 test "write parses new identity flags and refuses collisions before confirmation or mutation" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-collision-source.raw";
     const target = "test-write-command-collision-target.raw";
@@ -4784,7 +4772,7 @@ test "write parses new identity flags and refuses collisions before confirmation
 }
 
 test "write allows duplicate identifiers only with an explicit override" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-collision-override-source.raw";
     const target = "test-write-command-collision-override-target.raw";
@@ -4820,7 +4808,7 @@ test "write allows duplicate identifiers only with an explicit override" {
 }
 
 test "write prepared fresh-identity refusals stop before confirmation or mutation" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-prepared-refusal-source.raw";
     const target = "test-write-command-prepared-refusal-target.raw";
@@ -4849,7 +4837,7 @@ test "write prepared fresh-identity refusals stop before confirmation or mutatio
 }
 
 test "write new-uuids prepares unique fresh identifiers" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-new-uuids-prepare-source.raw";
     defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
@@ -4890,7 +4878,7 @@ test "write new-uuids prepares unique fresh identifiers" {
 }
 
 test "write new-uuids post-write verification rejects an unreworked image" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const source = "test-write-command-new-uuids-verify-source.raw";
@@ -4911,7 +4899,7 @@ test "write new-uuids post-write verification rejects an unreworked image" {
 }
 
 test "write new-uuids refuses unsupported filesystem inventory" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const source_path = "test-write-command-unsupported-fs-source.raw";
@@ -4978,7 +4966,7 @@ test "write new-uuids refuses unsupported filesystem inventory" {
 }
 
 test "write new-uuids refuses stale unsupported boot references" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-stale-boot-source.raw";
     defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
@@ -4999,7 +4987,7 @@ test "write new-uuids refuses stale unsupported boot references" {
 }
 
 test "write new-uuids refuses immutable or signed UKI references" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const source = "test-write-command-uki-refusal-source.raw";
     defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
@@ -5022,7 +5010,7 @@ test "write new-uuids refuses immutable or signed UKI references" {
 }
 
 test "write new-uuids rewrites identities and verifies supported references" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const source = "test-write-command-new-uuids-source.raw";

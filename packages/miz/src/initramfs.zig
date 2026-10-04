@@ -66,7 +66,7 @@ pub const module_dependency_markers = [_][]const u8{ "modules.dep", "modules.dep
 /// `<root>` would be a shared module that had opinions about the host's
 /// filesystem.
 pub fn imagePath(allocator: std.mem.Allocator, kernel_release: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "/boot/initramfs-{s}.img", .{kernel_release});
+    return allocator.print("/boot/initramfs-{s}.img", .{kernel_release});
 }
 
 /// The command that regenerates one initramfs.

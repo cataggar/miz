@@ -619,7 +619,7 @@ fn runCredentialHelper(
     server_key: []const u8,
 ) !Credential {
     if (!validHelperName(helper)) return error.InvalidCredentialHelperName;
-    const executable = try std.fmt.allocPrint(allocator, "docker-credential-{s}", .{helper});
+    const executable = try allocator.print("docker-credential-{s}", .{helper});
     defer allocator.free(executable);
     const argv = [_][]const u8{ executable, "get" };
     var result = runner.run(runner.context, allocator, io, &argv, server_key, max_helper_output_size) catch return error.CredentialHelperFailed;
@@ -717,7 +717,7 @@ fn runProcess(
 }
 
 pub fn basicAuthorizationAlloc(allocator: Allocator, credential: Credential) ![]u8 {
-    const raw = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ credential.username, credential.secret });
+    const raw = try allocator.print("{s}:{s}", .{ credential.username, credential.secret });
     defer {
         std.crypto.secureZero(u8, raw);
         allocator.free(raw);
@@ -1030,8 +1030,7 @@ test "token responses only accept bounded RFC 6750 bearer values" {
     const oversized_value = try std.testing.allocator.alloc(u8, max_token_length + 1);
     defer std.testing.allocator.free(oversized_value);
     @memset(oversized_value, 'a');
-    const oversized_document = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const oversized_document = try std.testing.allocator.print(
         "{{\"token\":\"{s}\"}}",
         .{oversized_value},
     );

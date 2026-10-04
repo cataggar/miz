@@ -249,8 +249,7 @@ pub fn stageEvidence(
             "unexpected or duplicate Azure evidence variant",
             .{},
         );
-        const relative = try std.fmt.allocPrint(
-            context.arena,
+        const relative = try context.arena.print(
             "azure-results/{s}/azure-result.json",
             .{variant},
         );
@@ -414,7 +413,7 @@ pub fn tagObject(
         "{s}: matching tag refs are not a list",
         .{refs_path},
     );
-    const expected_ref = try std.fmt.allocPrint(context.arena, "refs/tags/{s}", .{tag});
+    const expected_ref = try context.arena.print("refs/tags/{s}", .{tag});
 
     var match: ?std.json.ObjectMap = null;
     for (items.items) |item| {
@@ -513,8 +512,7 @@ pub fn verifyRemoteRelease(
             .{try releaseAssetNamesText(context, assets)},
         );
         const raw = document.stringOf(asset.get("digest")) orelse "";
-        const expected_digest = try std.fmt.allocPrint(
-            context.arena,
+        const expected_digest = try context.arena.print(
             "sha256:{s}",
             .{wanted.sha256},
         );
@@ -697,8 +695,7 @@ pub fn verifyPublishedRelease(
                 "published release did not retain the exact final allowlist",
                 .{},
             );
-        const expected_digest = try std.fmt.allocPrint(
-            context.arena,
+        const expected_digest = try context.arena.print(
             "sha256:{s}",
             .{wanted_asset.sha256},
         );

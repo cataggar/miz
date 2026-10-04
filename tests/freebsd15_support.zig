@@ -152,7 +152,7 @@ pub fn shellFunction(
     source: []const u8,
     name: []const u8,
 ) ![]const u8 {
-    const header = try std.fmt.allocPrint(allocator, "{s}() {{", .{name});
+    const header = try allocator.print("{s}() {{", .{name});
     defer allocator.free(header);
     const start = try indexOf(source, header);
     const end = try indexFrom(source, "\n}\n", start);
@@ -167,7 +167,7 @@ pub fn shellFunctionRun(
     name: []const u8,
     count: usize,
 ) ![]const u8 {
-    const header = try std.fmt.allocPrint(allocator, "{s}() {{", .{name});
+    const header = try allocator.print("{s}() {{", .{name});
     defer allocator.free(header);
     const start = try indexOf(source, header);
     var end = try indexFrom(source, "\n}\n", start) + 3;
@@ -187,8 +187,7 @@ pub const Tree = struct {
     pub fn create(gpa: Allocator) !Tree {
         const tmp = std.testing.tmpDir(.{});
         var arena: std.heap.ArenaAllocator = .init(gpa);
-        const root = try std.fmt.allocPrint(
-            arena.allocator(),
+        const root = try arena.allocator().print(
             ".zig-cache/tmp/{s}",
             .{tmp.sub_path},
         );
@@ -288,7 +287,7 @@ pub fn expectNames(actual: []const []const u8, expected: []const []const u8) !vo
 
 // ---- Release fixtures -----------------------------------------------------
 
-pub const source_commit = "a" ** 40;
+pub const source_commit = &@as([40:0]u8, @splat('a'));
 pub const release_date = "20260812";
 
 /// The recorded `<asset>.packages.txt` a builder would have produced, with
@@ -317,8 +316,7 @@ pub fn writePackageManifest(
         }
     }
     for (extra) |name| try text.writer.print("{s} 15.1 1024\n", .{name});
-    const relative = try std.fmt.allocPrint(
-        tree.allocator(),
+    const relative = try tree.allocator().print(
         "{s}/{s}.packages.txt",
         .{ directory, variant.asset_name },
     );
@@ -333,13 +331,12 @@ pub fn writeQemuInfo(
     allocated_size: u64,
 ) ![]const u8 {
     const variant = profiles.findVariant(key).?;
-    const text = try std.fmt.allocPrint(tree.allocator(),
+    const text = try tree.allocator().print(
         \\{{"format": "qcow2", "virtual-size": {d}, "actual-size": {d},
         \\ "backing-filename": "",
         \\ "format-specific": {{"data": {{"compression-type": "zstd"}}}}}}
     , .{ variant.virtual_size, allocated_size });
-    const relative = try std.fmt.allocPrint(
-        tree.allocator(),
+    const relative = try tree.allocator().print(
         "{s}/{s}-qemu-info.json",
         .{ directory, key },
     );
@@ -365,13 +362,11 @@ pub fn makeCandidate(
     const allocated = options.allocated_size orelse default_size;
     const compressed = options.compressed_size orelse allocated;
 
-    const directory = try std.fmt.allocPrint(
-        tree.allocator(),
+    const directory = try tree.allocator().print(
         "candidates/{s}",
         .{key},
     );
-    const asset_relative = try std.fmt.allocPrint(
-        tree.allocator(),
+    const asset_relative = try tree.allocator().print(
         "{s}/{s}",
         .{ directory, variant.asset_name },
     );
@@ -449,7 +444,7 @@ pub fn makeAzureResult(
         document.integerOf(candidate.get("virtual_size")).?,
         document.integerOf(candidate.get("allocated_size")).?,
         document.integerOf(candidate.get("compressed_size")).?,
-        "d" ** 64,
+        &@as([64:0]u8, @splat('d')),
     });
     for (contracts, 0..) |name, index| {
         if (index > 0) try text.writer.writeAll(", ");
@@ -462,8 +457,7 @@ pub fn makeAzureResult(
         document.stringOf(validation.get("run_attempt")).?,
     });
 
-    const relative = try std.fmt.allocPrint(
-        tree.allocator(),
+    const relative = try tree.allocator().print(
         "azure-results/{s}/azure-result.json",
         .{key},
     );

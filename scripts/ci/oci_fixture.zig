@@ -141,7 +141,7 @@ pub fn validateKernelVersion(version: []const u8) Error!void {
 /// stock copy when it lands at exactly the same path.
 pub fn verityArchivePath(allocator: Allocator, kernel_version: []const u8) ![]u8 {
     try validateKernelVersion(kernel_version);
-    return std.fmt.allocPrint(allocator, "boot/initramfs-{s}.img", .{kernel_version});
+    return allocator.print("boot/initramfs-{s}.img", .{kernel_version});
 }
 
 pub fn validateLayerFiles(files: []const LayerFile) Error!void {

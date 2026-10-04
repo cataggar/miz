@@ -207,7 +207,7 @@ pub const RecustomizeIsoReport = struct {
     boot_entries: []PreservedBootEntry,
     squashfs_compression: squashfs.WriterCompression,
     /// SHA-256 and byte length of the source ISO.
-    source_sha256: [32]u8 = [_]u8{0} ** 32,
+    source_sha256: [32]u8 = @as([32]u8, @splat(0)),
     source_size: u64 = 0,
     /// Volume metadata modeled from the source ISO.
     source_volume: iso9660.VolumeMetadata,
@@ -219,7 +219,7 @@ pub const RecustomizeIsoReport = struct {
     /// Total output ISO size in bytes (0 for a dry run).
     output_size: u64 = 0,
     /// SHA-256 of the published ISO (all zero for a dry run).
-    output_sha256: [32]u8 = [_]u8{0} ** 32,
+    output_sha256: [32]u8 = @as([32]u8, @splat(0)),
     limit_peaks: limits_mod.Peaks = .{},
 
     pub fn deinit(self: *RecustomizeIsoReport, allocator: std.mem.Allocator) void {
@@ -327,7 +327,7 @@ pub fn build(
     // rewrite still stamps the regenerated payload with a stable value rather
     // than the wall clock.
     const source_payload_mtime: i64 = blk: {
-        const lookup = std.fmt.allocPrint(allocator, "/{s}", .{build_iso.trimLeadingSlash(rootfs_path_in_iso)}) catch break :blk 0;
+        const lookup = allocator.print("/{s}", .{build_iso.trimLeadingSlash(rootfs_path_in_iso)}) catch break :blk 0;
         defer allocator.free(lookup);
         const idx = iso_reader.lookup(lookup) catch break :blk 0;
         break :blk iso_reader.getEntry(idx).mtime;
@@ -416,7 +416,7 @@ pub fn build(
 
     // 1. Write the customized root tree to a deterministic ext4 rootfs.img.
     try enterStage(options, .write_rootfs_image);
-    const rootfs_scratch = try std.fmt.allocPrint(allocator, "{s}.{s}-rootfs.img", .{ options.output_path, scratch_infix });
+    const rootfs_scratch = try allocator.print("{s}.{s}-rootfs.img", .{ options.output_path, scratch_infix });
     defer allocator.free(rootfs_scratch);
     var rootfs_written = false;
     defer if (rootfs_written) Io.Dir.cwd().deleteFile(io, rootfs_scratch) catch {};
@@ -433,7 +433,7 @@ pub fn build(
 
     // 2. Wrap rootfs.img in a native SquashFS at the LiveOS payload path.
     try enterStage(options, .wrap_squashfs_payload);
-    const payload_scratch = try std.fmt.allocPrint(allocator, "{s}.{s}-payload.sqsh", .{ options.output_path, scratch_infix });
+    const payload_scratch = try allocator.print("{s}.{s}-payload.sqsh", .{ options.output_path, scratch_infix });
     defer allocator.free(payload_scratch);
     var payload_written = false;
     defer if (payload_written) Io.Dir.cwd().deleteFile(io, payload_scratch) catch {};
@@ -470,7 +470,7 @@ pub fn build(
     //    Torito catalog is reproduced exactly (validation platform/id string,
     //    section grouping/order/id strings, entry order) via `boot_catalog`.
     try enterStage(options, .write_iso);
-    const iso_scratch = try std.fmt.allocPrint(allocator, "{s}.{s}.iso.tmp", .{ options.output_path, scratch_infix });
+    const iso_scratch = try allocator.print("{s}.{s}.iso.tmp", .{ options.output_path, scratch_infix });
     defer allocator.free(iso_scratch);
     var iso_written = false;
     defer if (iso_written) Io.Dir.cwd().deleteFile(io, iso_scratch) catch {};
@@ -820,14 +820,14 @@ fn validateBuildPathIsolation(allocator: std.mem.Allocator, io: Io, options: Rec
     defer allocator.free(output_path);
 
     const reserved = [_][]const u8{
-        try std.fmt.allocPrint(allocator, "{s}.{s}-rootfs.sqsh", .{ output_path, scratch_infix }),
-        try std.fmt.allocPrint(allocator, "{s}.{s}-root-tree.spool", .{ output_path, scratch_infix }),
-        try std.fmt.allocPrint(allocator, "{s}.{s}-rootfs.img", .{ output_path, scratch_infix }),
-        try std.fmt.allocPrint(allocator, "{s}.{s}-payload.sqsh", .{ output_path, scratch_infix }),
-        try std.fmt.allocPrint(allocator, "{s}.{s}.iso.tmp", .{ output_path, scratch_infix }),
+        try allocator.print("{s}.{s}-rootfs.sqsh", .{ output_path, scratch_infix }),
+        try allocator.print("{s}.{s}-root-tree.spool", .{ output_path, scratch_infix }),
+        try allocator.print("{s}.{s}-rootfs.img", .{ output_path, scratch_infix }),
+        try allocator.print("{s}.{s}-payload.sqsh", .{ output_path, scratch_infix }),
+        try allocator.print("{s}.{s}.iso.tmp", .{ output_path, scratch_infix }),
     };
     defer for (reserved) |path| allocator.free(path);
-    const nested_prefix = try std.fmt.allocPrint(allocator, "{s}.{s}-nested", .{ output_path, scratch_infix });
+    const nested_prefix = try allocator.print("{s}.{s}-nested", .{ output_path, scratch_infix });
     defer allocator.free(nested_prefix);
 
     var reserved_with_output: [reserved.len + 1][]const u8 = undefined;
@@ -864,7 +864,7 @@ const testing = std.testing;
 
 const deterministic_fixture = Determinism{
     .filesystem_timestamp = 1_700_000_000,
-    .root_filesystem_uuid = [_]u8{0x22} ** 16,
+    .root_filesystem_uuid = @as([16]u8, @splat(0x22)),
 };
 
 const FixtureNode = struct {
@@ -1014,7 +1014,7 @@ fn buildTar(allocator: std.mem.Allocator, entries: []const TarEntry) ![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     for (entries) |entry| {
-        var header = [_]u8{0} ** 512;
+        var header = @as([512]u8, @splat(0));
         @memcpy(header[0..entry.path.len], entry.path);
         testWriteOctal(header[100..108], 0o644);
         testWriteOctal(header[108..116], 0);
@@ -1052,10 +1052,10 @@ fn writeBlob(allocator: std.mem.Allocator, io: Io, dir: Io.Dir, data: []const u8
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    const blob_path = try std.fmt.allocPrint(allocator, "blobs/sha256/{s}", .{hex});
+    const blob_path = try allocator.print("blobs/sha256/{s}", .{hex});
     defer allocator.free(blob_path);
     try dir.writeFile(io, .{ .sub_path = blob_path, .data = data });
-    return std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
+    return allocator.print("sha256:{s}", .{hex});
 }
 
 fn createOciLayout(allocator: std.mem.Allocator, io: Io, root: []const u8) !void {
@@ -1077,16 +1077,14 @@ fn createOciLayout(allocator: std.mem.Allocator, io: Io, root: []const u8) !void
     defer allocator.free(config_digest);
     const layer_digest = try writeBlob(allocator, io, dir, layer_gzip);
     defer allocator.free(layer_digest);
-    const manifest_json = try std.fmt.allocPrint(
-        allocator,
+    const manifest_json = try allocator.print(
         "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ config_digest, config_json.len, layer_digest, layer_gzip.len },
     );
     defer allocator.free(manifest_json);
     const manifest_digest = try writeBlob(allocator, io, dir, manifest_json);
     defer allocator.free(manifest_digest);
-    const index_json = try std.fmt.allocPrint(
-        allocator,
+    const index_json = try allocator.print(
         "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ manifest_digest, manifest_json.len },
     );
@@ -1113,7 +1111,7 @@ fn collectTree(arena: std.mem.Allocator, io: Io, reader: *iso9660.Reader, parent
         const full = if (prefix.len == 0)
             try arena.dupe(u8, child.name)
         else
-            try std.fmt.allocPrint(arena, "{s}/{s}", .{ prefix, child.name });
+            try arena.print("{s}/{s}", .{ prefix, child.name });
         const entry = reader.getEntry(child.index);
         const target: []u8 = if (entry.kind == .symlink)
             try arena.dupe(u8, try reader.readLink(child.index))
@@ -1460,9 +1458,9 @@ test "recustomize-iso preserves an exact UEFI-validation + BIOS-section catalog 
     // could never emit: UEFI is the validation/default entry, BIOS is a section,
     // and both the validation entry and the section header carry non-empty id
     // strings.
-    var validation_id = [_]u8{0} ** 24;
+    var validation_id = @as([24]u8, @splat(0));
     @memcpy(validation_id[0.."MIZ-UEFI-VALID".len], "MIZ-UEFI-VALID");
-    var section_id = [_]u8{0} ** 28;
+    var section_id = @as([28]u8, @splat(0));
     @memcpy(section_id[0.."MIZ-BIOS-SECTION".len], "MIZ-BIOS-SECTION");
     try writeSourceIsoWithCatalog(allocator, io, iso_path, squashfs_bytes, .{
         .validation_platform = iso9660.boot_platform_uefi,
@@ -1931,7 +1929,7 @@ test "recustomize-iso verifies output volume metadata on the scratch ISO before 
     {
         const file = try Io.Dir.cwd().openFile(io, scratch_path, .{ .mode = .read_write });
         defer file.close(io);
-        var mutated = [_]u8{' '} ** 32;
+        var mutated = @as([32]u8, @splat(' '));
         @memcpy(mutated[0..10], "MUTATEDVOL");
         try file.writePositionalAll(io, &mutated, 16 * 2048 + 40);
     }

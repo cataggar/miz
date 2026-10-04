@@ -616,7 +616,7 @@ const Node = struct {
     size_on_disk: u64 = 0,
     data_block_count: u32 = 0,
     extents: []Extent = &.{},
-    extent_root: [60]u8 = [_]u8{0} ** 60,
+    extent_root: [60]u8 = @as([60]u8, @splat(0)),
     extent_tree_blocks: []ExtentTreeBlock = &.{},
     xattr_block: ?u64 = null,
     link_count: u16 = 1,
@@ -653,7 +653,7 @@ const ExtentIndex = struct {
 
 const ExtentTreeBlock = struct {
     block_number: u64,
-    bytes: [default_block_size]u8 = [_]u8{0} ** default_block_size,
+    bytes: [default_block_size]u8 = @as([default_block_size]u8, @splat(0)),
 };
 
 const ExtentNodeRef = struct {
@@ -1445,7 +1445,7 @@ fn resolveWriterProfile(options: PopulateOptions, journal_blocks: u32) PopulateE
         return error.UnsupportedFeatures;
     }
 
-    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const uuid = options.uuid orelse @as([16]u8, @splat(0));
     const checksum_seed = if (incompat & feature_incompat_csum_seed != 0)
         options.preserve_checksum_seed orelse ext4Crc32c(&.{&uuid})
     else
@@ -1730,7 +1730,7 @@ fn resizeImpl(
     if (mutate and new_group_count > old_group_count) {
         var group_index = old_group_count;
         while (group_index < new_group_count) : (group_index += 1) {
-            var zero_block: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+            var zero_block: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
             var block: u32 = 0;
             while (block < inode_table_blocks) : (block += 1) {
                 try file.writePositionalAll(io, &zero_block, options.offset + (@as(u64, new_layout.groups[group_index].inode_table_block) + block) * default_block_size);
@@ -2068,7 +2068,7 @@ fn resizeGeneral(
         const inode_bitmap = metadata_start + 1;
         const inode_table = metadata_start + 2;
 
-        var block_bitmap_bytes: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+        var block_bitmap_bytes: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
         var bit: u32 = 0;
         while (bit < metadata_blocks) : (bit += 1) setBitmapBit(&block_bitmap_bytes, bit);
         bit = group_block_count;
@@ -2077,14 +2077,14 @@ fn resizeGeneral(
             try file.writePositionalAll(io, &block_bitmap_bytes, options.offset + block_bitmap * default_block_size);
         }
 
-        var inode_bitmap_bytes: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+        var inode_bitmap_bytes: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
         bit = inodes_per_group;
         while (bit < default_block_size * 8) : (bit += 1) setBitmapBit(&inode_bitmap_bytes, bit);
         if (mutate) {
             try file.writePositionalAll(io, &inode_bitmap_bytes, options.offset + inode_bitmap * default_block_size);
         }
 
-        const zero_block: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+        const zero_block: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
         if (mutate) {
             var table_block: u32 = 0;
             while (table_block < inode_table_blocks) : (table_block += 1) {
@@ -3012,7 +3012,7 @@ fn validateUuidRewriteGroupDescriptors(
     while (group_index < reader.groups.len) : (group_index += 1) {
         const descriptor = gdt[group_index * descriptor_size ..][0..descriptor_size];
         const bg_flags = readInt(u16, descriptor[0x12..0x14]);
-        var descriptor_copy: [64]u8 = [_]u8{0} ** 64;
+        var descriptor_copy: [64]u8 = @as([64]u8, @splat(0));
         @memcpy(descriptor_copy[0..descriptor_size], descriptor);
         const stored_descriptor_checksum = readInt(u16, descriptor_copy[0x1E..0x20]);
         writeInt(u16, descriptor_copy[0x1E..0x20], 0);
@@ -4112,7 +4112,7 @@ pub const Reader = struct {
         const group = self.groups[group_index];
         const inode_offset = self.blockOffset(group.inode_table_block) + @as(u64, index_in_group) * self.inode_size;
 
-        var buf: [max_supported_reader_inode_size]u8 = [_]u8{0} ** max_supported_reader_inode_size;
+        var buf: [max_supported_reader_inode_size]u8 = @as([max_supported_reader_inode_size]u8, @splat(0));
         try self.readAll(io, buf[0..self.inode_size], inode_offset);
         return ParsedInode.fromBytes(inode_number, buf[0..self.inode_size]);
     }
@@ -4911,7 +4911,7 @@ pub const Editor = struct {
         writeInt(u32, buf[4..8], @truncate(content.len));
         writeInt(u32, buf[108..112], @as(u32, @truncate(@as(u64, content.len) >> 32)));
         writeInt(u32, buf[28..32], inodeBlockSectors(new_block_count, child_inode.file_acl_block != 0));
-        var extent_root: [60]u8 = [_]u8{0} ** 60;
+        var extent_root: [60]u8 = @as([60]u8, @splat(0));
         encodeExtentLeafNode(extent_root[0..], max_inline_extents, new_extents);
         @memcpy(buf[40..100], &extent_root);
         writeInt(u32, buf[32..36], readInt(u32, buf[32..36]) | inode_flag_extents);
@@ -5635,7 +5635,7 @@ const StrictScanner = struct {
             const child_path = if (path.len == 0)
                 try self.allocator.dupe(u8, child.name)
             else
-                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ path, child.name });
+                try self.allocator.print("{s}/{s}", .{ path, child.name });
             defer self.allocator.free(child_path);
             try self.scanNode(child.inode, inode.inode, child_path, child.kind, false);
         }
@@ -6966,7 +6966,7 @@ const GeneralScanner = struct {
             const child_path = if (path.len == 0)
                 try self.allocator.dupe(u8, child.name)
             else
-                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ path, child.name });
+                try self.allocator.print("{s}/{s}", .{ path, child.name });
             defer self.allocator.free(child_path);
             try self.scanChild(child, child_path);
         }
@@ -8483,7 +8483,7 @@ const BlockAllocator = struct {
 };
 
 fn populateChecksumSeed(options: PopulateOptions) u32 {
-    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const uuid = options.uuid orelse @as([16]u8, @splat(0));
     const incompat = options.preserve_feature_incompat orelse writer_feature_incompat;
     return if (incompat & feature_incompat_csum_seed != 0)
         options.preserve_checksum_seed orelse ext4Crc32c(&.{&uuid})
@@ -8499,9 +8499,9 @@ fn writeNodeData(
     layout: Layout,
     options: PopulateOptions,
 ) PopulateError!void {
-    var scratch: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    var scratch: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
     const block_len: usize = @intCast(options.block_size);
-    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const uuid = options.uuid orelse @as([16]u8, @splat(0));
     const checksum_seed = populateChecksumSeed(options);
     for (nodes) |node| {
         switch (node.kind) {
@@ -8616,7 +8616,7 @@ fn writeResizeInodeData(
     {
         return error.UnsupportedFeatures;
     }
-    var dindir: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    var dindir: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
     var index: u32 = 0;
     while (index < layout.reserved_gdt_blocks) : (index += 1) {
         const pointer_block = layout.groups[0].start_block + 1 +
@@ -8627,7 +8627,7 @@ fn writeResizeInodeData(
             @intCast(pointer_block),
             .little,
         );
-        var pointers: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+        var pointers: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
         var pointer_index: usize = 0;
         var group: u32 = 1;
         while (group < layout.group_count) : (group += 1) {
@@ -8709,7 +8709,7 @@ fn writeOrphanFileData(
 fn writeJournalData(io: Io, file: Io.File, journal: []const Node, options: PopulateOptions) PopulateError!void {
     if (journal.len == 0) return;
     const node = journal[0];
-    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const uuid = options.uuid orelse @as([16]u8, @splat(0));
     const checksum_seed = populateChecksumSeed(options);
     const block_len: usize = @intCast(options.block_size);
 
@@ -8769,7 +8769,7 @@ fn encodeJournalSuperblock(block: *[default_block_size]u8, block_count: u32, uui
 }
 
 fn zeroUnusedInodeTableBlocks(io: Io, file: Io.File, layout: Layout, offset: u64) PopulateError!void {
-    const zero_block: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    const zero_block: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
     for (layout.groups) |group| {
         var block: u32 = 0;
         while (block < layout.inode_table_blocks) : (block += 1) {
@@ -8869,14 +8869,14 @@ fn writeBitmaps(
 }
 
 fn writeInodes(io: Io, file: Io.File, nodes: []Node, layout: Layout, options: PopulateOptions) PopulateError!void {
-    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const uuid = options.uuid orelse @as([16]u8, @splat(0));
     const checksum_seed = populateChecksumSeed(options);
     for (nodes) |node| {
         // A hardlink shares the target's inode, which the target already
         // wrote; writing it twice would be redundant at best and would
         // overwrite the target's own link count at worst.
         if (!node.owns_inode) continue;
-        var buf: [writer_inode_size]u8 = [_]u8{0} ** writer_inode_size;
+        var buf: [writer_inode_size]u8 = @as([writer_inode_size]u8, @splat(0));
         writeInt(u16, buf[0..2], inodeMode(node));
         writeInt(u16, buf[2..4], @truncate(node.uid));
         writeInt(u32, buf[4..8], @truncate(node.size_on_disk));
@@ -8959,11 +8959,11 @@ fn writeSpecialInodes(
     layout: Layout,
     options: PopulateOptions,
 ) PopulateError!void {
-    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const uuid = options.uuid orelse @as([16]u8, @splat(0));
     const checksum_seed = populateChecksumSeed(options);
     const times = try encodeInodeTime(options.timestamp);
     for (nodes) |node| {
-        var buf: [writer_inode_size]u8 = [_]u8{0} ** writer_inode_size;
+        var buf: [writer_inode_size]u8 = @as([writer_inode_size]u8, @splat(0));
         writeInt(u16, buf[0..2], inodeMode(node));
         writeInt(u16, buf[26..28], 1);
         writeInt(u32, buf[8..12], times.seconds);
@@ -9093,9 +9093,9 @@ fn writeGroupDescriptorTables(
 }
 
 fn writeSuperblocks(io: Io, file: Io.File, layout: Layout, plan: WriterPlan, options: PopulateOptions) PopulateError!void {
-    var sb: [superblock_size]u8 = [_]u8{0} ** superblock_size;
+    var sb: [superblock_size]u8 = @as([superblock_size]u8, @splat(0));
     const label = encodeLabel(options.label);
-    const uuid = options.uuid orelse [_]u8{0} ** 16;
+    const uuid = options.uuid orelse @as([16]u8, @splat(0));
     const free_blocks = countFreeBlocks(layout.groups);
     const free_inodes = countFreeInodes(layout.groups, layout.inodes_per_group);
 
@@ -9883,7 +9883,7 @@ fn buildExtentTree(allocator: std.mem.Allocator, node: *Node, block_size: u32, d
 }
 
 fn encodeLabel(label: []const u8) [16]u8 {
-    var out: [16]u8 = [_]u8{0} ** 16;
+    var out: [16]u8 = @as([16]u8, @splat(0));
     @memcpy(out[0..label.len], label);
     return out;
 }
@@ -10320,8 +10320,8 @@ fn setInodeChecksumSeed(block: []u8, checksum_seed: u32, inode_number: u32) void
 }
 
 test "inode checksum uses i_generation rather than i_block data" {
-    var inode: [writer_inode_size]u8 = [_]u8{0} ** writer_inode_size;
-    const uuid = [_]u8{0x5a} ** 16;
+    var inode: [writer_inode_size]u8 = @as([writer_inode_size]u8, @splat(0));
+    const uuid = @as([16]u8, @splat(0x5a));
     writeInt(u16, inode[128..130], writer_extra_isize);
     writeInt(u32, inode[64..68], 0xdead_beef);
     writeInt(u32, inode[100..104], 0x1234_5678);
@@ -10529,7 +10529,7 @@ test "sparse files omit holes from external extent trees" {
     defer file.close(io);
     _ = try populate(io, file, allocator, &tree.view, .{
         .length = 16 * 1024 * 1024,
-        .uuid = [_]u8{0x73} ** 16,
+        .uuid = @as([16]u8, @splat(0x73)),
         .timestamp = 1_717_171_717,
     });
 
@@ -10594,7 +10594,7 @@ test "populate ext4 and round-trip a small tree with a multi-extent file" {
     const info = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = fs_size,
         .label = "miz-ext4",
-        .uuid = [_]u8{0x10} ** 16,
+        .uuid = @as([16]u8, @splat(0x10)),
         .timestamp = 1_717_171_717,
     });
     try std.testing.expectEqual(writer_feature_compat, info.feature_compat);
@@ -10662,9 +10662,9 @@ test "symlink targets at the 60-byte fast-symlink boundary round-trip correctly"
     const path = try temporaryTestPath(std.testing.allocator, io, &temporary, "test-ext4-symlink-boundary.img");
     defer std.testing.allocator.free(path);
 
-    const target_59 = "a" ** 59;
-    const target_60 = "a" ** 60;
-    const target_61 = "a" ** 61;
+    const target_59 = &@as([59:0]u8, @splat('a'));
+    const target_60 = &@as([60:0]u8, @splat('a'));
+    const target_61 = &@as([61:0]u8, @splat('a'));
 
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "link-59", .kind = .symlink, .mode = 0o777, .uid = 0, .gid = 0, .size = target_59.len, .bytes = target_59 },
@@ -10679,7 +10679,7 @@ test "symlink targets at the 60-byte fast-symlink boundary round-trip correctly"
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = 64 * 1024 * 1024,
         .label = "miz-ext4",
-        .uuid = [_]u8{0x11} ** 16,
+        .uuid = @as([16]u8, @splat(0x11)),
         .timestamp = 1_717_171_717,
     });
 
@@ -10740,7 +10740,7 @@ test "populate round-trips files that require extent index blocks" {
         defer file.close(io);
         _ = try populate(io, file, std.testing.allocator, &tree.view, .{
             .length = fs_size,
-            .uuid = [_]u8{0x33} ** 16,
+            .uuid = @as([16]u8, @splat(0x33)),
             .timestamp = 1_717_171_717,
         });
 
@@ -10994,7 +10994,7 @@ test "strict writer-compatible scan exposes deterministic owned view" {
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = length,
         .label = "strict",
-        .uuid = [_]u8{0x5A} ** 16,
+        .uuid = @as([16]u8, @splat(0x5A)),
         .timestamp = 1_717_171_717,
     });
 
@@ -11006,7 +11006,7 @@ test "strict writer-compatible scan exposes deterministic owned view" {
     defer scanned.deinit();
     try std.testing.expectEqual(@as(usize, 3), scanned.nodeCount());
     try std.testing.expectEqual(@as(u32, 1_717_171_717), scanned.identity.global_timestamp);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x5A} ** 16), &scanned.identity.uuid);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x5A))), &scanned.identity.uuid);
 
     const view = scanned.fileTreeView();
     const first = (try view.next()).?;
@@ -11032,7 +11032,7 @@ test "strict writer-compatible scan rejects divergent inode timestamps" {
     defer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = length,
-        .uuid = [_]u8{0x33} ** 16,
+        .uuid = @as([16]u8, @splat(0x33)),
         .timestamp = 1_717_171_717,
     });
 
@@ -11111,7 +11111,7 @@ test "the pinned Ubuntu 64-bit profile rebuilds resize and orphan metadata" {
     const info = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = old_length,
         .label = "ubuntu-root",
-        .uuid = [_]u8{0x6A} ** 16,
+        .uuid = @as([16]u8, @splat(0x6A)),
         .timestamp = 1_724_000_000,
         .journal = .{ .enabled = true },
         .preserve_feature_ro_compat = 0x046b,
@@ -11293,7 +11293,7 @@ fn populateSyntheticPinnedOrphan(
     defer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = 64 * 1024 * 1024,
-        .uuid = [_]u8{0x73} ** 16,
+        .uuid = @as([16]u8, @splat(0x73)),
         .journal = .{ .enabled = true },
         .preserve_feature_ro_compat = 0x046b,
         .preserve_feature_compat = 0x103c,
@@ -11366,7 +11366,7 @@ test "orphan file relocates past the tree when its preserved inode collides" {
     // Must succeed -- this is the exact populate that previously aborted.
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = 64 * 1024 * 1024,
-        .uuid = [_]u8{0x5C} ** 16,
+        .uuid = @as([16]u8, @splat(0x5C)),
         .journal = .{ .enabled = true },
         .preserve_feature_ro_compat = 0x046b,
         .preserve_feature_compat = 0x103c,
@@ -11448,8 +11448,8 @@ test "populate respects non-zero partition-relative offsets" {
     defer file.close(io);
     try file.setLength(io, suffix_off + default_block_size);
 
-    const prefix_guard: [32]u8 = [_]u8{0xA5} ** 32;
-    const suffix_guard: [32]u8 = [_]u8{0x5A} ** 32;
+    const prefix_guard: [32]u8 = @as([32]u8, @splat(0xA5));
+    const suffix_guard: [32]u8 = @as([32]u8, @splat(0x5A));
     try file.writePositionalAll(io, &prefix_guard, prefix_off - prefix_guard.len);
     try file.writePositionalAll(io, &suffix_guard, suffix_off);
 
@@ -11530,7 +11530,7 @@ test "populate round-trips xattrs and metadata checksums" {
 
         const info = try populate(io, file, std.testing.allocator, &tree.view, .{
             .length = 16 * 1024 * 1024,
-            .uuid = [_]u8{0x42} ** 16,
+            .uuid = @as([16]u8, @splat(0x42)),
             .timestamp = 1_717_171_717,
             .root_xattrs = &selinux,
         });
@@ -11620,7 +11620,7 @@ test "large directories use htree indexing" {
     defer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = 32 * 1024 * 1024,
-        .uuid = [_]u8{0x24} ** 16,
+        .uuid = @as([16]u8, @splat(0x24)),
         .timestamp = 1_717_171_717,
     });
 
@@ -11728,7 +11728,7 @@ test "very large directories use multi-level htree indexing" {
     defer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = 128 * 1024 * 1024,
-        .uuid = [_]u8{0x66} ** 16,
+        .uuid = @as([16]u8, @splat(0x66)),
         .timestamp = 1_717_171_717,
     });
 
@@ -11794,7 +11794,7 @@ test "resize grows ext4 filesystems in place" {
 
     const before = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = 64 * 1024 * 1024,
-        .uuid = [_]u8{0x55} ** 16,
+        .uuid = @as([16]u8, @splat(0x55)),
         .timestamp = 1_717_171_717,
     });
     const after = try resize(io, file, std.testing.allocator, .{ .length = 192 * 1024 * 1024 });
@@ -11829,7 +11829,7 @@ test "Editor.open loads live free-space state and a no-op flush leaves the image
     const fs_size: u64 = 16 * 1024 * 1024;
     const info = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = fs_size,
-        .uuid = [_]u8{0x21} ** 16,
+        .uuid = @as([16]u8, @splat(0x21)),
         .timestamp = 1_717_171_717,
     });
 
@@ -11908,7 +11908,7 @@ test "Editor frees an inode's extent-tree blocks (leaf, index, and xattr) and re
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
-    const info = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = [_]u8{0x30} ** 16 });
+    const info = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = @as([16]u8, @splat(0x30)) });
 
     var editor = try Editor.open(io, file, std.testing.allocator, .{});
     defer editor.deinit();
@@ -11991,7 +11991,7 @@ test "Editor removes directory entries by splicing, across a large htree-indexed
     defer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = 32 * 1024 * 1024,
-        .uuid = [_]u8{0x25} ** 16,
+        .uuid = @as([16]u8, @splat(0x25)),
     });
 
     var editor = try Editor.open(io, file, std.testing.allocator, .{});
@@ -12045,7 +12045,7 @@ test "Editor.deleteFile removes a regular file, frees its inode/blocks, and leav
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
-    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 768 * 1024 * 1024, .uuid = [_]u8{0x40} ** 16 });
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 768 * 1024 * 1024, .uuid = @as([16]u8, @splat(0x40)) });
 
     var editor = try Editor.open(io, file, std.testing.allocator, .{});
     defer editor.deinit();
@@ -12116,7 +12116,7 @@ test "Editor.deleteTree recursively removes a directory and adjusts the parent's
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
-    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = [_]u8{0x41} ** 16 });
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = @as([16]u8, @splat(0x41)) });
 
     const root_link_count_before = blk: {
         var reader = try open(io, file, std.testing.allocator, .{});
@@ -12174,7 +12174,7 @@ test "Editor frees inodes with valid metadata checksums" {
     defer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = 8 * 1024 * 1024,
-        .uuid = [_]u8{0x61} ** 16,
+        .uuid = @as([16]u8, @splat(0x61)),
     });
 
     var editor = try Editor.open(io, file, std.testing.allocator, .{});
@@ -12230,7 +12230,7 @@ test "Editor.writeFile overwrites content, preserves xattrs, and handles growth/
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
-    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = [_]u8{0x42} ** 16 });
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = @as([16]u8, @splat(0x42)) });
 
     var editor = try Editor.open(io, file, std.testing.allocator, .{});
     defer editor.deinit();
@@ -12305,7 +12305,7 @@ test "Editor.writeFile rolls back and reports TooManyExtents when free space is 
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
-    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = [_]u8{0x43} ** 16 });
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = 16 * 1024 * 1024, .uuid = @as([16]u8, @splat(0x43)) });
 
     var editor = try Editor.open(io, file, std.testing.allocator, .{});
     defer editor.deinit();
@@ -12363,7 +12363,7 @@ test "Editor.flush keeps sparse-super backup superblocks and GDT copies in sync 
 
     const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     defer file.close(io);
-    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = [_]u8{0x50} ** 16 });
+    _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = @as([16]u8, @splat(0x50)) });
 
     var editor = try Editor.open(io, file, std.testing.allocator, .{});
     defer editor.deinit();
@@ -12510,7 +12510,7 @@ fn crc32FileRange(
     offset: u64,
     length: u64,
 ) !u32 {
-    var hasher = std.hash.crc.Crc32.init();
+    var hasher = std.hash.Crc32.init();
     var buffer: [64 * 1024]u8 = undefined;
     var copied: u64 = 0;
     while (copied < length) {
@@ -12546,8 +12546,8 @@ test "rewriteUuid updates a miz ext4 region and its journal identity" {
 
     const offset: u64 = 1024 * 1024;
     const length: u64 = 256 * 1024 * 1024;
-    const old_uuid = [_]u8{0x31} ** 16;
-    const new_uuid = [_]u8{0x42} ** 16;
+    const old_uuid = @as([16]u8, @splat(0x31));
+    const new_uuid = @as([16]u8, @splat(0x42));
     const xattrs = [_]Xattr{.{ .name = "user.tag", .value = "rewrite" }};
     var tree = InMemoryTree.init(&[_]InMemoryEntry{
         .{ .path = "etc", .kind = .directory, .mode = 0o755, .uid = 0, .gid = 0 },
@@ -12639,8 +12639,8 @@ test "rewriteUuidImage preserves arbitrary checksum seeds" {
     const offset: u64 = 1024 * 1024;
     const length: u64 = 256 * 1024 * 1024;
     const image_size = offset + length + 1024 * 1024;
-    const old_uuid = [_]u8{0x51} ** 16;
-    const new_uuid = [_]u8{0x63} ** 16;
+    const old_uuid = @as([16]u8, @splat(0x51));
+    const new_uuid = @as([16]u8, @splat(0x63));
     const checksum_seed: u32 = 0xA1B2_C3D4;
 
     var image = try Image.create(io, path, .raw, image_size, .{});
@@ -12709,7 +12709,7 @@ test "rewriteUuid updates UUID-derived checksum seeds on a real e2fsprogs profil
     defer std.testing.allocator.free(path);
 
     const length: u64 = 256 * 1024 * 1024;
-    const new_uuid = [_]u8{0x74} ** 16;
+    const new_uuid = @as([16]u8, @splat(0x74));
     var blocks_text: [32]u8 = undefined;
     runExternalToolChecked(std.testing.allocator, "mke2fs", &.{
         "-q",
@@ -12749,8 +12749,8 @@ test "rewriteUuid refuses unsupported checksum-seed layouts before mutating" {
     defer std.testing.allocator.free(path);
 
     const length: u64 = 64 * 1024 * 1024;
-    const old_uuid = [_]u8{0x19} ** 16;
-    const new_uuid = [_]u8{0x91} ** 16;
+    const old_uuid = @as([16]u8, @splat(0x19));
+    const new_uuid = @as([16]u8, @splat(0x91));
     var tree = journalTestTree();
     tree.bind();
 
@@ -12834,7 +12834,7 @@ test "Editor edits (deletes, recursive tree removal, and overwrite) pass a real 
     {
         const file = try Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
         defer file.close(io);
-        _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = [_]u8{0x60} ** 16 });
+        _ = try populate(io, file, std.testing.allocator, &tree.view, .{ .length = fs_size, .uuid = @as([16]u8, @splat(0x60)) });
 
         var editor = try Editor.open(io, file, std.testing.allocator, .{});
         defer editor.deinit();
@@ -12959,7 +12959,7 @@ test "the minimum size is the smallest one that populates, and it really populat
     const options: PopulateOptions = .{
         .length = 0,
         .label = "miz-min",
-        .uuid = [_]u8{0x44} ** 16,
+        .uuid = @as([16]u8, @splat(0x44)),
         .timestamp = 1_717_171_717,
     };
 
@@ -13022,7 +13022,7 @@ test "the minimum size is the smallest one that populates, and it really populat
 test "the minimum size grows by exactly the journal the ladder chose" {
     var tree = minimumSizeTestTree();
     tree.bind();
-    const plain: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x45} ** 16 };
+    const plain: PopulateOptions = .{ .length = 0, .uuid = @as([16]u8, @splat(0x45)) };
     var journalled = plain;
     journalled.journal = .{ .enabled = true };
 
@@ -13042,7 +13042,7 @@ test "an explicit journal size is bounded and honoured when solving for the mini
     var tree = minimumSizeTestTree();
     tree.bind();
     const explicit_blocks: u32 = 2048;
-    var options: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x46} ** 16 };
+    var options: PopulateOptions = .{ .length = 0, .uuid = @as([16]u8, @splat(0x46)) };
     options.journal = .{
         .enabled = true,
         .size_bytes = @as(u64, explicit_blocks) * default_block_size,
@@ -13084,7 +13084,7 @@ test "the minimum size counts the extent-tree blocks a large file needs" {
         .{ .path = "boot/rootfs.img", .kind = .file, .mode = 0o600, .uid = 0, .gid = 0, .size = 544 * 1024 * 1024, .generator = .pattern },
     });
     tree.bind();
-    const options: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x47} ** 16 };
+    const options: PopulateOptions = .{ .length = 0, .uuid = @as([16]u8, @splat(0x47)) };
 
     const minimum = try minimumPopulateLength(std.testing.allocator, &tree.view, options);
     try expectMinimalPopulateLength(&tree.view, options, minimum);
@@ -13094,7 +13094,7 @@ test "the minimum size counts the extent-tree blocks a large file needs" {
 test "an empty tree still needs a filesystem, and the minimum one is valid" {
     var tree = InMemoryTree.init(&[_]InMemoryEntry{});
     tree.bind();
-    const options: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x48} ** 16 };
+    const options: PopulateOptions = .{ .length = 0, .uuid = @as([16]u8, @splat(0x48)) };
 
     const minimum = try minimumPopulateLength(std.testing.allocator, &tree.view, options);
     try expectMinimalPopulateLength(&tree.view, options, minimum);
@@ -13127,7 +13127,7 @@ test "a tree of many small files is bound by its inodes, not by its bytes" {
     }
     var tree = InMemoryTree.init(entries);
     tree.bind();
-    const options: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x49} ** 16 };
+    const options: PopulateOptions = .{ .length = 0, .uuid = @as([16]u8, @splat(0x49)) };
 
     const minimum = try minimumPopulateLength(std.testing.allocator, &tree.view, options);
     try expectMinimalPopulateLength(&tree.view, options, minimum);
@@ -13138,7 +13138,7 @@ test "a tree of many small files is bound by its inodes, not by its bytes" {
 test "a floor raises the answer without giving up minimality above it" {
     var tree = minimumSizeTestTree();
     tree.bind();
-    const options: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x4A} ** 16 };
+    const options: PopulateOptions = .{ .length = 0, .uuid = @as([16]u8, @splat(0x4A)) };
 
     const minimum = try minimumPopulateLength(std.testing.allocator, &tree.view, options);
     // A floor the answer already clears changes nothing at all.
@@ -13182,7 +13182,7 @@ test "a floor lands past the block-group boundary that would have refused it" {
     // where the boundaries fall or how far past one it has to reach.
     var tree = minimumSizeTestTree();
     tree.bind();
-    const options: PopulateOptions = .{ .length = 0, .uuid = [_]u8{0x4B} ** 16 };
+    const options: PopulateOptions = .{ .length = 0, .uuid = @as([16]u8, @splat(0x4B)) };
 
     const minimum = try minimumPopulateLength(std.testing.allocator, &tree.view, options);
     const boundary = default_blocks_per_group;
@@ -13229,7 +13229,7 @@ test "a floor lands past the block-group boundary that would have refused it" {
 // against the one `mke2fs` writes for the same geometry.
 // ---------------------------------------------------------------------------
 
-const journal_test_uuid: [16]u8 = [_]u8{0x11} ** 16;
+const journal_test_uuid: [16]u8 = @as([16]u8, @splat(0x11));
 const journal_test_uuid_text = "11111111-1111-1111-1111-111111111111";
 
 fn journalTestTree() InMemoryTree {
@@ -13322,7 +13322,7 @@ fn configureLegacyResizeInodeFixture(
         @as(u64, inode_table_block) * default_block_size,
     );
 
-    var gdt: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    var gdt: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
     @memcpy(gdt[0..32], old_gdt[0..32]);
     const descriptor = gdt[0..64];
     writeInt(u32, descriptor[0..4], block_bitmap_block);
@@ -13339,10 +13339,10 @@ fn configureLegacyResizeInodeFixture(
     setGeneralDescriptorChecksum(descriptor, 64, checksum_seed, 0);
     try file.writePositionalAll(io, &gdt, default_block_size);
 
-    var dindir: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    var dindir: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
     std.mem.writeInt(u32, dindir[4..8], pointer_block, .little);
     try file.writePositionalAll(io, &dindir, @as(u64, dindir_block) * default_block_size);
-    var pointers: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    var pointers: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
     try file.writePositionalAll(io, &pointers, @as(u64, pointer_block) * default_block_size);
 
     var inode7: []u8 = try allocator.alloc(u8, inode_size);
@@ -13402,7 +13402,7 @@ fn dumpInodeAlloc(
     scratch_path: []const u8,
     max_bytes: usize,
 ) !?[]u8 {
-    const request = try std.fmt.allocPrint(allocator, "dump <{d}> {s}", .{ inode_number, scratch_path });
+    const request = try allocator.print("dump <{d}> {s}", .{ inode_number, scratch_path });
     defer allocator.free(request);
     const output = (try runToolCapture(allocator, "debugfs", &.{ "-R", request, image_path })) orelse
         return null;
@@ -14105,7 +14105,7 @@ test "resize uses a metadata checksum seed for stock group metadata" {
     writeInt(u16, sb[0xFE..0x100], 64);
     writeInt(u32, sb[0x270..0x274], checksum_seed);
 
-    var gdt: [default_block_size]u8 = [_]u8{0} ** default_block_size;
+    var gdt: [default_block_size]u8 = @as([default_block_size]u8, @splat(0));
     _ = try file.readPositionalAll(io, &gdt, default_block_size);
     var original_descriptor: [32]u8 = undefined;
     @memcpy(&original_descriptor, gdt[0..32]);
@@ -14688,7 +14688,7 @@ test "a strict scan reports peaks and names the limit that stopped it" {
     defer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = length,
-        .uuid = [_]u8{0x21} ** 16,
+        .uuid = @as([16]u8, @splat(0x21)),
         .timestamp = 1_717_171_717,
     });
 
@@ -14745,7 +14745,7 @@ fn runExternalTool(
 ) !?std.process.RunResult {
     const prefixes = [_][]const u8{ "", "/sbin/", "/usr/sbin/" };
     for (prefixes) |prefix| {
-        const binary = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, name });
+        const binary = try allocator.print("{s}{s}", .{ prefix, name });
         defer allocator.free(binary);
         const argv = try allocator.alloc([]const u8, args.len + 1);
         defer allocator.free(argv);
@@ -14858,7 +14858,7 @@ const stock_fixture_image_name = "test-ext4-general.img";
 const stock_fixture_xattr_name = "test-ext4-general-xattr.bin";
 const stock_fixture_script_name = "test-ext4-general-debugfs.txt";
 const stock_fixture_bytes: u64 = 16 * 1024 * 1024;
-const stock_long_symlink_target = "../" ++ ("deep/" ** 20) ++ "target";
+const stock_long_symlink_target = "../" ++ ((@as([20 * "deep/".len]u8, @bitCast(@as([20]["deep/".len]u8, @splat("deep/".*)))) ++ "")) ++ "target";
 
 const StockFixturePaths = struct {
     source: []const u8,
@@ -14950,7 +14950,7 @@ fn buildStockFixture(
         try std.fmt.bufPrint(&size_text, "{d}", .{stock_fixture_bytes / 4096}),
     });
 
-    const script = try std.fmt.allocPrint(allocator,
+    const script = try allocator.print(
         \\cd /dev
         \\mknod console c 5 1
         \\mknod loop0 b 7 0
@@ -15165,7 +15165,7 @@ fn writeGeneralFixture(io: Io, path: []const u8, length: u64) !Io.File {
     errdefer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = length,
-        .uuid = [_]u8{0x42} ** 16,
+        .uuid = @as([16]u8, @splat(0x42)),
         .timestamp = 1_717_171_717,
     });
     return file;
@@ -15289,7 +15289,7 @@ test "the writer emits hardlinks devices and FIFOs that fsck and the general imp
         defer file.close(io);
         _ = try populate(io, file, allocator, &tree.view, .{
             .length = length,
-            .uuid = [_]u8{0x5a} ** 16,
+            .uuid = @as([16]u8, @splat(0x5a)),
             .timestamp = 1_700_000_000,
         });
     }
@@ -15374,7 +15374,7 @@ test "buildPlan resolves deep nesting and both hardlink directions from scramble
         defer file.close(io);
         _ = try populate(io, file, allocator, &tree.view, .{
             .length = length,
-            .uuid = [_]u8{0x3c} ** 16,
+            .uuid = @as([16]u8, @splat(0x3c)),
             .timestamp = 1_700_000_000,
         });
     }
@@ -15720,7 +15720,7 @@ test "strict writer-compatible scan rejects a tampered inode epoch" {
     defer file.close(io);
     _ = try populate(io, file, std.testing.allocator, &tree.view, .{
         .length = length,
-        .uuid = [_]u8{0x44} ** 16,
+        .uuid = @as([16]u8, @splat(0x44)),
         .timestamp = 1_717_171_717,
     });
 
@@ -15752,7 +15752,7 @@ test "strict writer-compatible scan rejects a tampered inode epoch" {
 }
 
 test "reader treats ee_len 0x8000 as an initialized 32768-block extent" {
-    var encoded = [_]u8{0} ** extent_entry_size;
+    var encoded = @as([extent_entry_size]u8, @splat(0));
     writeInt(u32, encoded[0..4], 123);
     writeInt(u16, encoded[4..6], 0x8000);
     writeInt(u16, encoded[6..8], 0);

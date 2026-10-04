@@ -122,7 +122,7 @@ const guest_kernel_cmdline = "/etc/kernel/cmdline";
 const guest_fstab = "/etc/fstab";
 
 pub fn available(io: Io) customize.CapabilityState {
-    if (builtin.os.tag != .linux or
+    if (builtin.target.os.tag != .linux or
         std.os.linux.geteuid() != 0 or
         !hasRequiredCapabilities() or
         !isCharacterDevice(io, "/dev/loop-control"))
@@ -327,7 +327,7 @@ pub fn runParent(
 }
 
 pub fn workerMain(init: std.process.Init, manifest_path: []const u8) !void {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0) {
+    if (builtin.target.os.tag != .linux or std.os.linux.geteuid() != 0) {
         return error.UnsafeChrootHostUnavailable;
     }
     const allocator = init.arena.allocator();
@@ -448,11 +448,11 @@ fn classifyRunFailure(err: anyerror) RunOutcome {
 /// difference between a transaction that cleaned up and one the caller has to
 /// be warned about.
 fn reapNamespace() void {
-    if (builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .linux) return;
     if (std.os.linux.getpid() != 1) return;
     _ = std.os.linux.kill(-1, .KILL);
     while (true) {
-        var status: u32 = undefined;
+        var status: i32 = undefined;
         const rc = std.os.linux.waitpid(-1, &status, 0);
         switch (std.os.linux.errno(rc)) {
             .SUCCESS => continue,
@@ -652,14 +652,12 @@ const Session = struct {
         }
         try self.snapshotAssociatedLoops();
 
-        const offset = try std.fmt.allocPrint(
-            self.allocator,
+        const offset = try self.allocator.print(
             "{d}",
             .{self.manifest.partition_offset},
         );
         defer self.allocator.free(offset);
-        const length = try std.fmt.allocPrint(
-            self.allocator,
+        const length = try self.allocator.print(
             "{d}",
             .{self.manifest.partition_length},
         );
@@ -1181,8 +1179,7 @@ const Session = struct {
     /// and inventing one only for hooks would state a guarantee the backend
     /// does not have.
     fn runHook(self: *Session, hook: customize.Hook, index: usize) !void {
-        const guest_path = try std.fmt.allocPrint(
-            self.allocator,
+        const guest_path = try self.allocator.print(
             "/run/miz-hook-{d}",
             .{index},
         );
@@ -1337,8 +1334,7 @@ const Session = struct {
             .exact => |pins| pins,
         };
         for (pins) |pin| {
-            const spec = try std.fmt.allocPrint(
-                self.allocator,
+            const spec = try self.allocator.print(
                 "{s}-{s}.{s}",
                 .{ pin.name, pin.evr, pin.architecture },
             );
@@ -2218,7 +2214,7 @@ const Session = struct {
     }
 
     fn createOneDirectory(self: *Session, path: []const u8) !void {
-        Io.Dir.cwd().createDir(self.io, path, @enumFromInt(0o755)) catch |err| switch (err) {
+        Io.Dir.cwd().createDir(self.io, path, @fromBackingInt(@intCast(0o755))) catch |err| switch (err) {
             error.PathAlreadyExists => return,
             else => return err,
         };
@@ -2227,7 +2223,7 @@ const Session = struct {
         // not -- `iterate` is what asks for a real descriptor.
         var opened = try Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true });
         defer opened.close(self.io);
-        try opened.setPermissions(self.io, @enumFromInt(0o755));
+        try opened.setPermissions(self.io, @fromBackingInt(@intCast(0o755)));
     }
 
     fn writeKernelModuleFiles(self: *Session) !void {
@@ -2256,11 +2252,11 @@ const Session = struct {
             // own mode through a truncating open, so it is set afterwards
             // rather than only at creation.
             const target = try Io.Dir.cwd().createFile(self.io, path, .{
-                .permissions = @enumFromInt(0o644),
+                .permissions = @fromBackingInt(@intCast(0o644)),
             });
             defer target.close(self.io);
             try target.writePositionalAll(self.io, file.contents, 0);
-            try target.setPermissions(self.io, @enumFromInt(0o644));
+            try target.setPermissions(self.io, @fromBackingInt(@intCast(0o644)));
         }
     }
 
@@ -2809,7 +2805,7 @@ fn exitedWithinDeadline(
     child: *std.process.Child,
     deadline: customize.Deadline,
 ) !bool {
-    if (builtin.os.tag != .linux) return true;
+    if (builtin.target.os.tag != .linux) return true;
     const pid = child.id orelse return true;
     const open_rc = std.os.linux.pidfd_open(pid, 0);
     if (std.os.linux.errno(open_rc) != .SUCCESS) return true;
@@ -2892,15 +2888,14 @@ fn repositoryHostPath(
 ) ![]u8 {
     const guest_path = try packages_mod.repositoryPath(allocator, id);
     defer allocator.free(guest_path);
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ root_path, guest_path });
+    return allocator.print("{s}{s}", .{ root_path, guest_path });
 }
 
 fn repositoryHostDirectory(
     allocator: Allocator,
     root_path: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}" ++ packages_mod.repository_directory,
         .{root_path},
     );
@@ -2910,8 +2905,7 @@ fn tdnfConfigHostPath(
     allocator: Allocator,
     root_path: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}" ++ packages_mod.config_path,
         .{root_path},
     );
@@ -3162,7 +3156,7 @@ fn validateManifestPolicy(manifest: Manifest) !void {
             if (std.mem.eql(u8, previous.name, hook.name)) return error.DuplicateHookName;
         }
         if (previous_phase) |phase| {
-            if (@intFromEnum(hook.phase) < @intFromEnum(phase)) {
+            if (@backingInt(hook.phase) < @backingInt(phase)) {
                 return error.HookPhasesOutOfOrder;
             }
         }
@@ -3300,7 +3294,7 @@ fn joinGuest(
     guest_path: []const u8,
 ) ![]u8 {
     if (guest_path.len == 0 or guest_path[0] != '/') return error.InvalidGuestPath;
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ root_path, guest_path });
+    return allocator.print("{s}{s}", .{ root_path, guest_path });
 }
 
 fn writeBytes(io: Io, path: []const u8, bytes: []const u8) !void {
@@ -3850,7 +3844,7 @@ test "findRequiredTool returns an error when no candidate exists" {
 }
 
 fn hasRequiredCapabilities() bool {
-    if (builtin.os.tag != .linux) return false;
+    if (builtin.target.os.tag != .linux) return false;
     var header = std.os.linux.cap_user_header_t{
         .version = 0x20080522,
         .pid = 0,
@@ -4273,8 +4267,7 @@ test "worker executes policy with strict reverse cleanup" {
         "",
     };
     for (context.unmounts.items, expected_unmounts) |actual, suffix| {
-        const expected = try std.fmt.allocPrint(
-            allocator,
+        const expected = try allocator.print(
             "{s}{s}",
             .{ root_path, suffix },
         );
@@ -4824,7 +4817,7 @@ test "the privilege boundary re-checks a hook it is handed" {
         .initramfs = .unchanged,
     };
     const runnable = "#!/bin/sh\nexit 0\n";
-    const long_argument = "x" ** (customize.max_hook_argument_bytes + 1);
+    const long_argument = &@as([(customize.max_hook_argument_bytes + 1):0]u8, @splat('x'));
     var many_arguments: [customize.max_hook_arguments + 1][]const u8 = undefined;
     for (&many_arguments) |*slot| slot.* = "x";
 
@@ -5265,7 +5258,7 @@ test "environment credentials use owned pipe storage and are scrubbed when consu
     const value_offset = environment_credential_magic.len + 4 + 4;
     try std.testing.expectEqualSlices(
         u8,
-        &([_]u8{0} ** "s3cr3t-from-a-variable".len),
+        &(@as(["s3cr3t-from-a-variable".len]u8, @splat(0))),
         sealed[value_offset..][0.."s3cr3t-from-a-variable".len],
     );
 
@@ -6444,8 +6437,7 @@ const FakeExecutorContext = struct {
     }
 
     fn readTargetFile(self: *FakeExecutorContext, relative: []const u8) ?[]const u8 {
-        const path = std.fmt.allocPrint(
-            self.allocator,
+        const path = self.allocator.print(
             "{s}/{s}",
             .{ self.root_path, relative },
         ) catch return null;
@@ -6459,14 +6451,13 @@ const FakeExecutorContext = struct {
     }
 
     fn modeOf(self: *FakeExecutorContext, relative: []const u8) ?u32 {
-        const path = std.fmt.allocPrint(
-            self.allocator,
+        const path = self.allocator.print(
             "{s}/{s}",
             .{ self.root_path, relative },
         ) catch return null;
         defer self.allocator.free(path);
         const status = Io.Dir.cwd().statFile(self.io, path, .{}) catch return null;
-        return @intFromEnum(status.permissions) & 0o7777;
+        return @backingInt(status.permissions) & 0o7777;
     }
 
     fn snapshotKernelModuleFiles(self: *FakeExecutorContext) ![]const []const u8 {
@@ -6607,8 +6598,7 @@ const FakeExecutorContext = struct {
                 "/etc/yum.repos.d",
                 "/boot",
             }) |suffix| {
-                const path = try std.fmt.allocPrint(
-                    self.allocator,
+                const path = try self.allocator.print(
                     "{s}{s}",
                     .{ self.root_path, suffix },
                 );
@@ -6624,31 +6614,27 @@ const FakeExecutorContext = struct {
                     .database_missing => &.{"/usr/bin/tdnf"},
                     .foreign => &.{ "/usr/bin/apt-get", "/usr/bin/dpkg" },
                 };
-                const binary_directory = try std.fmt.allocPrint(
-                    self.allocator,
+                const binary_directory = try self.allocator.print(
                     "{s}/usr/bin",
                     .{self.root_path},
                 );
                 try Io.Dir.cwd().createDirPath(self.io, binary_directory);
                 if (self.initramfs_generator_present) {
-                    const generator = try std.fmt.allocPrint(
-                        self.allocator,
+                    const generator = try self.allocator.print(
                         "{s}{s}",
                         .{ self.root_path, initramfs_mod.tool_path },
                     );
                     try writeBytes(self.io, generator, "");
                 }
                 for (binaries) |binary| {
-                    const path = try std.fmt.allocPrint(
-                        self.allocator,
+                    const path = try self.allocator.print(
                         "{s}{s}",
                         .{ self.root_path, binary },
                     );
                     try writeBytes(self.io, path, "");
                 }
             }
-            const resolver = try std.fmt.allocPrint(
-                self.allocator,
+            const resolver = try self.allocator.print(
                 "{s}/etc/resolv.conf",
                 .{self.root_path},
             );
@@ -6669,29 +6655,25 @@ const FakeExecutorContext = struct {
             // Mounting is what makes the target root's contents visible, so
             // it is where a fake target grows its installed kernels.
             if (self.modules_path_is_file) {
-                const lib = try std.fmt.allocPrint(
-                    self.allocator,
+                const lib = try self.allocator.print(
                     "{s}/lib",
                     .{self.root_path},
                 );
                 try Io.Dir.cwd().createDirPath(self.io, lib);
-                const modules = try std.fmt.allocPrint(
-                    self.allocator,
+                const modules = try self.allocator.print(
                     "{s}/modules",
                     .{lib},
                 );
                 try writeBytes(self.io, modules, "");
             }
             for (self.installed_kernels) |kernel| {
-                const directory = try std.fmt.allocPrint(
-                    self.allocator,
+                const directory = try self.allocator.print(
                     "{s}/lib/modules/{s}",
                     .{ self.root_path, kernel.release },
                 );
                 try Io.Dir.cwd().createDirPath(self.io, directory);
                 if (kernel.marker) |marker_name| {
-                    const marker = try std.fmt.allocPrint(
-                        self.allocator,
+                    const marker = try self.allocator.print(
                         "{s}/{s}",
                         .{ directory, marker_name },
                     );
@@ -6799,8 +6781,7 @@ const FakeExecutorContext = struct {
             try self.timeline.append("dracut");
             var index: usize = 0;
             while (index < 8) : (index += 1) {
-                const relative = try std.fmt.allocPrint(
-                    self.allocator,
+                const relative = try self.allocator.print(
                     "run/miz-hook-{d}",
                     .{index},
                 );

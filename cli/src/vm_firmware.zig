@@ -133,33 +133,27 @@ pub fn describeAlloc(
     err: ResolveError,
 ) std.mem.Allocator.Error![]u8 {
     return switch (err) {
-        error.OutOfMemory => std.fmt.allocPrint(
-            allocator,
+        error.OutOfMemory => allocator.print(
             "the builder ran out of memory resolving {t} EDK2 firmware",
             .{options.architecture},
         ),
-        error.VmFirmwareOverrideIncomplete => std.fmt.allocPrint(
-            allocator,
+        error.VmFirmwareOverrideIncomplete => allocator.print(
             "the firmware boot names one of code_path and vars_path without the other",
             .{},
         ),
-        error.VmFirmwareNotReadable => std.fmt.allocPrint(
-            allocator,
+        error.VmFirmwareNotReadable => allocator.print(
             "the firmware boot names EDK2 files that are not readable regular files",
             .{},
         ),
-        error.VmFirmwareNotSecureBootCapable => std.fmt.allocPrint(
-            allocator,
+        error.VmFirmwareNotSecureBootCapable => allocator.print(
             "no Secure Boot capable {t} EDK2 firmware was found near '{s}'",
             .{ options.architecture, options.emulator_command },
         ),
-        error.VmFirmwareNotMaterialized => std.fmt.allocPrint(
-            allocator,
+        error.VmFirmwareNotMaterialized => allocator.print(
             "{t} EDK2 firmware was found but could not be prepared under '{s}'",
             .{ options.architecture, options.materialize_directory },
         ),
-        error.VmFirmwareNotFound => std.fmt.allocPrint(
-            allocator,
+        error.VmFirmwareNotFound => allocator.print(
             "no {t} EDK2 firmware was found in the share directory beside '{s}' or in the system locations",
             .{ options.architecture, options.emulator_command },
         ),

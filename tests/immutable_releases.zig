@@ -54,8 +54,7 @@ const Fixture = struct {
             "MIZ_IMMUTABLE_RELEASE_ROOT",
         );
         defer allocator.free(repository);
-        const root = try std.fmt.allocPrint(
-            allocator,
+        const root = try allocator.print(
             "{s}/.zig-cache/tmp/{s}",
             .{ repository, tmp.sub_path },
         );
@@ -69,16 +68,14 @@ const Fixture = struct {
         errdefer allocator.free(workspace);
         try Dir.cwd().createDirPath(std.testing.io, assets);
         for (platforms) |platform| {
-            const name = try std.fmt.allocPrint(
-                allocator,
+            const name = try allocator.print(
                 "miz-{s}-{s}.tar.gz",
                 .{ version, platform },
             );
             defer allocator.free(name);
             const path = try std.fs.path.join(allocator, &.{ assets, name });
             defer allocator.free(path);
-            const contents = try std.fmt.allocPrint(
-                allocator,
+            const contents = try allocator.print(
                 "fixture:{s}\n",
                 .{name},
             );
@@ -170,14 +167,12 @@ const Fixture = struct {
 
     fn addExactAssets(self: *Fixture, version: []const u8) !void {
         for (platforms) |platform| {
-            const name = try std.fmt.allocPrint(
-                self.allocator,
+            const name = try self.allocator.print(
                 "miz-{s}-{s}.tar.gz",
                 .{ version, platform },
             );
             defer self.allocator.free(name);
-            const contents = try std.fmt.allocPrint(
-                self.allocator,
+            const contents = try self.allocator.print(
                 "fixture:{s}\n",
                 .{name},
             );
@@ -191,7 +186,7 @@ const Fixture = struct {
         scenario: []const u8,
         version: []const u8,
     ) !Run {
-        const tag = try std.fmt.allocPrint(self.allocator, "v{s}", .{version});
+        const tag = try self.allocator.print("v{s}", .{version});
         defer self.allocator.free(tag);
         var environment = try std.process.Environ.createMap(
             std.testing.environ,

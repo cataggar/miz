@@ -320,8 +320,7 @@ fn finalizeCompressedQcow2(
     // reads the mutable qcow2's guest bytes and re-encodes them into
     // compressed qcow2 v3 clusters, so the Ubuntu release path no longer
     // shells out to qemu-img/qemu-utils.
-    const staged_output = try std.fmt.allocPrint(
-        allocator,
+    const staged_output = try allocator.print(
         "{s}.miz-finalize-stage",
         .{output},
     );
@@ -872,11 +871,11 @@ fn assertRequestSeparation(request: package_family.Request) !void {
 }
 
 fn privateCacheDirPermissions() std.Io.File.Permissions {
-    return if (@import("builtin").os.tag == .windows) .default_dir else .fromMode(0o700);
+    return if (@import("builtin").target.os.tag == .windows) .default_dir else .fromMode(0o700);
 }
 
 fn privateCacheFilePermissions() std.Io.File.Permissions {
-    return if (@import("builtin").os.tag == .windows) .default_file else .fromMode(0o600);
+    return if (@import("builtin").target.os.tag == .windows) .default_file else .fromMode(0o600);
 }
 
 /// Remove only abandoned debz staging files from a persistent shared cache.
@@ -1252,7 +1251,7 @@ fn copyBoundedFile(
 
 fn validateManifest(bytes: []const u8, profile: *const Profile) !void {
     for (&required_manifest_packages) |name| {
-        const needle = try std.fmt.allocPrint(std.testing.allocator, "{s}\t", .{name});
+        const needle = try std.testing.allocator.print("{s}\t", .{name});
         defer std.testing.allocator.free(needle);
         if (std.mem.indexOf(u8, bytes, needle) == null) return error.RequiredPackageMissing;
     }
@@ -1265,7 +1264,7 @@ fn validateManifest(bytes: []const u8, profile: *const Profile) !void {
 
 fn validateManifestRuntime(allocator: Allocator, bytes: []const u8, profile: *const Profile) !void {
     for (&required_manifest_packages) |name| {
-        const needle = try std.fmt.allocPrint(allocator, "{s}\t", .{name});
+        const needle = try allocator.print("{s}\t", .{name});
         defer allocator.free(needle);
         if (std.mem.indexOf(u8, bytes, needle) == null) return error.RequiredPackageMissing;
     }
@@ -1659,7 +1658,7 @@ fn verifyOpenPgpDetachedSignature(
     @memcpy(&signature, signature_mpi.bytes);
     try std.crypto.Certificate.rsa.PKCS1v1_5Signature.concatVerify(
         512,
-        signature,
+        &signature,
         &.{ content, body[0..hashed_end], &trailer },
         key.rsa,
         std.crypto.hash.sha2.Sha512,
@@ -1719,11 +1718,11 @@ fn requireSelectedKernel(bytes: []const u8, flavor: Flavor) !void {
 
 fn validateExactLock(bytes: []const u8, profile: *const Profile, flavor: Flavor) !void {
     for (requiredPackages(flavor)) |package| {
-        const needle = try std.fmt.allocPrint(std.testing.allocator, "{s}\t", .{package});
+        const needle = try std.testing.allocator.print("{s}\t", .{package});
         defer std.testing.allocator.free(needle);
         if (std.mem.indexOf(u8, bytes, needle) == null) return error.ExactLockIncomplete;
     }
-    const expected_arch = try std.fmt.allocPrint(std.testing.allocator, "\t{s}\n", .{profile.ubuntu_architecture});
+    const expected_arch = try std.testing.allocator.print("\t{s}\n", .{profile.ubuntu_architecture});
     defer std.testing.allocator.free(expected_arch);
     if (std.mem.indexOf(u8, bytes, expected_arch) == null) return error.ExactLockArchitectureMissing;
     const foreign_arch = switch (profile.architecture) {
@@ -1732,7 +1731,7 @@ fn validateExactLock(bytes: []const u8, profile: *const Profile, flavor: Flavor)
     };
     if (std.mem.indexOf(u8, bytes, foreign_arch) != null) return error.ForeignArchitecturePackage;
     for (forbiddenPackages(flavor)) |package| {
-        const needle = try std.fmt.allocPrint(std.testing.allocator, "{s}\t", .{package});
+        const needle = try std.testing.allocator.print("{s}\t", .{package});
         defer std.testing.allocator.free(needle);
         if (std.mem.indexOf(u8, bytes, needle) != null) return error.ForbiddenCorePackage;
     }
@@ -1746,11 +1745,11 @@ fn validateExactLockRuntime(
     flavor: Flavor,
 ) !void {
     for (requiredPackages(flavor)) |package| {
-        const needle = try std.fmt.allocPrint(allocator, "{s}\t", .{package});
+        const needle = try allocator.print("{s}\t", .{package});
         defer allocator.free(needle);
         if (std.mem.indexOf(u8, bytes, needle) == null) return error.ExactLockIncomplete;
     }
-    const expected_arch = try std.fmt.allocPrint(allocator, "\t{s}\n", .{profile.ubuntu_architecture});
+    const expected_arch = try allocator.print("\t{s}\n", .{profile.ubuntu_architecture});
     defer allocator.free(expected_arch);
     if (std.mem.indexOf(u8, bytes, expected_arch) == null) return error.ExactLockArchitectureMissing;
     const foreign_arch = switch (profile.architecture) {
@@ -1759,7 +1758,7 @@ fn validateExactLockRuntime(
     };
     if (std.mem.indexOf(u8, bytes, foreign_arch) != null) return error.ForeignArchitecturePackage;
     for (forbiddenPackages(flavor)) |package| {
-        const needle = try std.fmt.allocPrint(allocator, "{s}\t", .{package});
+        const needle = try allocator.print("{s}\t", .{package});
         defer allocator.free(needle);
         if (std.mem.indexOf(u8, bytes, needle) != null) return error.ForbiddenCorePackage;
     }
@@ -1956,7 +1955,7 @@ fn collectInjectedInventory(
         const absolute = if (std.mem.startsWith(u8, entry.path, "/"))
             try allocator.dupe(u8, entry.path)
         else
-            try std.fmt.allocPrint(allocator, "/{s}", .{entry.path});
+            try allocator.print("/{s}", .{entry.path});
         try entries.append(allocator, .{
             .path = absolute,
             .logical_bytes = entry.size(),
@@ -2135,8 +2134,7 @@ fn publishNativeQcow2(
     raw_path: []const u8,
     destination_path: []const u8,
 ) !void {
-    const staged_path = try std.fmt.allocPrint(
-        allocator,
+    const staged_path = try allocator.print(
         "{s}.miz-native-stage",
         .{destination_path},
     );
@@ -2293,13 +2291,11 @@ fn ukiCmdline(
 ) ![]u8 {
     var root_guid_text: [36]u8 = undefined;
     return switch (flavor) {
-        .full => std.fmt.allocPrint(
-            allocator,
+        .full => allocator.print(
             "root=PARTUUID={s} {s}",
             .{ guid.formatLower(&root_guid_text, root_guid), profile.serial_console },
         ),
-        .core => std.fmt.allocPrint(
-            allocator,
+        .core => allocator.print(
             "root=PARTUUID={s} init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto mizinit.binder=required console=tty0 {s}",
             .{ guid.formatLower(&root_guid_text, root_guid), profile.serial_console },
         ),
@@ -2308,8 +2304,7 @@ fn ukiCmdline(
         // same thing more slowly. The serial console is kept alongside
         // `tty0` because this firmware's console has not been confirmed, and
         // a boot nobody can watch is a boot nobody can diagnose.
-        .baremetal => std.fmt.allocPrint(
-            allocator,
+        .baremetal => allocator.print(
             "root=PARTUUID={s} init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=off console=tty0 {s}",
             .{ guid.formatLower(&root_guid_text, root_guid), profile.serial_console },
         ),
@@ -2450,7 +2445,7 @@ fn kernelModulesPath(
     root: *offline_root.Root,
     release_name: []const u8,
 ) ![]u8 {
-    const merged = try std.fmt.allocPrint(allocator, "/usr/lib/modules/{s}", .{release_name});
+    const merged = try allocator.print("/usr/lib/modules/{s}", .{release_name});
     if (root.inspect(merged)) |inspection| {
         allocator.free(inspection.path);
         if (inspection.kind == .directory) return merged;
@@ -2462,7 +2457,7 @@ fn kernelModulesPath(
         },
     }
     allocator.free(merged);
-    return std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
+    return allocator.print("/lib/modules/{s}", .{release_name});
 }
 
 /// The `kernelModulesPath` rule for the built image rather than the staging
@@ -2474,7 +2469,7 @@ fn nativeKernelModulesPath(
     filesystem: *const miz.ext4_mountless.FileSystem,
     release_name: []const u8,
 ) ![]u8 {
-    const merged = try std.fmt.allocPrint(allocator, "/usr/lib/modules/{s}", .{release_name});
+    const merged = try allocator.print("/usr/lib/modules/{s}", .{release_name});
     if (filesystem.stat(merged)) |entry| {
         if (entry.kind == .directory) return merged;
     } else |err| switch (err) {
@@ -2485,7 +2480,7 @@ fn nativeKernelModulesPath(
         },
     }
     allocator.free(merged);
-    return std.fmt.allocPrint(allocator, "/lib/modules/{s}", .{release_name});
+    return allocator.print("/lib/modules/{s}", .{release_name});
 }
 
 /// The kernel artifacts `update-initramfs` reads: the module tree and the
@@ -2502,7 +2497,7 @@ fn validateKernelModuleArtifacts(
     const modules = try root.discover(modules_path, "*");
     defer root.freeFound(modules);
     if (modules.len == 0) return error.ExpectedKernelModulesMissing;
-    const modules_dep_path = try std.fmt.allocPrint(allocator, "{s}/modules.dep", .{modules_path});
+    const modules_dep_path = try allocator.print("{s}/modules.dep", .{modules_path});
     defer allocator.free(modules_dep_path);
     const modules_dep = root.inspect(modules_dep_path) catch |err| switch (err) {
         error.PathNotFound => return error.KernelModulesDependencyMissing,
@@ -2523,7 +2518,7 @@ fn validateInitramfs(
     root: *offline_root.Root,
     release_name: []const u8,
 ) !void {
-    const initrd_path = try std.fmt.allocPrint(allocator, "/boot/initrd.img-{s}", .{release_name});
+    const initrd_path = try allocator.print("/boot/initrd.img-{s}", .{release_name});
     defer allocator.free(initrd_path);
     const initrd = root.inspect(initrd_path) catch |err| switch (err) {
         error.PathNotFound => return error.InitramfsMissing,
@@ -2550,8 +2545,7 @@ fn validateCoreKernelModules(
 ) !void {
     const modules_path = try kernelModulesPath(allocator, root, release_name);
     defer allocator.free(modules_path);
-    const modules_dep_path = try std.fmt.allocPrint(
-        allocator,
+    const modules_dep_path = try allocator.print(
         "{s}/modules.dep",
         .{modules_path},
     );
@@ -2605,7 +2599,7 @@ fn validateBinderModule(
     const modules_path = try kernelModulesPath(allocator, root, release_name);
     defer allocator.free(modules_path);
 
-    const shadow_dir = try std.fmt.allocPrint(allocator, "{s}/updates/dkms", .{modules_path});
+    const shadow_dir = try allocator.print("{s}/updates/dkms", .{modules_path});
     defer allocator.free(shadow_dir);
     const shadow = root.discover(shadow_dir, "*") catch |err| switch (err) {
         error.FileNotFound, error.NotDirectory => &.{},
@@ -2614,7 +2608,7 @@ fn validateBinderModule(
     defer root.freeFound(shadow);
     if (shadow.len != 0) return error.ShadowBinderModulePresent;
 
-    const binder_driver_dir = try std.fmt.allocPrint(allocator, "{s}/kernel/drivers/android", .{modules_path});
+    const binder_driver_dir = try allocator.print("{s}/kernel/drivers/android", .{modules_path});
     defer allocator.free(binder_driver_dir);
     const found = root.discover(binder_driver_dir, binder_module_name ++ ".ko*") catch |err| switch (err) {
         error.FileNotFound, error.NotDirectory => return error.BinderModuleMissing,
@@ -2649,7 +2643,7 @@ fn validateCoreKernelConfig(
     root: *offline_root.Root,
     release_name: []const u8,
 ) !void {
-    const config_path = try std.fmt.allocPrint(allocator, "/boot/config-{s}", .{release_name});
+    const config_path = try allocator.print("/boot/config-{s}", .{release_name});
     defer allocator.free(config_path);
     const config = try root.readFile(config_path);
     defer allocator.free(config);
@@ -3018,7 +3012,7 @@ fn customizeOfflineRoot(
 
     const modules_path = try kernelModulesPath(allocator, &root, release_name);
     defer allocator.free(modules_path);
-    const initrd_path = try std.fmt.allocPrint(allocator, "/boot/initrd.img-{s}", .{release_name});
+    const initrd_path = try allocator.print("/boot/initrd.img-{s}", .{release_name});
     defer allocator.free(initrd_path);
     const full_cleanup_patterns = [_][]const u8{
         "/etc/ssh/ssh_host_*", "/var/lib/cloud/*",   "/var/lib/waagent/*",
@@ -3050,7 +3044,7 @@ fn customizeOfflineRoot(
     var lock_hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(lock, &lock_hash, .{});
     const lock_sha256 = artifact_pipeline.formatSha256(lock_hash);
-    const kernel_path = try std.fmt.allocPrint(allocator, "/boot/vmlinuz-{s}", .{release_name});
+    const kernel_path = try allocator.print("/boot/vmlinuz-{s}", .{release_name});
     defer allocator.free(kernel_path);
     // Structural evidence only: this records that the required kernel config
     // lines were present and that the packaged module carries a signature
@@ -3243,7 +3237,7 @@ fn injectCoreGuest(
     try filesystem.write("/usr/sbin/mizinit", mizinit_bytes, .{ .mode = 0o755 });
     try filesystem.write("/usr/sbin/azagent", azagent_bytes, .{ .mode = 0o755 });
     for (&[_][]const u8{ "init", "poweroff", "reboot", "shutdown" }) |name| {
-        const path = try std.fmt.allocPrint(allocator, "/usr/sbin/{s}", .{name});
+        const path = try allocator.print("/usr/sbin/{s}", .{name});
         defer allocator.free(path);
         try filesystem.symlink(path, "mizinit", .{ .mode = 0o777 });
     }
@@ -3257,8 +3251,7 @@ fn injectCoreGuest(
 
     for (evidence) |item| {
         for ([_][]const u8{ item.lock_path, item.provenance_path }) |source| {
-            const destination = try std.fmt.allocPrint(
-                allocator,
+            const destination = try allocator.print(
                 "/var/lib/miz/provenance/{s}",
                 .{std.fs.path.basename(source)},
             );
@@ -3272,8 +3265,7 @@ fn injectCoreGuest(
     if (stage) |built| {
         for (built.evidence[0..built.evidence_count]) |item| {
             for ([_][]const u8{ item.lock_path, item.provenance_path }) |source| {
-                const destination = try std.fmt.allocPrint(
-                    allocator,
+                const destination = try allocator.print(
                     "/var/lib/miz/provenance/{s}",
                     .{std.fs.path.basename(source)},
                 );
@@ -3283,8 +3275,7 @@ fn injectCoreGuest(
         }
     }
     if (plan.kernel) |selection| {
-        const destination = try std.fmt.allocPrint(
-            allocator,
+        const destination = try allocator.print(
             "/var/lib/miz/provenance/{s}",
             .{selection.lock_filename},
         );
@@ -3474,7 +3465,7 @@ fn validateCoreRoot(
     defer allocator.free(sbin);
     if (!std.mem.eql(u8, sbin, "usr/sbin")) return error.InvalidUsrMerge;
     for (&[_][]const u8{ "init", "poweroff", "reboot", "shutdown" }) |name| {
-        const path = try std.fmt.allocPrint(allocator, "/usr/sbin/{s}", .{name});
+        const path = try allocator.print("/usr/sbin/{s}", .{name});
         defer allocator.free(path);
         const target = try filesystem.readLink(allocator, path, 1024);
         defer allocator.free(target);
@@ -3561,8 +3552,7 @@ fn validateCoreRoot(
     );
 
     for (evidence) |item| {
-        const embedded_lock_path = try std.fmt.allocPrint(
-            allocator,
+        const embedded_lock_path = try allocator.print(
             "/var/lib/miz/provenance/{s}",
             .{std.fs.path.basename(item.lock_path)},
         );
@@ -3578,8 +3568,7 @@ fn validateCoreRoot(
             &item.lock_sha256,
         )) return error.EmbeddedProvenanceMismatch;
 
-        const embedded_provenance_path = try std.fmt.allocPrint(
-            allocator,
+        const embedded_provenance_path = try allocator.print(
             "/var/lib/miz/provenance/{s}",
             .{std.fs.path.basename(item.provenance_path)},
         );
@@ -3628,8 +3617,7 @@ fn requireEmbeddedProvenance(
     host_path: []const u8,
     expected: [64]u8,
 ) !void {
-    const embedded_path = try std.fmt.allocPrint(
-        allocator,
+    const embedded_path = try allocator.print(
         "/var/lib/miz/provenance/{s}",
         .{std.fs.path.basename(host_path)},
     );
@@ -3781,16 +3769,14 @@ const DebzContext = struct {
     offline: bool,
 
     fn lockFilename(self: DebzContext, package: []const u8) ![]u8 {
-        return std.fmt.allocPrint(
-            self.allocator,
+        return self.allocator.print(
             "debz-exact-lock-{s}-{s}.json",
             .{ package, self.profile.ubuntu_architecture },
         );
     }
 
     fn provenanceFilename(self: DebzContext, package: []const u8) ![]u8 {
-        return std.fmt.allocPrint(
-            self.allocator,
+        return self.allocator.print(
             "debz-transaction-provenance-{s}-{s}.json",
             .{ package, self.profile.ubuntu_architecture },
         );
@@ -3818,8 +3804,7 @@ fn createDebzTransactionDir(
 ) !DebzTransactionDir {
     const allocator = context.allocator;
     const io = context.io;
-    const directory = try std.fmt.allocPrint(
-        allocator,
+    const directory = try allocator.print(
         "{s}/debz-{s}",
         .{ context.work_dir, package },
     );
@@ -3954,7 +3939,7 @@ fn runDebzTransaction(
     try Dir.cwd().deleteTree(io, stage);
     try Dir.cwd().deleteTree(io, published);
     try Dir.cwd().createDirPath(io, stage);
-    const current_contents = try std.fmt.allocPrint(allocator, "{s}/.", .{current});
+    const current_contents = try allocator.print("{s}/.", .{current});
     defer allocator.free(current_contents);
     const restricted_permissions = try copyRootStage(allocator, io, current, current_contents, stage);
     const absolute_stage = try Dir.cwd().realPathFileAlloc(io, stage, allocator);
@@ -4180,37 +4165,36 @@ fn buildInitramfsStage(
     kernel_release: []const u8,
     build_roots: []const []const u8,
 ) !InitramfsStage {
+    var phase_error: anyerror = undefined;
     const allocator = context.allocator;
     const io = context.io;
     var stage_timing = timing.begin(.debz_transaction, "initramfs-build-stage");
     defer stage_timing.end();
-    errdefer |err| stage_timing.fail(@errorName(err));
+    errdefer stage_timing.fail(@errorName(phase_error));
 
-    if (build_roots.len == 0) return error.InitramfsBuildStageEmpty;
+    if (build_roots.len == 0) return phaseError(&phase_error, error.InitramfsBuildStageEmpty);
 
     var evidence: [max_debz_packages]DebzEvidence = undefined;
     var evidence_count: usize = 0;
     errdefer for (evidence[0..evidence_count]) |*item| item.deinit(allocator);
 
-    var current = try allocator.dupe(u8, guest_root);
+    var current = allocator.dupe(u8, guest_root) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(current);
     for (build_roots, 0..) |package, index| {
-        const stage = try std.fmt.allocPrint(
-            allocator,
+        const stage = allocator.print(
             "{s}/root-stage-build-{d}",
             .{ context.work_dir, index },
-        );
+        ) catch |err| return phaseError(&phase_error, err);
         defer allocator.free(stage);
-        const published = try std.fmt.allocPrint(
-            allocator,
+        const published = allocator.print(
             "{s}/root-build-{d}",
             .{ context.work_dir, index },
-        );
+        ) catch |err| return phaseError(&phase_error, err);
         defer allocator.free(published);
         // `.require_locked` because the stage starts from the finished guest
         // closure: a build stage whose baseline was empty would have generated
         // an initramfs against no kernel at all.
-        const next = try runDebzTransaction(
+        const next = runDebzTransaction(
             context,
             package,
             current,
@@ -4219,35 +4203,35 @@ fn buildInitramfsStage(
             .require_locked,
             .customize,
             &evidence[index],
-        );
+        ) catch |err| return phaseError(&phase_error, err);
         evidence_count += 1;
         allocator.free(current);
         current = next;
     }
 
-    var root = try offline_root.Root.init(allocator, io, current, .{});
+    var root = offline_root.Root.init(allocator, io, current, .{}) catch |err| return phaseError(&phase_error, err);
     defer root.deinit();
-    var executor = try offline_root.Executor.init(allocator, io, .{
+    var executor = offline_root.Executor.init(allocator, io, .{
         .root = &root,
         .architecture = switch (context.profile.architecture) {
             .x86_64 => .x86_64,
             .aarch64 => .aarch64,
         },
         .timeout_ms = 30 * 60 * 1000,
-    });
+    }) catch |err| return phaseError(&phase_error, err);
     defer executor.deinit();
 
     // The generation inputs belong to the stage, not to the appliance: the
     // guest has no generator to read them and no reason to carry them.
     switch (flavor) {
-        .core => try root.apply(&.{
+        .core => (root.apply(&.{
             .{ .create_directory = .{ .path = "/etc/initramfs-tools", .mode = 0o755 } },
             .{ .write_file = .{
                 .path = "/etc/initramfs-tools/modules",
                 .source = .{ .inline_bytes = core_initramfs_modules },
             } },
-        }),
-        .baremetal => try root.apply(&.{
+        }) catch |err| return phaseError(&phase_error, err)),
+        .baremetal => (root.apply(&.{
             .{ .create_directory = .{ .path = "/etc/initramfs-tools", .mode = 0o755 } },
             .{ .write_file = .{
                 .path = "/etc/initramfs-tools/initramfs.conf",
@@ -4257,35 +4241,33 @@ fn buildInitramfsStage(
                 .path = "/etc/initramfs-tools/modules",
                 .source = .{ .inline_bytes = baremetal_initramfs_modules },
             } },
-        }),
-        .full => return error.InitramfsBuildStageEmpty,
+        }) catch |err| return phaseError(&phase_error, err)),
+        .full => return phaseError(&phase_error, error.InitramfsBuildStageEmpty),
     }
-    try requireRootFile(&root, "/etc/initramfs-tools/initramfs.conf");
-    try requireRootFile(&root, "/usr/sbin/update-initramfs");
+    requireRootFile(&root, "/etc/initramfs-tools/initramfs.conf") catch |err| return phaseError(&phase_error, err);
+    requireRootFile(&root, "/usr/sbin/update-initramfs") catch |err| return phaseError(&phase_error, err);
 
     // The module tree the generator reads has to be the guest's own, or the
     // initramfs would describe a kernel the image does not boot.
-    try validateKernelModuleArtifacts(allocator, &root, kernel_release);
-    var generated = try runOfflineCommand(&executor, .{ .update_initramfs = kernel_release });
+    validateKernelModuleArtifacts(allocator, &root, kernel_release) catch |err| return phaseError(&phase_error, err);
+    var generated = runOfflineCommand(&executor, .{ .update_initramfs = kernel_release }) catch |err| return phaseError(&phase_error, err);
     defer generated.deinit(allocator);
-    try validateInitramfs(allocator, &root, kernel_release);
+    validateInitramfs(allocator, &root, kernel_release) catch |err| return phaseError(&phase_error, err);
 
-    const guest_path = try std.fmt.allocPrint(
-        allocator,
+    const guest_path = allocator.print(
         "/boot/initrd.img-{s}",
         .{kernel_release},
-    );
+    ) catch |err| return phaseError(&phase_error, err);
     errdefer allocator.free(guest_path);
-    const host_path = try std.fmt.allocPrint(
-        allocator,
+    const host_path = allocator.print(
         "{s}/initrd.img-{s}",
         .{ context.work_dir, kernel_release },
-    );
+    ) catch |err| return phaseError(&phase_error, err);
     errdefer allocator.free(host_path);
-    try root.extract(guest_path, host_path);
-    const metadata = try artifact_pipeline.hashFile(io, host_path);
-    const stat = try Dir.cwd().statFile(io, host_path, .{ .follow_symlinks = false });
-    if (stat.size == 0) return error.InitramfsMissing;
+    root.extract(guest_path, host_path) catch |err| return phaseError(&phase_error, err);
+    const metadata = artifact_pipeline.hashFile(io, host_path) catch |err| return phaseError(&phase_error, err);
+    const stat = Dir.cwd().statFile(io, host_path, .{ .follow_symlinks = false }) catch |err| return phaseError(&phase_error, err);
+    if (stat.size == 0) return phaseError(&phase_error, error.InitramfsMissing);
 
     stage_timing.succeed();
     return .{
@@ -4293,10 +4275,16 @@ fn buildInitramfsStage(
         .sha256 = artifact_pipeline.formatSha256(metadata.sha256),
         .bytes = stat.size,
         .guest_path = guest_path,
-        .kernel_release = try allocator.dupe(u8, kernel_release),
+        .kernel_release = (allocator.dupe(u8, kernel_release) catch |err| return phaseError(&phase_error, err)),
         .evidence = evidence,
         .evidence_count = evidence_count,
     };
+}
+
+// Record the escaping error before plain errdefer runs the nested timing scopes.
+fn phaseError(failure: *anyerror, err: anyerror) anyerror {
+    failure.* = err;
+    return err;
 }
 
 /// Fails unless `path` is a regular file in the offline root.
@@ -4327,61 +4315,62 @@ fn customizeRootWithDebz(
     offline: bool,
     authorized_key: ?[]const u8,
 ) !DebzCustomization {
+    var phase_error: anyerror = undefined;
     var debz_aggregate = timing.begin(.debz_aggregate, null);
     defer debz_aggregate.end();
-    errdefer |err| debz_aggregate.fail(@errorName(err));
+    errdefer debz_aggregate.fail(@errorName(phase_error));
 
-    const extraction = try std.fs.path.join(allocator, &.{ work_dir, "official-root" });
+    const extraction = std.fs.path.join(allocator, &.{ work_dir, "official-root" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(extraction);
-    try Dir.cwd().deleteTree(io, extraction);
-    try Dir.cwd().createDirPath(io, extraction);
-    var native_root = try openNativeRoot(allocator, io, mutable_image, work_dir);
+    Dir.cwd().deleteTree(io, extraction) catch |err| return phaseError(&phase_error, err);
+    Dir.cwd().createDirPath(io, extraction) catch |err| return phaseError(&phase_error, err);
+    var native_root = openNativeRoot(allocator, io, mutable_image, work_dir) catch |err| return phaseError(&phase_error, err);
     defer native_root.deinit();
     var host_manifest = miz.ext4_mountless.HostTreeManifest.init(allocator);
     defer host_manifest.deinit();
-    try native_root.filesystem.validateCommitProfile();
-    try native_root.filesystem.exportHostTreeWithManifest(extraction, .{}, &host_manifest);
+    native_root.filesystem.validateCommitProfile() catch |err| return phaseError(&phase_error, err);
+    native_root.filesystem.exportHostTreeWithManifest(extraction, .{}, &host_manifest) catch |err| return phaseError(&phase_error, err);
 
-    const direct_etc = try std.fs.path.join(allocator, &.{ extraction, "etc" });
+    const direct_etc = std.fs.path.join(allocator, &.{ extraction, "etc" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(direct_etc);
-    const nested_root = try std.fs.path.join(allocator, &.{ extraction, "root" });
+    const nested_root = std.fs.path.join(allocator, &.{ extraction, "root" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(nested_root);
-    const nested_etc = try std.fs.path.join(allocator, &.{ nested_root, "etc" });
+    const nested_etc = std.fs.path.join(allocator, &.{ nested_root, "etc" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(nested_etc);
     var current = if (Dir.cwd().statFile(io, direct_etc, .{})) |_|
-        try allocator.dupe(u8, extraction)
+        (allocator.dupe(u8, extraction) catch |err| return phaseError(&phase_error, err))
     else |_| if (Dir.cwd().statFile(io, nested_etc, .{})) |_|
-        try allocator.dupe(u8, nested_root)
+        (allocator.dupe(u8, nested_root) catch |err| return phaseError(&phase_error, err))
     else |_|
-        return error.OfficialRootExtractionFailed;
+        return phaseError(&phase_error, error.OfficialRootExtractionFailed);
     errdefer allocator.free(current);
 
     const repository_input_dir = debz_input_dir orelse work_dir;
-    try Dir.cwd().createDirPath(io, repository_input_dir);
-    const repository_input_stat = try Dir.cwd().statFile(io, repository_input_dir, .{ .follow_symlinks = false });
-    if (repository_input_stat.kind != .directory) return error.DebzInputDirNotDirectory;
-    const absolute_repository_input_dir = try Dir.cwd().realPathFileAlloc(io, repository_input_dir, allocator);
+    Dir.cwd().createDirPath(io, repository_input_dir) catch |err| return phaseError(&phase_error, err);
+    const repository_input_stat = Dir.cwd().statFile(io, repository_input_dir, .{ .follow_symlinks = false }) catch |err| return phaseError(&phase_error, err);
+    if (repository_input_stat.kind != .directory) return phaseError(&phase_error, error.DebzInputDirNotDirectory);
+    const absolute_repository_input_dir = Dir.cwd().realPathFileAlloc(io, repository_input_dir, allocator) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(absolute_repository_input_dir);
 
-    const trusted_keyring = try std.fs.path.join(allocator, &.{ current, "usr/share/keyrings/ubuntu-archive-keyring.gpg" });
+    const trusted_keyring = std.fs.path.join(allocator, &.{ current, "usr/share/keyrings/ubuntu-archive-keyring.gpg" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(trusted_keyring);
-    const external_keyring = try std.fs.path.join(allocator, &.{ absolute_repository_input_dir, "ubuntu-archive-keyring.gpg" });
+    const external_keyring = std.fs.path.join(allocator, &.{ absolute_repository_input_dir, "ubuntu-archive-keyring.gpg" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(external_keyring);
-    var trusted = try materializeTrustedKeyring(allocator, io, trusted_keyring, external_keyring);
+    var trusted = materializeTrustedKeyring(allocator, io, trusted_keyring, external_keyring) catch |err| return phaseError(&phase_error, err);
     defer trusted.deinit(allocator);
     const absolute_keyring = trusted.path;
     if (flavor.freshRoot()) {
-        try Dir.cwd().deleteTree(io, current);
-        try Dir.cwd().createDirPath(io, current);
+        Dir.cwd().deleteTree(io, current) catch |err| return phaseError(&phase_error, err);
+        Dir.cwd().createDirPath(io, current) catch |err| return phaseError(&phase_error, err);
     }
     for (&[_][]const u8{ "dev", "proc", "run", "sys" }) |name| {
-        const mountpoint = try std.fs.path.join(allocator, &.{ current, name });
+        const mountpoint = std.fs.path.join(allocator, &.{ current, name }) catch |err| return phaseError(&phase_error, err);
         defer allocator.free(mountpoint);
-        try Dir.cwd().createDirPath(io, mountpoint);
+        Dir.cwd().createDirPath(io, mountpoint) catch |err| return phaseError(&phase_error, err);
     }
-    const source_path = try std.fs.path.join(allocator, &.{ absolute_repository_input_dir, "ubuntu-snapshot.sources" });
+    const source_path = std.fs.path.join(allocator, &.{ absolute_repository_input_dir, "ubuntu-snapshot.sources" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(source_path);
-    const source_document = try std.fmt.allocPrint(allocator,
+    const source_document = allocator.print(
         \\Types: deb
         \\URIs: {s}
         \\Suites: resolute resolute-updates resolute-security
@@ -4389,20 +4378,20 @@ fn customizeRootWithDebz(
         \\Architectures: {s}
         \\Signed-By: {s}
         \\
-    , .{ snapshot_base, profile.ubuntu_architecture, absolute_keyring });
+    , .{ snapshot_base, profile.ubuntu_architecture, absolute_keyring }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(source_document);
-    try Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = source_document });
-    const absolute_source = try Dir.cwd().realPathFileAlloc(io, source_path, allocator);
+    Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = source_document }) catch |err| return phaseError(&phase_error, err);
+    const absolute_source = Dir.cwd().realPathFileAlloc(io, source_path, allocator) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(absolute_source);
-    const source_config_path = try std.fs.path.join(allocator, &.{ absolute_repository_input_dir, "ubuntu-snapshot.json" });
+    const source_config_path = std.fs.path.join(allocator, &.{ absolute_repository_input_dir, "ubuntu-snapshot.json" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(source_config_path);
-    const source_config = try std.json.Stringify.valueAlloc(allocator, .{
+    const source_config = std.json.Stringify.valueAlloc(allocator, .{
         .source_path = absolute_source,
         .immutable = true,
-    }, .{});
+    }, .{}) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(source_config);
-    try Dir.cwd().writeFile(io, .{ .sub_path = source_config_path, .data = source_config });
-    const absolute_source_config = try Dir.cwd().realPathFileAlloc(io, source_config_path, allocator);
+    Dir.cwd().writeFile(io, .{ .sub_path = source_config_path, .data = source_config }) catch |err| return phaseError(&phase_error, err);
+    const absolute_source_config = Dir.cwd().realPathFileAlloc(io, source_config_path, allocator) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(absolute_source_config);
 
     // Caller-owned single-element input slices. Their storage outlives every
@@ -4419,21 +4408,21 @@ fn customizeRootWithDebz(
     // admin state, not content, and reusing it across transactions would carry
     // one stage's installed baseline into the next.
     const shared_cache = if (debz_cache) |path|
-        try allocator.dupe(u8, path)
+        (allocator.dupe(u8, path) catch |err| return phaseError(&phase_error, err))
     else
-        try std.fs.path.join(allocator, &.{ work_dir, "debz-cache" });
+        std.fs.path.join(allocator, &.{ work_dir, "debz-cache" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(shared_cache);
     if (offline) {
-        const cache_stat = Dir.cwd().statFile(io, shared_cache, .{ .follow_symlinks = false }) catch |err| return switch (err) {
+        const cache_stat = Dir.cwd().statFile(io, shared_cache, .{ .follow_symlinks = false }) catch |err| return phaseError(&phase_error, switch (err) {
             error.FileNotFound => error.DebzOfflineCacheMissing,
             else => err,
-        };
-        if (cache_stat.kind != .directory) return error.DebzOfflineCacheNotDirectory;
+        });
+        if (cache_stat.kind != .directory) return phaseError(&phase_error, error.DebzOfflineCacheNotDirectory);
     } else {
-        try Dir.cwd().createDirPath(io, shared_cache);
+        Dir.cwd().createDirPath(io, shared_cache) catch |err| return phaseError(&phase_error, err);
     }
-    try cleanupSharedDebzCacheStaging(io, shared_cache);
-    const absolute_cache = try Dir.cwd().realPathFileAlloc(io, shared_cache, allocator);
+    cleanupSharedDebzCacheStaging(io, shared_cache) catch |err| return phaseError(&phase_error, err);
+    const absolute_cache = Dir.cwd().realPathFileAlloc(io, shared_cache, allocator) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(absolute_cache);
 
     const debz_context: DebzContext = .{
@@ -4453,9 +4442,9 @@ fn customizeRootWithDebz(
     // Issue #677 step 4: which roots the guest installs is decided before any
     // of them is installed, because for `core` the kernel roots are selected
     // from a metapackage rather than written down.
-    const absolute_empty_root = try Dir.cwd().realPathFileAlloc(io, current, allocator);
+    const absolute_empty_root = Dir.cwd().realPathFileAlloc(io, current, allocator) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(absolute_empty_root);
-    var plan = try planRoots(debz_context, flavor, absolute_empty_root);
+    var plan = planRoots(debz_context, flavor, absolute_empty_root) catch |err| return phaseError(&phase_error, err);
     var plan_transferred = false;
     defer if (!plan_transferred) plan.deinit();
     const debz_packages: []const []const u8 = plan.guest;
@@ -4469,17 +4458,17 @@ fn customizeRootWithDebz(
     for (debz_packages, 0..) |package, index| {
         var debz_transaction = timing.begin(.debz_transaction, package);
         defer debz_transaction.end();
-        errdefer |err| debz_transaction.fail(@errorName(err));
+        errdefer debz_transaction.fail(@errorName(phase_error));
 
         const installed_baseline: package_family.InstalledBaselinePolicy =
             if (flavor.freshRoot() and index == 0) .none else .require_locked;
         const apply_operation: package_family.Operation =
             if (flavor.freshRoot() and index == 0) .create else .customize;
-        const stage = try std.fmt.allocPrint(allocator, "{s}/root-stage-{d}", .{ work_dir, index });
+        const stage = allocator.print("{s}/root-stage-{d}", .{ work_dir, index }) catch |err| return phaseError(&phase_error, err);
         defer allocator.free(stage);
-        const published = try std.fmt.allocPrint(allocator, "{s}/root-debz-{d}", .{ work_dir, index });
+        const published = allocator.print("{s}/root-debz-{d}", .{ work_dir, index }) catch |err| return phaseError(&phase_error, err);
         defer allocator.free(published);
-        const next = try runDebzTransaction(
+        const next = runDebzTransaction(
             debz_context,
             package,
             current,
@@ -4488,20 +4477,20 @@ fn customizeRootWithDebz(
             installed_baseline,
             apply_operation,
             &evidence[index],
-        );
+        ) catch |err| return phaseError(&phase_error, err);
         evidence_count += 1;
         allocator.free(current);
         current = next;
         debz_transaction.succeed();
     }
 
-    try assertTrustedKeyringUnchanged(io, trusted);
+    assertTrustedKeyringUnchanged(io, trusted) catch |err| return phaseError(&phase_error, err);
     debz_aggregate.succeed();
 
     var initramfs_import = timing.begin(.initramfs_ext4_import, null);
     defer initramfs_import.end();
-    errdefer |err| initramfs_import.fail(@errorName(err));
-    var customization = try customizeOfflineRoot(
+    errdefer initramfs_import.fail(@errorName(phase_error));
+    var customization = customizeOfflineRoot(
         allocator,
         io,
         profile,
@@ -4511,7 +4500,7 @@ fn customizeRootWithDebz(
         timing,
         if (flavor.freshRoot()) debz_context else null,
         plan.build,
-    );
+    ) catch |err| return phaseError(&phase_error, err);
     var stage_transferred = false;
     defer {
         allocator.free(customization.release_name);
@@ -4520,28 +4509,28 @@ fn customizeRootWithDebz(
         }
     }
     const release_name = customization.release_name;
-    try native_root.filesystem.importHostTreeWithManifest(current, .{}, &host_manifest);
+    native_root.filesystem.importHostTreeWithManifest(current, .{}, &host_manifest) catch |err| return phaseError(&phase_error, err);
     if (flavor == .full) {
-        try native_root.filesystem.applyCustomization(.{
+        native_root.filesystem.applyCustomization(.{
             .services = &full_service_policy,
-        }, 0);
+        }, 0) catch |err| return phaseError(&phase_error, err);
     } else {
-        try native_root.filesystem.applyCustomization(.{
+        native_root.filesystem.applyCustomization(.{
             .services = &.{
                 .{ .name = "ssh.service", .state = .disabled },
             },
-        }, 0);
+        }, 0) catch |err| return phaseError(&phase_error, err);
         for (&[_][]const u8{
             "/etc/systemd/system/ssh.service",
             "/etc/systemd/system/multi-user.target.wants/ssh.service",
             "/etc/systemd/system/sockets.target.wants/ssh.socket",
-        }) |path| try removeIfPresent(&native_root.filesystem, path);
+        }) |path| (removeIfPresent(&native_root.filesystem, path) catch |err| return phaseError(&phase_error, err));
     }
-    try native_root.filesystem.generalize(generalizationPolicy(flavor));
+    native_root.filesystem.generalize(generalizationPolicy(flavor)) catch |err| return phaseError(&phase_error, err);
     // After generalization, which is what removes accounts: an administrator
     // created before it would be taken straight back out again.
     if (authorized_key) |key| {
-        try native_root.filesystem.applyCustomization(.{
+        native_root.filesystem.applyCustomization(.{
             .users = &.{.{
                 .name = baremetal_admin_user,
                 .shell = "/bin/bash",
@@ -4549,12 +4538,12 @@ fn customizeRootWithDebz(
                 .ssh_authorized_keys = &.{key},
                 .passwordless_sudo = true,
             }},
-        }, 0);
+        }, 0) catch |err| return phaseError(&phase_error, err);
     }
     if (flavor.freshRoot()) {
-        const mizinit = mizinit_path orelse return error.CoreGuestArtifactsRequired;
-        const azagent = azagent_path orelse return error.CoreGuestArtifactsRequired;
-        try injectCoreGuest(
+        const mizinit = mizinit_path orelse return phaseError(&phase_error, error.CoreGuestArtifactsRequired);
+        const azagent = azagent_path orelse return phaseError(&phase_error, error.CoreGuestArtifactsRequired);
+        injectCoreGuest(
             allocator,
             io,
             &native_root.filesystem,
@@ -4564,8 +4553,8 @@ fn customizeRootWithDebz(
             &plan,
             evidence[0..evidence_count],
             if (customization.stage) |*built| built else null,
-        );
-        try validateCoreRoot(
+        ) catch |err| return phaseError(&phase_error, err);
+        validateCoreRoot(
             allocator,
             io,
             &native_root.filesystem,
@@ -4574,42 +4563,42 @@ fn customizeRootWithDebz(
             &plan,
             evidence[0..evidence_count],
             if (customization.stage) |*built| built else null,
-        );
+        ) catch |err| return phaseError(&phase_error, err);
     } else {
-        try validateFullUdisks2Policy(allocator, &native_root.filesystem);
+        validateFullUdisks2Policy(allocator, &native_root.filesystem) catch |err| return phaseError(&phase_error, err);
     }
     if (native_root.filesystem.stat("/home/ubuntu")) |_| {
-        return error.UserCleanupIncomplete;
+        return phaseError(&phase_error, error.UserCleanupIncomplete);
     } else |err| switch (err) {
         error.PathNotFound => {},
-        else => return error.UserCleanupIncomplete,
+        else => return phaseError(&phase_error, error.UserCleanupIncomplete),
     }
     if (profile.architecture == .aarch64 and flavor == .full) {
-        try retireArm64BootMounts(allocator, &native_root.filesystem);
+        retireArm64BootMounts(allocator, &native_root.filesystem) catch |err| return phaseError(&phase_error, err);
     }
     // The injected entries borrow paths from the filesystem view, so they are
     // copied into an arena that outlives the walk and is released with it.
     var injected_arena: std.heap.ArenaAllocator = .init(allocator);
     defer injected_arena.deinit();
     var injected: std.ArrayList(size_inventory.InjectedEntry) = .empty;
-    try collectInjectedInventory(
+    collectInjectedInventory(
         injected_arena.allocator(),
         &native_root.filesystem,
         &injected,
-    );
-    const filesystem_info = try native_root.finish();
+    ) catch |err| return phaseError(&phase_error, err);
+    const filesystem_info = native_root.finish() catch |err| return phaseError(&phase_error, err);
     const root_free_bytes = @as(u64, filesystem_info.free_block_count) * 4096;
-    try validateRootHeadroom(flavor, root_free_bytes, filesystem_info.free_inode_count, null);
+    validateRootHeadroom(flavor, root_free_bytes, filesystem_info.free_inode_count, null) catch |err| return phaseError(&phase_error, err);
 
     // Measured now, while the root is still a walkable host tree: once it is
     // an image, per-package attribution would have to be reconstructed rather
     // than observed.
-    var inventory = try size_inventory.Report.init(
+    var inventory = size_inventory.Report.init(
         allocator,
         inventoryIdentity(profile, flavor),
-    );
+    ) catch |err| return phaseError(&phase_error, err);
     errdefer inventory.deinit();
-    try recordRootBuildInventory(
+    recordRootBuildInventory(
         allocator,
         io,
         &inventory,
@@ -4632,7 +4621,7 @@ fn customizeRootWithDebz(
             // shipping and being argued about later.
             .require_absent_content = flavor.freshRoot(),
         },
-    );
+    ) catch |err| return phaseError(&phase_error, err);
     initramfs_import.succeed();
     plan_transferred = true;
     stage_transferred = true;
@@ -4781,8 +4770,7 @@ fn writeSizeInventory(
     profile: *const Profile,
     flavor: Flavor,
 ) !InventoryBinding {
-    const filename = try std.fmt.allocPrint(
-        allocator,
+    const filename = try allocator.print(
         "ubuntu2604-size-inventory-{s}-{s}.json",
         .{ @tagName(flavor), @tagName(profile.architecture) },
     );
@@ -4809,8 +4797,7 @@ fn writeRuntimeContract(
     profile: *const Profile,
     flavor: Flavor,
 ) !InventoryBinding {
-    const filename = try std.fmt.allocPrint(
-        allocator,
+    const filename = try allocator.print(
         "ubuntu2604-runtime-contract-{s}-{s}.json",
         .{ @tagName(flavor), @tagName(profile.architecture) },
     );
@@ -4966,7 +4953,7 @@ fn writeProvenance(
     inventory: InventoryBinding,
 ) !void {
     if (evidence.len != full_debz_packages.len) return error.InvalidDebzEvidence;
-    const document = try std.fmt.allocPrint(allocator,
+    const document = try allocator.print(
         \\{{"schema":1,"type":"miz-ubuntu2604-build-provenance","architecture":"{s}","release":"26.04","size_inventory":{{"filename":"{s}","sha256":"{s}"}},"snapshot":{{"id":"release-{s}","base_url":"{s}/"}},"canonical_key_fingerprint":"{s}","sha256sums_signature_verified":true,"artifacts":{{"sha256sums":{{"filename":"SHA256SUMS","sha256":"{s}"}},"sha256sums_signature":{{"filename":"SHA256SUMS.gpg","sha256":"{s}"}},"source_image":{{"filename":"{s}","sha256":"{s}"}},"image_manifest":{{"filename":"{s}","sha256":"{s}"}}}},"disk_layout":{s},"debz":{{"api_commit":"{s}","baseline":{{"source":"canonical-image-dpkg-status","enforcement":"exact-final-closure"}},"transactions":[{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}},{{"package":"{s}","exact_lock":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}"}},"transaction_provenance":{{"filename":"{s}","sha256":"{s}","digest_sha256":"{s}","lock_sha256":"{s}"}}}}]}}}}
         \\
     , .{
@@ -5213,7 +5200,7 @@ fn writeSigningProvenance(
     const signed_hex = artifact_pipeline.formatSha256(signed.signed_sha256);
     const operation_id: ?[]const u8 = if (metadata) |value| value.operation_id else null;
     const signing_fingerprint: ?[]const u8 = if (metadata != null) &provider_fingerprint else null;
-    const fallback_path = try std.fmt.allocPrint(allocator, "EFI/BOOT/{s}", .{profile.efi_fallback});
+    const fallback_path = try allocator.print("EFI/BOOT/{s}", .{profile.efi_fallback});
     defer allocator.free(fallback_path);
     const Record = struct {
         path: []const u8,
@@ -5261,8 +5248,7 @@ fn writeSigningProvenance(
     };
     const json = try std.json.Stringify.valueAlloc(allocator, document, .{ .whitespace = .indent_2 });
     defer allocator.free(json);
-    const filename = try std.fmt.allocPrint(
-        allocator,
+    const filename = try allocator.print(
         "uki-signing-{s}-{s}.json",
         .{ @tagName(flavor), @tagName(profile.architecture) },
     );
@@ -5317,9 +5303,9 @@ fn extractNativeBootInputs(
 
     try Dir.cwd().deleteTree(io, extract_dir);
     try Dir.cwd().createDirPath(io, extract_dir);
-    const kernel_guest = try std.fmt.allocPrint(allocator, "/boot/vmlinuz-{s}", .{kernel_release});
+    const kernel_guest = try allocator.print("/boot/vmlinuz-{s}", .{kernel_release});
     defer allocator.free(kernel_guest);
-    const initrd_guest = try std.fmt.allocPrint(allocator, "/boot/initrd.img-{s}", .{kernel_release});
+    const initrd_guest = try allocator.print("/boot/initrd.img-{s}", .{kernel_release});
     defer allocator.free(initrd_guest);
     const kernel = try native_root.filesystem.read(allocator, kernel_guest, 256 * 1024 * 1024);
     defer allocator.free(kernel);
@@ -5331,9 +5317,9 @@ fn extractNativeBootInputs(
         try requireInitramfsModules(allocator, initrd, &core_required_initramfs_modules);
     const os_release = try native_root.filesystem.read(allocator, "/usr/lib/os-release", 64 * 1024);
     defer allocator.free(os_release);
-    const kernel_host = try std.fmt.allocPrint(allocator, "{s}/vmlinuz-{s}", .{ extract_dir, kernel_release });
+    const kernel_host = try allocator.print("{s}/vmlinuz-{s}", .{ extract_dir, kernel_release });
     defer allocator.free(kernel_host);
-    const initrd_host = try std.fmt.allocPrint(allocator, "{s}/initrd.img-{s}", .{ extract_dir, kernel_release });
+    const initrd_host = try allocator.print("{s}/initrd.img-{s}", .{ extract_dir, kernel_release });
     defer allocator.free(initrd_host);
     const os_release_host = try std.fs.path.join(allocator, &.{ extract_dir, "os-release" });
     defer allocator.free(os_release_host);
@@ -5459,7 +5445,7 @@ fn writeRawCopy(
     qcow2_path: []const u8,
     raw_path: []const u8,
 ) !void {
-    const staged = try std.fmt.allocPrint(allocator, "{s}.miz-raw-stage", .{raw_path});
+    const staged = try allocator.print("{s}.miz-raw-stage", .{raw_path});
     defer allocator.free(staged);
     Dir.cwd().deleteFile(io, staged) catch {};
     errdefer Dir.cwd().deleteFile(io, staged) catch {};
@@ -6274,7 +6260,7 @@ fn assembleCoreDisk(
     // policy calls for, and written from a tree that carries the one copy that
     // boots. Sizing against the volume's real metadata cost is why the length
     // comes from the FAT32 writer rather than from arithmetic here.
-    const fallback_path = try std.fmt.allocPrint(allocator, "EFI/BOOT/{s}", .{profile.efi_fallback});
+    const fallback_path = try allocator.print("EFI/BOOT/{s}", .{profile.efi_fallback});
     defer allocator.free(fallback_path);
     var esp_sizing = miz.root_tree.RootTree.initMemory(allocator, io, limits.tree());
     defer esp_sizing.deinit();
@@ -6287,8 +6273,7 @@ fn assembleCoreDisk(
     try esp_sizing.putDirectory("EFI", .{ .mode = 0o755 });
     try esp_sizing.putDirectory("EFI/BOOT", .{ .mode = 0o755 });
     for (copies, 0..) |_, index| {
-        const name = try std.fmt.allocPrint(
-            allocator,
+        const name = try allocator.print(
             "EFI/BOOT/{s}.{d}",
             .{ profile.efi_fallback, index },
         );
@@ -6495,8 +6480,7 @@ fn writeSizeBudget(
     flavor: Flavor,
 ) !InventoryBinding {
     const identity = inventoryIdentity(profile, flavor);
-    const filename = try std.fmt.allocPrint(
-        allocator,
+    const filename = try allocator.print(
         "ubuntu2604-size-budget-{s}-{s}.json",
         .{ @tagName(flavor), @tagName(profile.architecture) },
     );
@@ -6551,8 +6535,7 @@ fn writeDiskGeometry(
     flavor: Flavor,
     disk: *const CoreDisk,
 ) !InventoryBinding {
-    const filename = try std.fmt.allocPrint(
-        allocator,
+    const filename = try allocator.print(
         "ubuntu2604-disk-geometry-{s}-{s}.json",
         .{ @tagName(flavor), @tagName(profile.architecture) },
     );
@@ -6615,12 +6598,12 @@ fn insertSignedUki(
     };
     const signed = try Dir.cwd().readFileAlloc(io, signed_path, allocator, .limited(256 * 1024 * 1024));
     defer allocator.free(signed);
-    const fallback = try std.fmt.allocPrint(allocator, "EFI/BOOT/{s}", .{profile.efi_fallback});
+    const fallback = try allocator.print("EFI/BOOT/{s}", .{profile.efi_fallback});
     defer allocator.free(fallback);
     // Older images carried a duplicate under EFI/Linux. Nothing loads it -- that is the Boot Loader
     // Specification type 2 directory, which needs a boot loader to scan it, and this image ships
     // none -- and at 62 MiB the copy no longer fits beside the one that boots.
-    const stale_named = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{profile.efi_fallback});
+    const stale_named = try allocator.print("EFI/Linux/{s}", .{profile.efi_fallback});
     defer allocator.free(stale_named);
     for ([_][]const u8{ fallback, stale_named }) |path| {
         filesystem.deletePath(io, path) catch |err| switch (err) {
@@ -6757,7 +6740,7 @@ fn validateFinalNativeImage(
         .offset = esp.first_lba * miz.gpt.sector_size,
         .length = (esp.last_lba - esp.first_lba + 1) * miz.gpt.sector_size,
     });
-    const fallback = try std.fmt.allocPrint(allocator, "EFI/BOOT/{s}", .{profile.efi_fallback});
+    const fallback = try allocator.print("EFI/BOOT/{s}", .{profile.efi_fallback});
     defer allocator.free(fallback);
     const fallback_bytes = try filesystem.readFileAlloc(io, allocator, fallback);
     defer allocator.free(fallback_bytes);
@@ -6843,117 +6826,118 @@ fn buildImage(
     architecture: Architecture,
     timing: *image_phase_timing.Recorder,
 ) !void {
+    var phase_error: anyerror = undefined;
     const allocator = init.gpa;
     const io = init.io;
     const profile = profileFor(architecture);
     var input_acquisition = timing.begin(.input_acquisition, null);
     defer input_acquisition.end();
-    errdefer |err| input_acquisition.fail(@errorName(err));
+    errdefer input_acquisition.fail(@errorName(phase_error));
     const work_dir = args.work_dir orelse profile.workDirFor(args.flavor);
     const output = args.output orelse profile.outputFor(args.flavor);
-    try Dir.cwd().createDirPath(io, work_dir);
+    Dir.cwd().createDirPath(io, work_dir) catch |err| return phaseError(&phase_error, err);
     const allocated_provenance_dir = if (args.provenance_dir == null)
-        try std.fs.path.join(allocator, &.{ work_dir, "internal-provenance" })
+        (std.fs.path.join(allocator, &.{ work_dir, "internal-provenance" }) catch |err| return phaseError(&phase_error, err))
     else
         null;
     defer if (allocated_provenance_dir) |path| allocator.free(path);
     const provenance_dir = args.provenance_dir orelse allocated_provenance_dir.?;
-    try Dir.cwd().deleteTree(io, provenance_dir);
-    try Dir.cwd().createDirPath(io, provenance_dir);
+    Dir.cwd().deleteTree(io, provenance_dir) catch |err| return phaseError(&phase_error, err);
+    Dir.cwd().createDirPath(io, provenance_dir) catch |err| return phaseError(&phase_error, err);
 
     var https = if (args.proxy) |proxy|
-        try artifact_pipeline.NativeHttpsDownloader.initProxied(allocator, io, proxy)
+        (artifact_pipeline.NativeHttpsDownloader.initProxied(allocator, io, proxy) catch |err| return phaseError(&phase_error, err))
     else
         artifact_pipeline.NativeHttpsDownloader.init(allocator, io);
     defer https.deinit();
     const downloader = https.downloader();
 
-    const sums_path = try std.fs.path.join(allocator, &.{ work_dir, "SHA256SUMS" });
+    const sums_path = std.fs.path.join(allocator, &.{ work_dir, "SHA256SUMS" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(sums_path);
-    const signature_path = try std.fs.path.join(allocator, &.{ work_dir, "SHA256SUMS.gpg" });
+    const signature_path = std.fs.path.join(allocator, &.{ work_dir, "SHA256SUMS.gpg" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(signature_path);
-    try acquire(allocator, io, release_base ++ "/SHA256SUMS", sums_path, sums_sha256, sums_max_size, downloader, args.offline);
-    try acquire(allocator, io, release_base ++ "/SHA256SUMS.gpg", signature_path, sums_signature_sha256, signature_max_size, downloader, args.offline);
-    try verifyCanonicalPublication(allocator, io, sums_path, signature_path);
-    const sums = try Dir.cwd().readFileAlloc(io, sums_path, allocator, .limited(sums_max_size));
+    acquire(allocator, io, release_base ++ "/SHA256SUMS", sums_path, sums_sha256, sums_max_size, downloader, args.offline) catch |err| return phaseError(&phase_error, err);
+    acquire(allocator, io, release_base ++ "/SHA256SUMS.gpg", signature_path, sums_signature_sha256, signature_max_size, downloader, args.offline) catch |err| return phaseError(&phase_error, err);
+    verifyCanonicalPublication(allocator, io, sums_path, signature_path) catch |err| return phaseError(&phase_error, err);
+    const sums = Dir.cwd().readFileAlloc(io, sums_path, allocator, .limited(sums_max_size)) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(sums);
-    try requireSha256SumsEntry(sums, profile.source_name, profile.source_sha256);
-    try requireSha256SumsEntry(sums, profile.manifest_name, profile.manifest_sha256);
+    requireSha256SumsEntry(sums, profile.source_name, profile.source_sha256) catch |err| return phaseError(&phase_error, err);
+    requireSha256SumsEntry(sums, profile.manifest_name, profile.manifest_sha256) catch |err| return phaseError(&phase_error, err);
 
-    const manifest_path = try std.fs.path.join(allocator, &.{ work_dir, profile.manifest_name });
+    const manifest_path = std.fs.path.join(allocator, &.{ work_dir, profile.manifest_name }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(manifest_path);
-    const manifest_url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ release_base, profile.manifest_name });
+    const manifest_url = allocator.print("{s}/{s}", .{ release_base, profile.manifest_name }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(manifest_url);
-    try acquire(allocator, io, manifest_url, manifest_path, profile.manifest_sha256, manifest_max_size, downloader, args.offline);
-    const manifest = try Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(manifest_max_size));
+    acquire(allocator, io, manifest_url, manifest_path, profile.manifest_sha256, manifest_max_size, downloader, args.offline) catch |err| return phaseError(&phase_error, err);
+    const manifest = Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(manifest_max_size)) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(manifest);
-    try validateManifestRuntime(allocator, manifest, profile);
-    const provenance_sums = try std.fs.path.join(allocator, &.{ provenance_dir, "SHA256SUMS" });
+    validateManifestRuntime(allocator, manifest, profile) catch |err| return phaseError(&phase_error, err);
+    const provenance_sums = std.fs.path.join(allocator, &.{ provenance_dir, "SHA256SUMS" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(provenance_sums);
-    const provenance_signature = try std.fs.path.join(allocator, &.{ provenance_dir, "SHA256SUMS.gpg" });
+    const provenance_signature = std.fs.path.join(allocator, &.{ provenance_dir, "SHA256SUMS.gpg" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(provenance_signature);
-    const provenance_manifest = try std.fs.path.join(allocator, &.{ provenance_dir, profile.manifest_name });
+    const provenance_manifest = std.fs.path.join(allocator, &.{ provenance_dir, profile.manifest_name }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(provenance_manifest);
-    try copyBoundedFile(allocator, io, sums_path, provenance_sums, sums_max_size);
-    try copyBoundedFile(allocator, io, signature_path, provenance_signature, signature_max_size);
-    try copyBoundedFile(allocator, io, manifest_path, provenance_manifest, manifest_max_size);
+    copyBoundedFile(allocator, io, sums_path, provenance_sums, sums_max_size) catch |err| return phaseError(&phase_error, err);
+    copyBoundedFile(allocator, io, signature_path, provenance_signature, signature_max_size) catch |err| return phaseError(&phase_error, err);
+    copyBoundedFile(allocator, io, manifest_path, provenance_manifest, manifest_max_size) catch |err| return phaseError(&phase_error, err);
 
     const source_path = if (args.source) |source| source else blk: {
-        const path = try std.fs.path.join(allocator, &.{ work_dir, profile.source_name });
-        const url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ release_base, profile.source_name });
+        const path = std.fs.path.join(allocator, &.{ work_dir, profile.source_name }) catch |err| return phaseError(&phase_error, err);
+        const url = allocator.print("{s}/{s}", .{ release_base, profile.source_name }) catch |err| return phaseError(&phase_error, err);
         defer allocator.free(url);
-        try acquire(allocator, io, url, path, profile.source_sha256, source_max_size, downloader, args.offline);
+        acquire(allocator, io, url, path, profile.source_sha256, source_max_size, downloader, args.offline) catch |err| return phaseError(&phase_error, err);
         break :blk path;
     };
     defer if (args.source == null) allocator.free(source_path);
-    const source_metadata = try artifact_pipeline.hashFile(io, source_path);
-    if (!std.mem.eql(u8, &source_metadata.sha256, &(try artifact_pipeline.parseSha256(profile.source_sha256))))
-        return error.ChecksumMismatch;
+    const source_metadata = artifact_pipeline.hashFile(io, source_path) catch |err| return phaseError(&phase_error, err);
+    if (!std.mem.eql(u8, &source_metadata.sha256, &((artifact_pipeline.parseSha256(profile.source_sha256) catch |err| return phaseError(&phase_error, err)))))
+        return phaseError(&phase_error, error.ChecksumMismatch);
     if (args.preflight_only) {
         input_acquisition.succeed();
         return;
     }
 
-    const config = try signingConfig(args);
+    const config = signingConfig(args) catch |err| return phaseError(&phase_error, err);
     const authorized_key: ?[]u8 = if (args.authorized_key) |path|
-        try readAuthorizedKey(allocator, io, path)
+        (readAuthorizedKey(allocator, io, path) catch |err| return phaseError(&phase_error, err))
     else
         null;
     defer if (authorized_key) |key| allocator.free(key);
     input_acquisition.succeed();
 
-    const mutable = try std.fs.path.join(allocator, &.{ work_dir, "customized.qcow2" });
+    const mutable = std.fs.path.join(allocator, &.{ work_dir, "customized.qcow2" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(mutable);
     var source_setup = timing.begin(.source_qcow2_setup, null);
     defer source_setup.end();
-    errdefer |err| source_setup.fail(@errorName(err));
+    errdefer source_setup.fail(@errorName(phase_error));
     Dir.cwd().deleteFile(io, mutable) catch {};
-    var source_image = try miz.Image.openPathReadOnlyStandalone(io, source_path);
+    var source_image = miz.Image.openPathReadOnlyStandalone(io, source_path) catch |err| return phaseError(&phase_error, err);
     defer source_image.close(io);
     if (profile.architecture == .aarch64) {
-        try validateArm64SourceSubstrate(allocator, io, &source_image);
+        validateArm64SourceSubstrate(allocator, io, &source_image) catch |err| return phaseError(&phase_error, err);
     }
     if (args.flavor.freshRoot() and source_image.virtual_size != core_substrate_virtual_size)
-        return error.UnexpectedCoreSubstrateSize;
+        return phaseError(&phase_error, error.UnexpectedCoreSubstrateSize);
     // The staging copy is always the substrate's own size. For the flavors
     // that publish it, that is the output geometry; for core it is only where
     // the fresh root is assembled before being written onto a disk this build
     // planned.
     if (args.size) |requested| {
-        if (requested < source_image.virtual_size) return error.ImageTooSmall;
+        if (requested < source_image.virtual_size) return phaseError(&phase_error, error.ImageTooSmall);
     }
-    var mutable_image = try miz.Image.createExclusive(
+    var mutable_image = miz.Image.createExclusive(
         io,
         mutable,
         .qcow2,
         source_image.virtual_size,
         .{},
-    );
-    _ = try miz.copyAll(io, source_image, &mutable_image, allocator);
+    ) catch |err| return phaseError(&phase_error, err);
+    _ = miz.copyAll(io, source_image, &mutable_image, allocator) catch |err| return phaseError(&phase_error, err);
     mutable_image.close(io);
     if (args.size) |requested| {
         if (requested > source_image.virtual_size) {
-            _ = try miz.root_resize.growExistingQcow2(
+            _ = miz.root_resize.growExistingQcow2(
                 allocator,
                 io,
                 mutable,
@@ -6961,11 +6945,11 @@ fn buildImage(
                     .target_size = requested,
                     .filesystem_label = miz.root_resize.default_filesystem_label,
                 },
-            );
+            ) catch |err| return phaseError(&phase_error, err);
         }
     }
     source_setup.succeed();
-    var debz_customization = try customizeRootWithDebz(
+    var debz_customization = customizeRootWithDebz(
         allocator,
         io,
         timing,
@@ -6982,15 +6966,15 @@ fn buildImage(
         args.debz_lock_dir,
         args.offline,
         authorized_key,
-    );
+    ) catch |err| return phaseError(&phase_error, err);
     defer debz_customization.deinit(allocator);
 
     var uki_assembly = timing.begin(.uki_assembly, null);
     defer uki_assembly.end();
-    errdefer |err| uki_assembly.fail(@errorName(err));
-    const extract_dir = try std.fs.path.join(allocator, &.{ work_dir, "uki-input" });
+    errdefer uki_assembly.fail(@errorName(phase_error));
+    const extract_dir = std.fs.path.join(allocator, &.{ work_dir, "uki-input" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(extract_dir);
-    const release_name = try extractNativeBootInputs(
+    const release_name = extractNativeBootInputs(
         allocator,
         io,
         mutable,
@@ -6998,14 +6982,14 @@ fn buildImage(
         extract_dir,
         profile,
         args.flavor,
-    );
+    ) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(release_name);
 
-    const kernel_host = try std.fmt.allocPrint(allocator, "{s}/vmlinuz-{s}", .{ extract_dir, release_name });
+    const kernel_host = allocator.print("{s}/vmlinuz-{s}", .{ extract_dir, release_name }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(kernel_host);
-    const initrd_host = try std.fmt.allocPrint(allocator, "{s}/initrd.img-{s}", .{ extract_dir, release_name });
+    const initrd_host = allocator.print("{s}/initrd.img-{s}", .{ extract_dir, release_name }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(initrd_host);
-    const os_release_host = try std.fs.path.join(allocator, &.{ extract_dir, "os-release" });
+    const os_release_host = std.fs.path.join(allocator, &.{ extract_dir, "os-release" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(os_release_host);
     // A calculated disk chooses its own root PARTUUID before it exists, and the
     // command line has to name *that* one: the staging image's is Canonical's,
@@ -7013,54 +6997,54 @@ fn buildImage(
     const root_partition_guid = if (args.flavor.calculatesGeometry())
         coreDiskIdentity(profile.architecture).root_partition_guid
     else
-        try rootPartitionGuid(allocator, io, mutable, profile);
-    const cmdline = try ukiCmdline(allocator, root_partition_guid, profile, args.flavor);
+        rootPartitionGuid(allocator, io, mutable, profile) catch |err| return phaseError(&phase_error, err);
+    const cmdline = ukiCmdline(allocator, root_partition_guid, profile, args.flavor) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(cmdline);
 
     const stub_path = args.uki_stub orelse profile.uki_stub_host_path;
-    const stub_bytes = try readUkiStub(allocator, io, stub_path);
+    const stub_bytes = readUkiStub(allocator, io, stub_path) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(stub_bytes);
-    if (try peMachine(stub_bytes) != profile.pe_machine) return error.WrongStubArchitecture;
+    if ((peMachine(stub_bytes) catch |err| return phaseError(&phase_error, err)) != profile.pe_machine) return phaseError(&phase_error, error.WrongStubArchitecture);
     const stub_sha256 = artifact_pipeline.formatSha256(artifact_pipeline.sha256Bytes(stub_bytes));
 
-    const kernel_bytes = try Dir.cwd().readFileAlloc(io, kernel_host, allocator, .limited(miz.uki.limits.max_linux_size));
+    const kernel_bytes = Dir.cwd().readFileAlloc(io, kernel_host, allocator, .limited(miz.uki.limits.max_linux_size)) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(kernel_bytes);
-    var kernel_payload = try uki_kernel_payload.normalize(
+    var kernel_payload = uki_kernel_payload.normalize(
         allocator,
         profile.architecture,
         kernel_bytes,
         miz.uki.limits.max_linux_size,
-    );
+    ) catch |err| return phaseError(&phase_error, err);
     defer kernel_payload.deinit(allocator);
-    const initrd_bytes = try Dir.cwd().readFileAlloc(io, initrd_host, allocator, .limited(miz.uki.limits.max_initrd_size));
+    const initrd_bytes = Dir.cwd().readFileAlloc(io, initrd_host, allocator, .limited(miz.uki.limits.max_initrd_size)) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(initrd_bytes);
-    const os_release_bytes = try Dir.cwd().readFileAlloc(io, os_release_host, allocator, .limited(miz.uki.limits.max_os_release_size));
+    const os_release_bytes = Dir.cwd().readFileAlloc(io, os_release_host, allocator, .limited(miz.uki.limits.max_os_release_size)) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(os_release_bytes);
 
-    const unsigned_bytes = try miz.uki.generate(allocator, .{
+    const unsigned_bytes = miz.uki.generate(allocator, .{
         .stub = stub_bytes,
         .linux = kernel_payload.bytes,
         .initrd = initrd_bytes,
         .cmdline = cmdline,
         .os_release = os_release_bytes,
         .uname = release_name,
-    });
+    }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(unsigned_bytes);
-    if (try peMachine(unsigned_bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
-    const unsigned_uki = try std.fs.path.join(allocator, &.{ work_dir, "ubuntu2604.unsigned.efi" });
+    if ((peMachine(unsigned_bytes) catch |err| return phaseError(&phase_error, err)) != profile.pe_machine) return phaseError(&phase_error, error.WrongUkiArchitecture);
+    const unsigned_uki = std.fs.path.join(allocator, &.{ work_dir, "ubuntu2604.unsigned.efi" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(unsigned_uki);
-    try Dir.cwd().writeFile(io, .{ .sub_path = unsigned_uki, .data = unsigned_bytes });
+    Dir.cwd().writeFile(io, .{ .sub_path = unsigned_uki, .data = unsigned_bytes }) catch |err| return phaseError(&phase_error, err);
     uki_assembly.succeed();
 
     var uki_signing_phase = timing.begin(.uki_signing, null);
     defer uki_signing_phase.end();
-    errdefer |err| uki_signing_phase.fail(@errorName(err));
-    const signing_scratch = try std.fs.path.join(allocator, &.{ work_dir, "signing" });
+    errdefer uki_signing_phase.fail(@errorName(phase_error));
+    const signing_scratch = std.fs.path.join(allocator, &.{ work_dir, "signing" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(signing_scratch);
-    try uki_signing.prepareScratchDirectory(io, signing_scratch);
-    var certificate = try uki_signing.prepareCertificate(allocator, io, config);
+    uki_signing.prepareScratchDirectory(io, signing_scratch) catch |err| return phaseError(&phase_error, err);
+    var certificate = uki_signing.prepareCertificate(allocator, io, config) catch |err| return phaseError(&phase_error, err);
     defer certificate.deinit(allocator);
-    var signed = try uki_signing.signUkiAlloc(
+    var signed = uki_signing.signUkiAlloc(
         allocator,
         io,
         config,
@@ -7070,21 +7054,21 @@ fn buildImage(
         @tagName(profile.architecture),
         @tagName(args.flavor),
         unsigned_bytes,
-    );
+    ) catch |err| return phaseError(&phase_error, err);
     defer signed.deinit(allocator);
-    const signed_path = try std.fs.path.join(allocator, &.{ work_dir, profile.efi_fallback });
+    const signed_path = std.fs.path.join(allocator, &.{ work_dir, profile.efi_fallback }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(signed_path);
-    try Dir.cwd().writeFile(io, .{ .sub_path = signed_path, .data = signed.bytes });
-    try uki_signing.verifyBytes(allocator, io, config, signed.bytes);
+    Dir.cwd().writeFile(io, .{ .sub_path = signed_path, .data = signed.bytes }) catch |err| return phaseError(&phase_error, err);
+    uki_signing.verifyBytes(allocator, io, config, signed.bytes) catch |err| return phaseError(&phase_error, err);
     uki_signing_phase.succeed();
 
     var qcow2_finalization = timing.begin(.qcow2_finalization, null);
     defer qcow2_finalization.end();
-    errdefer |err| qcow2_finalization.fail(@errorName(err));
+    errdefer qcow2_finalization.fail(@errorName(phase_error));
     // #677 step 5: core plans and writes its own disk here; the other flavors
     // keep publishing the substrate they customized in place.
     var core_disk: ?CoreDisk = if (args.flavor.calculatesGeometry())
-        try assembleCoreDisk(
+        (assembleCoreDisk(
             allocator,
             io,
             mutable,
@@ -7093,24 +7077,24 @@ fn buildImage(
             profile,
             work_dir,
             output,
-        )
+        ) catch |err| return phaseError(&phase_error, err))
     else
         null;
     defer if (core_disk) |*disk| disk.deinit(allocator);
-    const esp_usage = if (core_disk) |disk| disk.esp else try insertSignedUki(
+    const esp_usage = if (core_disk) |disk| disk.esp else (insertSignedUki(
         allocator,
         io,
         mutable,
         signed_path,
         profile,
         args.size.?,
-    );
+    ) catch |err| return phaseError(&phase_error, err));
     const virtual_size = if (core_disk) |disk| disk.plan.virtual_size else size: {
-        try finalizeCompressedQcow2(allocator, io, mutable, output);
+        finalizeCompressedQcow2(allocator, io, mutable, output) catch |err| return phaseError(&phase_error, err);
         break :size args.size.?;
     };
-    try validateFinalQcow2(io, output, virtual_size);
-    try validateFinalNativeImage(
+    validateFinalQcow2(io, output, virtual_size) catch |err| return phaseError(&phase_error, err);
+    validateFinalNativeImage(
         allocator,
         io,
         output,
@@ -7118,25 +7102,25 @@ fn buildImage(
         profile,
         cmdline,
         if (core_disk) |disk| disk.plan else null,
-    );
+    ) catch |err| return phaseError(&phase_error, err);
     qcow2_finalization.succeed();
     var final_image_validation = timing.begin(.final_image_validation, null);
     defer final_image_validation.end();
-    errdefer |err| final_image_validation.fail(@errorName(err));
-    var final_root = try openNativeRoot(allocator, io, output, work_dir);
+    errdefer final_image_validation.fail(@errorName(phase_error));
+    var final_root = openNativeRoot(allocator, io, output, work_dir) catch |err| return phaseError(&phase_error, err);
     defer final_root.deinit();
-    const os_release = try final_root.filesystem.read(allocator, "/etc/os-release", 64 * 1024);
+    const os_release = final_root.filesystem.read(allocator, "/etc/os-release", 64 * 1024) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(os_release);
-    if (std.mem.indexOf(u8, os_release, "VERSION_ID=\"26.04\"") == null) return error.WrongGuestRelease;
-    const final_lock = try final_root.filesystem.read(allocator, "/var/lib/miz/ubuntu2604-package-lock.tsv", 4 * 1024 * 1024);
+    if (std.mem.indexOf(u8, os_release, "VERSION_ID=\"26.04\"") == null) return phaseError(&phase_error, error.WrongGuestRelease);
+    const final_lock = final_root.filesystem.read(allocator, "/var/lib/miz/ubuntu2604-package-lock.tsv", 4 * 1024 * 1024) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(final_lock);
-    try validateExactLockRuntime(allocator, final_lock, profile, args.flavor);
+    validateExactLockRuntime(allocator, final_lock, profile, args.flavor) catch |err| return phaseError(&phase_error, err);
     if (profile.architecture == .aarch64 and args.flavor == .full) {
-        const fstab = try final_root.filesystem.read(allocator, "/etc/fstab", 1024 * 1024);
+        const fstab = final_root.filesystem.read(allocator, "/etc/fstab", 1024 * 1024) catch |err| return phaseError(&phase_error, err);
         defer allocator.free(fstab);
-        try validateArm64BootFstabRetired(fstab);
+        validateArm64BootFstabRetired(fstab) catch |err| return phaseError(&phase_error, err);
     }
-    if (args.flavor.freshRoot()) try validateCoreRoot(
+    if (args.flavor.freshRoot()) (validateCoreRoot(
         allocator,
         io,
         &final_root.filesystem,
@@ -7145,47 +7129,47 @@ fn buildImage(
         &debz_customization.plan,
         debz_customization.evidence[0..debz_customization.evidence_count],
         if (debz_customization.stage) |*built| built else null,
-    ) else try validateFullUdisks2Policy(allocator, &final_root.filesystem);
-    if (try peMachine(signed.bytes) != profile.pe_machine) return error.WrongUkiArchitecture;
+    ) catch |err| return phaseError(&phase_error, err)) else (validateFullUdisks2Policy(allocator, &final_root.filesystem) catch |err| return phaseError(&phase_error, err));
+    if ((peMachine(signed.bytes) catch |err| return phaseError(&phase_error, err)) != profile.pe_machine) return phaseError(&phase_error, error.WrongUkiArchitecture);
     final_image_validation.succeed();
     if (args.raw_output) |raw_path| {
         var raw_materialization = timing.begin(.raw_image_materialization, null);
         defer raw_materialization.end();
-        errdefer |err| raw_materialization.fail(@errorName(err));
-        try writeRawCopy(allocator, io, output, raw_path);
+        errdefer raw_materialization.fail(@errorName(phase_error));
+        writeRawCopy(allocator, io, output, raw_path) catch |err| return phaseError(&phase_error, err);
         raw_materialization.succeed();
     } else {
         timing.skip(.raw_image_materialization, null);
     }
     var provenance_output = timing.begin(.provenance_output, null);
     defer provenance_output.end();
-    errdefer |err| provenance_output.fail(@errorName(err));
+    errdefer provenance_output.fail(@errorName(phase_error));
 
     // The image and artifact phases are recorded here, where the finished
     // geometry and the published bytes both exist. Recording them earlier
     // would mean recording a guess.
-    try recordFinalizedInventory(
+    recordFinalizedInventory(
         &debz_customization.inventory,
         if (core_disk) |disk| disk.root else debz_customization.root_filesystem,
         virtual_size,
         esp_usage,
         io,
         output,
-    );
-    const inventory_binding = try writeSizeInventory(
+    ) catch |err| return phaseError(&phase_error, err);
+    const inventory_binding = writeSizeInventory(
         allocator,
         io,
         provenance_dir,
         &debz_customization.inventory,
         profile,
         args.flavor,
-    );
+    ) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(inventory_binding.filename);
     // Core is the flavor #677 minimizes, so core is the flavor that publishes
     // what it needs. The document is written for every fresh-root flavor that
     // shares the contract and bound into the same provenance.
     const runtime_contract_binding: ?InventoryBinding = if (args.flavor == .core)
-        try writeRuntimeContract(allocator, io, provenance_dir, profile, args.flavor)
+        (writeRuntimeContract(allocator, io, provenance_dir, profile, args.flavor) catch |err| return phaseError(&phase_error, err))
     else
         null;
     defer if (runtime_contract_binding) |binding| allocator.free(binding.filename);
@@ -7193,7 +7177,7 @@ fn buildImage(
     // so a reviewer can read every input, margin, offset and length that
     // produced this disk instead of inferring them from the image.
     const geometry_binding: ?InventoryBinding = if (core_disk) |*disk|
-        try writeDiskGeometry(allocator, io, provenance_dir, profile, args.flavor, disk)
+        (writeDiskGeometry(allocator, io, provenance_dir, profile, args.flavor, disk) catch |err| return phaseError(&phase_error, err))
     else
         null;
     defer if (geometry_binding) |binding| allocator.free(binding.filename);
@@ -7202,19 +7186,19 @@ fn buildImage(
     // still knows which metric moved; an architecture with no reviewed budget
     // publishes the baseline the release gate then refuses to publish on.
     const budget_binding: ?InventoryBinding = if (args.flavor.freshRoot())
-        try writeSizeBudget(
+        (writeSizeBudget(
             allocator,
             io,
             provenance_dir,
             &debz_customization.inventory,
             profile,
             args.flavor,
-        )
+        ) catch |err| return phaseError(&phase_error, err))
     else
         null;
     defer if (budget_binding) |binding| allocator.free(binding.filename);
 
-    try writeSigningProvenance(
+    writeSigningProvenance(
         allocator,
         io,
         provenance_dir,
@@ -7225,12 +7209,12 @@ fn buildImage(
         &signed,
         stub_path,
         &stub_sha256,
-    );
+    ) catch |err| return phaseError(&phase_error, err);
 
-    const provenance_path = try std.fs.path.join(allocator, &.{ provenance_dir, "ubuntu2604-build-provenance.json" });
+    const provenance_path = std.fs.path.join(allocator, &.{ provenance_dir, "ubuntu2604-build-provenance.json" }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(provenance_path);
     if (args.flavor.freshRoot()) {
-        try writeFreshRootProvenance(
+        writeFreshRootProvenance(
             allocator,
             io,
             provenance_path,
@@ -7250,9 +7234,9 @@ fn buildImage(
             runtime_contract_binding,
             geometry_binding,
             budget_binding,
-        );
+        ) catch |err| return phaseError(&phase_error, err);
     } else {
-        try writeProvenance(
+        writeProvenance(
             allocator,
             io,
             provenance_path,
@@ -7260,7 +7244,7 @@ fn buildImage(
             artifact_pipeline.formatSha256(source_metadata.sha256),
             debz_customization.evidence[0..debz_customization.evidence_count],
             inventory_binding,
-        );
+        ) catch |err| return phaseError(&phase_error, err);
     }
     provenance_output.succeed();
 }
@@ -7330,7 +7314,7 @@ fn arm64VerifiedFixture(
 ) miz.gpt.VerifiedGpt {
     const total_sectors = virtual_size / miz.gpt.sector_size;
     const last_usable_lba = total_sectors - 2 - miz.gpt.partition_array_sectors;
-    const array_crc = std.hash.crc.Crc32.hash(partition_array);
+    const array_crc = std.hash.Crc32.hash(partition_array);
     const primary = miz.gpt.Header{
         .current_lba = 1,
         .backup_lba = total_sectors - 1,
@@ -7703,8 +7687,7 @@ test "both architecture profiles acquire through the shared native HTTPS downloa
         };
         Dir.cwd().deleteFile(io, output_path) catch {};
         defer Dir.cwd().deleteFile(io, output_path) catch {};
-        const url = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const url = try std.testing.allocator.print(
             "{s}/{s}",
             .{ release_base, profile.source_name },
         );
@@ -8561,8 +8544,7 @@ test "native image conversion round trips and failed publication cleans its stag
         error.IsDir,
         publishNativeQcow2(allocator, io, raw_path, blocked_destination),
     );
-    const staged = try std.fmt.allocPrint(
-        allocator,
+    const staged = try allocator.print(
         "{s}.miz-native-stage",
         .{blocked_destination},
     );
@@ -8613,7 +8595,7 @@ test "the raw copy is the same guest bytes, published only once complete" {
     defer allocator.free(blocked);
     try Dir.cwd().createDirPath(io, blocked);
     try std.testing.expectError(error.IsDir, writeRawCopy(allocator, io, qcow_path, blocked));
-    const staged_raw = try std.fmt.allocPrint(allocator, "{s}.miz-raw-stage", .{blocked});
+    const staged_raw = try allocator.print("{s}.miz-raw-stage", .{blocked});
     defer allocator.free(staged_raw);
     try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, staged_raw, .{}));
 }
@@ -9984,9 +9966,9 @@ test "core injection writes static agents links configuration and embedded evide
     var initialized: usize = 0;
     defer for (evidence[0..initialized]) |*item| item.deinit(allocator);
     for (plan.guest, 0..) |package, index| {
-        const lock_path = try std.fmt.allocPrint(allocator, "test-core-{d}.lock.json", .{index});
+        const lock_path = try allocator.print("test-core-{d}.lock.json", .{index});
         errdefer allocator.free(lock_path);
-        const provenance_path = try std.fmt.allocPrint(allocator, "test-core-{d}.transaction.json", .{index});
+        const provenance_path = try allocator.print("test-core-{d}.transaction.json", .{index});
         errdefer allocator.free(provenance_path);
         try Dir.cwd().writeFile(io, .{ .sub_path = lock_path, .data = "{}" });
         try Dir.cwd().writeFile(io, .{ .sub_path = provenance_path, .data = "{}" });
@@ -10232,8 +10214,7 @@ test "fresh-root provenance binds flavor closure size and free-space evidence" {
         var plan = try testRootPlan(std.testing.allocator, flavor);
         defer plan.deinit();
         const package_roots = plan.guest;
-        const path = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const path = try std.testing.allocator.print(
             "{s}/{s}-provenance.json",
             .{ root_buffer[0..root_length], @tagName(flavor) },
         );
@@ -10244,10 +10225,10 @@ test "fresh-root provenance binds flavor closure size and free-space evidence" {
         for (package_roots, 0..) |package, index| {
             evidence[index] = .{
                 .package = package,
-                .lock_path = try std.fmt.allocPrint(std.testing.allocator, "/state/{s}.lock", .{package}),
+                .lock_path = try std.testing.allocator.print("/state/{s}.lock", .{package}),
                 .lock_sha256 = @splat('1'),
                 .lock_digest_sha256 = @splat('a'),
-                .provenance_path = try std.fmt.allocPrint(std.testing.allocator, "/state/{s}.transaction.json", .{package}),
+                .provenance_path = try std.testing.allocator.print("/state/{s}.transaction.json", .{package}),
                 .provenance_sha256 = @splat('2'),
                 .provenance_digest_sha256 = @splat('b'),
                 .provenance_lock_sha256 = @splat('a'),
@@ -10372,10 +10353,10 @@ test "fresh-root provenance rejects evidence that is not this flavor's roots" {
     for (core_plan.guest, 0..) |package, index| {
         evidence[index] = .{
             .package = package,
-            .lock_path = try std.fmt.allocPrint(std.testing.allocator, "/state/{s}.lock", .{package}),
+            .lock_path = try std.testing.allocator.print("/state/{s}.lock", .{package}),
             .lock_sha256 = @splat('1'),
             .lock_digest_sha256 = @splat('a'),
-            .provenance_path = try std.fmt.allocPrint(std.testing.allocator, "/state/{s}.transaction.json", .{package}),
+            .provenance_path = try std.testing.allocator.print("/state/{s}.transaction.json", .{package}),
             .provenance_sha256 = @splat('2'),
             .provenance_digest_sha256 = @splat('b'),
             .provenance_lock_sha256 = @splat('a'),
@@ -10649,8 +10630,7 @@ test "both guest architectures resolve the same explicit roots with no recommend
         }
         for (roots, 0..) |package, index| {
             const first = index == 0;
-            const lock_filename = try std.fmt.allocPrint(
-                allocator,
+            const lock_filename = try allocator.print(
                 "debz-exact-lock-{s}-{s}.json",
                 .{ package, profile.ubuntu_architecture },
             );

@@ -546,7 +546,7 @@ pub fn validateGalleryImageVersion(
         );
         const source_id = source.get("id");
         if (document.isAbsentOrEmpty(source_id)) continue;
-        const key = try std.fmt.allocPrint(context.arena, "{s}.id", .{entry.path});
+        const key = try context.arena.print("{s}.id", .{entry.path});
         try source_ids.put(context.arena, key, source_id.?);
         if (!same(source_id, arguments.expected_disk_id)) {
             var out: Writer.Allocating = .init(context.arena);
@@ -854,7 +854,7 @@ fn providerPrefix(
         expected_id[0..at]
     else
         expected_id;
-    return std.fmt.allocPrint(context.arena, "{s}/providers/{s}", .{ scope, provider });
+    return context.arena.print("{s}/providers/{s}", .{ scope, provider });
 }
 
 pub fn isUuid(text: []const u8) bool {

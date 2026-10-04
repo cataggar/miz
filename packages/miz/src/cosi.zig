@@ -206,7 +206,7 @@ fn buildPartitionArtifact(
 ) WriteError!PartitionArtifact {
     const offset_bytes = entry.first_lba * gpt.sector_size;
     const uncompressed_size = (entry.last_lba - entry.first_lba + 1) * gpt.sector_size;
-    const image_path = try std.fmt.allocPrint(arena, "images/image_{d}.raw.zst", .{number});
+    const image_path = try arena.print("images/image_{d}.raw.zst", .{number});
 
     const part_type = try dupeGuidText(arena, entry.partition_type_guid);
     const part_name = try decodePartitionNameAlloc(arena, &entry.name_utf16le);
@@ -293,13 +293,13 @@ const FsProbe = struct {
 };
 
 fn probeFilesystem(arena: std.mem.Allocator, img: Image, io: Io, offset_bytes: u64, length: u64) WriteError!FsProbe {
-    var boot_sector: [512]u8 = [_]u8{0} ** 512;
+    var boot_sector: [512]u8 = @as([512]u8, @splat(0));
     if (length >= boot_sector.len) {
         const got = try img.pread(io, &boot_sector, offset_bytes);
         if (got == boot_sector.len and isFatBootSector(&boot_sector)) {
             const serial_offset: usize = if (std.mem.eql(u8, boot_sector[82..90], "FAT32   ")) 67 else 39;
             const serial = readU32Le(boot_sector[serial_offset .. serial_offset + 4]);
-            const fs_uuid = try std.fmt.allocPrint(arena, "{X:0>4}-{X:0>4}", .{ serial >> 16, serial & 0xFFFF });
+            const fs_uuid = try arena.print("{X:0>4}-{X:0>4}", .{ serial >> 16, serial & 0xFFFF });
             return .{ .fs_type = "vfat", .fs_uuid = fs_uuid };
         }
         if (got >= 96 and std.mem.eql(u8, boot_sector[0..4], "XFSB")) {
@@ -308,7 +308,7 @@ fn probeFilesystem(arena: std.mem.Allocator, img: Image, io: Io, offset_bytes: u
         }
     }
 
-    var superblock: [2048]u8 = [_]u8{0} ** 2048;
+    var superblock: [2048]u8 = @as([2048]u8, @splat(0));
     if (length >= superblock.len) {
         const got = try img.pread(io, &superblock, offset_bytes);
         if (got == superblock.len and std.mem.readInt(u16, superblock[1024 + 0x38 .. 1024 + 0x3A], .little) == 0xEF53) {
@@ -1000,7 +1000,7 @@ test "detectOsRelease treats an XFS partition it cannot open as having no os-rel
     // superblock is garbage, well short of a valid v5 filesystem. This
     // proves a malformed/unsupported XFS partition falls through to "no
     // os-release" rather than being misreported as a valid one.
-    var garbage: [512]u8 = [_]u8{0xAA} ** 512;
+    var garbage: [512]u8 = @as([512]u8, @splat(0xAA));
     @memcpy(garbage[0..4], "XFSB");
     try img.pwrite(io, &garbage, 0);
 

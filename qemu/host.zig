@@ -155,7 +155,7 @@ pub fn pathAccessible(io: Io, path: []const u8, options: Io.Dir.AccessOptions) !
 }
 
 pub fn executableName(comptime base: []const u8) []const u8 {
-    return if (builtin.os.tag == .windows) base ++ ".exe" else base;
+    return if (builtin.target.os.tag == .windows) base ++ ".exe" else base;
 }
 
 pub fn qemuSystemName(architecture: GuestArchitecture) []const u8 {
@@ -185,7 +185,7 @@ pub fn findExecutableInPathValueAlloc(
     path_value: []const u8,
     name: []const u8,
 ) !?[]u8 {
-    const suffix: []const u8 = if (builtin.os.tag == .windows and
+    const suffix: []const u8 = if (builtin.target.os.tag == .windows and
         !(name.len >= 4 and std.ascii.eqlIgnoreCase(name[name.len - 4 ..], ".exe")))
         ".exe"
     else
@@ -194,10 +194,9 @@ pub fn findExecutableInPathValueAlloc(
     var it = std.mem.splitScalar(u8, path_value, std.fs.path.delimiter);
     while (it.next()) |dir_path| {
         const candidate = if (dir_path.len == 0)
-            try std.fmt.allocPrint(allocator, "{s}{s}", .{ name, suffix })
+            try allocator.print("{s}{s}", .{ name, suffix })
         else
-            try std.fmt.allocPrint(
-                allocator,
+            try allocator.print(
                 "{s}{c}{s}{s}",
                 .{ dir_path, std.fs.path.sep, name, suffix },
             );
@@ -377,23 +376,23 @@ fn systemFirmwareCandidates(
 ) []const FirmwareCandidate {
     if (secure_boot) {
         return switch (architecture) {
-            .x86_64 => switch (builtin.os.tag) {
+            .x86_64 => switch (builtin.target.os.tag) {
                 .linux => &linux_x86_secure_boot_candidates,
                 else => &.{},
             },
-            .aarch64 => switch (builtin.os.tag) {
+            .aarch64 => switch (builtin.target.os.tag) {
                 .linux => &linux_aarch64_secure_boot_candidates,
                 else => &.{},
             },
         };
     }
     return switch (architecture) {
-        .x86_64 => switch (builtin.os.tag) {
+        .x86_64 => switch (builtin.target.os.tag) {
             .linux => &linux_x86_candidates,
             .macos => &macos_x86_candidates,
             else => &.{},
         },
-        .aarch64 => switch (builtin.os.tag) {
+        .aarch64 => switch (builtin.target.os.tag) {
             .linux => &linux_aarch64_candidates,
             .macos => &macos_aarch64_candidates,
             else => &.{},
@@ -445,8 +444,8 @@ fn findFirmwareInDataDirAlloc(
 
 fn firmwareCodeNameIndicatesSecureBoot(path: []const u8) bool {
     const name = std.fs.path.basename(path);
-    return std.ascii.indexOfIgnoreCase(name, "secboot") != null or
-        std.ascii.indexOfIgnoreCase(name, ".ms.") != null;
+    return std.ascii.findIgnoreCase(name, "secboot") != null or
+        std.ascii.findIgnoreCase(name, ".ms.") != null;
 }
 
 fn readableEncodedPairAlloc(
@@ -479,7 +478,7 @@ fn encodedPathAlloc(
 ) ![]u8 {
     return switch (encoding) {
         .raw => allocator.dupe(u8, base),
-        .bzip2 => std.fmt.allocPrint(allocator, "{s}.bz2", .{base}),
+        .bzip2 => allocator.print("{s}.bz2", .{base}),
     };
 }
 
@@ -1507,7 +1506,7 @@ test "concurrent pair materialization publishes one complete bundle" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const source_bytes = "firmware-source" ** 4096;
+    const source_bytes = (@as([4096 * "firmware-source".len]u8, @bitCast(@as([4096]["firmware-source".len]u8, @splat("firmware-source".*)))) ++ "");
     try tmp.dir.writeFile(io, .{ .sub_path = "code-source.fd", .data = source_bytes });
     try tmp.dir.writeFile(io, .{ .sub_path = "vars-source.fd", .data = source_bytes });
 

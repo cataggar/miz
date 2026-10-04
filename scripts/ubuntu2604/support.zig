@@ -265,7 +265,7 @@ pub const Builder = struct {
         comptime fmt: []const u8,
         args: anytype,
     ) Error!std.json.Value {
-        return .{ .string = try std.fmt.allocPrint(self.arena, fmt, args) };
+        return .{ .string = try self.arena.print(fmt, args) };
     }
 
     pub fn strings(self: Builder, items: []const []const u8) Error!std.json.Value {
@@ -503,8 +503,7 @@ fn absolutePath(allocator: Allocator, io: Io, path: []const u8) Error![]u8 {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const length = Dir.cwd().realPathFile(io, ".", &buffer) catch
         return allocator.dupe(u8, path) catch error.OutOfMemory;
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}/{s}",
         .{ buffer[0..length], path },
     ) catch error.OutOfMemory;
@@ -538,8 +537,7 @@ fn canonicalizeExisting(
         ""
     else
         "/";
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}{s}{s}",
         .{ resolved_parent, separator, base },
     ) catch error.OutOfMemory;
@@ -762,16 +760,14 @@ test "resolvePath anchors a relative path the way Path.resolve does" {
 
     // Redundant components normalize away, and a tail that does not exist is
     // still resolved rather than rejected.
-    const noisy = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const noisy = try std.testing.allocator.print(
         "{s}/./nested/../asset.qcow2",
         .{root},
     );
     defer std.testing.allocator.free(noisy);
     const normalized = try resolvePath(std.testing.allocator, io, noisy);
     defer std.testing.allocator.free(normalized);
-    const expected = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const expected = try std.testing.allocator.print(
         "{s}/asset.qcow2",
         .{absolute_root},
     );
@@ -798,8 +794,7 @@ test "resolvePath canonicalizes the existing prefix and keeps the missing tail" 
 
     // `Path.resolve()` follows symlinks through the part of the path that
     // exists, so the printed path names the real location.
-    const through_link = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const through_link = try std.testing.allocator.print(
         "{s}/absent/deeper.json",
         .{link},
     );

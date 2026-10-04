@@ -409,8 +409,7 @@ fn describeBuildImageFailure(
         var message_buffer: [miz.limits.Exceeded.max_message_bytes]u8 = undefined;
         var remediation_buffer: [miz.limits.Exceeded.max_remediation_bytes]u8 = undefined;
         if (breach.limit.err() == err) {
-            return std.fmt.allocPrint(
-                allocator,
+            return allocator.print(
                 "build-image: failed: {s}\n{s}, or import less content.",
                 .{
                     breach.describe(&message_buffer) catch unreachable,
@@ -422,14 +421,12 @@ fn describeBuildImageFailure(
 
     return switch (err) {
         error.MissingUkiStub => if (context.stub_source_path) |path|
-            std.fmt.allocPrint(
-                allocator,
+            allocator.print(
                 "build-image: failed: no systemd EFI stub was found at --stub-source-path {s} while preparing UKI boot files.\nExpected a stub such as linuxx64.efi.stub, systemd-stubx64.efi, or the matching aa64 variant, typically from the systemd-boot-unsigned package.\nInstall or inject that package into the merged source content, or update --stub-source-path to the correct in-tree location.",
                 .{path},
             )
         else
-            std.fmt.allocPrint(
-                allocator,
+            allocator.print(
                 "build-image: failed: {s} was requested, but no systemd EFI stub was found in the merged ISO/squashfs/container source tree.\nExpected a stub such as linuxx64.efi.stub, systemd-stubx64.efi, or the matching aa64 variant, typically from the systemd-boot-unsigned package.\nInstall or inject that package into the source content (for example via an extra container layer), or pass --stub-source-path <path> if the stub already exists at a non-standard path.",
                 .{uki_mode_text},
             ),
@@ -477,7 +474,7 @@ fn describeBuildImageFailure(
         error.FormatRequiresSeekableOutput => outputConstraintMessage(allocator, error.FormatRequiresSeekableOutput),
         error.CompressionLevelNotSupportedForZstd => outputConstraintMessage(allocator, error.CompressionLevelNotSupportedForZstd),
         error.CompressionLevelOutOfRange => outputConstraintMessage(allocator, error.CompressionLevelOutOfRange),
-        else => std.fmt.allocPrint(allocator, "build-image: failed: {s}", .{@errorName(err)}),
+        else => allocator.print("build-image: failed: {s}", .{@errorName(err)}),
     };
 }
 
@@ -485,8 +482,7 @@ fn outputConstraintMessage(
     allocator: std.mem.Allocator,
     err: miz.output.SpecError,
 ) std.mem.Allocator.Error![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "build-image: failed: {s}",
         .{opts.describeOutputError(err)},
     );

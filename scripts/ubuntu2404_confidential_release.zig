@@ -1155,7 +1155,7 @@ fn verifyJwtSignature(
             @memcpy(&buffer, signature);
             rsa.PKCS1v1_5Signature.concatVerify(
                 candidate,
-                buffer,
+                &buffer,
                 &.{ header_segment, ".", payload_segment },
                 public_key,
                 Sha256,
@@ -1367,7 +1367,7 @@ fn verifyAttestation(
         "OpenID issuer",
         diagnostic,
     );
-    const expected_jwks = try std.fmt.allocPrint(allocator, "{s}/certs", .{endpoint});
+    const expected_jwks = try allocator.print("{s}/certs", .{endpoint});
     defer allocator.free(expected_jwks);
     try requireEqual(
         try requireString(openid.object(), "jwks_uri", "OpenID JWKS URI", diagnostic),
@@ -1667,8 +1667,7 @@ fn requireBoundAzureId(
     if (!std.mem.startsWith(u8, id, "/subscriptions/")) {
         return invalid(diagnostic, "{s} is not an Azure resource ID", .{label});
     }
-    const group_segment = try std.fmt.allocPrint(
-        allocator,
+    const group_segment = try allocator.print(
         "/resourceGroups/{s}/providers/Microsoft.Compute/",
         .{resource_group},
     );
@@ -1842,8 +1841,7 @@ fn verifyAcceptanceResult(
         "accepted Azure VM size",
         diagnostic,
     );
-    const expected_group = try std.fmt.allocPrint(
-        allocator,
+    const expected_group = try allocator.print(
         "miz-u2404-cvm-{s}-{s}",
         .{ run_id, run_attempt },
     );
@@ -3662,8 +3660,7 @@ test "publication revalidates the protected acceptance binding" {
     const commit = "0123456789abcdef0123456789abcdef01234567";
     const virtual_size = 4 * 1024 * 1024;
     const vhd_size = virtual_size + azure_vhd.footer_bytes;
-    const provenance = try std.fmt.allocPrint(
-        allocator,
+    const provenance = try allocator.print(
         "{{\"schema\":1,\"type\":\"{s}\",\"release\":\"24.04\"," ++
             "\"architecture\":\"x86_64\",\"tee\":\"AMD SEV-SNP\"," ++
             "\"publication\":{{\"sha256sums_signature_verified\":true}}," ++
@@ -3673,8 +3670,7 @@ test "publication revalidates the protected acceptance binding" {
         .{ expected_build_type, &qcow_sha, candidate.len, virtual_size },
     );
     defer allocator.free(provenance);
-    const result = try std.fmt.allocPrint(
-        allocator,
+    const result = try allocator.print(
         "{{\"artifact\":{{\"qcow_sha256\":\"{s}\",\"qcow_size\":{d}," ++
             "\"vhd_sha256\":\"{s}\",\"vhd_size\":{d},\"virtual_size\":{d}}}," ++
             "\"attestation\":{{\"compliance\":\"azure-compliant-cvm\"," ++
@@ -3692,11 +3688,11 @@ test "publication revalidates the protected acceptance binding" {
         .{
             &qcow_sha,
             candidate.len,
-            "1" ** 64,
+            &@as([64:0]u8, @splat('1')),
             vhd_size,
             virtual_size,
-            "2" ** 64,
-            "3" ** 64,
+            &@as([64:0]u8, @splat('2')),
+            &@as([64:0]u8, @splat('3')),
             "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-123-4/providers/Microsoft.Compute",
             "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-123-4/providers/Microsoft.Compute",
             "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/miz-u2404-cvm-123-4/providers/Microsoft.Compute",
@@ -3787,8 +3783,7 @@ fn testFixturePath(
     sub_path: []const u8,
     name: []const u8,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         ".zig-cache/tmp/{s}/{s}",
         .{ sub_path, name },
     );
@@ -3804,20 +3799,17 @@ test "valid RS256 JWT and JWKS verify cryptographically" {
     defer allocator.free(openid_path);
     const jwks_path = try testFixturePath(allocator, &tmp.sub_path, "jwks.json");
     defer allocator.free(jwks_path);
-    const token = try std.fmt.allocPrint(
-        allocator,
+    const token = try allocator.print(
         "{s}.{s}.{s}",
         .{ test_jwt_header, test_jwt_payload, test_jwt_signature },
     );
     defer allocator.free(token);
-    const openid = try std.fmt.allocPrint(
-        allocator,
+    const openid = try allocator.print(
         "{{\"issuer\":\"{s}\",\"jwks_uri\":\"{s}/certs\"}}",
         .{ test_attestation_endpoint, test_attestation_endpoint },
     );
     defer allocator.free(openid);
-    const jwks = try std.fmt.allocPrint(
-        allocator,
+    const jwks = try allocator.print(
         "{{\"keys\":[{{\"kid\":\"test-key\",\"kty\":\"RSA\",\"use\":\"sig\",\"alg\":\"RS256\",\"n\":\"{s}\",\"e\":\"AQAB\"}}]}}",
         .{test_jwk_modulus},
     );
@@ -3894,8 +3886,7 @@ test "valid RS256 JWT and JWKS verify cryptographically" {
     var bad_signature = try allocator.dupe(u8, test_jwt_signature);
     defer allocator.free(bad_signature);
     bad_signature[0] = if (bad_signature[0] == 'a') 'b' else 'a';
-    const invalid_token = try std.fmt.allocPrint(
-        allocator,
+    const invalid_token = try allocator.print(
         "{s}.{s}.{s}",
         .{ test_jwt_header, test_jwt_payload, bad_signature },
     );

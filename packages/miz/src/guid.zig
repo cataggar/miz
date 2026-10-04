@@ -119,7 +119,7 @@ pub const linux_xbootldr: Guid = parse("BC13C2FF-59E6-4262-A352-B275FD6F7172");
 pub const microsoft_basic_data: Guid = parse("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7");
 
 /// A GUID with all bytes zero, used for "no partition" / unused entries.
-pub const nil: Guid = [_]u8{0} ** 16;
+pub const nil: Guid = @as([16]u8, @splat(0));
 
 test "formatLower reverses parse" {
     var buf: [36]u8 = undefined;

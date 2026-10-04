@@ -76,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(2);
     }
 
-    const lock_path = try std.fmt.allocPrint(arena, "{s}.lock", .{args.bundle_output_path});
+    const lock_path = try arena.print("{s}.lock", .{args.bundle_output_path});
     validateIsolation(arena, init.io, &args, lock_path) catch |err| {
         std.debug.print("miz-preserved-image-builder: result paths overlap an input: {t}\n", .{err});
         std.process.exit(2);
@@ -256,7 +256,7 @@ pub fn main(init: std.process.Init) !void {
         .limits = args.limits,
     };
 
-    const host_architecture: miz.customize.Architecture = switch (builtin.cpu.arch) {
+    const host_architecture: miz.customize.Architecture = switch (builtin.target.cpu.arch) {
         .x86_64 => .x86_64,
         .aarch64 => .aarch64,
         else => {
@@ -1724,7 +1724,7 @@ test "dependency closure is checked before a bundle can be reset" {
         .bundle_output_path = bundle_path,
         .image_basename = "disk.raw",
         .format = .raw,
-        .seed = .{ .bytes = [_]u8{0} ** 32 },
+        .seed = .{ .bytes = @as([32]u8, @splat(0)) },
         .source_date_epoch = 0,
     };
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1744,7 +1744,7 @@ test "import limit flags raise the limits the request carries" {
         "--bundle-output",         "out",
         "--image-basename",        "image.raw",
         "-O",                      "raw",
-        "--seed",                  "00" ** 32,
+        "--seed",                  (@as([32 * "00".len]u8, @bitCast(@as([32]["00".len]u8, @splat("00".*)))) ++ ""),
         "--source-date-epoch",     "0",
         "--max-nodes",             "8M",
         "--max-source-file-bytes", "4G",
@@ -1770,7 +1770,7 @@ test "a zero limit is rejected instead of silently rejecting every source" {
         "--bundle-output",     "out",
         "--image-basename",    "image.raw",
         "-O",                  "raw",
-        "--seed",              "00" ** 32,
+        "--seed",              (@as([32 * "00".len]u8, @bitCast(@as([32]["00".len]u8, @splat("00".*)))) ++ ""),
         "--source-date-epoch", "0",
         "--max-nodes",         "0",
     };

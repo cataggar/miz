@@ -1159,13 +1159,13 @@ pub fn stage(
     Dir.cwd().createDirPath(io, notes_parent) catch {};
 
     const pid = std.os.linux.getpid();
-    const temporary_output = try std.fmt.allocPrint(allocator, "{s}/.{s}.tmp-{d}", .{
+    const temporary_output = try allocator.print("{s}/.{s}.tmp-{d}", .{
         output_parent,
         std.fs.path.basename(output),
         pid,
     });
     defer allocator.free(temporary_output);
-    const temporary_notes = try std.fmt.allocPrint(allocator, "{s}/.{s}.tmp-{d}", .{
+    const temporary_notes = try allocator.print("{s}/.{s}.tmp-{d}", .{
         notes_parent,
         std.fs.path.basename(notes),
         pid,

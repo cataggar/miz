@@ -437,7 +437,7 @@ const Instance = struct {
         errdefer allocator.free(seed_path);
         const private_key_path = try std.fs.path.join(allocator, &.{ work_path, "id_ed25519" });
         errdefer allocator.free(private_key_path);
-        const public_key_path = try std.fmt.allocPrint(allocator, "{s}.pub", .{private_key_path});
+        const public_key_path = try allocator.print("{s}.pub", .{private_key_path});
         errdefer allocator.free(public_key_path);
         const serial_path = try std.fs.path.join(allocator, &.{ work_path, "serial.log" });
         errdefer allocator.free(serial_path);
@@ -791,8 +791,8 @@ fn requireQemuExecutionAlloc(
     candidate: Candidate,
 ) !ConfiguredExecution {
     const profile = candidate.executionProfile();
-    const host_is_linux = builtin.os.tag == .linux;
-    const host_is_native = builtin.cpu.arch == candidate.architecture.runnerCpu();
+    const host_is_linux = builtin.target.os.tag == .linux;
+    const host_is_native = builtin.target.cpu.arch == candidate.architecture.runnerCpu();
     const kvm_available: ?bool = switch (profile.accelerator) {
         .kvm => if (host_is_linux and host_is_native)
             try qemu_host.pathAccessible(io, "/dev/kvm", .{
@@ -805,7 +805,7 @@ fn requireQemuExecutionAlloc(
     };
     try validateQemuPrerequisites(
         host_is_linux,
-        builtin.cpu.arch,
+        builtin.target.cpu.arch,
         kvm_available,
         candidate,
     );
@@ -1332,8 +1332,7 @@ fn verifyUkiSignatures(
         candidate.architecture.fallbackUkiPath(),
     );
     defer allocator.free(fallback);
-    const fallback_path = try std.fmt.allocPrint(
-        allocator,
+    const fallback_path = try allocator.print(
         "{s}/uki-fallback.efi",
         .{scratch_path},
     );
@@ -1407,8 +1406,7 @@ fn requireRejectedUkiSignature(
     index: usize,
     bytes: []const u8,
 ) !void {
-    const path = try std.fmt.allocPrint(
-        allocator,
+    const path = try allocator.print(
         "{s}/tampered-{d}.efi",
         .{ scratch_path, index },
     );
@@ -1619,8 +1617,7 @@ fn validateFinalizedImage(
         &root_guid_text,
         root_partition.unique_partition_guid,
     );
-    const expected_prefix = try std.fmt.allocPrint(
-        allocator,
+    const expected_prefix = try allocator.print(
         "root=PARTUUID={s} ",
         .{root_guid},
     );
@@ -1630,8 +1627,7 @@ fn validateFinalizedImage(
 
     switch (candidate.flavor) {
         .core => {
-            const expected = try std.fmt.allocPrint(
-                allocator,
+            const expected = try allocator.print(
                 "{s}init=/sbin/mizinit mizinit.mode=persistent mizinit.azure=auto mizinit.binder=required console=tty0 {s}",
                 .{ expected_prefix, candidate.architecture.serialConsole() },
             );
@@ -1640,8 +1636,7 @@ fn validateFinalizedImage(
                 return error.UnexpectedCoreUkiCmdline;
         },
         .full => {
-            const expected = try std.fmt.allocPrint(
-                allocator,
+            const expected = try allocator.print(
                 "{s}{s}",
                 .{ expected_prefix, candidate.architecture.serialConsole() },
             );
@@ -1714,21 +1709,18 @@ fn createSeed(
     defer allocator.free(public_key_file);
     const public_key = std.mem.trim(u8, public_key_file, " \t\r\n");
 
-    const metadata = try std.fmt.allocPrint(
-        allocator,
+    const metadata = try allocator.print(
         "instance-id: miz-ubuntu2604-acceptance-{s}\n" ++
             "local-hostname: miz-ubuntu2604-{s}\n",
         .{ instance.label, instance.label },
     );
     defer allocator.free(metadata);
-    const user_data = try std.fmt.allocPrint(
-        allocator,
+    const user_data = try allocator.print(
         qemu_user_data_template,
         .{public_key},
     );
     defer allocator.free(user_data);
-    const ovf_env = try std.fmt.allocPrint(
-        allocator,
+    const ovf_env = try allocator.print(
         \\<?xml version="1.0" encoding="utf-8"?>
         \\<Environment xmlns="http://schemas.dmtf.org/ovf/environment/1" xmlns:wa="http://schemas.microsoft.com/windowsazure">
         \\  <wa:ProvisioningSection>
@@ -1806,20 +1798,17 @@ fn startInstance(
     try createSeed(allocator, io, ssh_keygen_path, instance);
     try Dir.cwd().createDir(io, instance.swtpm_state_path, .default_dir);
 
-    const swtpm_state_arg = try std.fmt.allocPrint(
-        allocator,
+    const swtpm_state_arg = try allocator.print(
         "dir={s}",
         .{instance.swtpm_state_path},
     );
     defer allocator.free(swtpm_state_arg);
-    const swtpm_ctrl_arg = try std.fmt.allocPrint(
-        allocator,
+    const swtpm_ctrl_arg = try allocator.print(
         "type=unixio,path={s}",
         .{instance.swtpm_socket_path},
     );
     defer allocator.free(swtpm_ctrl_arg);
-    const swtpm_log_arg = try std.fmt.allocPrint(
-        allocator,
+    const swtpm_log_arg = try allocator.print(
         "file={s}",
         .{instance.swtpm_log_path},
     );
@@ -1850,40 +1839,34 @@ fn startInstance(
         try Io.sleep(io, .fromMilliseconds(50), .awake);
     }
 
-    const hostfwd = try std.fmt.allocPrint(
-        allocator,
+    const hostfwd = try allocator.print(
         "user,id=net0,hostfwd=tcp:127.0.0.1:{d}-:22",
         .{instance.port},
     );
     defer allocator.free(hostfwd);
-    const serial_arg = try std.fmt.allocPrint(allocator, "file:{s}", .{instance.serial_path});
+    const serial_arg = try allocator.print("file:{s}", .{instance.serial_path});
     defer allocator.free(serial_arg);
-    const code_drive = try std.fmt.allocPrint(
-        allocator,
+    const code_drive = try allocator.print(
         "if=pflash,unit=0,format=raw,readonly=on,file={s}",
         .{firmware.code_path},
     );
     defer allocator.free(code_drive);
-    const vars_drive = try std.fmt.allocPrint(
-        allocator,
+    const vars_drive = try allocator.print(
         "if=pflash,unit=1,format=raw,file={s}",
         .{instance.vars_path},
     );
     defer allocator.free(vars_drive);
-    const image_drive = try std.fmt.allocPrint(
-        allocator,
+    const image_drive = try allocator.print(
         "file={s},format=qcow2,if=virtio",
         .{instance.overlay_path},
     );
     defer allocator.free(image_drive);
-    const seed_drive = try std.fmt.allocPrint(
-        allocator,
+    const seed_drive = try allocator.print(
         "file={s},if=none,id=seed,media=cdrom,readonly=on,format=raw",
         .{instance.seed_path},
     );
     defer allocator.free(seed_drive);
-    const tpm_chardev = try std.fmt.allocPrint(
-        allocator,
+    const tpm_chardev = try allocator.print(
         "socket,id=chrtpm,path={s}",
         .{instance.swtpm_socket_path},
     );
@@ -2015,10 +1998,9 @@ fn sshSucceededWithin(
     command: []const u8,
     timeout_seconds: i64,
 ) !bool {
-    const port_text = try std.fmt.allocPrint(allocator, "{d}", .{instance.port});
+    const port_text = try allocator.print("{d}", .{instance.port});
     defer allocator.free(port_text);
-    const connect_timeout = try std.fmt.allocPrint(
-        allocator,
+    const connect_timeout = try allocator.print(
         "ConnectTimeout={d}",
         .{instance.execution_profile.timeouts.ssh_connect_seconds},
     );
@@ -2083,10 +2065,9 @@ fn sshOutputAllocWithin(
     command: []const u8,
     timeout_seconds: i64,
 ) ![]u8 {
-    const port_text = try std.fmt.allocPrint(allocator, "{d}", .{instance.port});
+    const port_text = try allocator.print("{d}", .{instance.port});
     defer allocator.free(port_text);
-    const connect_timeout = try std.fmt.allocPrint(
-        allocator,
+    const connect_timeout = try allocator.print(
         "ConnectTimeout={d}",
         .{instance.execution_profile.timeouts.ssh_connect_seconds},
     );
@@ -2247,8 +2228,7 @@ const lockdown_requirement_id = "kernel-lockdown";
 /// "SSH command failed". A report that does not carry the expected lines is
 /// still a failure -- it is just a better-described one.
 fn uefiEvidenceCommandAlloc(allocator: Allocator) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "sudo -n {s} efivar {s} {s}; sudo -n {s} requirement {s}; exit 0",
         .{
             runtime_contract_probe_remote_path,
@@ -2372,8 +2352,7 @@ fn verifyGuestSecureBoot(
         return error.GuestSecureBootContractFailed;
     }
 
-    const command = try std.fmt.allocPrint(
-        allocator,
+    const command = try allocator.print(
         \\set -eu
         \\test -c /dev/tpm0
         \\test -c /dev/tpmrm0
@@ -2488,10 +2467,9 @@ fn sshWithStdinAlloc(
     command: []const u8,
     stdin_data: []const u8,
 ) ![]u8 {
-    const port_text = try std.fmt.allocPrint(allocator, "{d}", .{instance.port});
+    const port_text = try allocator.print("{d}", .{instance.port});
     defer allocator.free(port_text);
-    const connect_timeout = try std.fmt.allocPrint(
-        allocator,
+    const connect_timeout = try allocator.print(
         "ConnectTimeout={d}",
         .{instance.execution_profile.timeouts.ssh_connect_seconds},
     );
@@ -2596,8 +2574,7 @@ fn pushProbeBinary(
     defer allocator.free(encoded);
     _ = std.base64.standard.Encoder.encode(encoded, probe_bytes);
 
-    const push_command = try std.fmt.allocPrint(
-        allocator,
+    const push_command = try allocator.print(
         "base64 -d > {s} && chmod 0755 {s}",
         .{ remote_path, remote_path },
     );
@@ -2705,8 +2682,7 @@ fn verifyGuestBinderDeviceUsability(
     var built: usize = 0;
     defer for (device_paths[0..built]) |path| allocator.free(path);
     for (binder_dynamic_device_names, 0..) |name, i| {
-        device_paths[i] = try std.fmt.allocPrint(
-            allocator,
+        device_paths[i] = try allocator.print(
             "{s}/{s}",
             .{ binderfs_mount_point, name },
         );
@@ -2819,8 +2795,7 @@ fn readGuestFilesystemUsage(
     instance: *const Instance,
     path: []const u8,
 ) !size_inventory.FilesystemUsage {
-    const command = try std.fmt.allocPrint(
-        allocator,
+    const command = try allocator.print(
         "sudo -n {s} filesystem {s}",
         .{ runtime_contract_probe_remote_path, path },
     );
@@ -2873,7 +2848,7 @@ fn serialContains(
         else => return err,
     };
     defer allocator.free(serial);
-    return std.ascii.indexOfIgnoreCase(serial, marker) != null;
+    return std.ascii.findIgnoreCase(serial, marker) != null;
 }
 
 fn waitForSerialMarker(
@@ -2999,10 +2974,9 @@ fn verifyKeyOnlySsh(
     ssh_path: []const u8,
     instance: *const Instance,
 ) !void {
-    const port_text = try std.fmt.allocPrint(allocator, "{d}", .{instance.port});
+    const port_text = try allocator.print("{d}", .{instance.port});
     defer allocator.free(port_text);
-    const connect_timeout = try std.fmt.allocPrint(
-        allocator,
+    const connect_timeout = try allocator.print(
         "ConnectTimeout={d}",
         .{instance.execution_profile.timeouts.ssh_connect_seconds},
     );
@@ -3338,8 +3312,7 @@ fn verifyCoreSshdRestart(
     instance: *const Instance,
 ) !void {
     const initial_pid = try readCoreSshdPid(allocator, io, ssh_path, instance);
-    const kill_command = try std.fmt.allocPrint(
-        allocator,
+    const kill_command = try allocator.print(
         "sudo -n /usr/bin/kill -KILL {d}",
         .{initial_pid},
     );
@@ -3491,8 +3464,7 @@ fn verifyRootGrowth(
         original_root_size,
         gib,
     );
-    const command = try std.fmt.allocPrint(
-        allocator,
+    const command = try allocator.print(
         \\set -eu
         \\root_source=$(readlink -f "$(findmnt -n -o SOURCE /)")
         \\root_disk=$(lsblk -n -o PKNAME "$root_source")
@@ -4158,7 +4130,7 @@ test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
     try std.testing.expect(!hasContract(full.contracts(), "dma-heap-device"));
     try std.testing.expect(!hasContract(full.contracts(), "runtime-contract"));
     for (core.contracts()) |contract| {
-        try std.testing.expect(std.ascii.indexOfIgnoreCase(contract, "android") == null);
+        try std.testing.expect(std.ascii.findIgnoreCase(contract, "android") == null);
     }
 }
 
@@ -4231,7 +4203,7 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
     // preserved-geometry flavor it has to be the declared one.
     const fixture_virtual_size: u64 = 5 * gib;
     var identity: AcceptanceResultIdentity = .{
-        .source_commit = try allocator.dupe(u8, "a" ** 40),
+        .source_commit = try allocator.dupe(u8, &@as([40:0]u8, @splat('a'))),
         .candidate_run_id = try allocator.dupe(u8, "90"),
         .candidate_run_attempt = try allocator.dupe(u8, "1"),
         .run_id = try allocator.dupe(u8, "100"),
@@ -4301,7 +4273,7 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
         "Ubuntu-26.04-aarch64.qcow2",
         result.get("asset_name").?.string,
     );
-    try std.testing.expectEqualStrings("a" ** 40, result.get("source_commit").?.string);
+    try std.testing.expectEqualStrings(&@as([40:0]u8, @splat('a')), result.get("source_commit").?.string);
     try std.testing.expectEqualStrings("success", result.get("status").?.string);
     const candidate_workflow = result.get("candidate_workflow").?.object;
     try std.testing.expectEqualStrings(
@@ -4348,7 +4320,7 @@ test "a core acceptance result publishes the calculated size it booted" {
     try std.testing.expect(candidate.calculatesGeometry());
 
     var identity: AcceptanceResultIdentity = .{
-        .source_commit = try allocator.dupe(u8, "b" ** 40),
+        .source_commit = try allocator.dupe(u8, &@as([40:0]u8, @splat('b'))),
         .candidate_run_id = try allocator.dupe(u8, "91"),
         .candidate_run_attempt = try allocator.dupe(u8, "1"),
         .run_id = try allocator.dupe(u8, "101"),
@@ -4544,7 +4516,7 @@ test "EFI db parser finds the exact enrolled DER certificate" {
         0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
     };
     const certificate = "DER certificate";
-    var variable = [_]u8{0} ** (28 + 16 + certificate.len);
+    var variable = @as([(28 + 16 + certificate.len)]u8, @splat(0));
     const list_offset = 0;
     @memcpy(variable[list_offset..][0..efi_cert_x509_guid.len], &efi_cert_x509_guid);
     std.mem.writeInt(
@@ -4565,7 +4537,7 @@ test "EFI db parser finds the exact enrolled DER certificate" {
     try std.testing.expect(efiDbContainsCertificate(&variable, digest));
     try std.testing.expect(!efiDbContainsCertificate(
         &variable,
-        [_]u8{0xff} ** 32,
+        @as([32]u8, @splat(0xff)),
     ));
     try std.testing.expect(!efiDbContainsCertificate(variable[0 .. variable.len - 1], digest));
     variable[list_offset] = 0;
@@ -4790,7 +4762,7 @@ test "a probe report carries the enrolled signing certificate through to the db 
 
     const digest = miz.artifact_pipeline.sha256Bytes(certificate);
     try std.testing.expect(efiDbContainsCertificate(decoded, digest));
-    try std.testing.expect(!efiDbContainsCertificate(decoded, [_]u8{0xff} ** 32));
+    try std.testing.expect(!efiDbContainsCertificate(decoded, @as([32]u8, @splat(0xff))));
 }
 
 test "signed Binder module script pins the module tree and requires evidence" {
@@ -4916,7 +4888,7 @@ test "guest cloud-init verification runs no interpreter in the guest" {
     // may appear in either script, and the shell variable that used to carry
     // the guest-side verdict is gone.
     for ([_][]const u8{ full_checks, cloud_init_status_command }) |script| {
-        try std.testing.expect(std.ascii.indexOfIgnoreCase(script, interpreter) == null);
+        try std.testing.expect(std.ascii.findIgnoreCase(script, interpreter) == null);
         try std.testing.expect(std.mem.indexOf(u8, script, "import ") == null);
     }
     try std.testing.expect(std.mem.indexOf(u8, full_checks, "cloud_init_status") == null);
@@ -5058,9 +5030,7 @@ test "rejected cloud-init status documents are reported trimmed and bounded" {
 }
 
 test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    errdefer |err| {
+    verifyFinalizedQcow2Acceptance() catch |err| {
         std.debug.print(
             "Ubuntu 26.04 same-architecture QEMU acceptance failed: {s}\n",
             .{@errorName(err)},
@@ -5068,7 +5038,13 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         if (@errorReturnTrace()) |trace| {
             std.debug.dumpErrorReturnTrace(trace);
         }
-    }
+        return err;
+    };
+}
+
+fn verifyFinalizedQcow2Acceptance() !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
     const candidate = try selectedCandidate();
 
     const image_path = try requireImageAlloc(allocator, io, candidate);

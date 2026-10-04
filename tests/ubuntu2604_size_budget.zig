@@ -221,7 +221,7 @@ fn inventory(arena: Allocator, overrides: Overrides) !Value {
     while (index < packages_count) : (index += 1) {
         try names.append(
             arena,
-            try std.fmt.allocPrint(arena, "package-{d:0>4}", .{index}),
+            try arena.print("package-{d:0>4}", .{index}),
         );
     }
     if (overrides.forbidden_package) |forbidden| {
@@ -950,7 +950,7 @@ test "a malformed or truncated inventory is refused rather than half-judged" {
     try content.object.put(
         allocator,
         "policy_sha256",
-        .{ .string = "0" ** 64 },
+        .{ .string = &@as([64:0]u8, @splat('0')) },
     );
     try std.testing.expectError(error.Failed, size_budget.evaluate(
         std.testing.allocator,
@@ -1012,7 +1012,7 @@ test "a published verdict is re-derived rather than believed" {
         .{
             .architecture = "x86_64",
             .flavor = "core",
-            .inventory_sha256 = "9" ** 64,
+            .inventory_sha256 = &@as([64:0]u8, @splat('9')),
         },
         &diagnostic,
     ));

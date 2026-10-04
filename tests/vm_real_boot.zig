@@ -62,7 +62,7 @@ const hook_script = "#!" ++ guest_stub.hook_interpreter_path ++ "\n" ++
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
-    if (builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .linux) {
         std.debug.print("skipping vm real boot: Linux is required\n", .{});
         return;
     }
@@ -94,7 +94,7 @@ const Settings = struct {
             );
             return null;
         }
-        const host_architecture: miz.customize.Architecture = switch (builtin.cpu.arch) {
+        const host_architecture: miz.customize.Architecture = switch (builtin.target.cpu.arch) {
             .x86_64 => .x86_64,
             .aarch64 => .aarch64,
             else => {
@@ -153,8 +153,7 @@ fn runBoot(
     var random: [8]u8 = undefined;
     Io.random(io, &random);
     const random_hex = std.fmt.bytesToHex(random, .lower);
-    const work_path = try std.fmt.allocPrint(
-        allocator,
+    const work_path = try allocator.print(
         "{s}/miz-vm-boot-{s}",
         .{ settings.work_root, &random_hex },
     );
@@ -220,7 +219,7 @@ fn runBoot(
                 .command = settings.emulator_path,
             } },
         .reproducibility = .{
-            .seed = .{ .bytes = [_]u8{0x57} ** 32 },
+            .seed = .{ .bytes = @as([32]u8, @splat(0x57)) },
             .source_date_epoch = 1_735_689_600,
         },
     };
@@ -408,14 +407,13 @@ fn createSourceDisk(
     }) |path| {
         try tree.putDirectory(path, .{ .mode = 0o755 });
     }
-    const module_directory = try std.fmt.allocPrint(
-        allocator,
+    const module_directory = try allocator.print(
         "lib/modules/{s}",
         .{release},
     );
     try tree.putDirectory(module_directory, .{ .mode = 0o755 });
     try tree.putFileBytes(
-        try std.fmt.allocPrint(allocator, "{s}/modules.builtin", .{module_directory}),
+        try allocator.print("{s}/modules.builtin", .{module_directory}),
         modules_builtin,
         .{ .mode = 0o644 },
     );
@@ -423,14 +421,14 @@ fn createSourceDisk(
         try stageModuleTree(allocator, io, &tree, module_directory, source);
     }
     try tree.putFileBytes(
-        try std.fmt.allocPrint(allocator, "boot/vmlinuz-{s}", .{release}),
+        try allocator.print("boot/vmlinuz-{s}", .{release}),
         kernel,
         .{ .mode = 0o644 },
     );
     // The agent is appended to whatever the image ships, so an archive holding
     // nothing but its own end marker is enough to prove the concatenation.
     try tree.putFileBytes(
-        try std.fmt.allocPrint(allocator, "boot/initramfs-{s}.img", .{release}),
+        try allocator.print("boot/initramfs-{s}.img", .{release}),
         cpio_trailer,
         .{ .mode = 0o600 },
     );
@@ -450,7 +448,7 @@ fn createSourceDisk(
         .offset = partition_offset,
         .length = partition_length,
         .label = "vm-boot",
-        .uuid = [_]u8{0x57} ** 16,
+        .uuid = @as([16]u8, @splat(0x57)),
         .timestamp = 1_735_689_600,
     });
     return release;

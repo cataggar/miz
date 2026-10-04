@@ -41,7 +41,7 @@ pub const Header = struct {
     partition_array_crc32: u32,
 
     pub fn encode(self: Header) [sector_size]u8 {
-        var buf: [sector_size]u8 = [_]u8{0} ** sector_size;
+        var buf: [sector_size]u8 = @as([sector_size]u8, @splat(0));
         buf[0..8].* = signature;
         std.mem.writeInt(u32, buf[8..12], self.revision, .little);
         std.mem.writeInt(u32, buf[12..16], self.header_size, .little);
@@ -57,7 +57,7 @@ pub const Header = struct {
         std.mem.writeInt(u32, buf[84..88], self.partition_entry_size, .little);
         std.mem.writeInt(u32, buf[88..92], self.partition_array_crc32, .little);
 
-        const crc = std.hash.crc.Crc32.hash(buf[0..self.header_size]);
+        const crc = std.hash.Crc32.hash(buf[0..self.header_size]);
         std.mem.writeInt(u32, buf[16..20], crc, .little);
         return buf;
     }
@@ -73,7 +73,7 @@ pub const Header = struct {
 
         var checked = buf.*;
         checked[16..20].* = .{ 0, 0, 0, 0 };
-        const computed_crc = std.hash.crc.Crc32.hash(checked[0..hdr_size]);
+        const computed_crc = std.hash.Crc32.hash(checked[0..hdr_size]);
         if (computed_crc != stored_crc) return error.BadHeaderChecksum;
 
         return .{
@@ -102,7 +102,7 @@ pub const PartitionEntry = struct {
     last_lba: u64 = 0,
     attributes: u64 = 0,
     /// 36 UTF-16LE code units, matching the spec's fixed-width name field.
-    name_utf16le: [36]u16 = [_]u16{0} ** 36,
+    name_utf16le: [36]u16 = @as([36]u16, @splat(0)),
 
     pub fn isEmpty(self: PartitionEntry) bool {
         return std.mem.eql(u8, &self.partition_type_guid, &guid.nil);
@@ -138,7 +138,7 @@ pub const PartitionEntry = struct {
 /// Encodes an ASCII partition name into the fixed 36-UTF-16LE-code-unit
 /// field (truncated if too long; zero-padded if shorter).
 pub fn asciiName(name: []const u8) [36]u16 {
-    var out: [36]u16 = [_]u16{0} ** 36;
+    var out: [36]u16 = @as([36]u16, @splat(0));
     const n = @min(name.len, 36);
     for (name[0..n], 0..) |c, i| out[i] = c;
     return out;
@@ -148,7 +148,7 @@ pub const PartitionSpec = struct {
     type_guid: guid.Guid,
     unique_guid: guid.Guid,
     size_sectors: u64,
-    name_utf16le: [36]u16 = [_]u16{0} ** 36,
+    name_utf16le: [36]u16 = @as([36]u16, @splat(0)),
 };
 
 pub const Placement = struct {
@@ -167,7 +167,7 @@ pub const PlacedPartitionSpec = struct {
     type_guid: guid.Guid,
     unique_guid: guid.Guid,
     placement: Placement,
-    name_utf16le: [36]u16 = [_]u16{0} ** 36,
+    name_utf16le: [36]u16 = @as([36]u16, @splat(0)),
 };
 
 fn writePartitionTables(
@@ -176,11 +176,11 @@ fn writePartitionTables(
     disk_guid: guid.Guid,
     entries: []const PartitionEntry,
 ) WriteError!void {
-    var array_buf: [default_num_partition_entries * partition_entry_size]u8 = [_]u8{0} ** (default_num_partition_entries * partition_entry_size);
+    var array_buf: [default_num_partition_entries * partition_entry_size]u8 = @as([(default_num_partition_entries * partition_entry_size)]u8, @splat(0));
     for (entries, 0..) |entry, i| {
         entry.encode(array_buf[i * partition_entry_size ..][0..partition_entry_size]);
     }
-    const array_crc = std.hash.crc.Crc32.hash(&array_buf);
+    const array_crc = std.hash.Crc32.hash(&array_buf);
 
     const total_sectors = img.virtual_size / sector_size;
     const first_usable_lba: u64 = 2 + partition_array_sectors;
@@ -234,7 +234,7 @@ pub fn writeGpt(
     const first_usable_lba: u64 = 2 + partition_array_sectors;
     const last_usable_lba: u64 = total_sectors - 2 - partition_array_sectors;
 
-    var entries: [default_num_partition_entries]PartitionEntry = [_]PartitionEntry{.{}} ** default_num_partition_entries;
+    var entries: [default_num_partition_entries]PartitionEntry = @as([default_num_partition_entries]PartitionEntry, @splat(.{}));
     var cursor = first_usable_lba;
     for (specs, 0..) |spec, i| {
         if (spec.size_sectors == 0) return error.NotEnoughSpace;
@@ -270,7 +270,7 @@ pub fn writeGptPlaced(
     const first_usable_lba: u64 = 2 + partition_array_sectors;
     const last_usable_lba: u64 = total_sectors - 2 - partition_array_sectors;
 
-    var entries: [default_num_partition_entries]PartitionEntry = [_]PartitionEntry{.{}} ** default_num_partition_entries;
+    var entries: [default_num_partition_entries]PartitionEntry = @as([default_num_partition_entries]PartitionEntry, @splat(.{}));
     var prev_last_lba: u64 = 0;
     for (specs, 0..) |spec, i| {
         const placement = spec.placement;
@@ -388,7 +388,7 @@ pub fn readGpt(img: Image, io: Io, allocator: std.mem.Allocator) ReadError!Parse
         return error.UnexpectedEndOfFile;
     }
 
-    if (std.hash.crc.Crc32.hash(array_buf) != header.partition_array_crc32) {
+    if (std.hash.Crc32.hash(array_buf) != header.partition_array_crc32) {
         return error.BadPartitionArrayChecksum;
     }
 
@@ -460,7 +460,7 @@ pub fn detectVerifiedGpt(
     allocator: std.mem.Allocator,
     max_partition_array_bytes: u64,
 ) VerifyError!DetectedGpt {
-    var first_blocks: [2 * sector_size]u8 = [_]u8{0} ** (2 * sector_size);
+    var first_blocks: [2 * sector_size]u8 = @as([(2 * sector_size)]u8, @splat(0));
     const available = @min(img.virtual_size, first_blocks.len);
     if (available != 0) {
         const available_len: usize = @intCast(available);
@@ -473,7 +473,7 @@ pub fn detectVerifiedGpt(
     if (available >= sector_size) {
         for (0..4) |i| {
             const entry_offset = mbr.partition_table_offset + i * mbr.entry_size;
-            if (first_blocks[entry_offset + 4] == @intFromEnum(mbr.PartitionType.gpt_protective)) {
+            if (first_blocks[entry_offset + 4] == @backingInt(mbr.PartitionType.gpt_protective)) {
                 has_protective_entry = true;
                 break;
             }
@@ -679,7 +679,7 @@ pub fn readVerifiedGpt(
         primary_array,
         try sectorOffset(primary.partition_entry_lba),
     );
-    if (std.hash.crc.Crc32.hash(primary_array) !=
+    if (std.hash.Crc32.hash(primary_array) !=
         primary.partition_array_crc32)
     {
         return error.BadPartitionArrayChecksum;
@@ -693,7 +693,7 @@ pub fn readVerifiedGpt(
         backup_array,
         try sectorOffset(backup.partition_entry_lba),
     );
-    if (std.hash.crc.Crc32.hash(backup_array) !=
+    if (std.hash.Crc32.hash(backup_array) !=
         backup.partition_array_crc32)
     {
         return error.BadPartitionArrayChecksum;
@@ -794,7 +794,7 @@ pub const PartitionGuidRewrite = struct {
     first_lba: u64,
     last_lba: u64,
     attributes: u64 = 0,
-    name_utf16le: [36]u16 = [_]u16{0} ** 36,
+    name_utf16le: [36]u16 = @as([36]u16, @splat(0)),
     old_unique_guid: guid.Guid,
     new_unique_guid: guid.Guid,
 };
@@ -927,7 +927,7 @@ pub fn rewriteIdentity(
         };
     }
 
-    const array_crc = std.hash.crc.Crc32.hash(updated_array);
+    const array_crc = std.hash.Crc32.hash(updated_array);
     var primary_sector = verified.primary_header_sector;
     primary_sector[56..72].* = replacement.disk_guid;
     std.mem.writeInt(u32, primary_sector[88..92], array_crc, .little);
@@ -1061,7 +1061,7 @@ pub fn rewritePartitionEntries(
         }
     }
 
-    const array_crc = std.hash.crc.Crc32.hash(updated_array);
+    const array_crc = std.hash.Crc32.hash(updated_array);
     var primary_sector = verified.primary_header_sector;
     std.mem.writeInt(u32, primary_sector[88..92], array_crc, .little);
     updateHeaderChecksum(&primary_sector);
@@ -1318,7 +1318,7 @@ pub fn growPartitionToEnd(
         relocation.new_last_usable_lba,
         .little,
     );
-    const array_crc = std.hash.crc.Crc32.hash(array);
+    const array_crc = std.hash.Crc32.hash(array);
     std.mem.writeInt(u32, primary_sector[88..92], array_crc, .little);
     std.mem.writeInt(u32, backup_sector[88..92], array_crc, .little);
     updateHeaderChecksum(&primary_sector);
@@ -1522,7 +1522,7 @@ fn writeZeros(
     offset: u64,
     len: u64,
 ) Image.PwriteError!void {
-    const zeros: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024);
+    const zeros: [64 * 1024]u8 = @as([(64 * 1024)]u8, @splat(0));
     var written: u64 = 0;
     while (written < len) {
         const chunk_len: usize = @intCast(@min(len - written, zeros.len));
@@ -1557,7 +1557,7 @@ fn updateHeaderChecksum(buf: *[sector_size]u8) void {
     std.debug.assert(encoded_header_size >= header_size);
     std.debug.assert(encoded_header_size <= sector_size);
     buf[16..20].* = .{ 0, 0, 0, 0 };
-    const checksum = std.hash.crc.Crc32.hash(buf[0..encoded_header_size]);
+    const checksum = std.hash.Crc32.hash(buf[0..encoded_header_size]);
     std.mem.writeInt(u32, buf[16..20], checksum, .little);
 }
 
@@ -1625,7 +1625,7 @@ fn writeCustomPartitionTablesForTest(
         @memcpy(opaque_bytes[0..unused.bytes.len], unused.bytes);
     }
 
-    const array_crc = std.hash.crc.Crc32.hash(array);
+    const array_crc = std.hash.Crc32.hash(array);
     const primary = Header{
         .current_lba = 1,
         .backup_lba = total_sectors - 1,
@@ -1676,10 +1676,10 @@ test "invalidateDestinationPartitionStructures clears both GPT metadata regions"
     var img = try Image.create(io, path, .raw, size, .{});
     defer img.close(io);
 
-    const stale_start = [_]u8{0xa5} ** start_len;
-    const stale_end = [_]u8{0x5a} ** end_len;
-    const start_guard = [_]u8{0x3c} ** sector_size;
-    const end_guard = [_]u8{0xc3} ** sector_size;
+    const stale_start = @as([start_len]u8, @splat(0xa5));
+    const stale_end = @as([end_len]u8, @splat(0x5a));
+    const start_guard = @as([sector_size]u8, @splat(0x3c));
+    const end_guard = @as([sector_size]u8, @splat(0xc3));
     const end_guard_offset = size - end_len - sector_size;
     try img.pwrite(io, &stale_start, 0);
     try img.pwrite(io, &stale_end, size - end_len);
@@ -1720,7 +1720,7 @@ test "invalidateDestinationPartitionStructures clears small destinations safely"
     );
     defer img.close(io);
 
-    try img.pwrite(io, &([_]u8{0xa5} ** sector_size), 0);
+    try img.pwrite(io, &(@as([sector_size]u8, @splat(0xa5))), 0);
     try invalidateDestinationPartitionStructures(&img, io, array_bytes);
     var first_sector: [sector_size]u8 = undefined;
     try preadExact(img, io, &first_sector, 0);
@@ -1749,7 +1749,7 @@ test "invalidateDestinationPartitionStructures clears an advertised intermediate
     var img = try Image.create(io, path, .raw, size, .{});
     defer img.close(io);
 
-    var primary: [sector_size]u8 = [_]u8{0} ** sector_size;
+    var primary: [sector_size]u8 = @as([sector_size]u8, @splat(0));
     @memcpy(primary[0..signature.len], &signature);
     std.mem.writeInt(u32, primary[8..12], 0x0001_0000, .little);
     std.mem.writeInt(u32, primary[12..16], header_size, .little);
@@ -1759,7 +1759,7 @@ test "invalidateDestinationPartitionStructures clears an advertised intermediate
     try img.pwrite(io, &primary, sector_size);
     try img.pwrite(
         io,
-        &([_]u8{0xa5} ** sector_size),
+        &(@as([sector_size]u8, @splat(0xa5))),
         advertised_backup_lba * sector_size,
     );
 
@@ -2120,7 +2120,7 @@ test "sparse multi-terabyte GPT growth uses 64-bit offsets and validates both co
     try std.testing.expectEqual(@as(usize, 1), after.partitions.len);
     try std.testing.expectEqual(grown_last_usable_lba, after.partitions[0].last_lba);
     try std.testing.expectEqual(
-        std.hash.crc.Crc32.hash(after.partition_array),
+        std.hash.Crc32.hash(after.partition_array),
         after.primary_header.partition_array_crc32,
     );
     try std.testing.expectEqual(
@@ -2220,7 +2220,7 @@ test "readGpt detects a corrupted partition array" {
 }
 
 test "Header.decode rejects invalid header sizes before checksumming" {
-    var encoded = [_]u8{0} ** sector_size;
+    var encoded = @as([sector_size]u8, @splat(0));
     encoded[0..signature.len].* = signature;
 
     std.mem.writeInt(u32, encoded[12..16], header_size - 1, .little);
@@ -2278,7 +2278,7 @@ test "rewritePartitionEntries grows one slot clears another and preserves opaque
             .last_lba = 4095,
             .attributes = 0x0123_4567_89ab_cdef,
             .name_utf16le = asciiName("EFI System"),
-        }, .opaque_tail = &([_]u8{0xa1} ** 32) },
+        }, .opaque_tail = &(@as([32]u8, @splat(0xa1))) },
         .{ .entry = .{
             .partition_type_guid = guid.linux_xbootldr,
             .unique_partition_guid = guid.parse("22222222-2222-2222-2222-222222222222"),
@@ -2286,7 +2286,7 @@ test "rewritePartitionEntries grows one slot clears another and preserves opaque
             .last_lba = 8191,
             .attributes = 0xfedc_ba98_7654_3210,
             .name_utf16le = asciiName("XBOOTLDR"),
-        }, .opaque_tail = &([_]u8{0xb2} ** 32) },
+        }, .opaque_tail = &(@as([32]u8, @splat(0xb2))) },
         .{ .entry = .{
             .partition_type_guid = guid.linux_filesystem_data,
             .unique_partition_guid = guid.parse("33333333-3333-3333-3333-333333333333"),
@@ -2294,10 +2294,10 @@ test "rewritePartitionEntries grows one slot clears another and preserves opaque
             .last_lba = 32767,
             .attributes = 0x55aa_55aa_55aa_55aa,
             .name_utf16le = asciiName("root"),
-        }, .opaque_tail = &([_]u8{0xc3} ** 32) },
+        }, .opaque_tail = &(@as([32]u8, @splat(0xc3))) },
     };
     const unused_tails = [_]TestOpaqueTail{
-        .{ .table_index = 3, .bytes = &([_]u8{0xd4} ** 32) },
+        .{ .table_index = 3, .bytes = &(@as([32]u8, @splat(0xd4))) },
     };
     try writeCustomPartitionTablesForTest(
         &img,
@@ -2413,7 +2413,7 @@ test "rewriteIdentity preserves opaque GPT entry bytes on same-size disks" {
             .last_lba = 4095,
             .attributes = 0x0123_4567_89ab_cdef,
             .name_utf16le = asciiName("EFI System"),
-        }, .opaque_tail = &([_]u8{0xa1} ** 32) },
+        }, .opaque_tail = &(@as([32]u8, @splat(0xa1))) },
         .{ .entry = .{
             .partition_type_guid = guid.linux_filesystem_data,
             .unique_partition_guid = guid.parse("22222222-2222-2222-2222-222222222222"),
@@ -2421,11 +2421,11 @@ test "rewriteIdentity preserves opaque GPT entry bytes on same-size disks" {
             .last_lba = 32767,
             .attributes = 0xfedc_ba98_7654_3210,
             .name_utf16le = asciiName("root"),
-        }, .opaque_tail = &([_]u8{0xb2} ** 32) },
+        }, .opaque_tail = &(@as([32]u8, @splat(0xb2))) },
     };
     const unused_tails = [_]TestOpaqueTail{
-        .{ .table_index = 2, .bytes = &([_]u8{0xc3} ** 32) },
-        .{ .table_index = 3, .bytes = &([_]u8{0xd4} ** 32) },
+        .{ .table_index = 2, .bytes = &(@as([32]u8, @splat(0xc3))) },
+        .{ .table_index = 3, .bytes = &(@as([32]u8, @splat(0xd4))) },
     };
     try writeCustomPartitionTablesForTest(
         &img,
@@ -2503,7 +2503,7 @@ test "rewriteIdentity preserves opaque GPT entry bytes on same-size disks" {
     try std.testing.expectEqualSlices(u8, &replacement.disk_guid, &after.primary_header.disk_guid);
     try std.testing.expectEqualSlices(u8, &replacement.disk_guid, &after.backup_header.disk_guid);
     try std.testing.expectEqual(
-        std.hash.crc.Crc32.hash(after.partition_array),
+        std.hash.Crc32.hash(after.partition_array),
         after.primary_header.partition_array_crc32,
     );
     try std.testing.expectEqual(

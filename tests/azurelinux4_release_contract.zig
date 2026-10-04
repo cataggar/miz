@@ -292,7 +292,7 @@ test "build manifest dependencies are git-pinned to a full commit" {
     const names = [_][]const u8{ "bzip2z", "tls", "debz", "rpmz", "zstd" };
     try expectCount(manifest, ".url = \"git+https://", names.len);
     for (names) |name| {
-        const declaration = try std.fmt.allocPrint(allocator, ".{s} = .{{", .{name});
+        const declaration = try allocator.print(".{s} = .{{", .{name});
         defer allocator.free(declaration);
         const body = try section(manifest, declaration, "},");
         const url = try section(body, ".url = \"", "\"");
@@ -306,7 +306,7 @@ test "build manifest dependencies are git-pinned to a full commit" {
             else => return error.DependencyIsNotPinned,
         };
         const hash = try section(body, ".hash = \"", "\"");
-        const prefix = try std.fmt.allocPrint(allocator, "{s}-", .{name});
+        const prefix = try allocator.print("{s}-", .{name});
         defer allocator.free(prefix);
         try std.testing.expect(std.mem.startsWith(u8, hash, prefix));
     }
@@ -727,7 +727,7 @@ test "CI heavy phases are independent jobs" {
         "unsafe-chroot",
         "vm-boot",
     }) |job| {
-        const heading = try std.fmt.allocPrint(allocator, "  {s}:\n", .{job});
+        const heading = try allocator.print("  {s}:\n", .{job});
         defer allocator.free(heading);
         try expectContains(workflow, heading);
     }

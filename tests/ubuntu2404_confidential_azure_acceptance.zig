@@ -254,8 +254,7 @@ fn runGuestHarness(
     );
     defer allocator.free(library);
     try Dir.cwd().createDirPath(std.testing.io, root);
-    const harness = try std.fmt.allocPrint(
-        allocator,
+    const harness = try allocator.print(
         "{s}/{s}.sh",
         .{ root, name },
     );
@@ -293,8 +292,7 @@ test "attestation collection propagates SSH failure with token output" {
     defer tmp.cleanup();
     const repository = try rootAlloc(allocator);
     defer allocator.free(repository);
-    const root = try std.fmt.allocPrint(
-        allocator,
+    const root = try allocator.print(
         "{s}/.zig-cache/tmp/{s}",
         .{ repository, tmp.sub_path },
     );
@@ -343,8 +341,7 @@ test "final acceptance always cleans copied validation files" {
     defer tmp.cleanup();
     const repository = try rootAlloc(allocator);
     defer allocator.free(repository);
-    const root = try std.fmt.allocPrint(
-        allocator,
+    const root = try allocator.print(
         "{s}/.zig-cache/tmp/{s}",
         .{ repository, tmp.sub_path },
     );
@@ -436,8 +433,7 @@ fn runCleanup(
         allocator,
     );
     defer environment.deinit();
-    const path_value = try std.fmt.allocPrint(
-        allocator,
+    const path_value = try allocator.print(
         "{s}/bin:{s}",
         .{ root, existing_path },
     );
@@ -468,16 +464,15 @@ test "cleanup deletes only the exact owned resource group" {
     defer tmp.cleanup();
     const repository = try rootAlloc(allocator);
     defer allocator.free(repository);
-    const root = try std.fmt.allocPrint(
-        allocator,
+    const root = try allocator.print(
         "{s}/.zig-cache/tmp/{s}",
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const bin = try std.fmt.allocPrint(allocator, "{s}/bin", .{root});
+    const bin = try allocator.print("{s}/bin", .{root});
     defer allocator.free(bin);
     try Dir.cwd().createDirPath(std.testing.io, bin);
-    const az = try std.fmt.allocPrint(allocator, "{s}/az", .{bin});
+    const az = try allocator.print("{s}/az", .{bin});
     defer allocator.free(az);
     try Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = az,
@@ -494,13 +489,13 @@ test "cleanup deletes only the exact owned resource group" {
         ,
         .flags = .{ .permissions = .fromMode(0o755) },
     });
-    const state = try std.fmt.allocPrint(allocator, "{s}/state", .{root});
+    const state = try allocator.print("{s}/state", .{root});
     defer allocator.free(state);
     try Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = state,
         .data = "miz-u2404-cvm-123-4\n",
     });
-    const marker = try std.fmt.allocPrint(allocator, "{s}/deleted", .{root});
+    const marker = try allocator.print("{s}/deleted", .{root});
     defer allocator.free(marker);
 
     const accepted = try runCleanup(

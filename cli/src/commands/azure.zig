@@ -261,8 +261,7 @@ fn finishFixup(
 
 fn derivedVhdPath(allocator: std.mem.Allocator, input_path: []const u8) std.mem.Allocator.Error![]u8 {
     const extension = std.fs.path.extension(input_path);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}.vhd",
         .{input_path[0 .. input_path.len - extension.len]},
     );

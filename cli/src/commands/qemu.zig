@@ -530,7 +530,7 @@ const QemuArgv = struct {
         comptime format: []const u8,
         args: anytype,
     ) !void {
-        const value = try std.fmt.allocPrint(allocator, format, args);
+        const value = try allocator.print(format, args);
         self.owned.append(allocator, value) catch |err| {
             allocator.free(value);
             return err;
@@ -1212,11 +1212,11 @@ fn hostArchitecture(host_arch: std.Target.Cpu.Arch) GuestArchitecture {
 }
 
 fn catalogArchitecture(options: Options) GuestArchitecture {
-    if (!options.architecture_was_explicit) return hostArchitecture(builtin.cpu.arch);
+    if (!options.architecture_was_explicit) return hostArchitecture(builtin.target.cpu.arch);
     return switch (options.architecture_request) {
         .x86_64 => .x86_64,
         .aarch64 => .aarch64,
-        .auto => hostArchitecture(builtin.cpu.arch),
+        .auto => hostArchitecture(builtin.target.cpu.arch),
     };
 }
 
@@ -1321,7 +1321,7 @@ fn bundlePathAlloc(
 ) ![]u8 {
     const extension = std.fs.path.extension(disk_path);
     const stem = disk_path[0 .. disk_path.len - extension.len];
-    return std.fmt.allocPrint(allocator, "{s}{s}", .{ stem, suffix });
+    return allocator.print("{s}{s}", .{ stem, suffix });
 }
 
 fn resolveAccel(
@@ -1348,14 +1348,14 @@ fn hostMatchesGuest(host_arch: std.Target.Cpu.Arch, architecture: GuestArchitect
 }
 
 fn currentHostCapabilities(io: std.Io) HostCapabilities {
-    const kvm_available = if (builtin.os.tag == .linux)
+    const kvm_available = if (builtin.target.os.tag == .linux)
         qemu_host.pathAccessible(io, "/dev/kvm", .{ .read = true, .write = true }) catch false
     else
         false;
 
     return .{
-        .os_tag = builtin.os.tag,
-        .cpu_arch = builtin.cpu.arch,
+        .os_tag = builtin.target.os.tag,
+        .cpu_arch = builtin.target.cpu.arch,
         .kvm_available = kvm_available,
     };
 }
@@ -1693,7 +1693,7 @@ fn persistentVarsPathAlloc(
 ) ![]u8 {
     const extension = std.fs.path.extension(image_path);
     const stem = image_path[0 .. image_path.len - extension.len];
-    return std.fmt.allocPrint(allocator, "{s}.vars.fd", .{stem});
+    return allocator.print("{s}.vars.fd", .{stem});
 }
 
 fn secureBootStateExists(
@@ -2108,7 +2108,7 @@ fn randomTempPathAlloc(
     var random: [16]u8 = undefined;
     std.Io.random(io, &random);
     const hex = std.fmt.bytesToHex(random, .lower);
-    const filename = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ prefix, &hex, suffix });
+    const filename = try allocator.print("{s}{s}{s}", .{ prefix, &hex, suffix });
     defer allocator.free(filename);
     return std.fs.path.join(allocator, &.{ temp_dir, filename });
 }
@@ -2135,14 +2135,14 @@ fn createTemporaryWorkDirAlloc(
 }
 
 fn privateDirectoryPermissions() std.Io.File.Permissions {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows => .default_dir,
         else => .fromMode(0o700),
     };
 }
 
 fn privateFilePermissions() std.Io.File.Permissions {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows => .default_file,
         else => .fromMode(0o600),
     };
@@ -2153,7 +2153,7 @@ fn temporaryDirectoryAlloc(
     io: std.Io,
     environ: std.process.Environ,
 ) ![]u8 {
-    const keys: []const []const u8 = switch (builtin.os.tag) {
+    const keys: []const []const u8 = switch (builtin.target.os.tag) {
         .windows => &.{ "TEMP", "TMP" },
         else => &.{"TMPDIR"},
     };
@@ -2606,8 +2606,7 @@ fn buildOvfEnvAlloc(
 }
 
 fn buildNoCloudMetaDataAlloc(allocator: std.mem.Allocator, instance_id: []const u8) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "instance-id: {s}\nlocal-hostname: miz-local\n",
         .{instance_id},
     );
@@ -3025,7 +3024,7 @@ test "qemu temporary directory fallback has exact allocation ownership" {
 }
 
 test "qemu executable preflight reports process success and failure" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -3039,8 +3038,7 @@ test "qemu executable preflight reports process success and failure" {
         var file = try tmp.dir.createFile(io, script.name, .{
             .permissions = .executable_file,
         });
-        const contents = try std.fmt.allocPrint(
-            allocator,
+        const contents = try allocator.print(
             "#!/bin/sh\nexit {d}\n",
             .{script.exit_code},
         );
@@ -3290,7 +3288,7 @@ test "qemu resolves known aliases and explicit image paths" {
         .image_was_explicit = true,
     });
     defer short_alias.deinit(allocator);
-    const host_image = knownImageForHostArchitecture(.azure_linux, builtin.cpu.arch, .full);
+    const host_image = knownImageForHostArchitecture(.azure_linux, builtin.target.cpu.arch, .full);
     try std.testing.expectEqualStrings(host_image.disk_name, short_alias.disk_path);
     if (host_image.architecture == .aarch64) {
         try std.testing.expectEqualStrings("AzureLinux-4.0-aarch64.code.fd", short_alias.code_path);
@@ -3319,7 +3317,7 @@ test "qemu resolves known aliases and explicit image paths" {
         .model_was_explicit = true,
     });
     defer short_core.deinit(allocator);
-    const host_core = knownImageForHostArchitecture(.azure_linux, builtin.cpu.arch, .core);
+    const host_core = knownImageForHostArchitecture(.azure_linux, builtin.target.cpu.arch, .core);
     try std.testing.expectEqualStrings(host_core.disk_name, short_core.disk_path);
     try std.testing.expectEqual(host_core.architecture, short_core.architecture);
     try std.testing.expect(short_core.download_allowed);
@@ -3505,7 +3503,7 @@ test "qemu resolves FreeBSD aliases to host-native release images" {
     defer short_alias.deinit(allocator);
     const host_image = imageForFamilyAndArchitecture(
         .freebsd,
-        hostArchitecture(builtin.cpu.arch),
+        hostArchitecture(builtin.target.cpu.arch),
         .full,
     );
     try std.testing.expectEqualStrings(host_image.disk_name, short_alias.disk_path);
@@ -3553,7 +3551,7 @@ test "qemu resolves Ubuntu aliases for both host architectures" {
     defer host_alias.deinit(allocator);
     const expected_host = knownImageForHostArchitecture(
         .ubuntu,
-        builtin.cpu.arch,
+        builtin.target.cpu.arch,
         .full,
     );
     try std.testing.expectEqualStrings(expected_host.disk_name, host_alias.disk_path);
@@ -3599,7 +3597,7 @@ test "qemu resolves UbuntuCore for both host architectures" {
     defer host_alias.deinit(allocator);
     const expected_host = knownImageForHostArchitecture(
         .ubuntu,
-        builtin.cpu.arch,
+        builtin.target.cpu.arch,
         .core,
     );
     try std.testing.expectEqualStrings(expected_host.disk_name, host_alias.disk_path);
@@ -3865,7 +3863,7 @@ test "qemu architecture inference uses only recognized GPT root or usr GUIDs" {
 }
 
 test "qemu architecture inference reads PE machine metadata" {
-    var bytes = [_]u8{0} ** 128;
+    var bytes = @as([128]u8, @splat(0));
     bytes[0..2].* = "MZ".*;
     std.mem.writeInt(u32, bytes[0x3c..][0..4], 64, .little);
     bytes[64..68].* = "PE\x00\x00".*;
@@ -4283,7 +4281,7 @@ fn writeTestVars(
 const test_microsoft_db =
     "\xa1\x59\xc0\xa5\xe4\x94\xa7\x4a\x87\xb5\xab\x15\x5c\x2b\xf0\x72" ++
     "\x38\x00\x00\x00\x00\x00\x00\x00\x1c\x00\x00\x00" ++
-    "\x00" ** 16 ++ "microsoft db";
+    &@as([16:0]u8, @splat(0x00)) ++ "microsoft db";
 
 test "qemu enrolls and validates the exact release leaf in native vars" {
     const allocator = std.testing.allocator;
@@ -5192,8 +5190,7 @@ test "qemu resolves a complete ghr package tree" {
         .data = "vars",
     });
 
-    const metadata = try std.fmt.allocPrint(
-        allocator,
+    const metadata = try allocator.print(
         "{{\"bins\":[\"qemu-v11/{s}\"]}}",
         .{qemu_name},
     );
@@ -5246,8 +5243,7 @@ test "qemu resolves AArch64 from a ghr package containing both emulators" {
         .data = "compressed-vars",
     });
 
-    const metadata = try std.fmt.allocPrint(
-        allocator,
+    const metadata = try allocator.print(
         "{{\"bins\":[\"qemu-v11/{s}\",\"qemu-v11/{s}\"]}}",
         .{ x86_name, arm_name },
     );
@@ -5298,7 +5294,7 @@ test "qemu ignores a ghr package whose recorded binary is missing" {
 }
 
 test "qemu explicit paths bypass package and system discovery" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -5333,7 +5329,7 @@ test "qemu explicit paths bypass package and system discovery" {
 }
 
 test "qemu skips an invalid PATH emulator and resolves the next QEMU" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -5373,8 +5369,7 @@ test "qemu skips an invalid PATH emulator and resolves the next QEMU" {
     defer allocator.free(broken_path);
     const working_path = try tmp.dir.realPathFileAlloc(io, "working", allocator);
     defer allocator.free(working_path);
-    const path_value = try std.fmt.allocPrint(
-        allocator,
+    const path_value = try allocator.print(
         "{s}{c}{s}",
         .{ broken_path, std.fs.path.delimiter, working_path },
     );

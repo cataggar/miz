@@ -47,8 +47,7 @@ pub fn filenameAlloc(
     flavor: []const u8,
     architecture: []const u8,
 ) Error![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "ubuntu2604-runtime-contract-{s}-{s}.json",
         .{ flavor, architecture },
     );

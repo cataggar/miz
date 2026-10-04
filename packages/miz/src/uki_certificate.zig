@@ -130,8 +130,7 @@ pub fn extractAlloc(
         if (candidates.items.len != 0) return error.MultipleFallbackUkis;
         if (entry.size > options.max_uki_bytes) return error.UkiTooLarge;
         try candidates.append(.{
-            .path = try std.fmt.allocPrint(
-                allocator,
+            .path = try allocator.print(
                 "EFI/BOOT/{s}",
                 .{entry.name},
             ),
@@ -165,8 +164,7 @@ pub fn extractAlloc(
             }
             if (entry.size > options.max_uki_bytes) return error.UkiTooLarge;
             try candidates.append(.{
-                .path = try std.fmt.allocPrint(
-                    allocator,
+                .path = try allocator.print(
                     "EFI/Linux/{s}",
                     .{entry.name},
                 ),
@@ -469,7 +467,7 @@ fn makeSignedTestPe(
         unsigned,
     );
     defer prepared.deinit(allocator);
-    const signature = [_]u8{0x5a} ** 256;
+    const signature = @as([256]u8, @splat(0x5a));
     return authenticode.finishRsaSha256Alloc(
         allocator,
         prepared,

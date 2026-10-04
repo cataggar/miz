@@ -426,7 +426,7 @@ fn emitCommand(
             },
             .object => {
                 has_args = true;
-                inline_args_name = try std.fmt.allocPrint(allocator, "{s}Args", .{try pascalCase(allocator, wire_name)});
+                inline_args_name = try allocator.print("{s}Args", .{try pascalCase(allocator, wire_name)});
                 try args_type_buf.writer.writeAll(inline_args_name.?);
             },
             else => {},
@@ -481,7 +481,7 @@ fn emitEvent(
     const data_val = obj.get("data") orelse return false;
     if (data_val != .object) return false;
 
-    const type_name = try std.fmt.allocPrint(allocator, "{s}Data", .{try pascalCaseFromUpperSnake(allocator, wire_name)});
+    const type_name = try allocator.print("{s}Data", .{try pascalCaseFromUpperSnake(allocator, wire_name)});
     try w.print("/// Data payload of the QMP event `{s}`.\n", .{wire_name});
     try w.print("pub const {s} = struct {{\n", .{type_name});
     try emitFieldsFromData(w, known, data_val);

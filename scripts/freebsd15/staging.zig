@@ -196,8 +196,7 @@ pub fn fullCoreRows(context: *Context, manifest: Value) Error![]const Pair {
             "{s} core asset identity is invalid",
             .{key},
         );
-        const expected_full = try std.fmt.allocPrint(
-            context.arena,
+        const expected_full = try context.arena.print(
             "{s}-{s}-full",
             .{ core_profile.architecture, release_filesystem },
         );

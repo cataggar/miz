@@ -1207,8 +1207,7 @@ test "shell-created drafts bind and refetch the exact target before upload" {
             requirement.path,
         );
         defer allocator.free(source);
-        const create_marker = try std.fmt.allocPrint(
-            allocator,
+        const create_marker = try allocator.print(
             "gh release create \"{s}\"",
             .{requirement.tag},
         );
@@ -1216,8 +1215,7 @@ test "shell-created drafts bind and refetch the exact target before upload" {
         const create_at = std.mem.indexOf(u8, source, create_marker) orelse
             return error.RequiredTextMissing;
         const transaction = source[create_at..];
-        const target_marker = try std.fmt.allocPrint(
-            allocator,
+        const target_marker = try allocator.print(
             "--target \"{s}\"",
             .{requirement.target},
         );

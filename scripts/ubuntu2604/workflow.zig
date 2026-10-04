@@ -1954,8 +1954,7 @@ pub fn resolveArtifacts(
         var selected_entry: ?std.json.Value = null;
         var attempt = options.max_attempt;
         while (attempt > 0) : (attempt -= 1) {
-            const artifact_name = try std.fmt.allocPrint(
-                allocator,
+            const artifact_name = try allocator.print(
                 "{s}-{s}-{s}-{d}",
                 .{
                     options.kind.artifactPrefix(),
@@ -2140,16 +2139,15 @@ fn expectedJobName(
     key: []const u8,
 ) Error![]u8 {
     return switch (kind) {
-        .candidate => std.fmt.allocPrint(allocator, "build/native {s}", .{key}),
-        .native => std.fmt.allocPrint(
-            allocator,
+        .candidate => allocator.print("build/native {s}", .{key}),
+        .native => allocator.print(
             "same-architecture QEMU ({s}) {s}",
             .{
                 if (std.mem.startsWith(u8, key, "x86_64")) "kvm" else "tcg",
                 key,
             },
         ),
-        .azure => std.fmt.allocPrint(allocator, "Azure {s}", .{key}),
+        .azure => allocator.print("Azure {s}", .{key}),
     };
 }
 
@@ -2268,8 +2266,7 @@ fn loadArtifactSelection(
             "{s}: {s} artifact selection attempt is invalid",
             .{ key, @tagName(kind) },
         );
-        const expected_artifact = try std.fmt.allocPrint(
-            allocator,
+        const expected_artifact = try allocator.print(
             "{s}-{s}-{s}-{s}",
             .{ kind.artifactPrefix(), key, source_commit, attempt },
         );

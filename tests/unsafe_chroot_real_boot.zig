@@ -23,7 +23,7 @@ pub fn main(init: std.process.Init) !void {
     if (argv.len == 3 and std.mem.eql(u8, argv[1], "--unsafe-chroot-worker")) {
         return miz.unsafe_chroot.workerMain(init, argv[2]);
     }
-    if (builtin.os.tag != .linux or builtin.cpu.arch != .x86_64) {
+    if (builtin.target.os.tag != .linux or builtin.target.cpu.arch != .x86_64) {
         std.debug.print(
             "skipping real unsafe-chroot boot integration: Linux x86_64 is required\n",
             .{},
@@ -142,8 +142,7 @@ fn runIntegration(
     var random: [8]u8 = undefined;
     Io.random(io, &random);
     const random_hex = std.fmt.bytesToHex(random, .lower);
-    const work_path = try std.fmt.allocPrint(
-        allocator,
+    const work_path = try allocator.print(
         "/tmp/miz-real-package-boot-{s}",
         .{&random_hex},
     );
@@ -196,8 +195,7 @@ fn runIntegration(
         root_offset,
         "etc/systemd/system/multi-user.target.wants/miz-real-package-smoke.service",
     );
-    const initramfs_path = try std.fmt.allocPrint(
-        allocator,
+    const initramfs_path = try allocator.print(
         "boot/initramfs-{s}.img",
         .{kernel},
     );
@@ -288,7 +286,7 @@ fn runIntegration(
             .acknowledge_unsafe = true,
         },
         .reproducibility = .{
-            .seed = .{ .bytes = [_]u8{0x51} ** 32 },
+            .seed = .{ .bytes = @as([32]u8, @splat(0x51)) },
             .source_date_epoch = 1_735_689_600,
         },
     };
@@ -568,8 +566,7 @@ fn ensureBootEntryReferences(
         {
             continue;
         }
-        const path = try std.fmt.allocPrint(
-            allocator,
+        const path = try allocator.print(
             "loader/entries/{s}",
             .{entry.name},
         );

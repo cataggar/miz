@@ -301,7 +301,7 @@ pub fn createUserIfMissing(
 
     if (userExists(passwd_content, username)) {
         const uid, const gid = try findExistingIds(passwd_content, username);
-        const home = try std.fmt.allocPrint(allocator, "/home/{s}", .{username});
+        const home = try allocator.print("/home/{s}", .{username});
         return .{ .uid = uid, .gid = gid, .home = home, .already_existed = true };
     }
 
@@ -313,7 +313,7 @@ pub fn createUserIfMissing(
     const uid = try nextFreeUserId(passwd_content, group_content);
     const gid = uid; // user-private-group scheme: gid mirrors uid
 
-    const home = try std.fmt.allocPrint(allocator, "/home/{s}", .{username});
+    const home = try allocator.print("/home/{s}", .{username});
     errdefer allocator.free(home);
 
     const new_passwd = try appendPasswdLine(allocator, passwd_content, username, uid, gid, home);

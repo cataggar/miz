@@ -171,7 +171,7 @@ pub const BuildIsoReport = struct {
     /// Total output ISO size in bytes (0 for a dry run).
     output_size: u64 = 0,
     /// SHA-256 of the published ISO (all zero for a dry run).
-    output_sha256: [32]u8 = [_]u8{0} ** 32,
+    output_sha256: [32]u8 = @as([32]u8, @splat(0)),
     limit_peaks: limits_mod.Peaks = .{},
 
     pub fn deinit(self: *BuildIsoReport, allocator: std.mem.Allocator) void {
@@ -347,7 +347,7 @@ pub fn build(
 
     // 1. Write the customized root tree to a deterministic ext4 rootfs.img.
     try enterStage(options, .write_rootfs_image);
-    const rootfs_scratch = try std.fmt.allocPrint(allocator, "{s}.{s}-rootfs.img", .{ options.output_path, scratch_infix });
+    const rootfs_scratch = try allocator.print("{s}.{s}-rootfs.img", .{ options.output_path, scratch_infix });
     defer allocator.free(rootfs_scratch);
     var rootfs_written = false;
     defer if (rootfs_written) Io.Dir.cwd().deleteFile(io, rootfs_scratch) catch {};
@@ -364,7 +364,7 @@ pub fn build(
 
     // 2. Wrap rootfs.img in a native SquashFS at the LiveOS payload path.
     try enterStage(options, .wrap_squashfs_payload);
-    const payload_scratch = try std.fmt.allocPrint(allocator, "{s}.{s}-payload.sqsh", .{ options.output_path, scratch_infix });
+    const payload_scratch = try allocator.print("{s}.{s}-payload.sqsh", .{ options.output_path, scratch_infix });
     defer allocator.free(payload_scratch);
     var payload_written = false;
     defer if (payload_written) Io.Dir.cwd().deleteFile(io, payload_scratch) catch {};
@@ -406,7 +406,7 @@ pub fn build(
 
     // 4. Write the ISO to a scratch path, then publish it atomically.
     try enterStage(options, .write_iso);
-    const iso_scratch = try std.fmt.allocPrint(allocator, "{s}.{s}.iso.tmp", .{ options.output_path, scratch_infix });
+    const iso_scratch = try allocator.print("{s}.{s}.iso.tmp", .{ options.output_path, scratch_infix });
     defer allocator.free(iso_scratch);
     var iso_written = false;
     defer if (iso_written) Io.Dir.cwd().deleteFile(io, iso_scratch) catch {};
@@ -622,7 +622,7 @@ fn discoverBootImage(io: Io, reader: *iso9660.Reader, candidates: []const []cons
 
 fn isFilePath(io: Io, reader: *iso9660.Reader, path: []const u8) bool {
     _ = io;
-    const lookup_path = std.fmt.allocPrint(reader.allocator, "/{s}", .{path}) catch return false;
+    const lookup_path = reader.allocator.print("/{s}", .{path}) catch return false;
     defer reader.allocator.free(lookup_path);
     const index = reader.lookup(lookup_path) catch return false;
     return reader.getEntry(index).kind == .file;
@@ -633,14 +633,14 @@ fn validateBuildPathIsolation(allocator: std.mem.Allocator, io: Io, options: Bui
     defer allocator.free(output_path);
 
     const reserved = [_][]const u8{
-        try std.fmt.allocPrint(allocator, "{s}.{s}-rootfs.sqsh", .{ output_path, scratch_infix }),
-        try std.fmt.allocPrint(allocator, "{s}.{s}-root-tree.spool", .{ output_path, scratch_infix }),
-        try std.fmt.allocPrint(allocator, "{s}.{s}-rootfs.img", .{ output_path, scratch_infix }),
-        try std.fmt.allocPrint(allocator, "{s}.{s}-payload.sqsh", .{ output_path, scratch_infix }),
-        try std.fmt.allocPrint(allocator, "{s}.{s}.iso.tmp", .{ output_path, scratch_infix }),
+        try allocator.print("{s}.{s}-rootfs.sqsh", .{ output_path, scratch_infix }),
+        try allocator.print("{s}.{s}-root-tree.spool", .{ output_path, scratch_infix }),
+        try allocator.print("{s}.{s}-rootfs.img", .{ output_path, scratch_infix }),
+        try allocator.print("{s}.{s}-payload.sqsh", .{ output_path, scratch_infix }),
+        try allocator.print("{s}.{s}.iso.tmp", .{ output_path, scratch_infix }),
     };
     defer for (reserved) |path| allocator.free(path);
-    const nested_prefix = try std.fmt.allocPrint(allocator, "{s}.{s}-nested", .{ output_path, scratch_infix });
+    const nested_prefix = try allocator.print("{s}.{s}-nested", .{ output_path, scratch_infix });
     defer allocator.free(nested_prefix);
 
     var reserved_with_output: [reserved.len + 1][]const u8 = undefined;
@@ -875,7 +875,7 @@ pub const OutputIsoTree = struct {
             const full_path = if (prefix.len == 0)
                 try a.dupe(u8, child.name)
             else
-                try std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, child.name });
+                try a.print("{s}/{s}", .{ prefix, child.name });
 
             if (std.ascii.eqlIgnoreCase(full_path, payload_path)) continue;
 
@@ -1028,7 +1028,7 @@ fn countPreservedNodesRec(
         const full_path = if (prefix.len == 0)
             try a.dupe(u8, child.name)
         else
-            try std.fmt.allocPrint(a, "{s}/{s}", .{ prefix, child.name });
+            try a.print("{s}/{s}", .{ prefix, child.name });
 
         // Mirror `OutputIsoTree.collect`: skip the replaced payload, count every
         // other node, and recurse into directories.
@@ -1140,7 +1140,7 @@ fn buildTar(allocator: std.mem.Allocator, entries: []const TarEntry) ![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     for (entries) |entry| {
-        var header = [_]u8{0} ** 512;
+        var header = @as([512]u8, @splat(0));
         @memcpy(header[0..entry.path.len], entry.path);
         testWriteOctal(header[100..108], 0o644);
         testWriteOctal(header[108..116], 0);
@@ -1178,10 +1178,10 @@ fn writeBlob(allocator: std.mem.Allocator, io: Io, dir: Io.Dir, data: []const u8
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    const blob_path = try std.fmt.allocPrint(allocator, "blobs/sha256/{s}", .{hex});
+    const blob_path = try allocator.print("blobs/sha256/{s}", .{hex});
     defer allocator.free(blob_path);
     try dir.writeFile(io, .{ .sub_path = blob_path, .data = data });
-    return std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
+    return allocator.print("sha256:{s}", .{hex});
 }
 
 /// Writes a minimal one-layer OCI layout overlaying `app/hello.txt`.
@@ -1204,16 +1204,14 @@ fn createOciLayout(allocator: std.mem.Allocator, io: Io, root: []const u8) !void
     defer allocator.free(config_digest);
     const layer_digest = try writeBlob(allocator, io, dir, layer_gzip);
     defer allocator.free(layer_digest);
-    const manifest_json = try std.fmt.allocPrint(
-        allocator,
+    const manifest_json = try allocator.print(
         "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ config_digest, config_json.len, layer_digest, layer_gzip.len },
     );
     defer allocator.free(manifest_json);
     const manifest_digest = try writeBlob(allocator, io, dir, manifest_json);
     defer allocator.free(manifest_digest);
-    const index_json = try std.fmt.allocPrint(
-        allocator,
+    const index_json = try allocator.print(
         "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ manifest_digest, manifest_json.len },
     );
@@ -1238,7 +1236,7 @@ fn extractSquashfsFileToPath(allocator: std.mem.Allocator, io: Io, reader: *squa
 
 const deterministic_fixture = Determinism{
     .filesystem_timestamp = 1_700_000_000,
-    .root_filesystem_uuid = [_]u8{0x11} ** 16,
+    .root_filesystem_uuid = @as([16]u8, @splat(0x11)),
 };
 
 test "build-iso regenerates a LiveOS ISO: boot files survive, payload replaced, nested rootfs carries customized and OCI content" {

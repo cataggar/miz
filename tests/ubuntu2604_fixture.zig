@@ -27,7 +27,7 @@ const miz = @import("miz");
 pub const Builder = support.Builder;
 pub const Diagnostic = support.Diagnostic;
 
-pub const source_commit = "a" ** 40;
+pub const source_commit = &@as([40:0]u8, @splat('a'));
 pub const certificate_der_base64 =
     "MIIC2jCCAcKgAwIBAgICBKEwDQYJKoZIhvcNAQELBQAwMDEgMB4GA1UEAwwXbWl6IG5hdGl2ZSBsb2NhbCBzaWduZXIxDDAKBgNV" ++
     "BAoMA21pejAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEwMDAwMDBaMDAxIDAeBgNVBAMMF21peiBuYXRpdmUgbG9jYWwgc2lnbmVy" ++
@@ -39,7 +39,7 @@ pub const certificate_der_base64 =
     "+3bbchG+eakZn/w1LA6XsayOIsS9+VGSV4szcKhOsraPPuK2SkVtrzbvqsSr5phZb1P8BUE91YjZDsSlVWUYqUodRxn1gH0AbFrZ" ++
     "w9ZQ9lenhbx4WZaeTUiS/kQNHx/xs11pvWOozhaCoyAV2VXsAqqB92laSzqVLz1nm6Z16PD14VrycusNZdO/sQZwqrjLvRjmg24T" ++
     "YoUWAtRNPDc2F2mb/htcZFimdufWME5ZPEP54OeUJNFmQUvxScSGGEAHuU1kQxca1IqEU0FiJXPCy6o=";
-pub const signing_certificate_sha256 = "4" ** 64;
+pub const signing_certificate_sha256 = &@as([64:0]u8, @splat('4'));
 pub const operation_id = "00000000-0000-4000-8000-000000000001";
 /// Two aligned MiB: large enough to exercise the VHD footer geometry, small
 /// enough that every fixture is written in one go.
@@ -73,8 +73,7 @@ pub const Tree = struct {
 
     pub fn create(allocator: Allocator, io: Io) !Tree {
         const tmp = std.testing.tmpDir(.{});
-        const root = try std.fmt.allocPrint(
-            allocator,
+        const root = try allocator.print(
             ".zig-cache/tmp/{s}",
             .{tmp.sub_path},
         );
@@ -89,7 +88,7 @@ pub const Tree = struct {
 
     /// A path inside this tree. Caller owns the result.
     pub fn path(self: *const Tree, comptime fmt: []const u8, args: anytype) ![]u8 {
-        const relative = try std.fmt.allocPrint(self.allocator, fmt, args);
+        const relative = try self.allocator.print(fmt, args);
         defer self.allocator.free(relative);
         return std.fs.path.join(self.allocator, &.{ self.root, relative });
     }
@@ -192,7 +191,7 @@ pub fn makeBundle(tree: *const Tree, key: []const u8, options: Options) !void {
 
     const asset = try tree.assetPath(key);
     defer allocator.free(asset);
-    const default_asset_bytes = try std.fmt.allocPrint(allocator, "{s}\n", .{key});
+    const default_asset_bytes = try allocator.print("{s}\n", .{key});
     defer allocator.free(default_asset_bytes);
     try Dir.cwd().writeFile(io, .{
         .sub_path = asset,
@@ -210,8 +209,7 @@ pub fn makeBundle(tree: *const Tree, key: []const u8, options: Options) !void {
     const manifest = try tree.manifestPath(key);
     defer allocator.free(manifest);
     const asset_digest = try support.hashArtifact(io, asset);
-    const runner = try std.fmt.allocPrint(
-        allocator,
+    const runner = try allocator.print(
         "ubuntu-{s}",
         .{entry.architecture},
     );
@@ -243,8 +241,7 @@ pub fn makeBundle(tree: *const Tree, key: []const u8, options: Options) !void {
 
     const vhd_info = try tree.path("azure/{s}/vhd-info.json", .{key});
     defer allocator.free(vhd_info);
-    const info_text = try std.fmt.allocPrint(
-        allocator,
+    const info_text = try allocator.print(
         "{{\"format\": \"vpc\", \"virtual-size\": {d}}}",
         .{virtual_size},
     );
@@ -278,10 +275,9 @@ pub fn makeBundle(tree: *const Tree, key: []const u8, options: Options) !void {
 
     const output = try tree.azureResultPath(key);
     defer allocator.free(output);
-    const resource_group = try std.fmt.allocPrint(allocator, "ubuntu-{s}", .{key});
+    const resource_group = try allocator.print("ubuntu-{s}", .{key});
     defer allocator.free(resource_group);
-    const image_version_id = try std.fmt.allocPrint(
-        allocator,
+    const image_version_id = try allocator.print(
         "/subscriptions/test/gallery/ubuntu/{s}/versions/1.0.0",
         .{key},
     );
@@ -448,7 +444,7 @@ fn galleryDocument(allocator: Allocator, certificate: []const u8) ![]u8 {
     const encoded = try allocator.alloc(u8, encoder.calcSize(certificate.len));
     defer allocator.free(encoded);
     _ = encoder.encode(encoded, certificate);
-    return std.fmt.allocPrint(allocator,
+    return allocator.print(
         \\{{"properties": {{"securityProfile": {{"uefiSettings": {{
         \\"signatureTemplateNames": ["MicrosoftUefiCertificateAuthorityTemplate"],
         \\"additionalSignatures": {{"db": [{{"type": "x509", "value": ["{s}"]}}]}}
@@ -498,22 +494,19 @@ fn writeDebzLockFile(
 ) !DebzLockRecord {
     const allocator = tree.allocator;
     const digest = try repeatHex(arena, digest_character);
-    const name = try std.fmt.allocPrint(
-        arena,
+    const name = try arena.print(
         "debz-exact-lock-{s}-{s}.json",
         .{ package, source_architecture },
     );
     const package_records = if (empty_baseline)
-        try std.fmt.allocPrint(
-            allocator,
+        try allocator.print(
             \\  {{"name": "{s}", "version": "1", "architecture": "{s}",
             \\    "retention": "requested"}}
         ,
             .{ package, source_architecture },
         )
     else
-        try std.fmt.allocPrint(
-            allocator,
+        try allocator.print(
             \\  {{"name": "base-files", "version": "1", "architecture": "{s}",
             \\    "retention": "retained"}},
             \\  {{"name": "{s}", "version": "1", "architecture": "{s}",
@@ -522,7 +515,7 @@ fn writeDebzLockFile(
             .{ source_architecture, package, source_architecture },
         );
     defer allocator.free(package_records);
-    const lock_text = try std.fmt.allocPrint(allocator,
+    const lock_text = try allocator.print(
         \\{{"schema": "https://debz.dev/schema/exact-closure-lock-v1",
         \\"version": 1, "target_architecture": "{s}",
         \\"request_sha256": "{s}", "policy_sha256": "{s}",
@@ -532,8 +525,8 @@ fn writeDebzLockFile(
         \\"digest_sha256": "{s}"}}
     , .{
         source_architecture,
-        "1" ** 64,
-        "2" ** 64,
+        &@as([64:0]u8, @splat('1')),
+        &@as([64:0]u8, @splat('2')),
         package_records,
         digest,
     });
@@ -559,12 +552,11 @@ fn writeDebzTransactionRecord(
 ) !std.json.Value {
     const allocator = tree.allocator;
     const transaction_digest = try repeatHex(arena, transaction_character);
-    const transaction_name = try std.fmt.allocPrint(
-        arena,
+    const transaction_name = try arena.print(
         "debz-transaction-provenance-{s}-{s}.json",
         .{ package, source_architecture },
     );
-    const transaction_text = try std.fmt.allocPrint(allocator,
+    const transaction_text = try allocator.print(
         \\{{"schema": "https://debz.dev/schema/transaction-result-v1",
         \\"version": 1, "target_architecture": "{s}", "lock_sha256": "{s}",
         \\"outcome": "succeeded",
@@ -628,14 +620,12 @@ fn writeProvenance(
     defer arena.deinit();
     const builder = Builder.init(arena.allocator());
 
-    const prefix = try std.fmt.allocPrint(
-        arena.allocator(),
+    const prefix = try arena.allocator().print(
         "ubuntu-26.04-server-cloudimg-{s}",
         .{source_architecture},
     );
-    const image_name = try std.fmt.allocPrint(arena.allocator(), "{s}.img", .{prefix});
-    const manifest_name = try std.fmt.allocPrint(
-        arena.allocator(),
+    const image_name = try arena.allocator().print("{s}.img", .{prefix});
+    const manifest_name = try arena.allocator().print(
         "{s}.manifest",
         .{prefix},
     );
@@ -645,8 +635,7 @@ fn writeProvenance(
         &.{ provenance, manifest_name },
     );
     defer allocator.free(manifest_path);
-    const manifest_text = try std.fmt.allocPrint(
-        allocator,
+    const manifest_text = try allocator.print(
         "image_manifest for {s}\n",
         .{key},
     );
@@ -656,10 +645,9 @@ fn writeProvenance(
         .data = manifest_text,
     });
     const manifest_digest = support.digest.hexBytes(manifest_text);
-    const image_digest = "5" ** 64;
+    const image_digest = &@as([64:0]u8, @splat('5'));
 
-    const checksums = try std.fmt.allocPrint(
-        allocator,
+    const checksums = try allocator.print(
         "{s}  {s}\n{s}  {s}\n",
         .{ image_digest, image_name, &manifest_digest, manifest_name },
     );
@@ -807,14 +795,13 @@ fn writeProvenance(
         try builder.putString(
             &initramfs,
             "path",
-            try std.fmt.allocPrint(
-                arena.allocator(),
+            try arena.allocator().print(
                 "/boot/initrd.img-{s}",
                 .{fixture_kernel_release},
             ),
         );
         try builder.putString(&initramfs, "kernel_release", fixture_kernel_release);
-        try builder.putString(&initramfs, "sha256", "6" ** 64);
+        try builder.putString(&initramfs, "sha256", &@as([64:0]u8, @splat('6')));
         try builder.putInteger(&initramfs, "bytes", 32 * 1024 * 1024);
         var build_stage = builder.object();
         try builder.putString(&build_stage, "purpose", "initramfs-generation");
@@ -847,7 +834,7 @@ fn writeProvenance(
     try builder.putString(&document, "architecture", entry.architecture);
     try builder.putString(&document, "release", "26.04");
     try builder.put(&document, "snapshot", .{ .object = snapshot });
-    try builder.putString(&document, "canonical_key_fingerprint", "c" ** 40);
+    try builder.putString(&document, "canonical_key_fingerprint", &@as([40:0]u8, @splat('c')));
     try builder.put(&document, "sha256sums_signature_verified", .{ .bool = true });
     try builder.put(
         &document,
@@ -1141,8 +1128,7 @@ fn writeSizeInventory(
         },
     ), &diagnostic);
 
-    const filename = try std.fmt.allocPrint(
-        allocator,
+    const filename = try allocator.print(
         "ubuntu2604-size-inventory-{s}-{s}.json",
         .{ @tagName(flavor), entry.architecture },
     );
@@ -1175,8 +1161,7 @@ fn writeSizeBudget(
     const flavor = contracts.parseFlavor(entry.flavor).?;
 
     var name_buffer: [96]u8 = undefined;
-    const inventory_name = try std.fmt.allocPrint(
-        allocator,
+    const inventory_name = try allocator.print(
         "ubuntu2604-size-inventory-{s}-{s}.json",
         .{ @tagName(flavor), entry.architecture },
     );
@@ -1302,7 +1287,7 @@ fn writeSigning(
     else
         "EFI/BOOT/BOOTAA64.EFI";
 
-    const text = try std.fmt.allocPrint(allocator,
+    const text = try allocator.print(
         \\{{"schema": 1, "type": "miz-uki-signing",
         \\"architecture": "{s}", "flavor": "{s}",
         \\"signer_mode": "external-command",
@@ -1325,16 +1310,15 @@ fn writeSigning(
         encoded,
         options.signing_certificate_sha256,
         fallback,
-        "2" ** 64,
-        "3" ** 64,
-        "3" ** 64,
+        &@as([64:0]u8, @splat('2')),
+        &@as([64:0]u8, @splat('3')),
+        &@as([64:0]u8, @splat('3')),
         operation_id,
         options.signing_certificate_sha256,
     });
     defer allocator.free(text);
 
-    const name = try std.fmt.allocPrint(
-        allocator,
+    const name = try allocator.print(
         "uki-signing-{s}-{s}.json",
         .{ entry.flavor, entry.architecture },
     );

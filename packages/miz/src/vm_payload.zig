@@ -177,8 +177,7 @@ pub fn probeDrivers(
     );
     defer allocator.free(release);
 
-    const tree_path = try std.fmt.allocPrint(
-        allocator,
+    const tree_path = try allocator.print(
         "{s}/{s}",
         .{ modules_root, release },
     );
@@ -367,8 +366,7 @@ fn readModules(
         const name = try allocator.dupe(u8, kernel_modules.moduleName(path));
         errdefer allocator.free(name);
         if (!validModuleName(name)) return error.ModuleFileUnreadable;
-        const member_path = try std.fmt.allocPrint(
-            allocator,
+        const member_path = try allocator.print(
             "miz-module-{d:0>2}-{s}.ko",
             .{ index, name },
         );
@@ -545,9 +543,9 @@ fn extractFromBootDirectory(allocator: Allocator, io: Io, options: Options) !?Pa
     const selected = try selectKernel(entries, options.kernel_release) orelse return null;
     const initrd_name = selectInitrd(entries, selected.release) orelse return null;
 
-    const kernel_path = try std.fmt.allocPrint(allocator, "boot/{s}", .{selected.name});
+    const kernel_path = try allocator.print("boot/{s}", .{selected.name});
     errdefer allocator.free(kernel_path);
-    const initrd_path = try std.fmt.allocPrint(allocator, "boot/{s}", .{initrd_name});
+    const initrd_path = try allocator.print("boot/{s}", .{initrd_name});
     errdefer allocator.free(initrd_path);
 
     const kernel = try reader.readFileAlloc(io, allocator, kernel_path);
@@ -596,7 +594,7 @@ fn extractFromUnifiedKernel(allocator: Allocator, io: Io, options: Options) !?Pa
     }
     const name = chosen orelse return null;
 
-    const esp_path = try std.fmt.allocPrint(allocator, "EFI/Linux/{s}", .{name});
+    const esp_path = try allocator.print("EFI/Linux/{s}", .{name});
     errdefer allocator.free(esp_path);
     const bundle = try filesystem.readFileAlloc(io, allocator, esp_path);
     defer allocator.free(bundle);
@@ -642,7 +640,7 @@ fn findEspRegion(allocator: Allocator, io: Io, image: image_mod.Image) !?fat32.R
     } else false;
     if (!protective) {
         for (boot_record.entries) |entry| {
-            if (@intFromEnum(entry.partition_type) != mbr_efi_system or
+            if (@backingInt(entry.partition_type) != mbr_efi_system or
                 entry.sector_count == 0) continue;
             return .{
                 .offset = @as(u64, entry.first_lba) * mbr.sector_size,
@@ -930,7 +928,7 @@ test "a kernel and initramfs are extracted from a real ext4 boot directory" {
             .offset = partition_offset,
             .length = partition_length,
             .label = "vm-payload",
-            .uuid = [_]u8{0x51} ** 16,
+            .uuid = @as([16]u8, @splat(0x51)),
             .timestamp = 1_735_689_600,
         });
     }
@@ -985,7 +983,7 @@ test "extraction fails rather than booting an image with no kernel" {
         try file.setLength(io, 16 * 1024 * 1024);
         _ = try ext4.populate(io, file, allocator, try tree.ext4View(), .{
             .length = 16 * 1024 * 1024,
-            .uuid = [_]u8{0x52} ** 16,
+            .uuid = @as([16]u8, @splat(0x52)),
             .timestamp = 1_735_689_600,
         });
     }
@@ -1033,9 +1031,9 @@ test "a unified kernel image on the ESP is used when the root has no kernel" {
         try image.pwrite(io, &boot_record, 0);
 
         var placements: [1]gpt.Placement = undefined;
-        try gpt.writeGpt(&image, io, [_]u8{0x60} ** 16, &.{.{
+        try gpt.writeGpt(&image, io, @as([16]u8, @splat(0x60)), &.{.{
             .type_guid = guid.esp,
-            .unique_guid = [_]u8{0x61} ** 16,
+            .unique_guid = @as([16]u8, @splat(0x61)),
             .size_sectors = 48 * 1024 * 1024 / mbr.sector_size,
         }}, &placements);
 
@@ -1111,7 +1109,7 @@ const modular_dep =
 /// Enough of an ELF header for `moduleImage` to accept the file as an object.
 /// Distinct per module so a test can tell which bytes were appended where.
 fn elfModule(allocator: Allocator, name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "\x7fELF\x02\x01\x01\x00module:{s}", .{name});
+    return allocator.print("\x7fELF\x02\x01\x01\x00module:{s}", .{name});
 }
 
 /// The bytes a tree stores for `module_path`, in whatever compression the path
@@ -1171,8 +1169,7 @@ fn writeDriverProbeImage(
     }
     try tree.putDirectory(modules_root, .{ .mode = 0o755 });
     for (image.releases) |release| {
-        const directory = try std.fmt.allocPrint(
-            allocator,
+        const directory = try allocator.print(
             "{s}/{s}",
             .{ modules_root, release },
         );
@@ -1204,7 +1201,7 @@ fn writeDriverProbeImage(
         .offset = 0,
         .length = 16 * 1024 * 1024,
         .label = "drivers",
-        .uuid = [_]u8{0x57} ** 16,
+        .uuid = @as([16]u8, @splat(0x57)),
         .timestamp = 1_735_689_600,
     });
 }
@@ -1339,8 +1336,7 @@ test "a kernel that modularizes its drivers is served by its own module tree" {
     try std.testing.expectEqual(expected.len, drivers.modules.len);
     for (expected, drivers.modules, 0..) |name, module, index| {
         try std.testing.expectEqualStrings(name, module.name);
-        const member = try std.fmt.allocPrint(
-            allocator,
+        const member = try allocator.print(
             "miz-module-{d:0>2}-{s}.ko",
             .{ index, name },
         );

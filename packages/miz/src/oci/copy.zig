@@ -485,7 +485,7 @@ fn testDescriptor(allocator: std.mem.Allocator, media_type: []const u8, bytes: [
     const digest = content.digestBytes(bytes).format();
     return .{
         .mediaType = media_type,
-        .digest = try std.fmt.allocPrint(allocator, "{s}", .{digest}),
+        .digest = try allocator.print("{s}", .{digest}),
         .size = bytes.len,
     };
 }
@@ -510,11 +510,11 @@ fn testMakeLayout(allocator: std.mem.Allocator, io: std.Io, path: []const u8, na
     const layer = try testDescriptor(allocator, model.media_type_oci_layer, "layer");
     defer allocator.free(layer.digest);
     try testWriteBlob(io, dir, layer, "layer");
-    const manifest = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}", .{ model.media_type_oci_manifest, config.mediaType.?, config.digest, config.size, layer.mediaType.?, layer.digest, layer.size });
+    const manifest = try allocator.print("{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}", .{ model.media_type_oci_manifest, config.mediaType.?, config.digest, config.size, layer.mediaType.?, layer.digest, layer.size });
     defer allocator.free(manifest);
     const root = try testDescriptor(allocator, model.media_type_oci_manifest, manifest);
     try testWriteBlob(io, dir, root, manifest);
-    const index = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"{s}\"}}}}],\"x-extra\":{{\"preserved\":true}}}}", .{ root.mediaType.?, root.digest, root.size, name });
+    const index = try allocator.print("{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"{s}\"}}}}],\"x-extra\":{{\"preserved\":true}}}}", .{ root.mediaType.?, root.digest, root.size, name });
     defer allocator.free(index);
     try dir.writeFile(io, .{ .sub_path = "index.json", .data = index });
     return root;
@@ -529,7 +529,7 @@ fn testMakePlatformLayout(allocator: std.mem.Allocator, io: std.Io, path: []cons
     const config = try testDescriptor(allocator, model.media_type_oci_config, config_bytes);
     defer allocator.free(config.digest);
     try testWriteBlob(io, dir, config, config_bytes);
-    const manifest = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[]}}", .{
+    const manifest = try allocator.print("{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[]}}", .{
         model.media_type_oci_manifest,
         config.mediaType.?,
         config.digest,
@@ -538,7 +538,7 @@ fn testMakePlatformLayout(allocator: std.mem.Allocator, io: std.Io, path: []cons
     defer allocator.free(manifest);
     const root = try testDescriptor(allocator, model.media_type_oci_manifest, manifest);
     try testWriteBlob(io, dir, root, manifest);
-    const index = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"{s}\"}}}}]}}", .{
+    const index = try allocator.print("{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"{s}\"}}}}]}}", .{
         root.mediaType.?,
         root.digest,
         root.size,
@@ -576,10 +576,10 @@ test "local copy resolves named digest and unambiguous roots and preserves manif
     );
     defer copied.deinit();
     try std.testing.expectEqualStrings(source_manifest, copied.bytes);
-    const digest_reference = try std.fmt.allocPrint(allocator, "oci:test-oci-copy-source@{s}", .{root.digest});
+    const digest_reference = try allocator.print("oci:test-oci-copy-source@{s}", .{root.digest});
     defer allocator.free(digest_reference);
     const parsed_digest = (try reference.parse(digest_reference, .source)).layout;
-    const digest_destination_reference = try std.fmt.allocPrint(allocator, "oci:test-oci-copy-digest@{s}", .{root.digest});
+    const digest_destination_reference = try allocator.print("oci:test-oci-copy-digest@{s}", .{root.digest});
     defer allocator.free(digest_destination_reference);
     var digest_result = try localToLocal(io, allocator, parsed_digest, (try reference.parse(digest_destination_reference, .destination)).layout, .{});
     defer digest_result.deinit(allocator);
@@ -691,12 +691,12 @@ test "copy streams content blobs larger than the transfer buffer" {
     try testWriteBlob(io, source_dir, layer, payload);
     const config = try testDescriptor(allocator, model.media_type_oci_config, "{}");
     defer allocator.free(config.digest);
-    const manifest = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}", .{ config.mediaType.?, config.digest, config.size, layer.mediaType.?, layer.digest, layer.size });
+    const manifest = try allocator.print("{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}", .{ config.mediaType.?, config.digest, config.size, layer.mediaType.?, layer.digest, layer.size });
     defer allocator.free(manifest);
     const root = try testDescriptor(allocator, model.media_type_oci_manifest, manifest);
     defer allocator.free(root.digest);
     try testWriteBlob(io, source_dir, root, manifest);
-    const index = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"large\"}}}}]}}", .{ root.mediaType.?, root.digest, root.size });
+    const index = try allocator.print("{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"large\"}}}}]}}", .{ root.mediaType.?, root.digest, root.size });
     defer allocator.free(index);
     try source_dir.writeFile(io, .{ .sub_path = "index.json", .data = index });
     var result = try localToLocal(
@@ -829,7 +829,7 @@ test "copy rejects conflicting descriptors for the same digest" {
     const shared = try testDescriptor(allocator, model.media_type_oci_config, "{}");
     defer allocator.free(shared.digest);
     try testWriteBlob(io, dir, shared, "{}");
-    const manifest = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}", .{
+    const manifest = try allocator.print("{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}", .{
         model.media_type_oci_config,
         shared.digest,
         shared.size,
@@ -841,7 +841,7 @@ test "copy rejects conflicting descriptors for the same digest" {
     const root = try testDescriptor(allocator, model.media_type_oci_manifest, manifest);
     defer allocator.free(root.digest);
     try testWriteBlob(io, dir, root, manifest);
-    const index = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"conflict\"}}}}]}}", .{ root.mediaType.?, root.digest, root.size });
+    const index = try allocator.print("{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"conflict\"}}}}]}}", .{ root.mediaType.?, root.digest, root.size });
     defer allocator.free(index);
     try dir.writeFile(io, .{ .sub_path = "index.json", .data = index });
     try std.testing.expectError(error.ConflictingDescriptor, localToLocal(
@@ -892,8 +892,7 @@ test "digest layout destinations reject conflicting existing descriptors before 
         .sub_path = "oci-layout",
         .data = "{\"imageLayoutVersion\":\"1.0.0\"}",
     });
-    const index = try std.fmt.allocPrint(
-        allocator,
+    const index = try allocator.print(
         "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ root.mediaType.?, root.digest, root.size + 1 },
     );
@@ -907,8 +906,7 @@ test "digest layout destinations reject conflicting existing descriptors before 
         .{ .path = destination_path, .selection = .{ .digest = requested } },
         .{},
     ));
-    const media_conflict_index = try std.fmt.allocPrint(
-        allocator,
+    const media_conflict_index = try allocator.print(
         "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ model.media_type_oci_index, root.digest, root.size },
     );
@@ -983,12 +981,12 @@ test "selected copy materializes a leaf while all copy retains the index bytes" 
     var source_dir = try std.Io.Dir.cwd().openDir(io, source_path, .{});
     defer source_dir.close(io);
     try testWriteBlob(io, source_dir, alternate, alternate_bytes);
-    const index_bytes = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"urls\":[\"https://example.invalid/blob\"],\"data\":\"opaque\",\"artifactType\":\"example/type\",\"annotations\":{{\"org.example.keep\":\"yes\"}},\"platform\":{{\"os\":\"linux\",\"architecture\":\"amd64\",\"variant\":\"v3\"}},\"x-descriptor-extension\":{{\"kept\":true}}}},{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"platform\":{{\"os\":\"linux\",\"architecture\":\"arm64\"}}}}]}}", .{ model.media_type_oci_index, manifest.mediaType.?, manifest.digest, manifest.size, alternate.mediaType.?, alternate.digest, alternate.size });
+    const index_bytes = try allocator.print("{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"urls\":[\"https://example.invalid/blob\"],\"data\":\"opaque\",\"artifactType\":\"example/type\",\"annotations\":{{\"org.example.keep\":\"yes\"}},\"platform\":{{\"os\":\"linux\",\"architecture\":\"amd64\",\"variant\":\"v3\"}},\"x-descriptor-extension\":{{\"kept\":true}}}},{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"platform\":{{\"os\":\"linux\",\"architecture\":\"arm64\"}}}}]}}", .{ model.media_type_oci_index, manifest.mediaType.?, manifest.digest, manifest.size, alternate.mediaType.?, alternate.digest, alternate.size });
     defer allocator.free(index_bytes);
     const root = try testDescriptor(allocator, model.media_type_oci_index, index_bytes);
     defer allocator.free(root.digest);
     try testWriteBlob(io, source_dir, root, index_bytes);
-    const top_level = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"multi\"}}}}]}}", .{ root.mediaType.?, root.digest, root.size });
+    const top_level = try allocator.print("{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"multi\"}}}}]}}", .{ root.mediaType.?, root.digest, root.size });
     defer allocator.free(top_level);
     try source_dir.writeFile(io, .{ .sub_path = "index.json", .data = top_level });
     const source_ref = (try reference.parse("oci:test-oci-copy-platform-source:multi", .source)).layout;
@@ -1030,12 +1028,12 @@ test "selected copy rejects opaque matches and ambiguous platformless indexes" {
     const opaque_blob = try testDescriptor(allocator, "application/example", "opaque");
     defer allocator.free(opaque_blob.digest);
     try testWriteBlob(io, opaque_dir, opaque_blob, "opaque");
-    const opaque_index = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/example\",\"digest\":\"{s}\",\"size\":{d},\"platform\":{{\"os\":\"linux\",\"architecture\":\"amd64\"}}}}]}}", .{ opaque_blob.digest, opaque_blob.size });
+    const opaque_index = try allocator.print("{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/example\",\"digest\":\"{s}\",\"size\":{d},\"platform\":{{\"os\":\"linux\",\"architecture\":\"amd64\"}}}}]}}", .{ opaque_blob.digest, opaque_blob.size });
     defer allocator.free(opaque_index);
     const opaque_root = try testDescriptor(allocator, model.media_type_oci_index, opaque_index);
     defer allocator.free(opaque_root.digest);
     try testWriteBlob(io, opaque_dir, opaque_root, opaque_index);
-    const opaque_top = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"multi\"}}}}]}}", .{ opaque_root.mediaType.?, opaque_root.digest, opaque_root.size });
+    const opaque_top = try allocator.print("{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"multi\"}}}}]}}", .{ opaque_root.mediaType.?, opaque_root.digest, opaque_root.size });
     defer allocator.free(opaque_top);
     try opaque_dir.writeFile(io, .{ .sub_path = "index.json", .data = opaque_top });
     const platform_options = Options{ .mode = .{ .selected = .{ .os = "linux", .architecture = "amd64" } } };
@@ -1051,7 +1049,7 @@ test "selected copy rejects opaque matches and ambiguous platformless indexes" {
     defer allocator.free(manifest.digest);
     var ambiguous_dir = try std.Io.Dir.cwd().openDir(io, ambiguous_source, .{});
     defer ambiguous_dir.close(io);
-    const nested_one_bytes = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"platform\":{{\"os\":\"linux\",\"architecture\":\"amd64\"}}}}]}}", .{ manifest.mediaType.?, manifest.digest, manifest.size });
+    const nested_one_bytes = try allocator.print("{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"platform\":{{\"os\":\"linux\",\"architecture\":\"amd64\"}}}}]}}", .{ manifest.mediaType.?, manifest.digest, manifest.size });
     defer allocator.free(nested_one_bytes);
     const nested_two_bytes = try std.mem.concat(allocator, u8, &.{ nested_one_bytes, " " });
     defer allocator.free(nested_two_bytes);
@@ -1061,7 +1059,7 @@ test "selected copy rejects opaque matches and ambiguous platformless indexes" {
     defer allocator.free(nested_two.digest);
     try testWriteBlob(io, ambiguous_dir, nested_one, nested_one_bytes);
     try testWriteBlob(io, ambiguous_dir, nested_two, nested_two_bytes);
-    const outer_bytes = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}", .{
+    const outer_bytes = try allocator.print("{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}", .{
         nested_one.mediaType.?,
         nested_one.digest,
         nested_one.size,
@@ -1073,7 +1071,7 @@ test "selected copy rejects opaque matches and ambiguous platformless indexes" {
     const outer = try testDescriptor(allocator, model.media_type_oci_index, outer_bytes);
     defer allocator.free(outer.digest);
     try testWriteBlob(io, ambiguous_dir, outer, outer_bytes);
-    const top = try std.fmt.allocPrint(allocator, "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"multi\"}}}}]}}", .{ outer.mediaType.?, outer.digest, outer.size });
+    const top = try allocator.print("{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"multi\"}}}}]}}", .{ outer.mediaType.?, outer.digest, outer.size });
     defer allocator.free(top);
     try ambiguous_dir.writeFile(io, .{ .sub_path = "index.json", .data = top });
     try std.testing.expectError(error.AmbiguousPlatform, localToLocal(

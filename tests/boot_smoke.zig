@@ -263,10 +263,9 @@ pub fn runQemuBootSmoke(
     serial_output_path: []const u8,
     extra_wait_marker: ?[]const u8,
 ) !QemuBootSmokeResult {
-    const serial_arg = try std.fmt.allocPrint(allocator, "file:{s}", .{serial_output_path});
+    const serial_arg = try allocator.print("file:{s}", .{serial_output_path});
     defer allocator.free(serial_arg);
-    const image_drive = try std.fmt.allocPrint(
-        allocator,
+    const image_drive = try allocator.print(
         "file={s},format=raw,if=virtio",
         .{image_path},
     );
@@ -277,13 +276,11 @@ pub fn runQemuBootSmoke(
     var ovmf_vars_drive: ?[]u8 = null;
     defer if (ovmf_vars_drive) |d| allocator.free(d);
     if (ovmf) |firmware_pair| {
-        ovmf_code_drive = try std.fmt.allocPrint(
-            allocator,
+        ovmf_code_drive = try allocator.print(
             "if=pflash,format=raw,readonly=on,file={s}",
             .{firmware_pair.firmware.code_path},
         );
-        ovmf_vars_drive = try std.fmt.allocPrint(
-            allocator,
+        ovmf_vars_drive = try allocator.print(
             "if=pflash,format=raw,file={s}",
             .{firmware_pair.vars_copy_path},
         );
@@ -397,22 +394,19 @@ pub fn runQemuIsoBootSmoke(
     serial_output_path: []const u8,
     extra_wait_marker: ?[]const u8,
 ) !QemuBootSmokeResult {
-    const serial_arg = try std.fmt.allocPrint(allocator, "file:{s}", .{serial_output_path});
+    const serial_arg = try allocator.print("file:{s}", .{serial_output_path});
     defer allocator.free(serial_arg);
-    const cdrom_drive = try std.fmt.allocPrint(
-        allocator,
+    const cdrom_drive = try allocator.print(
         "file={s},format=raw,if=none,media=cdrom,id=live-cd",
         .{iso_path},
     );
     defer allocator.free(cdrom_drive);
-    const ovmf_code_drive = try std.fmt.allocPrint(
-        allocator,
+    const ovmf_code_drive = try allocator.print(
         "if=pflash,format=raw,readonly=on,file={s}",
         .{ovmf.firmware.code_path},
     );
     defer allocator.free(ovmf_code_drive);
-    const ovmf_vars_drive = try std.fmt.allocPrint(
-        allocator,
+    const ovmf_vars_drive = try allocator.print(
         "if=pflash,format=raw,file={s}",
         .{ovmf.vars_copy_path},
     );
@@ -644,7 +638,7 @@ test "native-edit boot-smokes a kernel argument appended to an already-built ima
         },
         .boot_security = .{ .extra_kernel_options = "miz.smoke=applied" },
         .reproducibility = .{
-            .seed = .{ .bytes = [_]u8{0x5B} ** 32 },
+            .seed = .{ .bytes = @as([32]u8, @splat(0x5B)) },
             .source_date_epoch = 1_735_689_600,
         },
     };

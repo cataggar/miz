@@ -76,14 +76,12 @@ fn runShellFixture(
     defer tmp.cleanup();
     const repository = try rootAlloc(allocator);
     defer allocator.free(repository);
-    const root = try std.fmt.allocPrint(
-        allocator,
+    const root = try allocator.print(
         "{s}/.zig-cache/tmp/{s}",
         .{ repository, tmp.sub_path },
     );
     defer allocator.free(root);
-    const path = try std.fmt.allocPrint(
-        allocator,
+    const path = try allocator.print(
         "{s}/{s}",
         .{ root, name },
     );
@@ -317,8 +315,7 @@ test "policy and publication GitHub App tokens stay separated" {
     try expectAbsent(capture, "gh api --method POST");
     try expectAbsent(capture, "gh api --method PATCH");
     for ([_][]const u8{ "POST", "PATCH", "DELETE" }) |method| {
-        const mutation = try std.fmt.allocPrint(
-            allocator,
+        const mutation = try allocator.print(
             "GH_TOKEN=\"$POLICY_GH_TOKEN\" gh api --method {s}",
             .{method},
         );

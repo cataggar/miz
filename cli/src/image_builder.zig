@@ -150,7 +150,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(2);
         }
     }
-    const lock_path = try std.fmt.allocPrint(arena, "{s}.lock", .{args.bundle_output_path});
+    const lock_path = try arena.print("{s}.lock", .{args.bundle_output_path});
     const lock_overlaps_source = pathsOverlapCanonically(arena, init.io, lock_path, args.iso_path) catch |err| {
         std.debug.print("miz-image-builder: cannot isolate result lock from ISO source: {t}\n", .{err});
         std.process.exit(1);
@@ -275,11 +275,11 @@ pub fn main(init: std.process.Init) !void {
         .limits = args.limits,
     };
 
-    const host_architecture: miz.customize.Architecture = switch (builtin.cpu.arch) {
+    const host_architecture: miz.customize.Architecture = switch (builtin.target.cpu.arch) {
         .x86_64 => .x86_64,
         .aarch64 => .aarch64,
         else => {
-            std.debug.print("miz-image-builder: unsupported host architecture: {t}\n", .{builtin.cpu.arch});
+            std.debug.print("miz-image-builder: unsupported host architecture: {t}\n", .{builtin.target.cpu.arch});
             std.process.exit(2);
         },
     };
@@ -888,7 +888,7 @@ fn testArgs(extra: []const []const u8, buffer: [][]const u8) []const []const u8 
         "--image-basename",    "image.vhd",
         "-O",                  "vhd",
         "--size",              "4G",
-        "--seed",              "00" ** 32,
+        "--seed",              (@as([32 * "00".len]u8, @bitCast(@as([32]["00".len]u8, @splat("00".*)))) ++ ""),
         "--source-date-epoch", "0",
     };
     @memcpy(buffer[0..base.len], &base);
