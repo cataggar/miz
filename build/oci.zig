@@ -71,9 +71,9 @@ pub fn add(
     }
     if (options.plain_http) run.addArg("--src-plain-http");
     run.addArg(options.source);
-    const layout = run.addPrefixedOutputDirectoryArg(
-        "oci:",
+    const layout = run.addOutputDirectoryArg2(
         b.fmt("{s}-oci-layout", .{options.name}),
+        .{ .prefix = "oci:" },
     );
     return .{ .layout = layout, .step = run };
 }

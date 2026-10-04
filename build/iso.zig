@@ -167,7 +167,8 @@ fn snapshotContainer(b: *std.Build, dependency: *std.Build.Dependency, name: []c
         .oci_layout => |layout| blk: {
             const validate = b.addRunArtifact(dependency.artifact("miz-input-validator"));
             validate.setName(b.fmt("validate OCI layout for {s}", .{name}));
-            validate.addDirectoryArg(layout);
+            validate.has_side_effects = true;
+            validate.addDirectoryArg2(layout, .{});
 
             const snapshot = b.addWriteFiles();
             snapshot.step.name = b.fmt("snapshot OCI layout for {s}", .{name});
@@ -189,7 +190,7 @@ fn configureRequest(
     run.addFileArg(options.iso);
     run.addArg("--container");
     switch (container) {
-        .oci_layout => |layout| run.addDirectoryArg(layout),
+        .oci_layout => |layout| run.addDirectoryArg2(layout, .{}),
         .archive => |archive| run.addFileArg(archive),
     }
     run.addArgs(&.{ "--rootfs-size", b.fmt("{d}", .{options.rootfs_size}) });
@@ -361,7 +362,7 @@ pub fn addRecustomize(
     run.addFileArg(options.iso);
     run.addArg("--container");
     switch (container) {
-        .oci_layout => |layout| run.addDirectoryArg(layout),
+        .oci_layout => |layout| run.addDirectoryArg2(layout, .{}),
         .archive => |archive| run.addFileArg(archive),
     }
     run.addArgs(&.{ "--rootfs-size", b.fmt("{d}", .{options.rootfs_size}) });
