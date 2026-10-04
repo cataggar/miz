@@ -732,7 +732,7 @@ test "CI heavy phases are independent jobs" {
         try expectContains(workflow, heading);
     }
     try expectAbsent(workflow, "\n    needs:");
-    try expectCount(workflow, "fail-fast: false", 2);
+    try expectCount(workflow, "fail-fast: false", 3);
     try expectCount(workflow, "name: build + test", 1);
     try expectContains(
         workflow,
