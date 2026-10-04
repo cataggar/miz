@@ -304,8 +304,7 @@ pub fn materializeCustomizedRootTree(
 ) !root_tree_mod.RootTree {
     const reporting = options.reporting;
 
-    const rootfs_scratch_path = try std.fmt.allocPrint(
-        allocator,
+    const rootfs_scratch_path = try allocator.print(
         "{s}.{s}-rootfs.sqsh",
         .{ options.scratch_base, options.scratch_infix },
     );
@@ -322,8 +321,7 @@ pub fn materializeCustomizedRootTree(
     var squash_reader_open = true;
     defer if (squash_reader_open) squash_reader.close(io);
 
-    const nested_scratch_prefix = try std.fmt.allocPrint(
-        allocator,
+    const nested_scratch_prefix = try allocator.print(
         "{s}.{s}-nested",
         .{ options.scratch_base, options.scratch_infix },
     );
@@ -359,8 +357,7 @@ pub fn materializeCustomizedRootTree(
         try installAzagentSystemdUnitIfPresent(allocator, &source_tree);
     }
 
-    const root_tree_spool_path = try std.fmt.allocPrint(
-        allocator,
+    const root_tree_spool_path = try allocator.print(
         "{s}.{s}-root-tree.spool",
         .{ options.scratch_base, options.scratch_infix },
     );
@@ -535,7 +532,7 @@ pub fn build(
     const raw_build_path = if (builds_output_in_place)
         options.output_path
     else
-        try std.fmt.allocPrint(allocator, "{s}.build-image.raw", .{scratch_base});
+        try allocator.print("{s}.build-image.raw", .{scratch_base});
     defer if (!builds_output_in_place) allocator.free(raw_build_path);
     defer if (!builds_output_in_place) Io.Dir.cwd().deleteFile(io, raw_build_path) catch {};
 
@@ -832,17 +829,17 @@ fn validateBuildPathIsolation(
 ) !void {
     const output_path = try std.fs.path.resolve(allocator, &.{scratchBase(options)});
     defer allocator.free(output_path);
-    const rootfs_scratch = try std.fmt.allocPrint(allocator, "{s}.build-image-rootfs.sqsh", .{output_path});
+    const rootfs_scratch = try allocator.print("{s}.build-image-rootfs.sqsh", .{output_path});
     defer allocator.free(rootfs_scratch);
-    const root_tree_spool = try std.fmt.allocPrint(allocator, "{s}.build-image-root-tree.spool", .{output_path});
+    const root_tree_spool = try allocator.print("{s}.build-image-root-tree.spool", .{output_path});
     defer allocator.free(root_tree_spool);
-    const nested_prefix = try std.fmt.allocPrint(allocator, "{s}.build-image-nested", .{output_path});
+    const nested_prefix = try allocator.print("{s}.build-image-nested", .{output_path});
     defer allocator.free(nested_prefix);
     const in_place = buildsOutputInPlace(options);
     const raw_build = if (in_place)
         output_path
     else
-        try std.fmt.allocPrint(allocator, "{s}.build-image.raw", .{output_path});
+        try allocator.print("{s}.build-image.raw", .{output_path});
     defer if (!in_place) allocator.free(raw_build);
 
     for ([_][]const u8{ options.iso_path, options.container_path }) |source| {
@@ -1193,7 +1190,7 @@ pub fn discoverRootfsPathInIso(
     override_path: ?[]const u8,
 ) ![]u8 {
     if (override_path) |path| {
-        const lookup_path = if (std.mem.startsWith(u8, path, "/")) path else try std.fmt.allocPrint(allocator, "/{s}", .{path});
+        const lookup_path = if (std.mem.startsWith(u8, path, "/")) path else try allocator.print("/{s}", .{path});
         defer if (lookup_path.ptr != path.ptr) allocator.free(lookup_path);
         const index = try reader.lookup(lookup_path);
         if (reader.getEntry(index).kind != .file) return error.InvalidRootfsPath;
@@ -1223,7 +1220,7 @@ pub fn discoverRootfsPathInIso(
             const children = try reader.listDirAlloc(allocator, item.index);
             defer allocator.free(children);
             for (children) |child| {
-                const child_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ item.path, child.name });
+                const child_path = try allocator.print("{s}/{s}", .{ item.path, child.name });
                 try queue.append(.{ .index = child.index, .path = child_path });
             }
             continue;
@@ -1242,16 +1239,16 @@ fn isRootfsCandidate(path: []const u8) bool {
     const base = baseName(path);
     return std.ascii.endsWithIgnoreCase(base, ".squashfs") or
         std.ascii.endsWithIgnoreCase(base, ".sqsh") or
-        std.ascii.indexOfIgnoreCase(base, "squashfs") != null or
-        std.ascii.indexOfIgnoreCase(base, "rootfs") != null or
+        std.ascii.findIgnoreCase(base, "squashfs") != null or
+        std.ascii.findIgnoreCase(base, "rootfs") != null or
         std.ascii.endsWithIgnoreCase(base, ".img");
 }
 
 fn candidateScore(path: []const u8) u8 {
     const base = baseName(path);
     if (std.ascii.endsWithIgnoreCase(base, ".squashfs") or std.ascii.endsWithIgnoreCase(base, ".sqsh")) return 4;
-    if (std.ascii.indexOfIgnoreCase(base, "squashfs") != null) return 3;
-    if (std.ascii.indexOfIgnoreCase(base, "rootfs") != null) return 2;
+    if (std.ascii.findIgnoreCase(base, "squashfs") != null) return 3;
+    if (std.ascii.findIgnoreCase(base, "rootfs") != null) return 2;
     if (std.ascii.endsWithIgnoreCase(base, ".img")) return 1;
     return 0;
 }
@@ -1263,7 +1260,7 @@ fn extractIsoEntryToPath(
     path_in_iso: []const u8,
     output_path: []const u8,
 ) !void {
-    const lookup_path = if (std.mem.startsWith(u8, path_in_iso, "/")) path_in_iso else try std.fmt.allocPrint(allocator, "/{s}", .{path_in_iso});
+    const lookup_path = if (std.mem.startsWith(u8, path_in_iso, "/")) path_in_iso else try allocator.print("/{s}", .{path_in_iso});
     defer if (lookup_path.ptr != path_in_iso.ptr) allocator.free(lookup_path);
 
     const index = try reader.lookup(lookup_path);
@@ -1909,7 +1906,7 @@ fn collectSquashfsEntries(
         const full_path = if (prefix.len == 0)
             try allocator.dupe(u8, child.name)
         else
-            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, child.name });
+            try allocator.print("{s}/{s}", .{ prefix, child.name });
         var full_path_owned = true;
         errdefer if (full_path_owned) allocator.free(full_path);
 
@@ -2161,8 +2158,7 @@ fn nextNestedScratchPath(
     next_nested_scratch_id: *usize,
     extension: []const u8,
 ) ![]u8 {
-    const path = try std.fmt.allocPrint(
-        allocator,
+    const path = try allocator.print(
         "{s}-{d}.{s}",
         .{ nested_scratch_prefix, next_nested_scratch_id.*, extension },
     );
@@ -2185,7 +2181,7 @@ fn collectExt4Entries(
         const full_path = if (prefix.len == 0)
             try allocator.dupe(u8, child.name)
         else
-            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, child.name });
+            try allocator.print("{s}/{s}", .{ prefix, child.name });
         var full_path_owned = true;
         errdefer if (full_path_owned) allocator.free(full_path);
 
@@ -2295,7 +2291,7 @@ fn collectIsoEntries(
         const full_path = if (prefix.len == 0)
             try allocator.dupe(u8, child.name)
         else
-            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, child.name });
+            try allocator.print("{s}/{s}", .{ prefix, child.name });
         var full_path_owned = true;
         errdefer if (full_path_owned) allocator.free(full_path);
 
@@ -2737,7 +2733,7 @@ fn expectGen2BuiltImageContents(
     try std.testing.expect(std.mem.indexOf(u8, bls_entry, "/boot/vmlinuz-test") != null);
 
     const root_partition = report.planned_partitions[1].planned;
-    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{image_path});
+    const rootfs_scratch_path = try allocator.print("{s}.test-rootfs.raw", .{image_path});
     defer allocator.free(rootfs_scratch_path);
     defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
     try extractImageRegionToPath(allocator, io, img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
@@ -3426,7 +3422,7 @@ test "build-image populates multi-block squashfs files into ext4 for small seque
     defer img.close(io);
 
     const root_partition = report.planned_partitions[1].planned;
-    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    const rootfs_scratch_path = try allocator.print("{s}.test-rootfs.raw", .{output_path});
     defer allocator.free(rootfs_scratch_path);
     defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
     try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
@@ -3484,7 +3480,7 @@ test "build-image unwraps nested ext4 filesystem images inside squashfs files" {
     defer img.close(io);
 
     const root_partition = report.planned_partitions[1].planned;
-    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    const rootfs_scratch_path = try allocator.print("{s}.test-rootfs.raw", .{output_path});
     defer allocator.free(rootfs_scratch_path);
     defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
     try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
@@ -3566,7 +3562,7 @@ test "build-image prefers squashfs kernel and initramfs over duplicate ISO boot 
     try std.testing.expect(std.mem.indexOf(u8, bls_entry, "/boot/initramfs-test.img") != null);
 
     const root_partition = report.planned_partitions[1].planned;
-    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    const rootfs_scratch_path = try allocator.print("{s}.test-rootfs.raw", .{output_path});
     defer allocator.free(rootfs_scratch_path);
     defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
     try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
@@ -3643,7 +3639,7 @@ test "build-image can skip the ISO rootfs while retaining boot assets" {
     defer img.close(io);
 
     const root_partition = report.planned_partitions[1].planned;
-    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    const rootfs_scratch_path = try allocator.print("{s}.test-rootfs.raw", .{output_path});
     defer allocator.free(rootfs_scratch_path);
     defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
     try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
@@ -3748,7 +3744,7 @@ test "build-image retains installed kernel modules during skip-iso-rootfs prunin
     defer img.close(io);
 
     const root_partition = report.planned_partitions[1].planned;
-    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    const rootfs_scratch_path = try allocator.print("{s}.test-rootfs.raw", .{output_path});
     defer allocator.free(rootfs_scratch_path);
     defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
     try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
@@ -3882,7 +3878,7 @@ test "build-image can skip the ISO rootfs and still build a UKI from ISO-only st
     try std.testing.expectError(error.PathNotFound, esp.readFileAlloc(io, allocator, "loader/loader.conf"));
 
     const root_partition = report.planned_partitions[1].planned;
-    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    const rootfs_scratch_path = try allocator.print("{s}.test-rootfs.raw", .{output_path});
     defer allocator.free(rootfs_scratch_path);
     defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
     try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
@@ -3973,7 +3969,7 @@ test "build-image installs a Gen1 BIOS GRUB chain into the post-MBR gap" {
     try std.testing.expectEqualSlices(u8, expected_core, embedded_core);
 
     const root_partition = report.planned_partitions[0].planned;
-    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    const rootfs_scratch_path = try allocator.print("{s}.test-rootfs.raw", .{output_path});
     defer allocator.free(rootfs_scratch_path);
     defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
     try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
@@ -4291,7 +4287,7 @@ test "build-image reports errors cleanly (no double-free) when squashfs open fai
     // Clear the inode table's metadata-block "uncompressed" bit and relabel
     // the filesystem as XZ-compressed so squashfs.Reader attempts to
     // decompress raw metadata bytes and fails after partition planning.
-    std.mem.writeInt(u16, squashfs_bytes[20..22], @intFromEnum(squashfs.Compression.xz), .little);
+    std.mem.writeInt(u16, squashfs_bytes[20..22], @backingInt(squashfs.Compression.xz), .little);
     const inode_table_start = std.mem.readInt(u64, squashfs_bytes[64..72], .little);
     const header_offset: usize = @intCast(inode_table_start);
     var header = std.mem.readInt(u16, squashfs_bytes[header_offset..][0..2], .little);
@@ -4422,7 +4418,7 @@ test "build-image installs and enables an azagent systemd unit when azagent is p
     var img = try Image.openPath(io, output_path);
     defer img.close(io);
     const root_partition = report.planned_partitions[1].planned;
-    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    const rootfs_scratch_path = try allocator.print("{s}.test-rootfs.raw", .{output_path});
     defer allocator.free(rootfs_scratch_path);
     defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
     try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
@@ -4477,7 +4473,7 @@ test "build-image does not install an azagent systemd unit when azagent is absen
     var img = try Image.openPath(io, output_path);
     defer img.close(io);
     const root_partition = report.planned_partitions[1].planned;
-    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    const rootfs_scratch_path = try allocator.print("{s}.test-rootfs.raw", .{output_path});
     defer allocator.free(rootfs_scratch_path);
     defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
     try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
@@ -4545,7 +4541,7 @@ test "build-image applies typed OS customization before generalization and ext4 
     var img = try Image.openPath(io, output_path);
     defer img.close(io);
     const root_partition = report.planned_partitions[1].planned;
-    const rootfs_scratch_path = try std.fmt.allocPrint(allocator, "{s}.test-rootfs.raw", .{output_path});
+    const rootfs_scratch_path = try allocator.print("{s}.test-rootfs.raw", .{output_path});
     defer allocator.free(rootfs_scratch_path);
     defer Io.Dir.cwd().deleteFile(io, rootfs_scratch_path) catch {};
     try extractImageRegionToPath(allocator, io, &img, root_partition.offset_bytes, root_partition.length_bytes, rootfs_scratch_path);
@@ -4773,22 +4769,19 @@ fn createBuildImageOciFixtureWithOptions(
 
     const layer1_gzip = try gzipBytes(allocator, layer1_tar);
     const layer2_gzip = try gzipBytes(allocator, layer2_tar);
-    const config_json = try std.fmt.allocPrint(
-        allocator,
+    const config_json = try allocator.print(
         "{{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[]}}}}",
         .{},
     );
     const config_digest = try writeBlobAndDigest(allocator, io, dir, config_json);
     const layer1_digest = try writeBlobAndDigest(allocator, io, dir, layer1_gzip);
     const layer2_digest = try writeBlobAndDigest(allocator, io, dir, layer2_gzip);
-    const manifest_json = try std.fmt.allocPrint(
-        allocator,
+    const manifest_json = try allocator.print(
         "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"{s}\",\"size\":{d}}},{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ config_digest, config_json.len, layer1_digest, layer1_gzip.len, layer2_digest, layer2_gzip.len },
     );
     const manifest_digest = try writeBlobAndDigest(allocator, io, dir, manifest_json);
-    const index_json = try std.fmt.allocPrint(
-        allocator,
+    const index_json = try allocator.print(
         "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ manifest_digest, manifest_json.len },
     );
@@ -4834,8 +4827,7 @@ fn createEfiOnlyBuildImageOciLayout(
     const layer_gzip = try gzipBytes(allocator, layer_tar);
     defer allocator.free(layer_gzip);
 
-    const config_json = try std.fmt.allocPrint(
-        allocator,
+    const config_json = try allocator.print(
         "{{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[]}}}}",
         .{},
     );
@@ -4844,16 +4836,14 @@ fn createEfiOnlyBuildImageOciLayout(
     defer allocator.free(config_digest);
     const layer_digest = try writeBlobAndDigest(allocator, io, dir, layer_gzip);
     defer allocator.free(layer_digest);
-    const manifest_json = try std.fmt.allocPrint(
-        allocator,
+    const manifest_json = try allocator.print(
         "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ config_digest, config_json.len, layer_digest, layer_gzip.len },
     );
     defer allocator.free(manifest_json);
     const manifest_digest = try writeBlobAndDigest(allocator, io, dir, manifest_json);
     defer allocator.free(manifest_digest);
-    const index_json = try std.fmt.allocPrint(
-        allocator,
+    const index_json = try allocator.print(
         "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ manifest_digest, manifest_json.len },
     );
@@ -4892,8 +4882,7 @@ fn createContainerRootfsOnlyBuildImageOciLayout(
     const layer_gzip = try gzipBytes(allocator, layer_tar);
     defer allocator.free(layer_gzip);
 
-    const config_json = try std.fmt.allocPrint(
-        allocator,
+    const config_json = try allocator.print(
         "{{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[]}}}}",
         .{},
     );
@@ -4902,16 +4891,14 @@ fn createContainerRootfsOnlyBuildImageOciLayout(
     defer allocator.free(config_digest);
     const layer_digest = try writeBlobAndDigest(allocator, io, dir, layer_gzip);
     defer allocator.free(layer_digest);
-    const manifest_json = try std.fmt.allocPrint(
-        allocator,
+    const manifest_json = try allocator.print(
         "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ config_digest, config_json.len, layer_digest, layer_gzip.len },
     );
     defer allocator.free(manifest_json);
     const manifest_digest = try writeBlobAndDigest(allocator, io, dir, manifest_json);
     defer allocator.free(manifest_digest);
-    const index_json = try std.fmt.allocPrint(
-        allocator,
+    const index_json = try allocator.print(
         "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ manifest_digest, manifest_json.len },
     );
@@ -4941,7 +4928,7 @@ fn buildTarArchive(allocator: std.mem.Allocator, specs: []const TarSpec) ![]u8 {
 }
 
 fn appendTarSpec(out: *std.Io.Writer.Allocating, spec: TarSpec) !void {
-    var header: [512]u8 = [_]u8{0} ** 512;
+    var header: [512]u8 = @as([512]u8, @splat(0));
     if (spec.path.len > 100) return error.InvalidHeader;
     @memcpy(header[0..spec.path.len], spec.path);
     try writeOctalField(header[100..108], spec.mode);
@@ -4971,7 +4958,7 @@ fn appendTarSpec(out: *std.Io.Writer.Allocating, spec: TarSpec) !void {
 fn buildPaxRecord(allocator: std.mem.Allocator, key: []const u8, value: []const u8) ![]u8 {
     var record_len: usize = 0;
     while (true) {
-        const record = try std.fmt.allocPrint(allocator, "{d} {s}={s}\n", .{ record_len, key, value });
+        const record = try allocator.print("{d} {s}={s}\n", .{ record_len, key, value });
         if (record.len == record_len) return record;
         record_len = record.len;
         allocator.free(record);
@@ -4993,8 +4980,8 @@ fn writeBlobAndDigest(allocator: std.mem.Allocator, io: Io, dir: Io.Dir, data: [
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    const digest_string = try std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
-    const blob_path = try std.fmt.allocPrint(allocator, "blobs/sha256/{s}", .{hex});
+    const digest_string = try allocator.print("sha256:{s}", .{hex});
+    const blob_path = try allocator.print("blobs/sha256/{s}", .{hex});
     defer allocator.free(blob_path);
     try dir.writeFile(io, .{ .sub_path = blob_path, .data = data });
     return digest_string;
@@ -5136,9 +5123,9 @@ fn writeMinimalIsoWithBootPayloads(
     initrd_name: []const u8,
     initrd_bytes: []const u8,
 ) !void {
-    const kernel_path = try std.fmt.allocPrint(allocator, "boot/{s}", .{stripVersionSuffix(kernel_name)});
+    const kernel_path = try allocator.print("boot/{s}", .{stripVersionSuffix(kernel_name)});
     defer allocator.free(kernel_path);
-    const initrd_path = try std.fmt.allocPrint(allocator, "boot/{s}", .{stripVersionSuffix(initrd_name)});
+    const initrd_path = try allocator.print("boot/{s}", .{stripVersionSuffix(initrd_name)});
     defer allocator.free(initrd_path);
 
     const nodes = [_]FixtureIsoNode{

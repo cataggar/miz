@@ -392,8 +392,7 @@ test "resolver retains the selected descriptor path and full image config" {
     const allocator = std.testing.allocator;
     const diff_id = content.digestBytes("uncompressed layer").format();
     const layer_digest = content.digestBytes("compressed layer").format();
-    const config_bytes = try std.fmt.allocPrint(
-        allocator,
+    const config_bytes = try allocator.print(
         "{{\"created\":\"2026-07-24T00:00:00Z\",\"architecture\":\"amd64\",\"os\":\"linux\",\"config\":{{\"User\":\"1000:1000\",\"Env\":[\"PATH=/bin\"],\"Entrypoint\":[\"/bin/app\"],\"Cmd\":[\"serve\"],\"ExposedPorts\":{{\"8080/tcp\":{{}}}},\"Labels\":{{\"org.example\":\"kept\"}}}},\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[\"{s}\"]}},\"history\":[]}}",
         .{&diff_id},
     );
@@ -404,8 +403,7 @@ test "resolver retains the selected descriptor path and full image config" {
         .digest = &config_digest,
         .size = config_bytes.len,
     };
-    const manifest_bytes = try std.fmt.allocPrint(
-        allocator,
+    const manifest_bytes = try allocator.print(
         "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{
             model.media_type_oci_manifest,
@@ -425,8 +423,7 @@ test "resolver retains the selected descriptor path and full image config" {
         .size = manifest_bytes.len,
         .platform = .{ .os = "linux", .architecture = "amd64" },
     };
-    const index_bytes = try std.fmt.allocPrint(
-        allocator,
+    const index_bytes = try allocator.print(
         "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"platform\":{{\"os\":\"linux\",\"architecture\":\"amd64\"}},\"x-path-extension\":\"kept\"}}]}}",
         .{
             model.media_type_oci_index,

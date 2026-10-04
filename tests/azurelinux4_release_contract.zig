@@ -266,11 +266,11 @@ test "azure acceptance uses the current harness with the accepted-source tool" {
     try expectContains(
         manifest,
         "git+https://github.com/cataggar/bzip2z" ++
-            "#05f6d4e34df2da2729490aee2a5bbe43b5ce94f6",
+            "#b1ee15f320f53a8f9794d4440fd43798c28f276d",
     );
     try expectContains(
         manifest,
-        "bzip2z-0.1.0-m5NdlhNXCwC5mTHdg2pgMytHjahuQP6nImdle78Pb9kO",
+        "bzip2z-0.1.0-m5NdlpirCwBFHH_3t0zvBLPeA0rNwqFU21SbRa6CPCDR",
     );
     try expectAbsent(manifest, "mirrors.kernel.org/sourceware/bzip2");
 
@@ -289,10 +289,10 @@ test "build manifest dependencies are git-pinned to a full commit" {
     const manifest = try readTracked(allocator, std.testing.io, "build.zig.zon");
     defer allocator.free(manifest);
 
-    const names = [_][]const u8{ "bzip2z", "tls", "debz", "rpmz", "zstd" };
+    const names = [_][]const u8{ "bzip2z", "tls", "debz", "rpmz", "zstd", "translate_c" };
     try expectCount(manifest, ".url = \"git+https://", names.len);
     for (names) |name| {
-        const declaration = try std.fmt.allocPrint(allocator, ".{s} = .{{", .{name});
+        const declaration = try allocator.print(".{s} = .{{", .{name});
         defer allocator.free(declaration);
         const body = try section(manifest, declaration, "},");
         const url = try section(body, ".url = \"", "\"");
@@ -306,14 +306,23 @@ test "build manifest dependencies are git-pinned to a full commit" {
             else => return error.DependencyIsNotPinned,
         };
         const hash = try section(body, ".hash = \"", "\"");
-        const prefix = try std.fmt.allocPrint(allocator, "{s}-", .{name});
+        const prefix = try allocator.print("{s}-", .{name});
         defer allocator.free(prefix);
         try std.testing.expect(std.mem.startsWith(u8, hash, prefix));
     }
     try expectContains(
         manifest,
+        "git+https://github.com/cataggar/translate-c" ++
+            "#62d06a5d3e93c82727544e8113e4762a315ca0ed",
+    );
+    try expectContains(
+        manifest,
+        "translate_c-2.0.0-Q_BUWlpOBwBWvgGBM20tJq-GXgPio3v3UD39rXEn70KN",
+    );
+    try expectContains(
+        manifest,
         "git+https://github.com/cataggar/zstd" ++
-            "#45b6dfcd9d0ffdba99fb653c66b233179b9f7229",
+            "#71502da18ccdacac0c2049c033dedbbf25a40b93",
     );
 
     const build = try readTracked(allocator, std.testing.io, "build.zig");
@@ -711,7 +720,7 @@ test "CI actions are pinned to audited commits" {
             return error.UnauditedAction;
         }
     }
-    try std.testing.expectEqual(@as(usize, 13), found);
+    try std.testing.expectEqual(@as(usize, 15), found);
 }
 
 test "CI heavy phases are independent jobs" {
@@ -727,12 +736,12 @@ test "CI heavy phases are independent jobs" {
         "unsafe-chroot",
         "vm-boot",
     }) |job| {
-        const heading = try std.fmt.allocPrint(allocator, "  {s}:\n", .{job});
+        const heading = try allocator.print("  {s}:\n", .{job});
         defer allocator.free(heading);
         try expectContains(workflow, heading);
     }
     try expectAbsent(workflow, "\n    needs:");
-    try expectCount(workflow, "fail-fast: false", 2);
+    try expectCount(workflow, "fail-fast: false", 3);
     try expectCount(workflow, "name: build + test", 1);
     try expectContains(
         workflow,
@@ -741,30 +750,62 @@ test "CI heavy phases are independent jobs" {
     try expectContains(
         workflow,
         "zig build check-ci-production-entrypoints test-package-family test-ci \\\n" ++
-            "            -Doptimize=Debug --summary all",
+            "            -Doptimize=debug --summary all",
     );
-    try expectAbsent(workflow, "run: zig build -Doptimize=Debug");
+    try expectAbsent(workflow, "run: zig build -Doptimize=debug");
     try expectCount(workflow, "zig build test-ci", 0);
     try expectCount(
         workflow,
-        "run: zig build test-vm-backend -Doptimize=Debug --summary all",
+        "run: zig build test-vm-backend -Doptimize=debug --summary all",
         1,
     );
     try expectCount(
         workflow,
-        "run: zig build test-device-write-integration -Doptimize=Debug --summary all",
+        "run: zig build test-device-write-integration -Doptimize=debug --summary all",
         1,
     );
     try expectCount(
         workflow,
-        "run: zig build test-unsafe-chroot-integration -Doptimize=Debug --summary all",
+        "run: zig build test-unsafe-chroot-integration -Doptimize=debug --summary all",
         1,
     );
     try expectCount(workflow, "zig build test-vm-real-boot", 3);
     try expectCount(workflow, "-Doptimize=${{ matrix.optimize }} --summary all", 3);
-    try expectCount(workflow, "optimize: Debug", 2);
-    try expectCount(workflow, "optimize: ReleaseSafe", 1);
+    try expectCount(workflow, "optimize: debug", 2);
+    try expectCount(workflow, "optimize: safe", 1);
     try expectContains(workflow, "cancel-in-progress: true");
+}
+
+test "CI native smoke covers all hosts and optimization modes" {
+    const allocator = std.testing.allocator;
+    const workflow = try readTracked(allocator, std.testing.io, ci_workflow_path);
+    defer allocator.free(workflow);
+    const native = try section(workflow, "  native-smoke:", "\n  vm-backend:");
+
+    try expectContains(native, "runs-on: ${{ matrix.os }}");
+    try expectContains(native, "os: [ubuntu-24.04, macos-15, windows-2025]");
+    try expectContains(native, "optimize: [debug, safe, fast, small]");
+    try expectContains(
+        native,
+        "run: zig build install-miz test-native-smoke -Doptimize=${{ matrix.optimize }} -j2 --summary all",
+    );
+    try expectContains(native, "\"$executable\" version");
+    try expectContains(native, "\"$executable\" --help");
+    try expectContains(native, "if [[ \"$RUNNER_OS\" == Windows ]]; then executable+=.exe; fi");
+    try expectAbsent(native, "-Dtarget=");
+    try expectAbsent(native, "MIZ_RUN_PRIVILEGED_TEST");
+    try expectAbsent(native, "MIZ_RUN_VM_BOOT_TEST");
+
+    const protected = try section(workflow, "  zig-tests:", "\n  native-smoke:");
+    try expectContains(protected, "name: build + test");
+    for ([_][]const u8{
+        try section(workflow, "  vm-backend:", "\n  windows:"),
+        try section(workflow, "  unsafe-chroot:", "\n  vm-boot:"),
+        try sectionToEnd(workflow, "  vm-boot:"),
+    }) |linux_job| {
+        try expectContains(linux_job, "runs-on: ubuntu-latest");
+        try expectAbsent(linux_job, "runs-on: ${{ matrix.os }}");
+    }
 }
 
 test "CI no longer runs an Azure Linux Python suite" {

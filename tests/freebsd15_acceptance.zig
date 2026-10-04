@@ -38,8 +38,7 @@ fn toolPath(allocator: Allocator, name: []const u8) ![]u8 {
 /// The three ported tools the harness resolves, spelled as shell assignments a
 /// generated fragment can prepend.
 fn toolEnvironment(allocator: Allocator) ![]const u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         \\export MIZ_FREEBSD15_RELEASE_TOOL={s}
         \\export MIZ_FREEBSD15_AZURE_METADATA_TOOL={s}
         \\export MIZ_AZURE_VHD_TOOL={s}
@@ -87,7 +86,7 @@ test "the harness runs under strict mode and has exactly two modes" {
 fn preflight(gpa: Allocator, tree: *Tree, candidate_key: []const u8) !u8 {
     const path = try support.sourcePath(tree.allocator(), script_path);
     const state_file = try tree.path(&.{"unused-state"});
-    const script = try std.fmt.allocPrint(tree.allocator(),
+    const script = try tree.allocator().print(
         \\{s}
         \\export STATE_FILE={s}
         \\export GITHUB_RUN_ID=123
@@ -111,8 +110,7 @@ test "the candidate key accepts every supported profile" {
     defer tree.deinit();
     for ([_][]const u8{ "x86_64", "aarch64" }) |architecture| {
         for ([_][]const u8{ "ufs-full", "ufs-core", "zfs-full", "zfs-core" }) |profile| {
-            const key = try std.fmt.allocPrint(
-                tree.allocator(),
+            const key = try tree.allocator().print(
                 "{s}-{s}",
                 .{ architecture, profile },
             );
@@ -136,7 +134,7 @@ test "the harness refuses to run without the ported tooling" {
     defer tree.deinit();
     const path = try support.sourcePath(tree.allocator(), script_path);
     const absent = try tree.path(&.{"absent-tool"});
-    const script = try std.fmt.allocPrint(tree.allocator(),
+    const script = try tree.allocator().print(
         \\export MIZ_FREEBSD15_RELEASE_TOOL={s}
         \\export MIZ_FREEBSD15_AZURE_METADATA_TOOL={s}
         \\export MIZ_AZURE_VHD_TOOL={s}
@@ -354,7 +352,7 @@ fn runSerialConsoleCase(
     );
     const root = try tree.path(&.{"serial"});
 
-    const script = try std.fmt.allocPrint(tree.allocator(),
+    const script = try tree.allocator().print(
         \\{s}
         \\set -u -o pipefail
         \\azure_metadata_tool=$MIZ_FREEBSD15_AZURE_METADATA_TOOL
@@ -590,7 +588,7 @@ test "failure-time collection preserves an existing serial log" {
     _ = try tree.write("cleanup/boot.log", existing);
     const root = try tree.path(&.{"cleanup"});
 
-    const script = try std.fmt.allocPrint(tree.allocator(),
+    const script = try tree.allocator().print(
         \\{s}
         \\set -u -o pipefail
         \\azure_metadata_tool=$MIZ_FREEBSD15_AZURE_METADATA_TOOL
@@ -696,7 +694,7 @@ fn runReplicationCase(
         "tests/fixtures/freebsd15_azure_replication",
     );
     const result = try tree.path(&.{"replication.json"});
-    const script = try std.fmt.allocPrint(tree.allocator(),
+    const script = try tree.allocator().print(
         \\{s}
         \\set -u -o pipefail
         \\azure_metadata_tool=$MIZ_FREEBSD15_AZURE_METADATA_TOOL
@@ -866,7 +864,7 @@ fn runBootDiagnosticsCase(
     );
     const root = try tree.path(&.{"diagnostics"});
 
-    const script = try std.fmt.allocPrint(tree.allocator(),
+    const script = try tree.allocator().print(
         \\{s}
         \\set -u -o pipefail
         \\azure_metadata_tool=$MIZ_FREEBSD15_AZURE_METADATA_TOOL
@@ -1037,7 +1035,7 @@ test "the Azure location display name resolves exactly once" {
             tree.allocator(),
             "tests/fixtures/freebsd15_azure_locations.json",
         );
-        const script = try std.fmt.allocPrint(tree.allocator(),
+        const script = try tree.allocator().print(
             \\{s}
             \\set -u -o pipefail
             \\azure_metadata_tool=$MIZ_FREEBSD15_AZURE_METADATA_TOOL
@@ -1315,10 +1313,10 @@ fn runGalleryCase(
     const gallery_id = "/subscriptions/test/resourceGroups/rg-test/providers/" ++
         "Microsoft.Compute/galleries/gallery-test";
     const sharing = if (sharing_text) |text|
-        try std.fmt.allocPrint(tree.allocator(), ", \"sharingProfile\": {s}", .{text})
+        try tree.allocator().print(", \"sharingProfile\": {s}", .{text})
     else
         "";
-    const document_text = try std.fmt.allocPrint(tree.allocator(),
+    const document_text = try tree.allocator().print(
         \\{{"id": "{s}", "name": "gallery-test", "resourceGroup": "rg-test",
         \\ "location": "swedencentral", "type": "Microsoft.Compute/galleries",
         \\ "provisioningState": "Succeeded"{s}}}
@@ -1378,7 +1376,7 @@ test "the harness delegates gallery image-version validation to the tool" {
         defer tree.deinit();
         const source = try harness(tree.allocator());
         const fixture = try support.sourcePath(tree.allocator(), case[0]);
-        const script = try std.fmt.allocPrint(tree.allocator(),
+        const script = try tree.allocator().print(
             \\{s}
             \\set -u -o pipefail
             \\azure_metadata_tool=$MIZ_FREEBSD15_AZURE_METADATA_TOOL
@@ -1499,7 +1497,7 @@ test "the architecture profile maps exactly for the gallery definition" {
         \\      azure_image_architecture=x64
     );
 
-    const script = try std.fmt.allocPrint(tree.allocator(),
+    const script = try tree.allocator().print(
         \\set -u
         \\{s}
         \\for architecture in aarch64 x86_64; do
@@ -1801,8 +1799,7 @@ fn guestContractScript(allocator: Allocator, source: []const u8) ![]const u8 {
 /// the fragment cannot be exercised at all, so the test says so rather than
 /// asserting on the behaviour of a missing tool.
 fn requireHostTool(gpa: Allocator, tree: *Tree, name: []const u8) !void {
-    const script = try std.fmt.allocPrint(
-        tree.allocator(),
+    const script = try tree.allocator().print(
         "command -v {s} >/dev/null",
         .{name},
     );
@@ -1866,7 +1863,7 @@ test "a post-root failure observes the UFS root device it resolved" {
         "guest_contract_diagnostics",
         "guest_contract_exit",
     });
-    const script = try std.fmt.allocPrint(tree.allocator(),
+    const script = try tree.allocator().print(
         \\set -u
         \\sudo() {{
         \\  printf 'sudo-call:%s\n' "$*" >&2
@@ -1916,7 +1913,7 @@ test "guest contract capture preserves status files and bounds its output" {
     const stderr_path = try tree.path(&.{"guest-contract.stderr"});
     try Dir.cwd().createDirPath(std.testing.io, tree.root);
 
-    const script = try std.fmt.allocPrint(tree.allocator(),
+    const script = try tree.allocator().print(
         \\set -u -o pipefail
         \\guest_output_line_limit=5
         \\ssh_options=()
@@ -2003,8 +2000,7 @@ test "guest contract failure artefacts and observations are bounded" {
         "swapinfo",
         "mdconfig",
     }) |observation| {
-        const needle = try std.fmt.allocPrint(
-            tree.allocator(),
+        const needle = try tree.allocator().print(
             "guest_observation {s}",
             .{observation},
         );
@@ -2024,7 +2020,7 @@ fn runProviderResolution(
         "partition_disk_for_provider",
         "resolve_guest_provider",
     });
-    const script = try std.fmt.allocPrint(tree.allocator(),
+    const script = try tree.allocator().print(
         \\set -u
         \\GLABEL_OUTPUT='{s}'
         \\sudo() {{
@@ -2060,13 +2056,13 @@ test "the guest provider resolver resolves exact GEOM labels with sudo -n" {
         var tree = try Tree.create(gpa);
         defer tree.deinit();
         try requireHostTool(gpa, &tree, "awk");
-        const fixture = try std.fmt.allocPrint(tree.allocator(),
+        const fixture = try tree.allocator().print(
             \\Name Status Components
             \\gpt/efi N/A da0p1
             \\{s} N/A da0p3
             \\
         , .{label});
-        const provider = try std.fmt.allocPrint(tree.allocator(), "/dev/{s}", .{label});
+        const provider = try tree.allocator().print("/dev/{s}", .{label});
         var run = try runProviderResolution(gpa, &tree, provider, fixture);
         defer run.deinit(gpa);
         try std.testing.expectEqualStrings("status=0\nresolved=da0p3\n", run.stdout);
@@ -2105,7 +2101,7 @@ test "privileged storage commands use exact non-interactive sudo invocations" {
         "privileged_glabel_status",
         "privileged_mdconfig",
     });
-    const script = try std.fmt.allocPrint(tree.allocator(),
+    const script = try tree.allocator().print(
         \\set -u
         \\sudo() {{
         \\  printf '%s\n' "$*"
@@ -2135,7 +2131,7 @@ test "swap must be backed by a resource-disk partition, never the OS disk" {
         "partition_disk_for_provider",
         "require_resource_disk_provider",
     });
-    const script = try std.fmt.allocPrint(tree.allocator(),
+    const script = try tree.allocator().print(
         \\set -u
         \\sudo_call=
         \\sudo() {{
@@ -2186,8 +2182,7 @@ test "the mdconfig and resource-disk parsers read only the fields they claim" {
         },
     }) |case| {
         const input = try tree.write("mdconfig.txt", case[0]);
-        const script = try std.fmt.allocPrint(
-            tree.allocator(),
+        const script = try tree.allocator().print(
             "awk -F '\\t' '$2 == \"vnode\" {{ print $4; exit }}' {s}",
             .{input},
         );
@@ -2202,8 +2197,7 @@ test "the mdconfig and resource-disk parsers read only the fields they claim" {
         .{ "da1s1", "da1" },
         .{ "ada2s4", "ada2" },
     }) |case| {
-        const script = try std.fmt.allocPrint(
-            tree.allocator(),
+        const script = try tree.allocator().print(
             "printf '{s}\\n' | sed -E 's/(p|s)[0-9]+$//'",
             .{case[0]},
         );
@@ -2234,8 +2228,7 @@ test "the guest phase names and storage contracts are stable" {
         "gpt-health",
         "swap-policy",
     }) |phase| {
-        const needle = try std.fmt.allocPrint(
-            tree.allocator(),
+        const needle = try tree.allocator().print(
             "begin_guest_phase {s} ",
             .{phase},
         );
@@ -2327,8 +2320,7 @@ test "only the Azure acceptance job receives protected Azure configuration" {
     const section = try azureSection(tree.allocator(), flow);
     const start = try support.indexOf(flow, "azure_acceptance:");
     const end = try support.indexFrom(flow, "\n  stage:", start);
-    const outside = try std.fmt.allocPrint(
-        tree.allocator(),
+    const outside = try tree.allocator().print(
         "{s}{s}",
         .{ flow[0..start], flow[end..] },
     );

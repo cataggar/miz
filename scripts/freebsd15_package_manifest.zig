@@ -741,8 +741,7 @@ fn retainedRootsAlloc(
     const libraries = try joinAlloc(allocator, manifest.library_roots, " ");
     defer allocator.free(libraries);
     if (libraries.len == 0) return allocator.dupe(u8, required);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s} {s}",
         .{ required, libraries },
     );
@@ -789,7 +788,7 @@ pub fn guestScriptAlloc(
         .{ .token = "@NONCE@", .value = nonce },
     });
     defer allocator.free(record);
-    return std.fmt.allocPrint(allocator, "{s}\n{s}", .{ shared, record });
+    return allocator.print("{s}\n{s}", .{ shared, record });
 }
 
 /// One line of a manifest an image actually shipped.
@@ -858,7 +857,7 @@ pub fn verifyRecordedManifest(
 test "each filesystem retained contract claims every clause" {
     for (std.enums.values(RootFilesystem)) |filesystem| {
         const required = forProfile(filesystem, .core).required;
-        var claimed = std.EnumSet(Clause).initEmpty();
+        var claimed: std.EnumSet(Clause) = .empty;
         for (required, 0..) |package, index| {
             try std.testing.expect(package.name.len != 0);
             try std.testing.expect(package.why.len != 0);

@@ -290,7 +290,7 @@ pub fn releaseIdentity(
         unreachable; // Every declared release set is date qualified.
     }
     const reviewed = try document.requireReleaseDate(context, release_date);
-    const tag = try std.fmt.allocPrint(context.arena, "{s}{s}", .{
+    const tag = try context.arena.print("{s}{s}", .{
         selected.release_tag_prefix,
         reviewed,
     });
@@ -300,7 +300,7 @@ pub fn releaseIdentity(
     );
     return .{
         .tag = tag,
-        .title = try std.fmt.allocPrint(context.arena, "{s}{s}", .{
+        .title = try context.arena.print("{s}{s}", .{
             selected.release_title_prefix,
             reviewed,
         }),
@@ -1095,8 +1095,7 @@ pub fn candidateBinding(
         .{},
     );
 
-    const recorded_path = try std.fmt.allocPrint(
-        context.arena,
+    const recorded_path = try context.arena.print(
         "{s}.packages.txt",
         .{requested},
     );

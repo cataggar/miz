@@ -431,7 +431,10 @@ pub fn add(
         .oci_layout => |layout| blk: {
             const validate = b.addRunArtifact(dependency.artifact("miz-input-validator"));
             validate.setName(b.fmt("validate OCI layout for {s}", .{options.name}));
-            validate.addDirectoryArg(layout);
+            // Directory arguments track paths, not the mutable tree being
+            // validated. The snapshot below content-addresses accepted files.
+            validate.has_side_effects = true;
+            validate.addDirectoryArg2(layout, .{});
 
             const snapshot = b.addWriteFiles();
             snapshot.step.name = b.fmt("snapshot OCI layout for {s}", .{options.name});
@@ -473,7 +476,7 @@ pub fn add(
 
     const preflight_check = b.addRunArtifact(dependency.artifact("miz-image-status-check"));
     preflight_check.setName(b.fmt("check image preflight {s}", .{options.name}));
-    preflight_check.addDirectoryArg(preflight_bundle);
+    preflight_check.addDirectoryArg2(preflight_bundle, .{});
     preflight_check.addFileInput(preflight_bundle.path(b, "status"));
 
     const run = b.addRunArtifact(dependency.artifact("miz-image-builder"));
@@ -489,7 +492,10 @@ pub fn add(
 
     const status_check = b.addRunArtifact(dependency.artifact("miz-image-status-check"));
     status_check.setName(b.fmt("check image result {s}", .{options.name}));
-    status_check.addDirectoryArg(bundle);
+    // The builder can rewrite a bundle in place. Check the image every time,
+    // including failures with no image, rather than cache a previous copy.
+    status_check.has_side_effects = true;
+    status_check.addDirectoryArg2(bundle, .{});
     status_check.addFileInput(bundle.path(b, "status"));
     status_check.addFileInput(bundle.path(b, "provenance.json"));
     status_check.addArg(options.output.basename);
@@ -530,7 +536,7 @@ pub fn addPreserved(
 
     const preflight_check = b.addRunArtifact(dependency.artifact("miz-image-status-check"));
     preflight_check.setName(b.fmt("check preserved image preflight {s}", .{options.name}));
-    preflight_check.addDirectoryArg(preflight_bundle);
+    preflight_check.addDirectoryArg2(preflight_bundle, .{});
     preflight_check.addFileInput(preflight_bundle.path(b, "status"));
 
     const run = b.addRunArtifact(dependency.artifact("miz-preserved-image-builder"));
@@ -547,7 +553,8 @@ pub fn addPreserved(
 
     const status_check = b.addRunArtifact(dependency.artifact("miz-image-status-check"));
     status_check.setName(b.fmt("check preserved image result {s}", .{options.name}));
-    status_check.addDirectoryArg(bundle);
+    status_check.has_side_effects = true;
+    status_check.addDirectoryArg2(bundle, .{});
     status_check.addFileInput(bundle.path(b, "status"));
     status_check.addFileInput(bundle.path(b, "provenance.json"));
     status_check.addArg(options.output.basename);
@@ -815,7 +822,7 @@ fn configureRequest(
     run.addFileArg(options.input.iso);
     run.addArg("--container");
     switch (container) {
-        .oci_layout => |layout| run.addDirectoryArg(layout),
+        .oci_layout => |layout| run.addDirectoryArg2(layout, .{}),
         .archive => |archive| run.addFileArg(archive),
         .registry => |declared| {
             run.addArg(declared.reference);

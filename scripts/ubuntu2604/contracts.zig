@@ -366,7 +366,7 @@ pub fn sizeBudgetFilename(
     ) catch null;
 }
 
-pub const debz_api_commit = "beac3f20dd93fd98863af71e8fe621d47db663f6";
+pub const debz_api_commit = "56be0a32fac5293f20bde45d266b708e53321c73";
 pub const full_debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
 
 /// The literal package roots the core appliance installs into the final guest,

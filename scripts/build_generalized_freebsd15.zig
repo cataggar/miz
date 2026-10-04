@@ -822,8 +822,7 @@ fn freeSpaceReclamationScriptAlloc(
         .ufs => ufs_reclamation_script,
         .zfs => zfs_reclamation_script,
     };
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}\n{s}",
         .{ swap_reclamation_script, filesystem_arm },
     );
@@ -885,8 +884,7 @@ const TemporaryDirectory = struct {
         for (0..16) |_| {
             Io.random(io, &random);
             const hex = std.fmt.bytesToHex(random, .lower);
-            const path = try std.fmt.allocPrint(
-                allocator,
+            const path = try allocator.print(
                 "{s}/.miz-freebsd-{s}",
                 .{ parent, &hex },
             );
@@ -1019,7 +1017,7 @@ fn resolveAccel(
     architecture: Architecture,
 ) !Accel {
     if (requested != .auto) return requested;
-    if (builtin.cpu.arch == architecture.hostCpu()) {
+    if (builtin.target.cpu.arch == architecture.hostCpu()) {
         Dir.cwd().access(
             io,
             "/dev/kvm",
@@ -1084,8 +1082,7 @@ fn parseRecordedManifest(
     log: []const u8,
     nonce: []const u8,
 ) !RecordedManifest {
-    const marker = try std.fmt.allocPrint(
-        allocator,
+    const marker = try allocator.print(
         "{s} {s} ",
         .{ packages.record_prefix, nonce },
     );
@@ -1223,19 +1220,17 @@ fn runGuestCustomization(
     defer allocator.free(escaped_code);
     const escaped_vars = try escapeQemuDriveValue(allocator, vars_path);
     defer allocator.free(escaped_vars);
-    const code_drive = try std.fmt.allocPrint(
-        allocator,
+    const code_drive = try allocator.print(
         "if=pflash,format=raw,readonly=on,file={s}",
         .{escaped_code},
     );
     defer allocator.free(code_drive);
-    const vars_drive = try std.fmt.allocPrint(
-        allocator,
+    const vars_drive = try allocator.print(
         "if=pflash,format=raw,file={s}",
         .{escaped_vars},
     );
     defer allocator.free(vars_drive);
-    const serial = try std.fmt.allocPrint(allocator, "file:{s}", .{serial_path});
+    const serial = try allocator.print("file:{s}", .{serial_path});
     defer allocator.free(serial);
 
     const image = try Dir.cwd().openFile(io, image_path, .{
@@ -1309,14 +1304,12 @@ fn runGuestCustomization(
         spawned.deinit();
     }
 
-    const success_marker = try std.fmt.allocPrint(
-        allocator,
+    const success_marker = try allocator.print(
         "{s} {s} 0",
         .{ customization_result_prefix, nonce },
     );
     defer allocator.free(success_marker);
-    const result_marker = try std.fmt.allocPrint(
-        allocator,
+    const result_marker = try allocator.print(
         "{s} {s} ",
         .{ customization_result_prefix, nonce },
     );
@@ -1601,8 +1594,7 @@ pub fn main(init: std.process.Init) !void {
             );
             return err;
         };
-        const manifest_path = try std.fmt.allocPrint(
-            allocator,
+        const manifest_path = try allocator.print(
             "{s}.packages.txt",
             .{args.output},
         );

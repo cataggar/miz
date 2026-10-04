@@ -190,7 +190,7 @@ pub fn apply(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const suffix = try std.fmt.allocPrint(arena, " {s}", .{options});
+    const suffix = try arena.print(" {s}", .{options});
     var files = std.array_list.Managed(EntryFile).init(arena);
     var filesystem = try openEntryFiles(arena, io, image, &files);
 
@@ -382,7 +382,7 @@ fn collectGrubConfigs(
     };
     for (vendors) |vendor| {
         if (vendor.kind != .directory) continue;
-        const vendor_path = try std.fmt.allocPrint(allocator, "EFI/{s}", .{vendor.name});
+        const vendor_path = try allocator.print("EFI/{s}", .{vendor.name});
         const entries = listDir(filesystem, io, allocator, vendor_path) catch |err| switch (err) {
             error.PathNotFound, error.NotDirectory => continue,
             else => |other| return other,
@@ -392,7 +392,7 @@ fn collectGrubConfigs(
             if (!std.ascii.eqlIgnoreCase(entry.name, "grub.cfg")) continue;
             if (files.items.len >= max_entry_files) return error.TooManyEntryFiles;
             try files.append(.{
-                .path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ vendor_path, entry.name }),
+                .path = try allocator.print("{s}/{s}", .{ vendor_path, entry.name }),
                 .kind = .grub,
             });
         }
@@ -412,7 +412,7 @@ fn collectBlsEntries(
     for (entries) |entry| {
         if (entry.kind != .file) continue;
         if (!std.ascii.endsWithIgnoreCase(entry.name, ".conf")) continue;
-        const path = try std.fmt.allocPrint(allocator, "loader/entries/{s}", .{entry.name});
+        const path = try allocator.print("loader/entries/{s}", .{entry.name});
         if (files.items.len >= max_entry_files) return error.TooManyEntryFiles;
         try files.append(.{ .path = path, .kind = .bls });
     }
@@ -894,7 +894,7 @@ test "an ESP whose declared sectors run past the disk is refused rather than tru
     _ = try image.pread(io, array, header.partition_entry_lba * gpt.sector_size);
     std.mem.writeInt(u64, array[40..48], std.math.maxInt(u64), .little);
     try image.pwrite(io, array, header.partition_entry_lba * gpt.sector_size);
-    header.partition_array_crc32 = std.hash.crc.Crc32.hash(array);
+    header.partition_array_crc32 = std.hash.Crc32.hash(array);
     try image.pwrite(io, &header.encode(), gpt.sector_size);
 
     try std.testing.expectError(
@@ -928,7 +928,7 @@ test "option text that could change more than the command line is refused" {
     try std.testing.expectError(error.InvalidKernelOptions, validateOptions("quiet "));
     try std.testing.expectError(error.InvalidKernelOptions, validateOptions("quiet\nmenuentry 'x' {"));
     try std.testing.expectError(error.InvalidKernelOptions, validateOptions("quiet\x00"));
-    try std.testing.expectError(error.InvalidKernelOptions, validateOptions("q" ** (max_options_bytes + 1)));
+    try std.testing.expectError(error.InvalidKernelOptions, validateOptions(&@as([(max_options_bytes + 1):0]u8, @splat('q'))));
     try validateOptions("console=ttyS0 quiet");
 }
 

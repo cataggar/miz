@@ -5,7 +5,7 @@
     // live in the same repository, and a shared fingerprint would make them
     // the same package to the build system.
     .fingerprint = 0xc0215423c28c4221,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",

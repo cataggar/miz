@@ -88,8 +88,7 @@ test "the canonical command block is generated from production builders" {
         "<!-- BEGIN GENERATED AZURE TRUSTED LAUNCH COMMANDS -->\n",
         "<!-- END GENERATED AZURE TRUSTED LAUNCH COMMANDS -->",
     );
-    const expected = try std.fmt.allocPrint(
-        allocator,
+    const expected = try allocator.print(
         "```console\n{s}```\n",
         .{rendered},
     );
@@ -132,16 +131,14 @@ test "documented support equals both protected Azure acceptance matrices" {
     const ubuntu_job = try section(ubuntu, "\n  azure_acceptance:", "\n  publish:");
 
     for (trusted_launch.acceptance_coverage) |entry| {
-        const row = try std.fmt.allocPrint(
-            allocator,
+        const row = try allocator.print(
             "| {s} | `{s}` | `{s}` | `{s}` |",
             .{ entry.family, entry.architecture, entry.flavor, entry.asset_name },
         );
         defer allocator.free(row);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, documented, row));
 
-        const matrix_row = try std.fmt.allocPrint(
-            allocator,
+        const matrix_row = try allocator.print(
             \\          - key: {s}-{s}
             \\            architecture: {s}
             \\            flavor: {s}
@@ -211,7 +208,7 @@ test "both release families consume every shared resource contract" {
         "azure_trusted_launch_vm_instance_security_args",
     };
     for (builders) |builder| {
-        const declaration = try std.fmt.allocPrint(allocator, "{s}() {{", .{builder});
+        const declaration = try allocator.print("{s}() {{", .{builder});
         defer allocator.free(declaration);
         try expectContains(library, declaration);
         try expectContains(examples, builder);

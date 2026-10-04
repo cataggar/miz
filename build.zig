@@ -3,6 +3,8 @@ const std = @import("std");
 const image_build = @import("build/image.zig");
 const iso_build = @import("build/iso.zig");
 const oci_build = @import("build/oci.zig");
+const zstd_build = @import("build/zstd.zig");
+const run_build = @import("build/run.zig");
 
 const AzureLinuxArchitecture = enum {
     x86_64,
@@ -77,7 +79,7 @@ test {
 fn zstdDependency(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) *std.Build.Dependency {
     return b.dependency("zstd", .{
         .target = target,
@@ -89,12 +91,11 @@ fn zstdDependency(
 }
 
 fn addZstdHeaders(module: *std.Build.Module, dependency: *std.Build.Dependency) void {
-    module.addIncludePath(dependency.path("lib"));
+    zstd_build.addHeaders(module, dependency);
 }
 
 fn addZstdLibrary(module: *std.Build.Module, dependency: *std.Build.Dependency) void {
-    addZstdHeaders(module, dependency);
-    module.linkLibrary(dependency.artifact("zstd"));
+    zstd_build.addLibrary(module, dependency);
 }
 
 const Ubuntu2604CoreArtifacts = struct {
@@ -113,18 +114,18 @@ fn addUbuntu2604CoreArtifacts(
         },
         .os_tag = .linux,
     });
-    const guest_zstd = zstdDependency(b, guest_target, .ReleaseSmall);
+    const guest_zstd = zstdDependency(b, guest_target, .small);
     const cdrom_mod = b.createModule(.{
         .root_source_file = b.path("azagent/cdrom.zig"),
         .target = guest_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
     });
     const mizinit = b.addExecutable(.{
         .name = b.fmt("ubuntu2604-mizinit-{s}", .{@tagName(architecture)}),
         .root_module = b.createModule(.{
             .root_source_file = b.path("mizinit/init.zig"),
             .target = guest_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
             .imports = &.{
                 .{ .name = "provisioning_media", .module = cdrom_mod },
             },
@@ -134,20 +135,20 @@ fn addUbuntu2604CoreArtifacts(
     const miz_guest_mod = b.createModule(.{
         .root_source_file = b.path("packages/miz/src/root.zig"),
         .target = guest_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
     });
     addZstdHeaders(miz_guest_mod, guest_zstd);
     const wireserver_guest_mod = b.createModule(.{
         .root_source_file = b.path("wireserver/wireserver.zig"),
         .target = guest_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
     });
     const azagent = b.addExecutable(.{
         .name = b.fmt("ubuntu2604-azagent-{s}", .{@tagName(architecture)}),
         .root_module = b.createModule(.{
             .root_source_file = b.path("azagent/main.zig"),
             .target = guest_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
             .imports = &.{
                 .{ .name = "wireserver", .module = wireserver_guest_mod },
                 .{ .name = "miz", .module = miz_guest_mod },
@@ -168,7 +169,7 @@ fn addUbuntu2604CoreArtifacts(
 fn addUbuntu2604RuntimeContractModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path("scripts/ubuntu2604/runtime_contract.zig"),
@@ -203,10 +204,10 @@ fn addUbuntu2604RuntimeContractProbe(
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/ubuntu2604_runtime_contract_probe.zig"),
             .target = guest_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
             .imports = &.{.{
                 .name = "ubuntu2604_runtime_contract",
-                .module = addUbuntu2604RuntimeContractModule(b, guest_target, .ReleaseSmall),
+                .module = addUbuntu2604RuntimeContractModule(b, guest_target, .small),
             }},
         }),
         .linkage = .static,
@@ -234,7 +235,7 @@ fn addUbuntu2604BinderProbe(
         .root_module = b.createModule(.{
             .root_source_file = b.path("tests/ubuntu2604_binder_probe.zig"),
             .target = guest_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         }),
         .linkage = .static,
     });
@@ -248,13 +249,13 @@ pub fn build(b: *std.Build) void {
         "Version string embedded in the miz CLI",
     ) orelse "dev";
     // `std.Build.standardOptimizeOption` with no explicit flag, except the
-    // fallback is ReleaseSafe rather than Debug. What this repository builds
+    // fallback is safe rather than debug. What this repository builds
     // is image tooling -- decompression, hashing, dependency solving, ext4
-    // and QCOW2 writes -- and Debug makes that an order of magnitude slower:
-    // a bare-metal aarch64 Ubuntu image takes about 36 minutes at Debug
+    // and QCOW2 writes -- and debug makes that an order of magnitude slower:
+    // a bare-metal aarch64 Ubuntu image takes about 36 minutes at debug
     // against about 6 optimized, on one machine with one warm package cache.
-    // Every release workflow already passes `-Doptimize=ReleaseSafe`, so the
-    // Debug default only ever applied to invocations that had no reason to
+    // Every release workflow already passes `-Doptimize=safe`, so the
+    // debug default only ever applied to invocations that had no reason to
     // want it, including `zig build generalized-ubuntu2604`. Safety checks
     // stay on: this parses archives it did not write and produces filesystem
     // images a machine boots from.
@@ -262,13 +263,13 @@ pub fn build(b: *std.Build) void {
     // Spelled out rather than passing `preferred_optimize_mode`, which would
     // withdraw `-Doptimize` in favour of a `-Drelease` bool and break every
     // caller that names a mode.
-    const default_optimize: std.builtin.OptimizeMode = switch (b.release_mode) {
-        .off, .any, .safe => .ReleaseSafe,
-        .fast => .ReleaseFast,
-        .small => .ReleaseSmall,
+    const default_optimize: std.lang.Optimize = switch (b.graph.release_mode) {
+        .off, .any, .safe => .safe,
+        .fast => .fast,
+        .small => .small,
     };
     const optimize = b.option(
-        std.builtin.OptimizeMode,
+        std.lang.Optimize,
         "optimize",
         "Prioritize performance, safety, or binary size",
     ) orelse default_optimize;
@@ -338,6 +339,31 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addZstdHeaders(static_host_miz_mod, host_zstd_dependency);
+    const zstd_test_mod = b.createModule(.{
+        .root_source_file = b.path("packages/miz/src/zstd.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    addZstdLibrary(zstd_test_mod, host_zstd_dependency);
+    const zstd_tests = b.addTest(.{ .root_module = zstd_test_mod });
+    const no_libc_zstd_test_mod = b.createModule(.{
+        .root_source_file = b.path("packages/miz/src/zstd.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+        .link_libc = false,
+    });
+    addZstdHeaders(no_libc_zstd_test_mod, host_zstd_dependency);
+    const no_libc_zstd_tests = b.addTest(.{
+        .root_module = no_libc_zstd_test_mod,
+        .filters = &.{"no-libc"},
+    });
+    const run_no_libc_zstd_tests = b.addRunArtifact(no_libc_zstd_tests);
+    const zstd_test_step = b.step(
+        "test-zstd",
+        "Test pinned libzstd bindings and libc-free raw framing",
+    );
+    zstd_test_step.dependOn(&b.addRunArtifact(zstd_tests).step);
+    zstd_test_step.dependOn(&run_no_libc_zstd_tests.step);
     const package_family_mod = b.createModule(.{
         .root_source_file = b.path("packages/miz/src/package_family.zig"),
         .target = b.graph.host,
@@ -536,6 +562,10 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // Windows QCOW2 path buffers make allocation-free Image temporaries
+    // larger than the default PE stack reserve.
+    const windows_image_stack_reserve = 128 * 1024 * 1024;
+    if (target.result.os.tag == .windows) cli_exe.stack_size = windows_image_stack_reserve;
     ci_production_entrypoint_check.dependOn(&cli_exe.step);
     const install_cli = b.addInstallArtifact(cli_exe, .{});
     b.getInstallStep().dependOn(&install_cli.step);
@@ -545,14 +575,75 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(cli_exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run miz");
     run_step.dependOn(&run_cmd.step);
 
     const cli_tests = b.addTest(.{ .root_module = cli_exe.root_module });
+    if (target.result.os.tag == .windows) cli_tests.stack_size = cli_exe.stack_size;
     const run_cli_tests = b.addRunArtifact(cli_tests);
     const cli_test_step = b.step("test-cli", "Run miz CLI tests");
     cli_test_step.dependOn(&run_cli_tests.step);
+
+    const native_smoke_step = b.step(
+        "test-native-smoke",
+        "Run portable image codecs and native CLI smoke checks",
+    );
+    const native_vhd_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("packages/miz/src/vhd.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    native_smoke_step.dependOn(&b.addRunArtifact(native_vhd_tests).step);
+    native_smoke_step.dependOn(zstd_test_step);
+
+    // Exercise native execution and filesystem behavior even with a warm cache.
+    const smoke_version = b.addRunArtifact(cli_exe);
+    smoke_version.has_side_effects = true;
+    smoke_version.addArg("version");
+    smoke_version.expectStdOutEqual(b.fmt("miz {s}\n", .{version}));
+    smoke_version.expectStdErrEqual("");
+    smoke_version.expectExitCode(0);
+    native_smoke_step.dependOn(&smoke_version.step);
+
+    const smoke_help = b.addRunArtifact(cli_exe);
+    smoke_help.has_side_effects = true;
+    smoke_help.addArg("--help");
+    smoke_help.expectStdOutEqual("");
+    smoke_help.expectStdErrMatch("Usage: miz <command> [options]");
+    smoke_help.expectExitCode(0);
+    native_smoke_step.dependOn(&smoke_help.step);
+
+    for ([_][]const u8{ "vhd", "qcow2" }) |format| {
+        const smoke_create = b.addRunArtifact(cli_exe);
+        smoke_create.has_side_effects = true;
+        smoke_create.addArgs(&.{ "create", "-f", format });
+        if (std.mem.eql(u8, format, "vhd")) smoke_create.addArgs(&.{ "-o", "subformat=fixed" });
+        const smoke_image = smoke_create.addOutputFileArg(b.fmt("native-smoke.{s}", .{format}));
+        smoke_create.addArg("1M");
+        smoke_create.expectExitCode(0);
+
+        const smoke_info = b.addRunArtifact(cli_exe);
+        smoke_info.has_side_effects = true;
+        smoke_info.addArgs(&.{ "info", "--output=json" });
+        smoke_info.addFileArg(smoke_image);
+        smoke_info.expectExitCode(0);
+        smoke_info.expectStdOutMatch(b.fmt("\"format\":\"{s}\"", .{format}));
+        smoke_info.expectStdOutMatch("\"virtual-size\":1048576");
+        if (std.mem.eql(u8, format, "vhd")) smoke_info.expectStdOutMatch("\"subformat\":\"fixed\"");
+        smoke_info.expectStdErrEqual("");
+        native_smoke_step.dependOn(&smoke_info.step);
+
+        const smoke_check = b.addRunArtifact(cli_exe);
+        smoke_check.has_side_effects = true;
+        smoke_check.addArg("check");
+        smoke_check.addFileArg(smoke_image);
+        smoke_check.expectExitCode(0);
+        smoke_check.expectStdErrMatch("No errors were found on the image.");
+        native_smoke_step.dependOn(&smoke_check.step);
+    }
 
     // Host-only image builders used by the exported build helpers. They remain
     // executable even when the dependency is configured for a foreign target.
@@ -703,6 +794,20 @@ pub fn build(b: *std.Build) void {
     ci_production_entrypoint_check.dependOn(&image_status_check_exe.step);
     const image_status_check_tests = b.addTest(.{ .root_module = image_status_check_mod });
     const run_image_status_check_tests = b.addRunArtifact(image_status_check_tests);
+    if (b.graph.host.result.os.tag == .windows) {
+        for ([_]*std.Build.Step.Compile{
+            image_builder_exe,
+            image_builder_tests,
+            iso_builder_exe,
+            iso_builder_tests,
+            recustomize_iso_builder_exe,
+            recustomize_iso_builder_tests,
+            preserved_image_builder_exe,
+            preserved_image_builder_tests,
+            image_status_check_exe,
+            image_status_check_tests,
+        }) |artifact| artifact.stack_size = windows_image_stack_reserve;
+    }
 
     // ---- qmp: native Zig QEMU Machine Protocol (QMP) client ----
     const qmp_mod = b.addModule("qmp", .{
@@ -741,7 +846,7 @@ pub fn build(b: *std.Build) void {
 
     const run_qapi_codegen = b.addRunArtifact(qapi_codegen_exe);
     run_qapi_codegen.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_qapi_codegen.addArgs(args);
+    run_qapi_codegen.addPassthruArgs();
     const qapi_codegen_step = b.step("qapi-codegen", "Regenerate qmp/src/qapi_generated.zig from a QEMU checkout's qapi/qapi-schema.json");
     qapi_codegen_step.dependOn(&run_qapi_codegen.step);
 
@@ -805,7 +910,7 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(make_oci_fixture_exe);
     const run_make_oci_fixture = b.addRunArtifact(make_oci_fixture_exe);
-    if (b.args) |args| run_make_oci_fixture.addArgs(args);
+    run_make_oci_fixture.addPassthruArgs();
     const make_oci_fixture_step = b.step(
         "oci-fixture",
         "Build a from-scratch OCI image-layout fixture (minimal|uki-stub|verity-initramfs)",
@@ -841,7 +946,7 @@ pub fn build(b: *std.Build) void {
     const run_device_write_integration = b.addRunArtifact(
         device_write_integration_exe,
     );
-    run_device_write_integration.addArtifactArg(cli_exe);
+    run_device_write_integration.addArtifactArg2(cli_exe, .{});
     const device_write_integration_step = b.step(
         "test-device-write-integration",
         "Run miz write against real sparse loop devices",
@@ -1032,21 +1137,24 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    const run_immutable_release_transaction_tests = b.addRunArtifact(
+    const run_immutable_release_transaction_tests = run_build.addArtifactWithEnvironmentPaths(
+        b,
         immutable_release_transaction_tests,
+        &.{
+            .{
+                .name = "MIZ_RELEASE_PUBLISHER",
+                .path = b.graph.path(.install_bin, "miz_release"),
+            },
+            .{
+                .name = "MIZ_RELEASE_MOCK_GH",
+                .path = b.graph.path(.install_bin, "miz_release_mock_gh"),
+            },
+        },
     );
     run_immutable_release_transaction_tests.has_side_effects = true;
     run_immutable_release_transaction_tests.setEnvironmentVariable(
         "MIZ_IMMUTABLE_RELEASE_ROOT",
-        b.build_root.path orelse ".",
-    );
-    run_immutable_release_transaction_tests.setEnvironmentVariable(
-        "MIZ_RELEASE_PUBLISHER",
-        b.getInstallPath(.bin, "miz_release"),
-    );
-    run_immutable_release_transaction_tests.setEnvironmentVariable(
-        "MIZ_RELEASE_MOCK_GH",
-        b.getInstallPath(.bin, "miz_release_mock_gh"),
+        b.root.toString(b.allocator) catch @panic("OOM"),
     );
     run_immutable_release_transaction_tests.step.dependOn(
         &install_miz_release.step,
@@ -1070,7 +1178,7 @@ pub fn build(b: *std.Build) void {
     run_immutable_release_guard_tests.has_side_effects = true;
     run_immutable_release_guard_tests.setEnvironmentVariable(
         "MIZ_IMMUTABLE_RELEASE_ROOT",
-        b.build_root.path orelse ".",
+        b.root.toString(b.allocator) catch @panic("OOM"),
     );
     immutable_release_test_step.dependOn(
         &run_immutable_release_guard_tests.step,
@@ -1091,7 +1199,7 @@ pub fn build(b: *std.Build) void {
     run_azure_trusted_launch_contract_tests.has_side_effects = true;
     run_azure_trusted_launch_contract_tests.setEnvironmentVariable(
         "MIZ_AZURE_TRUSTED_LAUNCH_ROOT",
-        b.build_root.path orelse ".",
+        b.root.toString(b.allocator) catch @panic("OOM"),
     );
     release_support_test_step.dependOn(
         &run_azure_trusted_launch_contract_tests.step,
@@ -1112,7 +1220,7 @@ pub fn build(b: *std.Build) void {
     run_azure_confidential_vm_contract_tests.has_side_effects = true;
     run_azure_confidential_vm_contract_tests.setEnvironmentVariable(
         "MIZ_AZURE_CONFIDENTIAL_VM_ROOT",
-        b.build_root.path orelse ".",
+        b.root.toString(b.allocator) catch @panic("OOM"),
     );
     release_support_test_step.dependOn(
         &run_azure_confidential_vm_contract_tests.step,
@@ -1195,7 +1303,7 @@ pub fn build(b: *std.Build) void {
     run_azurelinux4_contract_tests.has_side_effects = true;
     run_azurelinux4_contract_tests.setEnvironmentVariable(
         "MIZ_AZURELINUX4_CONTRACT_ROOT",
-        b.build_root.path orelse ".",
+        b.root.toString(b.allocator) catch @panic("OOM"),
     );
     const azurelinux4_release_test_step = b.step(
         "test-azurelinux4-release",
@@ -1272,7 +1380,7 @@ pub fn build(b: *std.Build) void {
     run_ubuntu2604_image_benchmark_workflow_tests.has_side_effects = true;
     run_ubuntu2604_image_benchmark_workflow_tests.setEnvironmentVariable(
         "MIZ_REPOSITORY_ROOT",
-        b.build_root.path orelse ".",
+        b.root.toString(b.allocator) catch @panic("OOM"),
     );
     const ubuntu2604_image_benchmark_workflow_test_step = b.step(
         "test-ubuntu2604-image-benchmark-workflow",
@@ -1365,7 +1473,7 @@ pub fn build(b: *std.Build) void {
     run_freebsd15_contract_tests.has_side_effects = true;
     run_freebsd15_contract_tests.setEnvironmentVariable(
         "MIZ_FREEBSD15_ROOT",
-        b.build_root.path orelse ".",
+        b.root.toString(b.allocator) catch @panic("OOM"),
     );
     const freebsd15_contract_test_step = b.step(
         "test-freebsd15-release-contract",
@@ -1384,26 +1492,31 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const run_freebsd15_acceptance_tests = b.addRunArtifact(freebsd15_acceptance_tests);
+    const run_freebsd15_acceptance_tests = run_build.addArtifactWithEnvironmentPaths(
+        b,
+        freebsd15_acceptance_tests,
+        &.{
+            .{
+                .name = "MIZ_FREEBSD15_AZURE_METADATA_TOOL",
+                .path = b.graph.path(.install_bin, "freebsd15_azure_metadata"),
+            },
+            .{
+                .name = "MIZ_FREEBSD15_RELEASE_TOOL",
+                .path = b.graph.path(.install_bin, "freebsd15_release"),
+            },
+            .{
+                .name = "MIZ_AZURE_VHD_TOOL",
+                .path = b.graph.path(.install_bin, "azure_vhd"),
+            },
+        },
+    );
     run_freebsd15_acceptance_tests.has_side_effects = true;
     run_freebsd15_acceptance_tests.setEnvironmentVariable(
         "MIZ_FREEBSD15_ROOT",
-        b.build_root.path orelse ".",
+        b.root.toString(b.allocator) catch @panic("OOM"),
     );
     // The harness tests drive the real tools the shell calls, so the binaries
     // have to exist before they run.
-    run_freebsd15_acceptance_tests.setEnvironmentVariable(
-        "MIZ_FREEBSD15_AZURE_METADATA_TOOL",
-        b.getInstallPath(.bin, "freebsd15_azure_metadata"),
-    );
-    run_freebsd15_acceptance_tests.setEnvironmentVariable(
-        "MIZ_FREEBSD15_RELEASE_TOOL",
-        b.getInstallPath(.bin, "freebsd15_release"),
-    );
-    run_freebsd15_acceptance_tests.setEnvironmentVariable(
-        "MIZ_AZURE_VHD_TOOL",
-        b.getInstallPath(.bin, "azure_vhd"),
-    );
     run_freebsd15_acceptance_tests.step.dependOn(
         &b.addInstallArtifact(freebsd15_azure_metadata_exe, .{}).step,
     );
@@ -1672,27 +1785,29 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        const run_guard = b.addRunArtifact(guard_tests);
+        const run_guard = run_build.addArtifactWithEnvironmentPaths(
+            b,
+            guard_tests,
+            &.{.{
+                .name = "MIZ_UBUNTU2604_RELEASE_TOOL",
+                .path = b.graph.path(.install_bin, "ubuntu2604_release"),
+            }},
+        );
         run_guard.has_side_effects = true;
         run_guard.setEnvironmentVariable(
             "MIZ_UBUNTU2604_SOURCE_ROOT",
-            b.build_root.path orelse ".",
+            b.root.toString(b.allocator) catch @panic("OOM"),
         );
         // The harness guards run the real release tool the shell calls, so
         // the installed artifact is a declared dependency rather than
         // something a previous `zig build` is assumed to have left behind.
-        run_guard.setEnvironmentVariable(
-            "MIZ_UBUNTU2604_RELEASE_TOOL",
-            b.getInstallPath(.bin, "ubuntu2604_release"),
-        );
         run_guard.step.dependOn(&install_ubuntu2604_release.step);
         run_ubuntu2604_guards[guard_index] = run_guard;
         ubuntu2604_guard_step.dependOn(&run_guard.step);
     }
-    const run_zig_fetch_retry_tests = b.addSystemCommand(&.{
-        "bash",
-        "tests/zig_fetch_retry.sh",
-    });
+    const run_zig_fetch_retry_tests = b.addSystemCommand(&.{"bash"});
+    run_zig_fetch_retry_tests.addFileArg(b.path("tests/zig_fetch_retry.sh"));
+    run_zig_fetch_retry_tests.setCwd(b.path(""));
     run_zig_fetch_retry_tests.has_side_effects = true;
     ubuntu2604_guard_step.dependOn(&run_zig_fetch_retry_tests.step);
 
@@ -1716,7 +1831,7 @@ pub fn build(b: *std.Build) void {
     // brand guard.
     run_python_inventory_tests.setEnvironmentVariable(
         "MIZ_PYTHON_INVENTORY_ROOT",
-        b.build_root.path orelse ".",
+        b.root.toString(b.allocator) catch @panic("OOM"),
     );
     const python_inventory_step = b.step(
         "test-python-inventory",
@@ -1820,12 +1935,12 @@ pub fn build(b: *std.Build) void {
     const mizinit_cdrom_mod = b.createModule(.{
         .root_source_file = b.path("azagent/cdrom.zig"),
         .target = mizinit_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
     });
     const mizinit_mod = b.createModule(.{
         .root_source_file = b.path("mizinit/init.zig"),
         .target = mizinit_target,
-        .optimize = .ReleaseSmall,
+        .optimize = .small,
         .imports = &.{
             .{ .name = "provisioning_media", .module = mizinit_cdrom_mod },
         },
@@ -1873,14 +1988,14 @@ pub fn build(b: *std.Build) void {
         const guest_control_mod = b.createModule(.{
             .root_source_file = b.path("packages/miz/src/vm_control.zig"),
             .target = guest_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         });
         const mizguest_exe = b.addExecutable(.{
             .name = b.fmt("miz-guest-agent-{s}", .{@tagName(architecture)}),
             .root_module = b.createModule(.{
                 .root_source_file = b.path("mizguest/main.zig"),
                 .target = guest_target,
-                .optimize = .ReleaseSmall,
+                .optimize = .small,
                 .imports = &.{
                     .{ .name = "vm_control", .module = guest_control_mod },
                 },
@@ -1909,7 +2024,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tests/vm_guest_stub.zig"),
                 .target = guest_target,
-                .optimize = .ReleaseSmall,
+                .optimize = .small,
             }),
             .linkage = .static,
         });
@@ -1967,7 +2082,7 @@ pub fn build(b: *std.Build) void {
     // directory the test binary happens to be started in.
     run_stale_brand_tests.setEnvironmentVariable(
         "MIZ_STALE_BRAND_ROOT",
-        b.build_root.path orelse ".",
+        b.root.toString(b.allocator) catch @panic("OOM"),
     );
     const stale_brand_test_step = b.step(
         "test-stale-brand",
@@ -1989,18 +2104,20 @@ pub fn build(b: *std.Build) void {
     );
     build_api_test_step.dependOn(&run_build_api_tests.step);
 
-    const build_api_consumer_check = b.addSystemCommand(&.{
-        b.graph.zig_exe,
+    const build_api_consumer_check = b.addRunFile(.zig_exe);
+    build_api_consumer_check.addArgs(&.{
         "build",
         "package-family",
+        "-j2",
     });
     build_api_consumer_check.setName("check external build.zig consumer");
     build_api_consumer_check.setCwd(b.path("tests/build_api_consumer"));
 
-    const package_family_consumer_check = b.addSystemCommand(&.{
-        b.graph.zig_exe,
+    const package_family_consumer_check = b.addRunFile(.zig_exe);
+    package_family_consumer_check.addArgs(&.{
         "build",
         "check",
+        "-j2",
     });
     package_family_consumer_check.setName(
         "check external host package-family consumer",
@@ -2009,36 +2126,40 @@ pub fn build(b: *std.Build) void {
         b.path("tests/package_family_consumer"),
     );
 
-    const build_api_diagnostics_check = b.addSystemCommand(&.{
-        b.graph.zig_exe,
+    const build_api_diagnostics_check = b.addRunFile(.zig_exe);
+    build_api_diagnostics_check.addArgs(&.{
         "build",
         "diagnostics",
+        "-j2",
     });
     build_api_diagnostics_check.setName("check external build.zig diagnostics");
     build_api_diagnostics_check.setCwd(b.path("tests/build_api_consumer"));
 
-    const build_api_execution_diagnostics_check = b.addSystemCommand(&.{
-        b.graph.zig_exe,
+    const build_api_execution_diagnostics_check = b.addRunFile(.zig_exe);
+    build_api_execution_diagnostics_check.addArgs(&.{
         "build",
         "execution-diagnostics",
+        "-j2",
     });
     build_api_execution_diagnostics_check.setName("check external build.zig execution diagnostics");
     build_api_execution_diagnostics_check.setCwd(b.path("tests/build_api_consumer"));
 
-    const build_api_preserved_diagnostics_check = b.addSystemCommand(&.{
-        b.graph.zig_exe,
+    const build_api_preserved_diagnostics_check = b.addRunFile(.zig_exe);
+    build_api_preserved_diagnostics_check.addArgs(&.{
         "build",
         "preserved-diagnostics",
+        "-j2",
     });
     build_api_preserved_diagnostics_check.setName(
         "check external preserved-image build.zig diagnostics",
     );
     build_api_preserved_diagnostics_check.setCwd(b.path("tests/build_api_consumer"));
 
-    const build_api_preserved_vm_diagnostics_check = b.addSystemCommand(&.{
-        b.graph.zig_exe,
+    const build_api_preserved_vm_diagnostics_check = b.addRunFile(.zig_exe);
+    build_api_preserved_vm_diagnostics_check.addArgs(&.{
         "build",
         "preserved-vm-diagnostics",
+        "-j2",
     });
     build_api_preserved_vm_diagnostics_check.setName(
         "check external preserved-image vm backend diagnostics",
@@ -2051,26 +2172,26 @@ pub fn build(b: *std.Build) void {
     // meaningful on Linux.  The zstd_max_preload shared library is also
     // Linux-specific. ----
     if (b.graph.host.result.os.tag == .linux) {
-        const guest_zstd_dependency = zstdDependency(b, mizinit_target, .ReleaseSmall);
+        const guest_zstd_dependency = zstdDependency(b, mizinit_target, .small);
 
         // Guest-targeted azagent for embedding in the generalized image.
-        // It follows -Dazurelinux-arch and is static/ReleaseSmall, matching
+        // It follows -Dazurelinux-arch and is static/small, matching
         // mizinit.
         const miz_guest_mod = b.createModule(.{
             .root_source_file = b.path("packages/miz/src/root.zig"),
             .target = mizinit_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         });
         addZstdHeaders(miz_guest_mod, guest_zstd_dependency);
         const wireserver_guest_mod = b.createModule(.{
             .root_source_file = b.path("wireserver/wireserver.zig"),
             .target = mizinit_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
         });
         const azagent_guest_mod = b.createModule(.{
             .root_source_file = b.path("azagent/main.zig"),
             .target = mizinit_target,
-            .optimize = .ReleaseSmall,
+            .optimize = .small,
             .imports = &.{
                 .{ .name = "wireserver", .module = wireserver_guest_mod },
                 .{ .name = "miz", .module = miz_guest_mod },
@@ -2090,7 +2211,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("scripts/zstd_max_preload.zig"),
                 .target = b.graph.host,
-                .optimize = .ReleaseFast,
+                .optimize = .fast,
                 .link_libc = true,
             }),
         });
@@ -2137,16 +2258,16 @@ pub fn build(b: *std.Build) void {
         run_builder.addArg("--flavor");
         run_builder.addArg(@tagName(azurelinux_flavor));
         run_builder.addArg("--miz");
-        run_builder.addArtifactArg(cli_exe);
+        run_builder.addArtifactArg2(cli_exe, .{});
         if (azurelinux_flavor == .core) {
             run_builder.addArg("--mizinit");
-            run_builder.addArtifactArg(mizinit_exe);
+            run_builder.addArtifactArg2(mizinit_exe, .{});
             run_builder.addArg("--azagent");
-            run_builder.addArtifactArg(azagent_guest_exe);
+            run_builder.addArtifactArg2(azagent_guest_exe, .{});
         }
         run_builder.addArg("--preload");
-        run_builder.addArtifactArg(zstd_preload_lib);
-        if (b.args) |args| run_builder.addArgs(args);
+        run_builder.addArtifactArg2(zstd_preload_lib, .{});
+        run_builder.addPassthruArgs();
         const generalized_step = b.step(
             "generalized-azurelinux4",
             "Build a generalized Azure Linux 4 Gen2 core or full QCOW2 image (requires root, Linux, dnf, qemu-img)",
@@ -2216,7 +2337,7 @@ pub fn build(b: *std.Build) void {
         const run_ubuntu2404_confidential = b.addRunArtifact(
             ubuntu2404_confidential_builder_exe,
         );
-        if (b.args) |args| run_ubuntu2404_confidential.addArgs(args);
+        run_ubuntu2404_confidential.addPassthruArgs();
         const ubuntu2404_confidential_step = b.step(
             "generalized-ubuntu2404-confidential",
             "Build generalized Ubuntu 24.04 for Azure Confidential VMs",
@@ -2280,7 +2401,7 @@ pub fn build(b: *std.Build) void {
         run_ubuntu2404_confidential_acceptance_tests.has_side_effects = true;
         run_ubuntu2404_confidential_acceptance_tests.setEnvironmentVariable(
             "MIZ_UBUNTU2404_CONFIDENTIAL_ROOT",
-            b.build_root.path orelse ".",
+            b.root.toString(b.allocator) catch @panic("OOM"),
         );
         ubuntu2404_confidential_release_test_step.dependOn(
             &run_ubuntu2404_confidential_acceptance_tests.step,
@@ -2306,7 +2427,7 @@ pub fn build(b: *std.Build) void {
         run_ubuntu2404_confidential_capture_harness_tests.has_side_effects = true;
         run_ubuntu2404_confidential_capture_harness_tests.setEnvironmentVariable(
             "MIZ_UBUNTU2404_CONFIDENTIAL_ROOT",
-            b.build_root.path orelse ".",
+            b.root.toString(b.allocator) catch @panic("OOM"),
         );
         const ubuntu2404_confidential_capture_harness_test_step = b.step(
             "test-ubuntu2404-confidential-capture-harness",
@@ -2333,7 +2454,7 @@ pub fn build(b: *std.Build) void {
         run_ubuntu2404_confidential_workflow_tests.has_side_effects = true;
         run_ubuntu2404_confidential_workflow_tests.setEnvironmentVariable(
             "MIZ_UBUNTU2404_CONFIDENTIAL_ROOT",
-            b.build_root.path orelse ".",
+            b.root.toString(b.allocator) catch @panic("OOM"),
         );
         const ubuntu2404_confidential_workflow_test_step = b.step(
             "test-ubuntu2404-confidential-workflow",
@@ -2360,7 +2481,7 @@ pub fn build(b: *std.Build) void {
         run_ubuntu2404_confidential_capture_workflow_tests.has_side_effects = true;
         run_ubuntu2404_confidential_capture_workflow_tests.setEnvironmentVariable(
             "MIZ_UBUNTU2404_CONFIDENTIAL_ROOT",
-            b.build_root.path orelse ".",
+            b.root.toString(b.allocator) catch @panic("OOM"),
         );
         const ubuntu2404_confidential_capture_workflow_test_step = b.step(
             "test-ubuntu2404-confidential-capture-workflow",
@@ -2455,11 +2576,11 @@ pub fn build(b: *std.Build) void {
         });
         if (selected_ubuntu2604_core) |artifacts| {
             run_ubuntu2604.addArg("--mizinit");
-            run_ubuntu2604.addArtifactArg(artifacts.mizinit);
+            run_ubuntu2604.addArtifactArg2(artifacts.mizinit, .{});
             run_ubuntu2604.addArg("--azagent");
-            run_ubuntu2604.addArtifactArg(artifacts.azagent);
+            run_ubuntu2604.addArtifactArg2(artifacts.azagent, .{});
         }
-        if (b.args) |args| run_ubuntu2604.addArgs(args);
+        run_ubuntu2604.addPassthruArgs();
         const ubuntu2604_step = b.step(
             "generalized-ubuntu2604",
             "Build the selected generalized Ubuntu 26.04 Gen2 QCOW2 image",
@@ -2478,11 +2599,11 @@ pub fn build(b: *std.Build) void {
             };
             if (core_artifacts) |artifacts| {
                 run_arch.addArg("--mizinit");
-                run_arch.addArtifactArg(artifacts.mizinit);
+                run_arch.addArtifactArg2(artifacts.mizinit, .{});
                 run_arch.addArg("--azagent");
-                run_arch.addArtifactArg(artifacts.azagent);
+                run_arch.addArtifactArg2(artifacts.azagent, .{});
             }
-            if (b.args) |args| run_arch.addArgs(args);
+            run_arch.addPassthruArgs();
             const step_name = switch (architecture) {
                 .x86_64 => "generalized-ubuntu2604-amd64",
                 .aarch64 => "generalized-ubuntu2604-arm64",
@@ -2617,7 +2738,7 @@ pub fn build(b: *std.Build) void {
         ci_production_entrypoint_check.dependOn(&freebsd_builder_exe.step);
 
         const run_freebsd_builder = b.addRunArtifact(freebsd_builder_exe);
-        if (b.args) |args| run_freebsd_builder.addArgs(args);
+        run_freebsd_builder.addPassthruArgs();
         const generalized_freebsd_step = b.step(
             "generalized-freebsd15",
             "Build a generalized FreeBSD 15.1 QCOW2 (Linux, QEMU, UEFI)",
@@ -2654,6 +2775,7 @@ pub fn build(b: *std.Build) void {
 
     for (aggregate_test_steps) |aggregate_test_step| {
         aggregate_test_step.dependOn(&run_miz_tests.step);
+        aggregate_test_step.dependOn(&run_no_libc_zstd_tests.step);
         aggregate_test_step.dependOn(&run_host_package_family_tests.step);
         aggregate_test_step.dependOn(&run_oci_registry_tests.step);
         aggregate_test_step.dependOn(&run_wireserver_tests.step);

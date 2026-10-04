@@ -94,8 +94,8 @@ pub const Phase = enum {
     }
 
     pub fn parse(text: []const u8) ?Phase {
-        inline for (@typeInfo(Phase).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        inline for (@typeInfo(Phase).@"enum".field_names) |name| {
+            if (std.mem.eql(u8, text, name)) return @field(Phase, name);
         }
         return null;
     }
@@ -303,7 +303,7 @@ pub const Report = struct {
     }
 
     pub fn has(self: *const Report, phase: Phase) bool {
-        return self.present[@intFromEnum(phase)];
+        return self.present[@backingInt(phase)];
     }
 
     /// Records `section` as `phase`. Refuses a repeat and refuses a phase that
@@ -330,7 +330,7 @@ pub const Report = struct {
         }
         const builder: Builder = .{ .arena = self.arena.allocator() };
         try builder.put(&self.fields, phase.key(), section);
-        self.present[@intFromEnum(phase)] = true;
+        self.present[@backingInt(phase)] = true;
     }
 
     /// The document as a JSON value. `phases_present` is rebuilt here so it
@@ -396,7 +396,7 @@ pub const Usage = struct {
 /// alone; the release tool validates these documents and must not need the
 /// image library to do it.
 fn pathUsage(path: [:0]const u8) ?Usage {
-    if (builtin.os.tag != .linux) return null;
+    if (builtin.target.os.tag != .linux) return null;
     var info: std.os.linux.Statx = undefined;
     const result = std.os.linux.statx(
         std.os.linux.AT.FDCWD,
@@ -430,8 +430,8 @@ pub const PathKind = enum {
     }
 
     pub fn parse(text: []const u8) ?PathKind {
-        inline for (@typeInfo(PathKind).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        inline for (@typeInfo(PathKind).@"enum".field_names) |name| {
+            if (std.mem.eql(u8, text, name)) return @field(PathKind, name);
         }
         return null;
     }
@@ -477,8 +477,8 @@ pub const UnownedCategory = enum {
     }
 
     pub fn parse(text: []const u8) ?UnownedCategory {
-        inline for (@typeInfo(UnownedCategory).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        inline for (@typeInfo(UnownedCategory).@"enum".field_names) |name| {
+            if (std.mem.eql(u8, text, name)) return @field(UnownedCategory, name);
         }
         return null;
     }
@@ -500,8 +500,8 @@ pub const UnownedSource = enum {
     }
 
     pub fn parse(text: []const u8) ?UnownedSource {
-        inline for (@typeInfo(UnownedSource).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        inline for (@typeInfo(UnownedSource).@"enum".field_names) |name| {
+            if (std.mem.eql(u8, text, name)) return @field(UnownedSource, name);
         }
         return null;
     }
@@ -670,7 +670,7 @@ fn normalizeMergedUsr(allocator: Allocator, path: []const u8) Error![]const u8 {
     for (&merged_usr_aliases) |alias| {
         if (!std.mem.startsWith(u8, path, alias)) continue;
         if (path.len != alias.len and path[alias.len] != '/') continue;
-        return std.fmt.allocPrint(allocator, "/usr{s}", .{path});
+        return allocator.print("/usr{s}", .{path});
     }
     return path;
 }
@@ -805,8 +805,7 @@ pub fn unownedPolicyDigest(allocator: Allocator, flavor: Flavor) Error![64]u8 {
     for (&tables) |table| {
         for (table) |rule| {
             var buffer: [512]u8 = undefined;
-            try lines.append(allocator, try std.fmt.allocPrint(
-                allocator,
+            try lines.append(allocator, try allocator.print(
                 "{s}\t{s}\t{s}\t{s}\t{s}\t{s}\n",
                 .{
                     rule.pattern,
@@ -875,8 +874,8 @@ pub const ContentDisposition = enum {
     }
 
     pub fn parse(text: []const u8) ?ContentDisposition {
-        inline for (@typeInfo(ContentDisposition).@"enum".fields) |field| {
-            if (std.mem.eql(u8, text, field.name)) return @enumFromInt(field.value);
+        inline for (@typeInfo(ContentDisposition).@"enum".field_names) |name| {
+            if (std.mem.eql(u8, text, name)) return @field(ContentDisposition, name);
         }
         return null;
     }
@@ -1145,8 +1144,7 @@ pub fn contentPolicyDigest(allocator: Allocator) Error![64]u8 {
     for (&tables) |table| {
         for (table) |rule| {
             for (rule.patterns) |pattern| {
-                const line = try std.fmt.allocPrint(
-                    allocator,
+                const line = try allocator.print(
                     "{s}\t{s}\t{s}\t{s}\n",
                     .{ rule.id, rule.disposition.key(), pattern, rule.reason },
                 );
@@ -1229,8 +1227,7 @@ const DerivedRules = struct {
         var iterator = directory.iterate();
         while (iterator.next(self.io) catch null) |entry| {
             if (entry.kind != .file) continue;
-            const origin = try std.fmt.allocPrint(
-                self.scratch,
+            const origin = try self.scratch.print(
                 "{s}/{s}",
                 .{ dpkg_alternatives_path, entry.name },
             );
@@ -1264,8 +1261,7 @@ const DerivedRules = struct {
         name: []const u8,
         link: []const u8,
     ) Error!void {
-        const switchable = try std.fmt.allocPrint(
-            self.scratch,
+        const switchable = try self.scratch.print(
             "/etc/alternatives/{s}",
             .{name},
         );
@@ -1309,15 +1305,13 @@ const DerivedRules = struct {
                 if (!std.ascii.isDigit(name[1]) or !std.ascii.isDigit(name[2])) continue;
                 const service = name[3..];
                 if (std.mem.indexOfScalar(u8, service, '/') != null) continue;
-                const script = try std.fmt.allocPrint(
-                    self.scratch,
+                const script = try self.scratch.print(
                     "/etc/init.d/{s}",
                     .{service},
                 );
                 if (!self.owners.contains(script)) continue;
                 try self.add(.{
-                    .pattern = try std.fmt.allocPrint(
-                        self.scratch,
+                    .pattern = try self.scratch.print(
                         "{s}/{s}",
                         .{ guest, name },
                     ),
@@ -1325,8 +1319,7 @@ const DerivedRules = struct {
                     .category = .sysv_service_link,
                     .source = .update_rc_d,
                     .kind = .symlink,
-                    .target = .{ .literal = try std.fmt.allocPrint(
-                        self.scratch,
+                    .target = .{ .literal = try self.scratch.print(
                         "../init.d/{s}",
                         .{service},
                     ) },
@@ -1351,13 +1344,11 @@ const DerivedRules = struct {
                 if (entry.kind != .directory) continue;
                 if (!std.mem.endsWith(u8, entry.name, ".wants") and
                     !std.mem.endsWith(u8, entry.name, ".requires")) continue;
-                const farm = try std.fmt.allocPrint(
-                    self.scratch,
+                const farm = try self.scratch.print(
                     "{s}/{s}",
                     .{ pair.units, entry.name },
                 );
-                const record = try std.fmt.allocPrint(
-                    self.scratch,
+                const record = try self.scratch.print(
                     "{s}/{s}",
                     .{ pair.state, entry.name },
                 );
@@ -1380,8 +1371,7 @@ const DerivedRules = struct {
                 while (links.next(self.io) catch null) |link| {
                     if (link.kind != .file) continue;
                     try self.add(.{
-                        .pattern = try std.fmt.allocPrint(
-                            self.scratch,
+                        .pattern = try self.scratch.print(
                             "{s}/{s}",
                             .{ farm, link.name },
                         ),
@@ -1390,8 +1380,7 @@ const DerivedRules = struct {
                         .source = .deb_systemd_helper,
                         .kind = .symlink,
                         .target = .package_owned_same_name,
-                        .origin = try std.fmt.allocPrint(
-                            self.scratch,
+                        .origin = try self.scratch.print(
                             "{s}/{s}",
                             .{ record, link.name },
                         ),
@@ -1406,13 +1395,11 @@ const DerivedRules = struct {
     /// four links are pinned to the exact release the root boots, so a second
     /// kernel's leftovers are not silently carried.
     fn kernelBoot(self: DerivedRules, kernel_release: []const u8) Error!void {
-        const image = try std.fmt.allocPrint(
-            self.scratch,
+        const image = try self.scratch.print(
             "/boot/vmlinuz-{s}",
             .{kernel_release},
         );
-        const initramfs = try std.fmt.allocPrint(
-            self.scratch,
+        const initramfs = try self.scratch.print(
             "initrd.img-{s}",
             .{kernel_release},
         );
@@ -1430,7 +1417,7 @@ const DerivedRules = struct {
             }
         }
         try self.add(.{
-            .pattern = try std.fmt.allocPrint(self.scratch, "/boot/{s}", .{initramfs}),
+            .pattern = try self.scratch.print("/boot/{s}", .{initramfs}),
             .reason = "initramfs generated for the installed kernel by the discarded build stage of #677 step 4",
             .category = .generated_state,
             .source = .miz_builder,
@@ -1450,8 +1437,7 @@ const DerivedRules = struct {
         }
         for (&depmod_index_names) |name| {
             try self.add(.{
-                .pattern = try std.fmt.allocPrint(
-                    self.scratch,
+                .pattern = try self.scratch.print(
                     "/usr/lib/modules/{s}/{s}",
                     .{ kernel_release, name },
                 ),
@@ -1612,8 +1598,7 @@ pub fn measureRootBuild(
     var index: std.StringHashMapUnmanaged(u32) = .empty;
     defer index.deinit(scratch);
     for (packages.items, 0..) |entry, position| {
-        const qualified = try std.fmt.allocPrint(
-            scratch,
+        const qualified = try scratch.print(
             "{s}:{s}",
             .{ entry.name, entry.architecture },
         );
@@ -1662,18 +1647,15 @@ pub fn measureRootBuild(
         .content_rules = content_rules,
         .content_buckets = try scratch.alloc(Bucket, content_rules.len),
         .unexpected_limit = options.unexpected_path_limit,
-        .kernel_path = try std.fmt.allocPrint(
-            scratch,
+        .kernel_path = try scratch.print(
             "/boot/vmlinuz-{s}",
             .{options.kernel_release},
         ),
-        .initramfs_path = try std.fmt.allocPrint(
-            scratch,
+        .initramfs_path = try scratch.print(
             "/boot/initrd.img-{s}",
             .{options.kernel_release},
         ),
-        .modules_prefix = try std.fmt.allocPrint(
-            scratch,
+        .modules_prefix = try scratch.print(
             "/usr/lib/modules/{s}/",
             .{options.kernel_release},
         ),
@@ -1954,8 +1936,7 @@ fn closureDigest(allocator: Allocator, packages: []const PackageEntry) Error![64
     }
     try lines.ensureTotalCapacity(allocator, packages.len);
     for (packages) |entry| {
-        lines.appendAssumeCapacity(try std.fmt.allocPrint(
-            allocator,
+        lines.appendAssumeCapacity(try allocator.print(
             "{s}\t{s}\t{s}\n",
             .{ entry.name, entry.version, entry.architecture },
         ));
@@ -2253,7 +2234,7 @@ const Walk = struct {
             "size inventory cannot walk the root tree: {s}",
             .{@errorName(err)},
         )) |entry| {
-            const guest = try std.fmt.allocPrint(self.scratch, "/{s}", .{entry.name});
+            const guest = try self.scratch.print("/{s}", .{entry.name});
             defer self.scratch.free(guest);
             const host = try std.fs.path.join(
                 self.scratch,
@@ -2279,7 +2260,7 @@ const Walk = struct {
         kind: std.Io.File.Kind,
         top_level: *Bucket,
     ) Error!void {
-        const host_z = try self.scratch.dupeZ(u8, host);
+        const host_z = try self.scratch.dupeSentinel(u8, host, 0);
         defer self.scratch.free(host_z);
         const usage = pathUsage(host_z) orelse {
             self.unreadable += 1;
@@ -2312,8 +2293,7 @@ const Walk = struct {
                 return;
             };
             const entry = next orelse break;
-            const child_guest = try std.fmt.allocPrint(
-                self.scratch,
+            const child_guest = try self.scratch.print(
                 "{s}/{s}",
                 .{ guest, entry.name },
             );
@@ -2576,7 +2556,7 @@ pub const Summary = struct {
     content_policy_sha256: []const u8 = "",
 
     pub fn has(self: Summary, phase: Phase) bool {
-        return self.phases[@intFromEnum(phase)];
+        return self.phases[@backingInt(phase)];
     }
 };
 
@@ -2718,7 +2698,7 @@ pub fn validateDocument(
             "size inventory declares unknown phase {s}",
             .{text},
         );
-        const rank = @intFromEnum(phase);
+        const rank = @backingInt(phase);
         if (position != 0 and rank <= previous) return fail(
             diagnostic,
             "size inventory phases_present is out of order at {s}",
@@ -3666,7 +3646,7 @@ pub fn compareAlloc(
         for (entry.fields) |field| {
             const before = countOf(left.get(field)) orelse continue;
             const after = countOf(right.get(field)) orelse continue;
-            const key = try std.fmt.allocPrint(arena, "{s}_delta", .{field});
+            const key = try arena.print("{s}_delta", .{field});
             try builder.put(&section, key, .{ .integer = delta(before, after) });
         }
         try builder.put(&document, entry.phase.key(), .{ .object = section });

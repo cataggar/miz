@@ -22,7 +22,7 @@ Part of the Zig-on-QEMU experiment (see issue #3). MIT licensed.
 
 ## Build & test
 
-Requires Zig 0.16. Built as part of the repo-root build graph (there's no
+Requires Zig 0.17.0. Built as part of the repo-root build graph (there's no
 separate `qmp/build.zig`), so run these from the repo root:
 
 ```sh

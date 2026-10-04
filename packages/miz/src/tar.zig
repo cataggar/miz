@@ -522,8 +522,7 @@ pub const StreamReader = struct {
         const name = trimField(self.header[0..100]);
         const prefix = trimField(self.header[345..500]);
         if (prefix.len == 0) return self.entry_arena.allocator().dupe(u8, name);
-        return std.fmt.allocPrint(
-            self.entry_arena.allocator(),
+        return self.entry_arena.allocator().print(
             "{s}/{s}",
             .{ prefix, name },
         );
@@ -804,7 +803,7 @@ pub const Writer = struct {
                 try writePaxRecord(self.out, key, xattr.value);
             }
             if (padLen(pax_size) > 0) {
-                const zeros = [_]u8{0} ** block_size;
+                const zeros = @as([block_size]u8, @splat(0));
                 try self.out.writeAll(zeros[0..padLen(pax_size)]);
             }
         }
@@ -835,7 +834,7 @@ pub const Writer = struct {
         if (self.bytes_remaining != 0) return error.SizeMismatch;
 
         if (self.pad_bytes > 0) {
-            const zeros = [_]u8{0} ** block_size;
+            const zeros = @as([block_size]u8, @splat(0));
             try self.out.writeAll(zeros[0..self.pad_bytes]);
         }
         self.pad_bytes = 0;
@@ -860,7 +859,7 @@ pub const Writer = struct {
 
     pub fn finish(self: *Writer) Error!void {
         if (self.entry_open) return error.EntryStillOpen;
-        const zeros = [_]u8{0} ** block_size;
+        const zeros = @as([block_size]u8, @splat(0));
         try self.out.writeAll(&zeros);
         try self.out.writeAll(&zeros);
         try self.out.flush();
@@ -974,7 +973,7 @@ fn makeEntryHeader(
 }
 
 fn makeRawHeader(raw: RawHeader) Error![block_size]u8 {
-    var header: [block_size]u8 = [_]u8{0} ** block_size;
+    var header: [block_size]u8 = @as([block_size]u8, @splat(0));
 
     splitPath(raw.path, header[0..100], header[345..500]) catch
         return error.PathTooLong;
@@ -1192,7 +1191,7 @@ fn buildTar(allocator: std.mem.Allocator, specs: []const ReaderTarSpec) ![]u8 {
 }
 
 fn appendTarEntry(out: *std.Io.Writer.Allocating, spec: ReaderTarSpec) !void {
-    var header: [block_size]u8 = [_]u8{0} ** block_size;
+    var header: [block_size]u8 = @as([block_size]u8, @splat(0));
     if (spec.path.len > 100) return error.InvalidHeader;
     @memcpy(header[0..spec.path.len], spec.path);
     try writeOctalField(header[100..108], spec.mode);
@@ -1224,7 +1223,7 @@ fn appendTarEntry(out: *std.Io.Writer.Allocating, spec: ReaderTarSpec) !void {
 fn buildPaxRecord(allocator: std.mem.Allocator, key: []const u8, value: []const u8) ![]u8 {
     var record_len: usize = 0;
     while (true) {
-        const record = try std.fmt.allocPrint(allocator, "{d} {s}={s}\n", .{ record_len, key, value });
+        const record = try allocator.print("{d} {s}={s}\n", .{ record_len, key, value });
         if (record.len == record_len) return record;
         record_len = record.len;
         allocator.free(record);
@@ -1274,7 +1273,7 @@ fn parseEntries(allocator: std.mem.Allocator, archive: []const u8) ![]TarEntry {
         const full_path = if (prefix.len == 0)
             try allocator.dupe(u8, name)
         else
-            try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, name });
+            try allocator.print("{s}/{s}", .{ prefix, name });
 
         const size = try parseTarEntryOctal(trimNul(header[124..136]));
         const payload = archive[offset .. offset + size];
@@ -1351,7 +1350,7 @@ test "reader preserves USTAR ownership and bounded relevant PAX xattrs" {
     defer allocator.free(capability);
     const ignored = try buildPaxRecord(allocator, "SCHILY.xattr.invalid.namespace", "ignored");
     defer allocator.free(ignored);
-    const pax = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ uid, gid, capability, ignored });
+    const pax = try allocator.print("{s}{s}{s}{s}", .{ uid, gid, capability, ignored });
     defer allocator.free(pax);
 
     const bytes = try buildTar(allocator, &.{
@@ -1375,7 +1374,7 @@ test "reader rejects PAX xattrs beyond the per-entry bound" {
     var pax = std.Io.Writer.Allocating.init(allocator);
     defer pax.deinit();
     for (0..max_pax_xattrs_per_entry + 1) |index| {
-        const value = try std.fmt.allocPrint(allocator, "{d}", .{index});
+        const value = try allocator.print("{d}", .{index});
         defer allocator.free(value);
         const record = try buildPaxRecord(allocator, "SCHILY.xattr.user.bound", value);
         defer allocator.free(record);
@@ -1419,8 +1418,7 @@ test "stream reader preserves PAX precedence metadata and special files" {
         "inherited",
     );
     defer allocator.free(global_xattr);
-    const global_pax = try std.fmt.allocPrint(
-        allocator,
+    const global_pax = try allocator.print(
         "{s}{s}",
         .{ global_uid, global_xattr },
     );
@@ -1436,8 +1434,7 @@ test "stream reader preserves PAX precedence metadata and special files" {
         "capability",
     );
     defer allocator.free(local_xattr);
-    const local_pax = try std.fmt.allocPrint(
-        allocator,
+    const local_pax = try allocator.print(
         "{s}{s}{s}",
         .{ local_uid, local_mtime, local_xattr },
     );

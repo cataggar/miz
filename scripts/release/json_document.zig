@@ -269,7 +269,7 @@ fn expectDiagnostic(
     comptime fmt: []const u8,
     args: anytype,
 ) !void {
-    const expected = try std.fmt.allocPrint(std.testing.allocator, fmt, args);
+    const expected = try std.testing.allocator.print(fmt, args);
     defer std.testing.allocator.free(expected);
     try std.testing.expectEqualStrings(expected, diagnostic.message());
 }
@@ -302,8 +302,7 @@ test "readObject reports the Python failure text for every rejection" {
         testing_max_bytes,
         &diagnostic,
     ));
-    const prefix = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const prefix = try std.testing.allocator.print(
         "cannot read {s}: ",
         .{path},
     );

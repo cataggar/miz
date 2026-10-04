@@ -11,8 +11,8 @@ const Dir = Io.Dir;
 pub const api_version: u32 = 4;
 pub const request_schema = "io.github.cataggar.miz.package-family.request.v4";
 pub const result_schema = "io.github.cataggar.miz.package-family.result.v4";
-pub const debz_api_commit = "beac3f20dd93fd98863af71e8fe621d47db663f6";
-pub const rpmz_api_commit = "15b5e1291a9fc3eb3980a4088d757b9d0254d468";
+pub const debz_api_commit = "56be0a32fac5293f20bde45d266b708e53321c73";
+pub const rpmz_api_commit = "c9b23a2103b9682434ab663841d00cd657647561";
 pub const rpm_lock_schema = "io.github.cataggar.miz.rpm-lock.v1";
 pub const rpm_provenance_schema = "io.github.cataggar.miz.rpm-provenance.v1";
 
@@ -222,7 +222,7 @@ pub fn execute(
             .backend_failed,
             "embedded debz package-family transaction failed",
             disposition,
-            @intFromEnum(backend_result.exit_status),
+            @backingInt(backend_result.exit_status),
         );
     }
 
@@ -254,7 +254,7 @@ pub fn execute(
     if (requiresProvenance(request.operation)) {
         const path = provenance_path orelse
             return failed(.provenance_missing, "debz did not return transaction provenance", .recoverable, 0);
-        const expected = try std.fmt.allocPrint(allocator, "{s}/{s}", .{
+        const expected = try allocator.print("{s}/{s}", .{
             request.inputs.state_path,
             debz.package_family_backend.provenance_basename,
         });
@@ -668,8 +668,7 @@ const FakeProduct = struct {
         self.seen_packages = request.packages.len;
         if (self.fail_status) |status| {
             const message = if (self.heap_message)
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "backend stage failed: FileNotFound opening credential=https://secret@example.invalid state lock",
                     .{},
                 )
@@ -682,7 +681,7 @@ const FakeProduct = struct {
                 try writeTestLock(self.io, path, request.options.architecture);
         }
         if (request.operation.mutates() and request.operation != .recover and request.options.lock_input_path != null) {
-            const provenance = try std.fmt.allocPrint(std.testing.allocator, "{s}/transaction-result.json", .{self.state_path});
+            const provenance = try std.testing.allocator.print("{s}/transaction-result.json", .{self.state_path});
             defer std.testing.allocator.free(provenance);
             try writeTestProvenance(self.io, request.options.lock_input_path.?, provenance);
         }
@@ -782,10 +781,10 @@ fn fixturePaths(allocator: Allocator, io: Io, suffix: []const u8) !struct {
     const cwd = try std.process.currentPathAlloc(io, allocator);
     defer allocator.free(cwd);
     return .{
-        .stage = try std.fmt.allocPrint(allocator, "{s}/.test-package-{s}-stage", .{ cwd, suffix }),
-        .output = try std.fmt.allocPrint(allocator, "{s}/.test-package-{s}-root", .{ cwd, suffix }),
-        .state = try std.fmt.allocPrint(allocator, "{s}/.test-package-{s}-state", .{ cwd, suffix }),
-        .lock = try std.fmt.allocPrint(allocator, "{s}/.test-package-{s}.lock", .{ cwd, suffix }),
+        .stage = try allocator.print("{s}/.test-package-{s}-stage", .{ cwd, suffix }),
+        .output = try allocator.print("{s}/.test-package-{s}-root", .{ cwd, suffix }),
+        .state = try allocator.print("{s}/.test-package-{s}-state", .{ cwd, suffix }),
+        .lock = try allocator.print("{s}/.test-package-{s}.lock", .{ cwd, suffix }),
     };
 }
 
@@ -1086,11 +1085,11 @@ test "arm64 resolve then customize completes the exact-lock handoff without leak
     // production transaction lock open into a missing parent and surface a bare
     // FileNotFound the first time customize ran after resolve.
     try Dir.cwd().createDir(io, paths.stage, .default_dir);
-    const dpkg_dir = try std.fmt.allocPrint(allocator, "{s}/var/lib/dpkg", .{paths.stage});
+    const dpkg_dir = try allocator.print("{s}/var/lib/dpkg", .{paths.stage});
     defer allocator.free(dpkg_dir);
     try Dir.cwd().createDirPath(io, dpkg_dir);
     try Dir.cwd().createDir(io, paths.state, .default_dir);
-    const debz_dir = try std.fmt.allocPrint(allocator, "{s}/var/lib/debz", .{paths.stage});
+    const debz_dir = try allocator.print("{s}/var/lib/debz", .{paths.stage});
     defer allocator.free(debz_dir);
     try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, debz_dir, .{}));
 
@@ -1157,7 +1156,7 @@ test "arm64 resolve then customize completes the exact-lock handoff without leak
     // provenance_path must be owned by the caller's allocator (freed here); the
     // production customize leak was exactly an unfreed escaping backend string.
     defer allocator.free(customized.provenance_path.?);
-    const expected_provenance = try std.fmt.allocPrint(allocator, "{s}/transaction-result.json", .{paths.state});
+    const expected_provenance = try allocator.print("{s}/transaction-result.json", .{paths.state});
     defer allocator.free(expected_provenance);
     try std.testing.expectEqualStrings(expected_provenance, customized.provenance_path.?);
 

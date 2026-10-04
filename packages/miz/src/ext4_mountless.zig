@@ -132,7 +132,7 @@ const DeviceIdentity = struct {
 };
 
 fn linuxDeviceFromFile(file: Io.File) Error!DeviceIdentity {
-    if (comptime builtin.os.tag != .linux) return .{ .major = 0, .minor = 0 };
+    if (comptime builtin.target.os.tag != .linux) return .{ .major = 0, .minor = 0 };
     var statx: std.os.linux.Statx = undefined;
     const result = std.os.linux.statx(
         @intCast(file.handle),
@@ -146,7 +146,7 @@ fn linuxDeviceFromFile(file: Io.File) Error!DeviceIdentity {
 }
 
 fn linuxDeviceFromPath(allocator: Allocator, io: Io, path: []const u8) Error!DeviceIdentity {
-    if (comptime builtin.os.tag != .linux) return .{ .major = 0, .minor = 0 };
+    if (comptime builtin.target.os.tag != .linux) return .{ .major = 0, .minor = 0 };
     const path_z = try allocator.allocSentinel(u8, path.len, 0);
     defer allocator.free(path_z);
     @memcpy(path_z, path);
@@ -164,7 +164,7 @@ fn linuxDeviceFromPath(allocator: Allocator, io: Io, path: []const u8) Error!Dev
 }
 
 fn syncDirectoryPath(io: Io, path: []const u8) Error!void {
-    if (comptime builtin.os.tag != .linux) {
+    if (comptime builtin.target.os.tag != .linux) {
         return error.AtomicDurabilityUnsupported;
     }
     var directory = if (std.fs.path.isAbsolute(path))
@@ -185,7 +185,7 @@ fn syncDestinationDirectory(io: Io, atomic_path: []const u8) Error!void {
 
 fn captureHostMetadata(allocator: Allocator, io: Io, file: Io.File) Error!HostMetadata {
     const stat = try file.stat(io);
-    if (comptime builtin.os.tag != .linux) {
+    if (comptime builtin.target.os.tag != .linux) {
         return error.HostMetadataPreservationUnsupported;
     }
     const linux = std.os.linux;
@@ -264,7 +264,7 @@ fn purgeHostXattrsNotInSource(
     file: Io.File,
     metadata: *const HostMetadata,
 ) Error!void {
-    if (comptime builtin.os.tag != .linux) {
+    if (comptime builtin.target.os.tag != .linux) {
         return error.HostMetadataPreservationUnsupported;
     }
     const linux = std.os.linux;
@@ -305,7 +305,7 @@ fn purgeHostXattrsNotInSource(
 }
 
 fn purgeAllHostXattrsFd(allocator: Allocator, fd: std.posix.fd_t) Error!void {
-    if (comptime builtin.os.tag != .linux) {
+    if (comptime builtin.target.os.tag != .linux) {
         return error.HostMetadataPreservationUnsupported;
     }
     const linux = std.os.linux;
@@ -340,7 +340,7 @@ fn purgeAllHostXattrs(allocator: Allocator, file: Io.File) Error!void {
 }
 
 fn applyHostMetadata(io: Io, file: Io.File, metadata: *const HostMetadata) Error!void {
-    if (comptime builtin.os.tag != .linux) {
+    if (comptime builtin.target.os.tag != .linux) {
         return error.HostMetadataPreservationUnsupported;
     }
     if (metadata.uid != null or metadata.gid != null) {
@@ -373,8 +373,7 @@ fn createPrivateDirectory(allocator: Allocator, io: Io, atomic_path: []const u8)
     const timestamp = @as(u64, @intCast(Io.Clock.real.now(io).nanoseconds));
     var attempt: u32 = 0;
     while (attempt < 64) : (attempt += 1) {
-        const path = try std.fmt.allocPrint(
-            allocator,
+        const path = try allocator.print(
             "{s}.mountless-private-{x}-{d}",
             .{ atomic_path, timestamp, attempt },
         );
@@ -399,7 +398,7 @@ fn preparePrivateDirectory(
     path: []const u8,
     expected_device: DeviceIdentity,
 ) Error!Io.Dir {
-    if (comptime builtin.os.tag != .linux) return error.AtomicPublishUnsupported;
+    if (comptime builtin.target.os.tag != .linux) return error.AtomicPublishUnsupported;
     var directory = Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch
         return error.AtomicPublishFailed;
     errdefer directory.close(io);
@@ -459,8 +458,8 @@ const SparseExtent = struct {
 const linux_seek_data = 3;
 const linux_seek_hole = 4;
 
-fn linuxSparseSeek(file: Io.File, offset: u64, whence: usize) Error!?u64 {
-    if (comptime builtin.os.tag != .linux or @sizeOf(usize) != 8) {
+fn linuxSparseSeek(file: Io.File, offset: u64, whence: u32) Error!?u64 {
+    if (comptime builtin.target.os.tag != .linux or @sizeOf(usize) != 8) {
         return error.SparseExtentUnsupported;
     }
     const result = std.os.linux.lseek(
@@ -1223,7 +1222,7 @@ pub const FileSystem = struct {
             const child = if (relative.len == 0)
                 try self.allocator.dupe(u8, entry.name)
             else
-                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ relative, entry.name });
+                try self.allocator.print("{s}/{s}", .{ relative, entry.name });
             defer self.allocator.free(child);
             if (excludedTopLevel(child, options.excluded_top_level)) continue;
             try seen.put(try self.allocator.dupe(u8, child), {});
@@ -1249,7 +1248,7 @@ pub const FileSystem = struct {
             const child = if (relative.len == 0)
                 try self.allocator.dupe(u8, entry.name)
             else
-                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ relative, entry.name });
+                try self.allocator.print("{s}/{s}", .{ relative, entry.name });
             errdefer self.allocator.free(child);
             if (excludedTopLevel(child, options.excluded_top_level)) {
                 self.allocator.free(child);
@@ -1378,7 +1377,7 @@ pub const FileSystem = struct {
         const cursor = try self.tree.cursor();
         const root = self.tree.rootMetadata();
         const label = self.identity.label;
-        const lock_path = try std.fmt.allocPrint(self.allocator, "{s}.mountless-lock", .{atomic_path});
+        const lock_path = try self.allocator.print("{s}.mountless-lock", .{atomic_path});
         defer self.allocator.free(lock_path);
         var lock_file = try Io.Dir.cwd().createFile(self.io, lock_path, .{
             .read = true,
@@ -1495,7 +1494,7 @@ pub const FileSystem = struct {
         atomic_path: []const u8,
         exchanged: *bool,
     ) Error!void {
-        if (comptime builtin.os.tag != .linux) {
+        if (comptime builtin.target.os.tag != .linux) {
             return error.AtomicPublishUnsupported;
         }
         const linux = std.os.linux;
@@ -1727,7 +1726,7 @@ fn excludedTopLevel(path: []const u8, excluded: []const []const u8) bool {
 }
 
 fn setTestHostXattr(io: Io, path: []const u8, name: []const u8, value: []const u8) !void {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
     const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
     defer file.close(io);
     const name_z = try std.heap.page_allocator.allocSentinel(u8, name.len, 0);
@@ -1744,7 +1743,7 @@ fn setTestHostXattr(io: Io, path: []const u8, name: []const u8, value: []const u
 }
 
 fn setTestHostDirectoryXattr(io: Io, path: []const u8, name: []const u8, value: []const u8) !void {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
     _ = io;
     const path_z = try std.heap.page_allocator.allocSentinel(u8, path.len, 0);
     defer std.heap.page_allocator.free(path_z);
@@ -1763,7 +1762,7 @@ fn setTestHostDirectoryXattr(io: Io, path: []const u8, name: []const u8, value: 
 }
 
 fn testHostXattrExists(allocator: Allocator, io: Io, path: []const u8, name: []const u8) !bool {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
     const file = try Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const name_z = try allocator.allocSentinel(u8, name.len, 0);
@@ -1786,7 +1785,7 @@ fn readTestHostXattr(
     path: []const u8,
     name: []const u8,
 ) ![]u8 {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
     const file = try Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const name_z = try allocator.allocSentinel(u8, name.len, 0);
@@ -1870,7 +1869,7 @@ fn temporaryTestPath(
 }
 
 test "atomic commit preserves host image mode timestamps and xattrs" {
-    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var temporary = std.testing.tmpDir(.{});
@@ -2204,7 +2203,7 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
     _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
         .length = 32 * 1024 * 1024,
         .label = "mountless",
-        .uuid = [_]u8{0x52} ** 16,
+        .uuid = @as([16]u8, @splat(0x52)),
     });
     var fs = try FileSystem.open(allocator, io, image.file, .{
         .length = 32 * 1024 * 1024,
@@ -2212,7 +2211,7 @@ test "mountless ext4 API preserves mode zero and exposes bounded mutations" {
         .atomic_path = image_path,
     });
     defer fs.deinit();
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x52} ** 16), &fs.filesystemIdentity().uuid);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x52))), &fs.filesystemIdentity().uuid);
     try std.testing.expectEqualSlices(u8, "mountless", fs.filesystemIdentity().label[0..9]);
     const listed = try fs.list(allocator, "/", 16);
     defer allocator.free(listed);
@@ -2275,7 +2274,7 @@ test "importHostTree frees excluded top-level directory names (#455)" {
     _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
         .length = 32 * 1024 * 1024,
         .label = "mountless",
-        .uuid = [_]u8{0x52} ** 16,
+        .uuid = @as([16]u8, @splat(0x52)),
     });
     var fs = try FileSystem.open(allocator, io, image.file, .{
         .length = 32 * 1024 * 1024,
@@ -2344,7 +2343,7 @@ test "exportHostTree preserves guest execute bits above the readable floor" {
     _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
         .length = 32 * 1024 * 1024,
         .label = "exec",
-        .uuid = [_]u8{0x53} ** 16,
+        .uuid = @as([16]u8, @splat(0x53)),
     });
     var fs = try FileSystem.open(allocator, io, image.file, .{
         .length = 32 * 1024 * 1024,
@@ -2416,7 +2415,7 @@ test "mountless commit preserves the pinned Ubuntu descriptor-64 profile" {
     _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
         .length = length,
         .label = "ubuntu-root",
-        .uuid = [_]u8{0x71} ** 16,
+        .uuid = @as([16]u8, @splat(0x71)),
         .timestamp = 1_724_000_000,
         .journal = .{ .enabled = true },
         .preserve_feature_ro_compat = 0x046b,
@@ -2526,7 +2525,7 @@ test "mountless round trip preserves security metadata and special nodes" {
         .mtime = 1_700_000_001,
         .xattrs = &xattrs,
     });
-    var sparse_bytes = [_]u8{0} ** 8192;
+    var sparse_bytes = @as([8192]u8, @splat(0));
     @memcpy(sparse_bytes[0..6], "sparse");
     try source_tree.putFileBytesSparse("etc/sparse", &sparse_bytes, &.{
         .{ .logical_block = 1, .block_count = 1 },
@@ -2544,7 +2543,7 @@ test "mountless round trip preserves security metadata and special nodes" {
     _ = try ext4.populate(io, image.file, allocator, try source_tree.cursor(), .{
         .length = 64 * 1024 * 1024,
         .label = "fidelity",
-        .uuid = [_]u8{0x45} ** 16,
+        .uuid = @as([16]u8, @splat(0x45)),
         .root_xattrs = &xattrs,
     });
 
@@ -2618,7 +2617,7 @@ test "mountless round trip preserves security metadata and special nodes" {
         "usr/bin/void-alias",
         (try fs.stat("/usr/bin/void-alias2")).payload.hardlink_target,
     );
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x45} ** 16), &fs.filesystemIdentity().uuid);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x45))), &fs.filesystemIdentity().uuid);
     try std.testing.expectEqualSlices(u8, "fidelity", fs.filesystemIdentity().label[0..8]);
     const locked = try fs.stat("/usr/bin/void-alias");
     try std.testing.expectEqual(@as(u16, 0), locked.metadata.mode);

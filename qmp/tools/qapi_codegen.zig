@@ -244,16 +244,64 @@ fn hasIfCondition(type_spec: std.json.Value) bool {
     return type_spec == .object and type_spec.object.contains("if");
 }
 
-/// Zig 0.16 keywords that would otherwise collide with a bare identifier
-/// derived from a QAPI name.
+/// Conservative Zig keyword set for identifiers derived from QAPI names.
 const zig_keywords = [_][]const u8{
-    "align",       "allowzero", "and",      "anyframe",    "anytype", "asm",         "async",          "await",
-    "break",       "callconv",  "catch",    "comptime",    "const",   "continue",    "defer",          "else",
-    "enum",        "errdefer",  "error",    "export",      "extern",  "fn",          "for",            "if",
-    "inline",      "noalias",   "noinline", "nosuspend",   "opaque",  "or",          "orelse",         "packed",
-    "pub",         "resume",    "return",   "linksection", "struct",  "suspend",     "switch",         "test",
-    "threadlocal", "try",       "type",     "undefined",   "union",   "unreachable", "usingnamespace", "var",
-    "volatile",    "while",     "null",     "true",        "false",   "void",        "noreturn",
+    "addrspace",
+    "align",
+    "allowzero",
+    "and",
+    "anyframe",
+    "anytype",
+    "asm",
+    "async",
+    "await",
+    "break",
+    "callconv",
+    "catch",
+    "comptime",
+    "const",
+    "continue",
+    "defer",
+    "else",
+    "enum",
+    "errdefer",
+    "error",
+    "export",
+    "extern",
+    "fn",
+    "for",
+    "if",
+    "inline",
+    "noalias",
+    "noinline",
+    "nosuspend",
+    "opaque",
+    "or",
+    "orelse",
+    "packed",
+    "pub",
+    "resume",
+    "return",
+    "linksection",
+    "struct",
+    "suspend",
+    "switch",
+    "test",
+    "threadlocal",
+    "try",
+    "type",
+    "undefined",
+    "union",
+    "unreachable",
+    "usingnamespace",
+    "var",
+    "volatile",
+    "while",
+    "null",
+    "true",
+    "false",
+    "void",
+    "noreturn",
 };
 
 fn isPlainIdent(name: []const u8) bool {
@@ -426,7 +474,7 @@ fn emitCommand(
             },
             .object => {
                 has_args = true;
-                inline_args_name = try std.fmt.allocPrint(allocator, "{s}Args", .{try pascalCase(allocator, wire_name)});
+                inline_args_name = try allocator.print("{s}Args", .{try pascalCase(allocator, wire_name)});
                 try args_type_buf.writer.writeAll(inline_args_name.?);
             },
             else => {},
@@ -481,7 +529,7 @@ fn emitEvent(
     const data_val = obj.get("data") orelse return false;
     if (data_val != .object) return false;
 
-    const type_name = try std.fmt.allocPrint(allocator, "{s}Data", .{try pascalCaseFromUpperSnake(allocator, wire_name)});
+    const type_name = try allocator.print("{s}Data", .{try pascalCaseFromUpperSnake(allocator, wire_name)});
     try w.print("/// Data payload of the QMP event `{s}`.\n", .{wire_name});
     try w.print("pub const {s} = struct {{\n", .{type_name});
     try emitFieldsFromData(w, known, data_val);
@@ -522,6 +570,10 @@ test "isPlainIdent: rejects keywords and non-identifier chars" {
     try std.testing.expect(!isPlainIdent("error"));
     try std.testing.expect(!isPlainIdent("type"));
     try std.testing.expect(!isPlainIdent(""));
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeIdent(&out.writer, "addrspace");
+    try std.testing.expectEqualStrings("@\"addrspace\"", out.written());
 }
 
 test "builtinType: maps QAPI scalar names to Zig types" {

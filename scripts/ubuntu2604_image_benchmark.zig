@@ -48,7 +48,8 @@ pub const schema = 1;
 pub const architecture = "aarch64";
 pub const ubuntu_architecture = "arm64";
 pub const flavor = "baremetal";
-pub const optimize_mode = "ReleaseSafe";
+pub const required_zig_version = "0.17.0";
+pub const optimize_mode = "safe";
 pub const virtual_size: i64 = 5 * 1024 * 1024 * 1024;
 pub const minimum_free_disk: u64 = 30 * 1024 * 1024 * 1024;
 pub const measured_runs = 3;
@@ -62,7 +63,7 @@ pub const sums_sha256 =
     "d562d59dac70f68d67d00e994db5cd89e49e9d93f7f80b4cb868a5eeb057ec36";
 pub const sums_signature_sha256 =
     "2bf5fae8be0c79cc30c5c10223f1d4790b6ef541240896bfe48c7ac57c3404ed";
-pub const debz_api_commit = "beac3f20dd93fd98863af71e8fe621d47db663f6";
+pub const debz_api_commit = "56be0a32fac5293f20bde45d266b708e53321c73";
 pub const canonical_fingerprint = "d2eb44626fddc30b513d5bb71a5d6c4c7db87c81";
 pub const asset_name = "Ubuntu-26.04-aarch64.baremetal.qcow2";
 pub const raw_asset_name = "Ubuntu-26.04-aarch64.baremetal.raw";
@@ -542,7 +543,7 @@ pub fn prepareSessionDir(
     if (pathExistsOrSymlink(io, candidate)) {
         return context.fail("output root must not already exist: {s}", .{candidate});
     }
-    try Dir.cwd().createDir(io, candidate, @enumFromInt(0o755));
+    try Dir.cwd().createDir(io, candidate, @fromBackingInt(@intCast(0o755)));
     return candidate;
 }
 
@@ -2674,7 +2675,7 @@ pub fn readableSummary(allocator: Allocator, summary: Value) ![]u8 {
     try writer.line(
         &text,
         allocator,
-        "Ubuntu 26.04 aarch64 bare-metal ReleaseSafe image benchmark",
+        "Ubuntu 26.04 aarch64 bare-metal safe image benchmark",
         .{},
     );
     try writer.line(&text, allocator, "", .{});
@@ -2764,8 +2765,8 @@ const Statfs = extern struct {
 
 /// `shutil.disk_usage(path).free`: available bytes for an unprivileged writer.
 fn freeDiskBytes(allocator: Allocator, path: []const u8) !u64 {
-    if (builtin.os.tag != .linux) return error.Unsupported;
-    const path_z = try allocator.dupeZ(u8, path);
+    if (builtin.target.os.tag != .linux) return error.Unsupported;
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
     var buffer: Statfs = undefined;
     const result = std.os.linux.syscall2(
@@ -2839,10 +2840,16 @@ fn timevalNanoseconds(value: std.posix.timeval) i128 {
 fn exitCodeOf(term: std.process.Child.Term) i64 {
     return switch (term) {
         .exited => |code| code,
-        .signal => |signal| -@as(i64, @intFromEnum(signal)),
-        .stopped => |signal| -@as(i64, @intFromEnum(signal)),
+        .signal => |signal| -@as(i64, @backingInt(signal)),
+        .stopped => |signal| -@as(i64, @backingInt(signal)),
         .unknown => |code| @intCast(code),
     };
+}
+
+pub fn validateZigVersion(version_text: []const u8, exit_code: i64, context: *Context) Failure!void {
+    if (exit_code != 0 or !std.mem.eql(u8, version_text, required_zig_version)) {
+        return context.fail("benchmark requires exactly Zig {s}", .{required_zig_version});
+    }
 }
 
 fn spawnLogged(
@@ -3061,7 +3068,7 @@ fn runMeasuredCommand(
         .io = io,
     };
     const pid: u32 = @intCast(spawned.child.id orelse 0);
-    if (builtin.os.tag == .linux and pid != 0) {
+    if (builtin.target.os.tag == .linux and pid != 0) {
         const opened = std.os.linux.pidfd_open(@intCast(pid), 0);
         if (std.os.linux.errno(opened) == .SUCCESS) {
             const pidfd: i32 = @intCast(opened);
@@ -3346,7 +3353,7 @@ pub fn benchmarkCommand(
     try command.appendSlice(allocator, &.{
         args.zig,
         "build",
-        "-Doptimize=ReleaseSafe",
+        "-Doptimize=safe",
         "-Dubuntu2604-arch=aarch64",
         "-Dubuntu2604-flavor=baremetal",
         "generalized-ubuntu2604",
@@ -3576,9 +3583,7 @@ fn preflight(
         .stderr_limit = .limited(4096),
     });
     const version_text = std.mem.trim(u8, version.stdout, " \t\r\n");
-    if (exitCodeOf(version.term) != 0 or !std.mem.eql(u8, version_text, "0.16.0")) {
-        return context.fail("benchmark requires Zig 0.16.0", .{});
-    }
+    try validateZigVersion(version_text, exitCodeOf(version.term), context);
 
     const host_document = try hostDocument(
         allocator,
@@ -3621,6 +3626,13 @@ fn preflight(
         "ZIG_GLOBAL_CACHE_DIR",
         try resolvePathAlloc(allocator, io, args.zig_global_cache),
     );
+    // Keep the extracted 0.17 packages with the staged global archives, not
+    // under the disposable staging compilation cache or an ambient checkout.
+    const local_packages = try joinPath(allocator, &.{ args.zig_global_cache, "zig-pkg" });
+    try environ.put(
+        "ZIG_LOCAL_PKG_DIR",
+        try resolvePathAlloc(allocator, io, local_packages),
+    );
     const local_cache = try joinPath(allocator, &.{ session, "zig-local-cache" });
     try environ.put(
         "ZIG_LOCAL_CACHE_DIR",
@@ -3631,7 +3643,7 @@ fn preflight(
     try runLogged(io, &.{
         args.zig,
         "build",
-        "-Doptimize=ReleaseSafe",
+        "-Doptimize=safe",
         "-Dubuntu2604-arch=aarch64",
         "-Dubuntu2604-flavor=baremetal",
         "install-miz",

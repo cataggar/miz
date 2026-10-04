@@ -366,9 +366,9 @@ fn applyAccounts(
         const home_path = try normalizedPath(home);
         try tree.putDirectory(home_path, .{ .mode = 0o700, .uid = uid, .gid = gid.? });
         if (user.ssh_authorized_keys.len != 0) {
-            const ssh_path = try std.fmt.allocPrint(allocator, "{s}/.ssh", .{home_path});
+            const ssh_path = try allocator.print("{s}/.ssh", .{home_path});
             defer allocator.free(ssh_path);
-            const authorized_keys_path = try std.fmt.allocPrint(allocator, "{s}/authorized_keys", .{ssh_path});
+            const authorized_keys_path = try allocator.print("{s}/authorized_keys", .{ssh_path});
             defer allocator.free(authorized_keys_path);
             try tree.putDirectory(ssh_path, .{ .mode = 0o700, .uid = uid, .gid = gid.? });
             const keys = try authorizedKeysContent(allocator, user.ssh_authorized_keys);
@@ -376,9 +376,9 @@ fn applyAccounts(
             try tree.putFileBytes(authorized_keys_path, keys, .{ .mode = 0o600, .uid = uid, .gid = gid.? });
         }
         if (user.passwordless_sudo) {
-            const sudo_path = try std.fmt.allocPrint(allocator, "etc/sudoers.d/{s}", .{user.name});
+            const sudo_path = try allocator.print("etc/sudoers.d/{s}", .{user.name});
             defer allocator.free(sudo_path);
-            const sudo_line = try std.fmt.allocPrint(allocator, "{s} ALL=(ALL) NOPASSWD: ALL\n", .{user.name});
+            const sudo_line = try allocator.print("{s} ALL=(ALL) NOPASSWD: ALL\n", .{user.name});
             defer allocator.free(sudo_line);
             try tree.putFileBytes(sudo_path, sudo_line, .{ .mode = 0o440 });
         }
@@ -636,7 +636,7 @@ fn removeUser(allocator: Allocator, tree: *RootTree, username: []const u8) !void
         try tree.putFileBytes(path, filtered, replacementMetadata(tree, path, if (std.mem.eql(u8, path, "etc/shadow")) 0o600 else 0o644));
     }
     if (home_path) |path| _ = try tree.remove(path);
-    const sudoers_path = try std.fmt.allocPrint(allocator, "etc/sudoers.d/{s}", .{username});
+    const sudoers_path = try allocator.print("etc/sudoers.d/{s}", .{username});
     defer allocator.free(sudoers_path);
     _ = try tree.remove(sudoers_path);
 }
@@ -754,7 +754,7 @@ fn joinComma(allocator: Allocator, members: []const []const u8) ![]u8 {
 }
 
 fn defaultHomePath(allocator: Allocator, username: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "/home/{s}", .{username});
+    return allocator.print("/home/{s}", .{username});
 }
 
 fn authorizedKeysContent(allocator: Allocator, keys: []const []const u8) ![]u8 {

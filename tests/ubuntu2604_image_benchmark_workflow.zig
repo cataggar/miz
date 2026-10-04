@@ -223,6 +223,21 @@ test "permissions and actions are minimal and pinned" {
     }
 }
 
+test "the compiler is exact and extracted packages survive staging cleanup" {
+    const allocator = std.testing.allocator;
+    const source = try workflowSource(allocator, std.testing.io);
+    defer allocator.free(source);
+
+    try expectContains(source, "cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U");
+    try expectContains(source, "test \"$(zig version)\" = 0.17.0");
+    try expectExcludes(source, "cataggar/zig@v0.16.0");
+    try std.testing.expectEqual(@as(usize, 2), count(source, "export ZIG_LOCAL_PKG_DIR=\"$ZIG_GLOBAL_CACHE_DIR/zig-pkg\""));
+    try expectContains(source, "export ZIG_GLOBAL_CACHE_DIR=\"$INPUT_ROOT/zig-global-cache\"");
+    try expectContains(source, "bash scripts/zig_fetch_retry.sh\n");
+    try expectExcludes(source, "--global-cache-dir");
+    try expectExcludes(source, "ZIG_LOCAL_PKG_DIR=\"$STAGING_ROOT/");
+}
+
 test "staging uses the production builder and verified exact inputs" {
     const allocator = std.testing.allocator;
     const source = try workflowSource(allocator, std.testing.io);
@@ -230,7 +245,7 @@ test "staging uses the production builder and verified exact inputs" {
     const stage = try section(source, staging_step, measured_step);
 
     try expectContains(stage, "generalized-ubuntu2604 --");
-    try expectContains(stage, "-Doptimize=ReleaseSafe");
+    try expectContains(stage, "-Doptimize=safe");
     try expectContains(stage, "-Dubuntu2604-arch=aarch64");
     try expectContains(stage, "-Dubuntu2604-flavor=baremetal");
     try expectContains(stage, "--debz-cache \"$cache\"");

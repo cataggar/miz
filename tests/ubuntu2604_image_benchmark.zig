@@ -135,7 +135,25 @@ fn expectExcludes(haystack: []const u8, needle: []const u8) !void {
     }
 }
 
-const digest_a = "a" ** 64;
+test "benchmark compiler validation rejects other releases and failed probes" {
+    var context: benchmark.Context = .init(std.testing.allocator);
+    defer context.deinit();
+    try benchmark.validateZigVersion("0.17.0", 0, &context);
+    for ([_][]const u8{ "", "0.16.0", "0.17.1", "0.17.0-dev.1", "0.18.0" }) |version| {
+        try expectFailure(benchmark.validateZigVersion(version, 0, &context));
+        try expectContains(context.message(), "requires exactly Zig 0.17.0");
+    }
+    try expectFailure(benchmark.validateZigVersion("0.17.0", 1, &context));
+}
+
+const digest_a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const digest_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const digest_c = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const digest_d = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const digest_e = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const digest_f = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+const digest_zero = "0000000000000000000000000000000000000000000000000000000000000000";
+const commit_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 fn hexDigest(allocator: Allocator, bytes: []const u8) ![]const u8 {
     var raw: [32]u8 = undefined;
@@ -419,7 +437,7 @@ test "the benchmark command fixes the profile and its offline inputs" {
     );
 
     const required = [_][]const u8{
-        "-Doptimize=ReleaseSafe",
+        "-Doptimize=safe",
         "-Dubuntu2604-arch=aarch64",
         "-Dubuntu2604-flavor=baremetal",
         "--debz-lock-dir",
@@ -647,7 +665,7 @@ test "a cache manifest reports its missing metadata object" {
         fixture.allocator(),
         contents,
         cache.metadata_digest,
-        "f" ** 64,
+        digest_f,
     );
     try Dir.cwd().writeFile(fixture.io, .{ .sub_path = manifest, .data = replaced });
     try expectFailure(benchmark.verifyWarmCache(
@@ -739,7 +757,7 @@ test "the lock set fails closed on a cache miss" {
         allocator,
         contents,
         cache.package_digest,
-        "f" ** 64,
+        digest_f,
     );
     try Dir.cwd().writeFile(fixture.io, .{ .sub_path = target, .data = mutated });
     try expectFailure(benchmark.verifyLockSet(
@@ -913,8 +931,8 @@ test "correctness diagnostics report all safe field paths" {
     const message = fixture.message();
     try expectContains(message, "$.acceptance.command");
     try expectContains(message, "$.profile.source_sha256");
-    try expectContains(message, "a" ** 64);
-    try expectContains(message, "b" ** 64);
+    try expectContains(message, digest_a);
+    try expectContains(message, digest_b);
     try expectContains(message, "<absolute-path sha256=");
     try expectExcludes(message, "/private/");
 }
@@ -923,8 +941,8 @@ test "transaction correctness uses a semantic identity" {
     var fixture = try Fixture.create();
     defer fixture.deinit();
     const allocator = fixture.allocator();
-    const lock_digest = "b" ** 64;
-    const transaction_digests = [_][]const u8{ "a" ** 64, "c" ** 64 };
+    const lock_digest = digest_b;
+    const transaction_digests = [_][]const u8{ digest_a, digest_c };
     const run_names = [_][]const u8{ "run-warmup", "run-measured-01" };
     var contracts: [2]Value = undefined;
     var files: [2]Value = undefined;
@@ -1012,14 +1030,14 @@ test "transaction correctness uses a semantic identity" {
             files[0].object.get("file_sha256").?.string,
             transaction_digests[0],
         })),
-        "e" ** 64,
+        digest_e,
         benchmark.package_roots[0],
         &fixture.context,
     ));
 
     const mutations = [_][2][]const u8{
-        .{ "semantic_digest_sha256", "c" ** 64 },
-        .{ "lock_sha256", "d" ** 64 },
+        .{ "semantic_digest_sha256", digest_c },
+        .{ "lock_sha256", digest_d },
     };
     for (mutations) |mutation| {
         var mutated = std.json.ObjectMap.empty;
@@ -1097,24 +1115,24 @@ test "correctness rejects each semantic contract change" {
     ;
     const mutations = [_][2][]const u8{
         .{
-            "\"source_sha256\": \"" ++ "a" ** 64 ++ "\"",
-            "\"source_sha256\": \"" ++ "f" ** 64 ++ "\"",
+            "\"source_sha256\": \"" ++ digest_a ++ "\"",
+            "\"source_sha256\": \"" ++ digest_f ++ "\"",
         },
         .{
-            "\"closure_sha256\": \"" ++ "b" ** 64 ++ "\"",
-            "\"closure_sha256\": \"" ++ "f" ** 64 ++ "\"",
+            "\"closure_sha256\": \"" ++ digest_b ++ "\"",
+            "\"closure_sha256\": \"" ++ digest_f ++ "\"",
         },
         .{
-            "\"semantic_digest_sha256\": \"" ++ "c" ** 64 ++ "\"",
-            "\"semantic_digest_sha256\": \"" ++ "f" ** 64 ++ "\"",
+            "\"semantic_digest_sha256\": \"" ++ digest_c ++ "\"",
+            "\"semantic_digest_sha256\": \"" ++ digest_f ++ "\"",
         },
         .{
-            "\"lock_sha256\": \"" ++ "d" ** 64 ++ "\"",
-            "\"lock_sha256\": \"" ++ "f" ** 64 ++ "\"",
+            "\"lock_sha256\": \"" ++ digest_d ++ "\"",
+            "\"lock_sha256\": \"" ++ digest_f ++ "\"",
         },
         .{
-            "\"certificate_sha256\": \"" ++ "e" ** 64 ++ "\"",
-            "\"certificate_sha256\": \"" ++ "f" ** 64 ++ "\"",
+            "\"certificate_sha256\": \"" ++ digest_e ++ "\"",
+            "\"certificate_sha256\": \"" ++ digest_f ++ "\"",
         },
         .{ "\"compression_type\": \"zstd\"", "\"compression_type\": \"none\"" },
         .{
@@ -1167,8 +1185,8 @@ fn summaryRun(
             .block_outputs = 5,
             .io_bytes_source = "linux-proc-descendant-sampling",
         },
-        .correctness_sha256 = "a" ** 64,
-        .image_sha256 = "0" ** 64,
+        .correctness_sha256 = digest_a,
+        .image_sha256 = digest_zero,
         .image_bytes = 1,
         .raw_output = .{
             .bytes = benchmark.virtual_size,
@@ -1192,14 +1210,14 @@ test "summary generation uses three measured medians" {
     const summary = try benchmark.buildSummary(
         allocator,
         &runs,
-        "b" ** 40,
+        commit_b,
         try fixture.parse(
             \\{"machine": "aarch64"}
         ),
         try fixture.parse(
             \\{"inventory_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
         ),
-        "d" ** 64,
+        digest_d,
         try fixture.parse("[]"),
         &fixture.context,
     );
@@ -1240,7 +1258,7 @@ fn hostDocumentFromDeepFrame(allocator: Allocator, depth: usize) !Value {
     setUtsField(&uts.sysname, "Linux");
     setUtsField(&uts.release, "6.14.0-1234-benchmark");
     setUtsField(&uts.machine, "aarch64");
-    return benchmark.hostDocument(allocator, &uts, "0.16.0", 8);
+    return benchmark.hostDocument(allocator, &uts, "0.17.0", 8);
 }
 
 /// Overwrites the stack region the frames above used, so a document that had
@@ -1267,7 +1285,7 @@ test "the recorded host identity outlives the utsname it was read from" {
         .{ "system", "Linux" },
         .{ "kernel", "6.14.0-1234-benchmark" },
         .{ "machine", "aarch64" },
-        .{ "zig", "0.16.0" },
+        .{ "zig", "0.17.0" },
     };
     for (fields) |field| {
         const value = document.object.get(field[0]) orelse return error.TestMissingField;
@@ -1286,10 +1304,10 @@ test "the recorded host identity outlives the utsname it was read from" {
             try summaryRun(allocator, "run-2", "measured", 10, 10),
             try summaryRun(allocator, "run-3", "measured", 20, 20),
         },
-        "b" ** 40,
+        commit_b,
         document,
         try fixture.parse("{}"),
-        "d" ** 64,
+        digest_d,
         try fixture.parse("[]"),
         &fixture.context,
     );
@@ -1313,10 +1331,10 @@ test "a summary requires exactly three measured runs" {
     try expectFailure(benchmark.buildSummary(
         allocator,
         &runs,
-        "b" ** 40,
+        commit_b,
         try fixture.parse("{}"),
         try fixture.parse("{}"),
-        "d" ** 64,
+        digest_d,
         try fixture.parse("[]"),
         &fixture.context,
     ));
@@ -1446,7 +1464,7 @@ test "the non-regression gate passes, fails, and records missing evidence" {
         \\{{"status": "valid", "source_commit": "{s}",
         \\  "medians": {{"phase_elapsed_ns": {{"total_runtime": 520000000000,
         \\               "raw_image_materialization": 42000000000}}}}}}
-    , .{"b" ** 40}));
+    , .{commit_b}));
     try std.testing.expect(try benchmark.runGate(
         allocator,
         fixture.io,
@@ -1466,7 +1484,7 @@ test "the non-regression gate passes, fails, and records missing evidence" {
         \\{{"status": "valid", "source_commit": "{s}",
         \\  "medians": {{"phase_elapsed_ns": {{"total_runtime": 530000000001,
         \\               "raw_image_materialization": 42000000000}}}}}}
-    , .{"b" ** 40}));
+    , .{commit_b}));
     try std.testing.expect(!try benchmark.runGate(
         allocator,
         fixture.io,
@@ -1485,11 +1503,11 @@ test "the evidence scan fails closed on a candidate it cannot read" {
     const evidence_root = try fixture.mkdir(&.{"evidence"});
     const benchmark_root = try fixture.mkdir(&.{"benchmark"});
     const unreadable = try fixture.write(&.{ "evidence", "sealed.log" }, "sealed\n");
-    try Dir.cwd().setFilePermissions(fixture.io, unreadable, @enumFromInt(0o000), .{});
+    try Dir.cwd().setFilePermissions(fixture.io, unreadable, @fromBackingInt(@intCast(0o000)), .{});
     defer Dir.cwd().setFilePermissions(
         fixture.io,
         unreadable,
-        @enumFromInt(0o600),
+        @fromBackingInt(@intCast(0o600)),
         .{},
     ) catch {};
 

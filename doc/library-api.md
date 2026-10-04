@@ -1,5 +1,18 @@
 # Library API
 
+## Windows stack reservation
+
+`miz.Image` keeps bounded QCOW2 path records inline to remain allocation-free.
+Windows permits substantially larger path buffers than Unix, so image
+operations need more stack than the default PE executable reserve. The
+Windows CLI and host image tools reserve 128 MiB; unoptimized image-open
+call chains use about 98 MiB of stack with Windows-sized path records.
+Windows library consumers using `miz.Image` should likewise set
+`exe.stack_size = 128 * 1024 * 1024` in their Zig build
+and provide the same reservation for worker threads that perform image
+operations. This is virtual address-space reservation, not an eager 128 MiB
+allocation, and does not reduce supported path lengths.
+
 ## Package a standalone UEFI application
 
 `miz.efi_application_image.build` creates an ESP-only GPT disk without
@@ -431,7 +444,7 @@ pub fn build(b: *std.Build) void {
 }
 ```
 
-Use `.container = .{ .archive = ... }` for a docker/podman save tarball. OCI layout directories are validated and snapshotted into the Zig build cache so adding, removing, or changing a blob invalidates the image step. Layouts containing symlinks or special files are rejected because Zig 0.16's cached directory-copy step cannot preserve them. The helper runs the dedicated `miz-image-builder` artifact for the build host even when the consuming project targets another architecture.
+Use `.container = .{ .archive = ... }` for a docker/podman save tarball. OCI layout directories are validated and snapshotted into the Zig build cache so adding, removing, or changing a blob invalidates the image step. Layouts containing symlinks or special files are rejected because the cached directory-copy step cannot preserve them. The helper runs the dedicated `miz-image-builder` artifact for the build host even when the consuming project targets another architecture.
 
 To acquire a registry image as a tracked OCI layout, construct a digest-pinned pull and pass its output directly to `addImage`:
 

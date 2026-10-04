@@ -632,13 +632,13 @@ const ScratchPaths = struct {
     metadata: []const u8,
 
     fn init(allocator: Allocator, scratch_path: []const u8, index: usize) Error!ScratchPaths {
-        const unsigned = try std.fmt.allocPrint(allocator, "{s}/unsigned-{d}.efi", .{ scratch_path, index });
+        const unsigned = try allocator.print("{s}/unsigned-{d}.efi", .{ scratch_path, index });
         errdefer allocator.free(unsigned);
-        const signed = try std.fmt.allocPrint(allocator, "{s}/signed-{d}.efi", .{ scratch_path, index });
+        const signed = try allocator.print("{s}/signed-{d}.efi", .{ scratch_path, index });
         errdefer allocator.free(signed);
-        const certificate = try std.fmt.allocPrint(allocator, "{s}/certificate-{d}.pem", .{ scratch_path, index });
+        const certificate = try allocator.print("{s}/certificate-{d}.pem", .{ scratch_path, index });
         errdefer allocator.free(certificate);
-        const metadata = try std.fmt.allocPrint(allocator, "{s}/metadata-{d}.json", .{ scratch_path, index });
+        const metadata = try allocator.print("{s}/metadata-{d}.json", .{ scratch_path, index });
         return .{
             .unsigned = unsigned,
             .signed = signed,
@@ -854,7 +854,7 @@ fn signForTest(
 ) ![]u8 {
     var prepared = try authenticode.prepareRsaSha256Alloc(allocator, unsigned);
     defer prepared.deinit(allocator);
-    const signature = [_]u8{0x5a} ** 256;
+    const signature = @as([256]u8, @splat(0x5a));
     return authenticode.finishRsaSha256Alloc(
         allocator,
         prepared,
@@ -944,23 +944,21 @@ fn writeTestProvider(
     name: []const u8,
     body: []const u8,
 ) ![]u8 {
-    const script = try std.fmt.allocPrint(allocator, "#!/bin/sh\nset -e\n{s}", .{body});
+    const script = try allocator.print("#!/bin/sh\nset -e\n{s}", .{body});
     defer allocator.free(script);
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = name,
         .data = script,
         .flags = .{ .truncate = true, .permissions = .fromMode(0o700) },
     });
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "./.zig-cache/tmp/{s}/{s}",
         .{ tmp.sub_path, name },
     );
 }
 
 fn testScratchPath(allocator: Allocator, tmp: *const std.testing.TmpDir) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         ".zig-cache/tmp/{s}/scratch",
         .{tmp.sub_path},
     );
@@ -991,9 +989,9 @@ test "an external provider is run over the declared protocol and its result reco
 
     // The provider records the environment it was handed before producing a
     // result, so the test can check the protocol rather than assume it.
-    const tmp_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const tmp_path = try allocator.print(".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer allocator.free(tmp_path);
-    const body = try std.fmt.allocPrint(allocator,
+    const body = try allocator.print(
         \\{{
         \\  echo "unsigned=$MIZ_UKI_UNSIGNED"
         \\  echo "signed=$MIZ_UKI_SIGNED"

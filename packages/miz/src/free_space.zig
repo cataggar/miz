@@ -32,7 +32,7 @@ const LinuxStatfs = extern struct {
 /// Bytes available to an unprivileged writer under `path`, or null when the
 /// host offers no way to ask.
 pub fn availableBytes(path: []const u8) ?u64 {
-    if (builtin.os.tag != .linux or @sizeOf(usize) != 8) return null;
+    if (builtin.target.os.tag != .linux or @sizeOf(usize) != 8) return null;
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     if (path.len >= path_buffer.len) return null;
     @memcpy(path_buffer[0..path.len], path);
@@ -52,7 +52,7 @@ pub fn availableBytes(path: []const u8) ?u64 {
 /// Logical and physically allocated bytes for `path`, or null when the host
 /// cannot report both values. Linux reports allocation in 512-byte blocks.
 pub fn fileUsage(path: []const u8) ?FileUsage {
-    if (builtin.os.tag != .linux) return null;
+    if (builtin.target.os.tag != .linux) return null;
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     if (path.len >= path_buffer.len) return null;
     @memcpy(path_buffer[0..path.len], path);
@@ -74,7 +74,7 @@ pub fn fileUsage(path: []const u8) ?FileUsage {
 }
 
 test "free space is reported for an existing directory on Linux" {
-    if (builtin.os.tag != .linux or @sizeOf(usize) != 8) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux or @sizeOf(usize) != 8) return error.SkipZigTest;
     try std.testing.expect(availableBytes(".") != null);
 }
 

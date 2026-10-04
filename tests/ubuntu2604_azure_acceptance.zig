@@ -853,8 +853,7 @@ fn runWithStdin(
     defer tmp.cleanup();
     const root = try source.rootAlloc(allocator);
     defer allocator.free(root);
-    const stdin_path = try std.fmt.allocPrint(
-        allocator,
+    const stdin_path = try allocator.print(
         "{s}/.zig-cache/tmp/{s}/stdin",
         .{ root, tmp.sub_path },
     );
@@ -866,16 +865,14 @@ fn runWithStdin(
 
     const tool = try toolPath(allocator);
     defer allocator.free(tool);
-    const script = try std.fmt.allocPrint(
-        allocator,
+    const script = try allocator.print(
         "\"$TOOL\" {s} <\"$STDIN\"",
         .{command},
     );
     defer allocator.free(script);
-    const tool_variable = try std.fmt.allocPrint(allocator, "TOOL={s}", .{tool});
+    const tool_variable = try allocator.print("TOOL={s}", .{tool});
     defer allocator.free(tool_variable);
-    const stdin_variable = try std.fmt.allocPrint(
-        allocator,
+    const stdin_variable = try allocator.print(
         "STDIN={s}",
         .{stdin_path},
     );
@@ -897,13 +894,12 @@ const Harness = struct {
         const tmp = std.testing.tmpDir(.{});
         const repository = try source.rootAlloc(std.testing.allocator);
         defer std.testing.allocator.free(repository);
-        const root = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const root = try std.testing.allocator.print(
             "{s}/.zig-cache/tmp/{s}",
             .{ repository, tmp.sub_path },
         );
         errdefer std.testing.allocator.free(root);
-        const bin = try std.fmt.allocPrint(std.testing.allocator, "{s}/bin", .{root});
+        const bin = try std.testing.allocator.print("{s}/bin", .{root});
         defer std.testing.allocator.free(bin);
         try Dir.cwd().createDirPath(std.testing.io, bin);
         return .{ .tmp = tmp, .root = root };
@@ -975,28 +971,24 @@ const Harness = struct {
         ) catch try std.testing.allocator.dupe(u8, "/usr/bin:/bin");
         defer std.testing.allocator.free(existing_path);
 
-        const path_variable = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const path_variable = try std.testing.allocator.print(
             "PATH={s}/bin:{s}",
             .{ self.root, existing_path },
         );
         defer std.testing.allocator.free(path_variable);
-        const state_variable = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const state_variable = try std.testing.allocator.print(
             "STATE_FILE={s}/state",
             .{self.root},
         );
         defer std.testing.allocator.free(state_variable);
-        const key_variable = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const key_variable = try std.testing.allocator.print(
             "CANDIDATE_KEY={s}",
             .{key},
         );
         defer std.testing.allocator.free(key_variable);
         const tool = try source.releaseToolAlloc(std.testing.allocator);
         defer std.testing.allocator.free(tool);
-        const tool_variable = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const tool_variable = try std.testing.allocator.print(
             "UBUNTU2604_RELEASE_TOOL={s}",
             .{tool},
         );
@@ -1029,14 +1021,12 @@ const Harness = struct {
             &.{ repository, library_path },
         );
         defer std.testing.allocator.free(library);
-        const script = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const script = try std.testing.allocator.print(
             "source \"$ACCEPTANCE_LIBRARY\"; {s}",
             .{command},
         );
         defer std.testing.allocator.free(script);
-        const variable = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const variable = try std.testing.allocator.print(
             "ACCEPTANCE_LIBRARY={s}",
             .{library},
         );
@@ -1067,8 +1057,7 @@ fn stageReportAlloc(
 ) ![]u8 {
     const root = try source.rootAlloc(allocator);
     defer allocator.free(root);
-    const path = try std.fmt.allocPrint(
-        allocator,
+    const path = try allocator.print(
         "{s}/.zig-cache/tmp/{s}/uefi-variables.txt",
         .{ root, tmp.sub_path },
     );
@@ -1134,8 +1123,7 @@ fn dbReportAlloc(
     hex: []const u8,
     bytes: usize,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "efivar name={s} status=ok mount=probe mount_point=/run/miz-efivars " ++
             "filesystem={s} attributes={s} bytes={d} data={s}\n" ++
             "efivar name=SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c status=ok " ++
@@ -1183,7 +1171,7 @@ test "azure-uefi-db accepts a probe report carrying the enrolled certificate" {
         "--report",
         path,
         "--certificate-sha256",
-        "0" ** 64,
+        &@as([64:0]u8, @splat('0')),
     });
     defer rejected.deinit(allocator);
     try std.testing.expect(!rejected.succeeded());

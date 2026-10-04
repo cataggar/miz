@@ -365,7 +365,7 @@ fn shellStatus(term: std.process.Child.Term) ?u8 {
         .signal => |signal| std.math.add(
             u8,
             128,
-            @intCast(@intFromEnum(signal)),
+            @intCast(@backingInt(signal)),
         ) catch null,
         else => null,
     };
@@ -491,10 +491,9 @@ fn runSshCommandAlloc(
     operation: SshOperation,
     command: []const u8,
 ) !SshCommandResult {
-    const port_text = try std.fmt.allocPrint(allocator, "{d}", .{port});
+    const port_text = try allocator.print("{d}", .{port});
     defer allocator.free(port_text);
-    const timeout_text = try std.fmt.allocPrint(
-        allocator,
+    const timeout_text = try allocator.print(
         "{d}s",
         .{operation.timeoutSeconds()},
     );
@@ -567,11 +566,11 @@ fn sshFailureDiagnosticAlloc(
         ),
         .signal => |signal| try output.writer.print(
             "FreeBSD acceptance {s} ended by signal {d}\n",
-            .{ result.operation.description(), @intFromEnum(signal) },
+            .{ result.operation.description(), @backingInt(signal) },
         ),
         .stopped => |signal| try output.writer.print(
             "FreeBSD acceptance {s} stopped by signal {d}\n",
-            .{ result.operation.description(), @intFromEnum(signal) },
+            .{ result.operation.description(), @backingInt(signal) },
         ),
         .unknown => |status| try output.writer.print(
             "FreeBSD acceptance {s} ended with unknown status {d}\n",
@@ -968,8 +967,7 @@ fn updateRemoteChecksAlloc(
         },
         flavor,
     );
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "set -eu\n" ++
             "package_state_before=$(/usr/local/sbin/pkg query -a '%n %v %a' | " ++
             "/usr/bin/sort | /sbin/sha256 -q)\n" ++
@@ -992,8 +990,7 @@ fn updateRemoteChecksAlloc(
 /// without changing the shipped package set. No assertion requires an update
 /// to exist; the lifecycle only requires the current catalogue to be usable.
 fn packageLifecycleRemoteChecksAlloc(allocator: Allocator) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "set -eu\n" ++
             "! /usr/local/sbin/pkg info -e {s}\n" ++
             "/usr/local/sbin/pkg rquery '%n-%v' {s} >/dev/null\n" ++
@@ -1028,8 +1025,7 @@ fn staticRemoteChecksAlloc(
         .ufs => ufs_remote_checks,
         .zfs => zfs_remote_checks,
     };
-    const minimum = try std.fmt.allocPrint(
-        allocator,
+    const minimum = try allocator.print(
         "{d}",
         .{minimum_grown_root_bytes},
     );
@@ -1047,8 +1043,7 @@ fn staticRemoteChecksAlloc(
         flavor,
     );
     defer allocator.free(contract);
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}\n{s}\n{s}",
         .{ shared_remote_checks, rendered, contract },
     );
@@ -1073,8 +1068,7 @@ fn identityCommandAlloc(
 ) ![]u8 {
     return switch (root_filesystem) {
         .ufs => allocator.dupe(u8, shared_identity_command),
-        .zfs => std.fmt.allocPrint(
-            allocator,
+        .zfs => allocator.print(
             "{s}\n{s}",
             .{ shared_identity_command, zfs_identity_command },
         ),
@@ -1298,8 +1292,7 @@ test "static remote checks enforce each filesystem and flavor contract" {
                 flavor,
             );
             for (manifest.required) |package| {
-                const line = try std.fmt.allocPrint(
-                    allocator,
+                const line = try allocator.print(
                     "\n/usr/local/sbin/pkg info -e {s}\n",
                     .{package.name},
                 );
@@ -1321,8 +1314,7 @@ test "static remote checks enforce each filesystem and flavor contract" {
     const core = try staticRemoteChecksAlloc(allocator, .zfs, .core);
     defer allocator.free(core);
     for (packages.core_excluded_packages) |excluded| {
-        const line = try std.fmt.allocPrint(
-            allocator,
+        const line = try allocator.print(
             "! /usr/local/sbin/pkg info -e {s}\n",
             .{excluded},
         );
@@ -1331,8 +1323,7 @@ test "static remote checks enforce each filesystem and flavor contract" {
         try std.testing.expect(std.mem.indexOf(u8, full, line) == null);
     }
     for (packages.library_roots) |library| {
-        const line = try std.fmt.allocPrint(
-            allocator,
+        const line = try allocator.print(
             "/usr/local/sbin/pkg info -e {s}\n",
             .{library},
         );
@@ -1477,8 +1468,7 @@ test "timeout wrapper distinguishes completion, expiry, and SIGKILL escalation" 
     try std.testing.expectEqual(@as(?u8, 0), completed.timeout_evidence.completed_status);
 
     for ([_]u8{ 124, 137 }) |child_status| {
-        const command = try std.fmt.allocPrint(
-            allocator,
+        const command = try allocator.print(
             "exit {d}",
             .{child_status},
         );
@@ -1590,8 +1580,7 @@ test "timeout escalation reaches a grandchild that ignores SIGTERM" {
     // The workload leads its own process group, so its pid names the group that escalation has to
     // clear. Signalling only the direct child leaves the backgrounded grandchild holding the
     // captured pipes, which is what wedges a run instead of failing it.
-    const command = try std.fmt.allocPrint(
-        allocator,
+    const command = try allocator.print(
         "printf '%s\\n' \"$$\" > '{s}'; " ++
             "/bin/bash -c \"trap '' TERM; while :; do /bin/sleep 1; done\" & " ++
             "trap '' TERM; while :; do /bin/sleep 1; done",
@@ -1635,8 +1624,7 @@ test "timeout wrapper cleans up descendants after successful leader exit" {
     );
     defer allocator.free(group_path);
 
-    const command = try std.fmt.allocPrint(
-        allocator,
+    const command = try allocator.print(
         "printf '%s\\n' \"$$\" > '{s}'; " ++
             "/bin/bash -c \"trap '' TERM; exec >/dev/null 2>&1; " ++
             "while :; do /bin/sleep 1; done\" &",
@@ -1670,7 +1658,7 @@ fn expectProcessGroupGone(io: Io, group_id: std.posix.pid_t) !void {
     // Signal 0 runs the permission and existence check without delivering anything, which is how
     // POSIX asks whether a process group still has members. The signal enum is non-exhaustive
     // because it carries no name for a signal that is never delivered.
-    const existence_probe: std.posix.SIG = @enumFromInt(0);
+    const existence_probe: std.posix.SIG = @fromBackingInt(@intCast(0));
     var attempt: usize = 0;
     while (attempt < 200) : (attempt += 1) {
         std.posix.kill(-group_id, existence_probe) catch |err| switch (err) {
@@ -1701,7 +1689,7 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
     const architecture = try architectureFromEnvironment(allocator);
     const root_filesystem = try rootFilesystemFromEnvironment(allocator);
     const flavor = try flavorFromEnvironment(allocator);
-    if (builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .linux) {
         std.debug.print(
             "skipping FreeBSD {s} {s} {s} boot acceptance: QEMU is Linux-only\n",
             .{
@@ -1812,8 +1800,7 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             &.{ temporary_path, "id_ed25519" },
         );
         defer allocator.free(private_key_path);
-        const public_key_path = try std.fmt.allocPrint(
-            allocator,
+        const public_key_path = try allocator.print(
             "{s}.pub",
             .{private_key_path},
         );
@@ -1828,8 +1815,7 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
         // Create the overlay larger than its backing image so first-boot
         // growth has somewhere to expand into. This proves the release image
         // grows on a bigger disk without ever rewriting the release asset.
-        const expanded_size_text = try std.fmt.allocPrint(
-            allocator,
+        const expanded_size_text = try allocator.print(
             "{d}",
             .{expanded_virtual_size},
         );
@@ -1872,28 +1858,24 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
         var nonce_bytes: [16]u8 = undefined;
         Io.random(io, &nonce_bytes);
         const nonce = std.fmt.bytesToHex(nonce_bytes, .lower);
-        const ready_marker = try std.fmt.allocPrint(
-            allocator,
+        const ready_marker = try allocator.print(
             "MIZ_FREEBSD_ACCEPTANCE_READY {s}",
             .{&nonce},
         );
         defer allocator.free(ready_marker);
-        const failure_marker = try std.fmt.allocPrint(
-            allocator,
+        const failure_marker = try allocator.print(
             "MIZ_FREEBSD_ACCEPTANCE_FAILED {s}",
             .{&nonce},
         );
         defer allocator.free(failure_marker);
 
-        const metadata = try std.fmt.allocPrint(
-            allocator,
+        const metadata = try allocator.print(
             "instance-id: miz-acceptance-{s}\n" ++
                 "local-hostname: miz-acceptance\n",
             .{&nonce},
         );
         defer allocator.free(metadata);
-        const user_data = try std.fmt.allocPrint(
-            allocator,
+        const user_data = try allocator.print(
             \\#cloud-config
             \\hostname: miz-acceptance
             \\ssh_pwauth: false
@@ -1945,38 +1927,32 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
         Io.random(io, &port_bytes);
         const port: u16 = 20_000 +
             (@as(u16, port_bytes[0]) << 8 | port_bytes[1]) % 20_000;
-        const hostfwd = try std.fmt.allocPrint(
-            allocator,
+        const hostfwd = try allocator.print(
             "user,id=net0,hostfwd=tcp:127.0.0.1:{d}-:22",
             .{port},
         );
         defer allocator.free(hostfwd);
-        const serial_arg = try std.fmt.allocPrint(
-            allocator,
+        const serial_arg = try allocator.print(
             "file:{s}",
             .{serial_path},
         );
         defer allocator.free(serial_arg);
-        const code_drive = try std.fmt.allocPrint(
-            allocator,
+        const code_drive = try allocator.print(
             "if=pflash,format=raw,readonly=on,file={s}",
             .{firmware.code_path},
         );
         defer allocator.free(code_drive);
-        const vars_drive = try std.fmt.allocPrint(
-            allocator,
+        const vars_drive = try allocator.print(
             "if=pflash,format=raw,file={s}",
             .{vars_path},
         );
         defer allocator.free(vars_drive);
-        const image_drive = try std.fmt.allocPrint(
-            allocator,
+        const image_drive = try allocator.print(
             "file={s},format=qcow2,if=virtio",
             .{overlay_path},
         );
         defer allocator.free(image_drive);
-        const seed_drive = try std.fmt.allocPrint(
-            allocator,
+        const seed_drive = try allocator.print(
             "file={s},format=raw,if=virtio,readonly=on",
             .{seed_path},
         );

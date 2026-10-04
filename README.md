@@ -1,6 +1,6 @@
 # miz
 
-A Zig 0.16 library and CLI for reading, writing, converting, and building disk
+A Zig 0.17 library and CLI for reading, writing, converting, and building disk
 images for bare-metal systems and virtual machines, including raw, VHD/VPC,
 VHDX, and qcow2 formats. It also provides filesystem, boot configuration,
 image customization, QEMU, and cloud-ready image workflows.
@@ -14,7 +14,9 @@ ghr install cataggar/miz
 ```
 
 The only executable in release archives is the `miz` CLI. Build from source
-to use the library or the repository's other tools.
+with Zig **0.17.0** to use the library or the repository's other tools; the
+default optimization mode is `.safe`. Source-built target OS floors, including
+guest targets, are Linux 5.10+, macOS 15+, Windows 10+, and FreeBSD 14+.
 
 The current naming is a hard cutover with no compatibility aliases or
 fallbacks. See [Migration and breaking changes](doc/migration.md).

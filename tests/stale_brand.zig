@@ -128,7 +128,7 @@ pub const Report = struct {
     }
 
     fn add(self: *Report, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
-        const text = try std.fmt.allocPrint(self.allocator, fmt, args);
+        const text = try self.allocator.print(fmt, args);
         errdefer self.allocator.free(text);
         try self.violations.append(self.allocator, text);
     }
@@ -444,7 +444,7 @@ fn buildPemCertificate(allocator: Allocator, der: []const u8) ![]u8 {
     const encoded = try allocator.alloc(u8, encoder.calcSize(der.len));
     defer allocator.free(encoded);
     const body = encoder.encode(encoded, der);
-    return std.fmt.allocPrint(allocator, "{s}\n{s}\n{s}\n", .{ pem_begin, body, pem_end });
+    return allocator.print("{s}\n{s}\n{s}\n", .{ pem_begin, body, pem_end });
 }
 
 fn expectSingleViolation(report: *const Report, expected: []const u8) !void {
@@ -479,10 +479,9 @@ test "a legacy brand in a tracked path is matched case-insensitively" {
     defer report.deinit();
     var storage: [legacy_brands[1].len]u8 = undefined;
     const upper = std.ascii.upperString(&storage, legacy_brands[1]);
-    const path = try std.fmt.allocPrint(testing.allocator, "doc/{s}.md", .{upper});
+    const path = try testing.allocator.print("doc/{s}.md", .{upper});
     defer testing.allocator.free(path);
-    const expected = try std.fmt.allocPrint(
-        testing.allocator,
+    const expected = try testing.allocator.print(
         "{s}: legacy brand in tracked path",
         .{path},
     );
@@ -518,7 +517,7 @@ test "legacy branding in tracked content is matched case-insensitively" {
     defer report.deinit();
     var storage: [legacy_brands[0].len]u8 = undefined;
     const upper = std.ascii.upperString(&storage, legacy_brands[0]);
-    const contents = try std.fmt.allocPrint(testing.allocator, "release {s}\n", .{upper});
+    const contents = try testing.allocator.print("release {s}\n", .{upper});
     defer testing.allocator.free(contents);
     try checkTrackedContents(&report, "doc/readme.md", contents);
     try expectSingleViolation(&report, "doc/readme.md:1: legacy brand in tracked content");
@@ -580,7 +579,7 @@ test "certificate metadata is scanned case-insensitively" {
 
     var storage: [legacy_brands[0].len]u8 = undefined;
     const upper = std.ascii.upperString(&storage, legacy_brands[0]);
-    const der = try std.fmt.allocPrint(testing.allocator, "\x30\x82{s}\x00", .{upper});
+    const der = try testing.allocator.print("\x30\x82{s}\x00", .{upper});
     defer testing.allocator.free(der);
 
     const pem = try buildPemCertificate(testing.allocator, der);
@@ -641,8 +640,7 @@ test "every certificate block in a file is parsed" {
     );
     defer testing.allocator.free(branded);
 
-    const bundle = try std.fmt.allocPrint(
-        testing.allocator,
+    const bundle = try testing.allocator.print(
         "# leading comment\n{s}\n{s}",
         .{ clean, branded },
     );
@@ -713,8 +711,7 @@ test "an undecodable certificate does not stop the ones after it" {
         "\x30\x82" ++ comptime encodeBrand(legacy_brands[0], .utf32_be),
     );
     defer testing.allocator.free(branded);
-    const bundle = try std.fmt.allocPrint(
-        testing.allocator,
+    const bundle = try testing.allocator.print(
         "{s}\n{s}",
         .{ pem_begin ++ "\nnot-a-real-certificate\n" ++ pem_end, branded },
     );

@@ -19,7 +19,7 @@ pub const Architecture = enum {
     aarch64,
 
     pub fn host() Architecture {
-        return switch (builtin.cpu.arch) {
+        return switch (builtin.target.cpu.arch) {
             .x86_64 => .x86_64,
             .aarch64 => .aarch64,
             else => .x86_64,
@@ -162,7 +162,7 @@ pub const Executor = struct {
         if (options.network != .disabled) return error.NetworkPolicyViolation;
         if (options.devices != .minimal) return error.DevicePolicyViolation;
         if (options.require_privileged_namespace and
-            (builtin.os.tag != .linux or std.os.linux.geteuid() != 0))
+            (builtin.target.os.tag != .linux or std.os.linux.geteuid() != 0))
         {
             return error.PrivilegedNamespaceRequired;
         }
@@ -280,7 +280,7 @@ pub const Executor = struct {
         guest_argv: []const []const u8,
         timeout_ms: u64,
     ) !CommandResult {
-        if (builtin.os.tag != .linux) return error.UnsupportedHost;
+        if (builtin.target.os.tag != .linux) return error.UnsupportedHost;
         const host_timeout_ms = self.options.supervisor_timeout_ms_override orelse
             (std.math.add(u64, timeout_ms, cleanup_timeout_ms) catch return error.TimeoutOutOfRange);
         // Resolve the supervisor deadline before allocating any descriptor so a
@@ -311,14 +311,12 @@ pub const Executor = struct {
         const root_fd_path: [*:0]const u8 = if (self.options.root_bind_path_override) |override|
             override
         else
-            (try std.fmt.allocPrintSentinel(
-                arena,
+            (try arena.printSentinel(
                 "/proc/self/fd/{d}",
                 .{self.root_dir.handle},
                 0,
             )).ptr;
-        const mountpoint = try std.fmt.allocPrintSentinel(
-            arena,
+        const mountpoint = try arena.printSentinel(
             "/run/miz-offline-root-{d}-{d}",
             .{ linux.getpid(), self.root_dir.handle },
             0,
@@ -374,7 +372,7 @@ pub const Executor = struct {
         const clone_flags: u32 = @as(u32, linux.CLONE.NEWNS) |
             @as(u32, linux.CLONE.NEWNET) |
             @as(u32, linux.CLONE.NEWPID) |
-            @as(u32, @intFromEnum(linux.SIG.CHLD));
+            @as(u32, @backingInt(linux.SIG.CHLD));
         const clone_rc = linux.clone(
             namespaceChild,
             stack_top,
@@ -559,7 +557,7 @@ const guest_devices = [_]DeviceNode{
 
 fn dupeArgvZ(arena: Allocator, argv: []const []const u8) ![:null]const ?[*:0]const u8 {
     const list = try arena.allocSentinel(?[*:0]const u8, argv.len, null);
-    for (argv, 0..) |value, index| list[index] = (try arena.dupeZ(u8, value)).ptr;
+    for (argv, 0..) |value, index| list[index] = (try arena.dupeSentinel(u8, value, 0)).ptr;
     return list;
 }
 
@@ -573,7 +571,7 @@ fn buildGuestEnvironment(arena: Allocator) ![:null]const ?[*:0]const u8 {
         "DEBIAN_FRONTEND=noninteractive",
     };
     const list = try arena.allocSentinel(?[*:0]const u8, entries.len, null);
-    inline for (entries, 0..) |value, index| list[index] = (try arena.dupeZ(u8, value)).ptr;
+    inline for (entries, 0..) |value, index| list[index] = (try arena.dupeSentinel(u8, value, 0)).ptr;
     return list;
 }
 
@@ -601,7 +599,7 @@ fn namespaceChild(arg: usize) callconv(.c) u8 {
 
     // If the supervising parent dies, take the whole namespace down with it.
     // This replaces `unshare --kill-child`.
-    _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @as(usize, @intFromEnum(linux.SIG.KILL)), 0, 0, 0);
+    _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @as(usize, @backingInt(linux.SIG.KILL)), 0, 0, 0);
     // Lead a fresh session/process group so the parent can signal the whole
     // tree at once (previously provided by `setsid`).
     _ = linux.setsid();
@@ -721,13 +719,13 @@ fn superviseGuest(guest_pid: i32, timeout_ms: u64, kill_grace_ms: u64) u8 {
     var terminate_at: u64 = 0;
     while (true) {
         while (true) {
-            var status: u32 = undefined;
+            var status: i32 = undefined;
             const rc = linux.waitpid(-1, &status, linux.W.NOHANG);
             switch (linux.errno(rc)) {
                 .SUCCESS => {
                     if (rc == 0) break;
                     if (@as(i32, @intCast(rc)) == guest_pid) {
-                        guest_status = status;
+                        guest_status = @bitCast(status);
                         guest_reaped = true;
                     }
                 },
@@ -759,10 +757,10 @@ fn superviseGuest(guest_pid: i32, timeout_ms: u64, kill_grace_ms: u64) u8 {
 /// clears the ambient set, empties the bounding set, and zeroes the permitted,
 /// effective and inheritable sets so the exec starts with no capabilities.
 fn dropAllCapabilities() void {
-    _ = linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+    _ = linux.prctl(@backingInt(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
     var capability: usize = 0;
     while (capability <= linux.CAP.LAST_CAP) : (capability += 1) {
-        _ = linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), capability, 0, 0, 0);
+        _ = linux.prctl(@backingInt(linux.PR.CAPBSET_DROP), capability, 0, 0, 0);
     }
     var header = linux.cap_user_header_t{ .version = linux_capability_version_3, .pid = 0 };
     const data = [2]linux.cap_user_data_t{
@@ -825,7 +823,7 @@ fn childWriteAll(fd: i32, bytes: []const u8) void {
 }
 
 fn signalChildTree(pid: i32) void {
-    if (comptime builtin.os.tag != .linux) return;
+    if (comptime builtin.target.os.tag != .linux) return;
     _ = linux.kill(-pid, linux.SIG.TERM);
     _ = linux.kill(pid, linux.SIG.TERM);
     _ = linux.kill(-pid, linux.SIG.KILL);
@@ -833,8 +831,8 @@ fn signalChildTree(pid: i32) void {
 }
 
 fn reapChild(pid: i32) void {
-    if (comptime builtin.os.tag != .linux) return;
-    var status: u32 = undefined;
+    if (comptime builtin.target.os.tag != .linux) return;
+    var status: i32 = undefined;
     while (true) {
         const rc = linux.waitpid(pid, &status, 0);
         if (linux.errno(rc) == .INTR) continue;
@@ -857,7 +855,7 @@ fn waitUntilDeadline(
     mode: PidfdMode,
     pidfd_open_fn: ?PidfdOpenFn,
 ) !std.process.Child.Term {
-    if (comptime builtin.os.tag != .linux) return error.Timeout;
+    if (comptime builtin.target.os.tag != .linux) return error.Timeout;
     if (mode == .force_unexpected) return error.PidfdSetupFailed;
     if (mode != .auto) return waitpidFallback(io, pid, deadline);
     const opened = if (pidfd_open_fn) |open_fn|
@@ -892,11 +890,11 @@ fn waitpidFallback(io: Io, pid: i32, deadline: Io.Timeout) !std.process.Child.Te
     while (true) {
         const remaining = deadline.toDurationFromNow(io) orelse return reapTerm(pid);
         if (remaining.raw.nanoseconds <= 0) return error.Timeout;
-        var status: u32 = undefined;
+        var status: i32 = undefined;
         const result = linux.waitpid(pid, &status, linux.W.NOHANG);
         switch (linux.errno(result)) {
             .SUCCESS => {
-                if (result != 0) return waitStatusTerm(status);
+                if (result != 0) return waitStatusTerm(@bitCast(status));
             },
             .INTR => continue,
             else => return error.WaitpidFailed,
@@ -910,20 +908,20 @@ fn waitpidFallback(io: Io, pid: i32, deadline: Io.Timeout) !std.process.Child.Te
 }
 
 fn reapTerm(pid: i32) std.process.Child.Term {
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     while (true) {
         const rc = linux.waitpid(pid, &status, 0);
         if (linux.errno(rc) == .INTR) continue;
         break;
     }
-    return waitStatusTerm(status);
+    return waitStatusTerm(@bitCast(status));
 }
 
 fn waitStatusTerm(status: u32) std.process.Child.Term {
     const signal = status & 0x7f;
     if (signal == 0) return .{ .exited = @intCast((status >> 8) & 0xff) };
-    if (signal == 0x7f) return .{ .stopped = @enumFromInt(@as(u8, @intCast((status >> 8) & 0xff))) };
-    return .{ .signal = @enumFromInt(@as(u8, @intCast(signal))) };
+    if (signal == 0x7f) return .{ .stopped = @fromBackingInt(@intCast(@as(u8, @intCast((status >> 8) & 0xff)))) };
+    return .{ .signal = @fromBackingInt(@intCast(@as(u8, @intCast(signal)))) };
 }
 
 pub const Root = struct {
@@ -1064,9 +1062,9 @@ pub const Root = struct {
             if (entries.items.len >= self.limits.max_entries) return error.EntryLimitExceeded;
             if (!wildcardMatch(pattern, entry.name)) continue;
             const path = if (std.mem.eql(u8, guest_directory, "/"))
-                try std.fmt.allocPrint(self.allocator, "/{s}", .{entry.name})
+                try self.allocator.print("/{s}", .{entry.name})
             else
-                try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ guest_directory, entry.name });
+                try self.allocator.print("{s}/{s}", .{ guest_directory, entry.name });
             try entries.append(.{ .path = path, .directory = entry.kind == .directory });
         }
         return entries.toOwnedSlice();
@@ -1169,7 +1167,7 @@ pub const Root = struct {
     }
 
     pub fn duplicateDir(self: *const Root) !Io.Dir {
-        const duplicate = if (comptime builtin.os.tag == .linux) blk: {
+        const duplicate = if (comptime builtin.target.os.tag == .linux) blk: {
             const result = std.os.linux.fcntl(
                 self.root_dir.handle,
                 std.os.linux.F.DUPFD,
@@ -1635,7 +1633,7 @@ const FakeRunner = struct {
 };
 
 fn fakePidfdErrno(errno: std.os.linux.E) usize {
-    return @bitCast(-@as(isize, @intCast(@intFromEnum(errno))));
+    return @bitCast(-@as(isize, @intCast(@backingInt(errno))));
 }
 
 fn fakePidfdEnosys(_: i32) usize {
@@ -1737,7 +1735,7 @@ test "offline executor enforces architecture, allowlist, timeout, and failure" {
 }
 
 test "privileged offline namespace contains PID1 and reaps descendants" {
-    if (builtin.os.tag != .linux or std.os.linux.geteuid() != 0) {
+    if (builtin.target.os.tag != .linux or std.os.linux.geteuid() != 0) {
         std.debug.print("skipping offline-root containment test: root Linux runner required\n", .{});
         return;
     }
@@ -1789,7 +1787,7 @@ test "privileged offline namespace contains PID1 and reaps descendants" {
     defer allocator.free(sentinel_bytes);
     try std.testing.expectEqualStrings("unchanged", sentinel_bytes);
     try expectNoResidualOfflineMounts(io);
-    const root_fd_text = try std.fmt.allocPrint(allocator, "{d}", .{executor.root_dir.handle});
+    const root_fd_text = try allocator.print("{d}", .{executor.root_dir.handle});
     defer allocator.free(root_fd_text);
     const fd_probe = try executor.runIsolated(
         &.{

@@ -47,7 +47,7 @@ fn writeStr(s: []const u8) void {
 
 fn writeErrno(prefix: []const u8, e: linux.E) void {
     var buf: [96]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "{s}: errno={d}\r\n", .{ prefix, @intFromEnum(e) }) catch "errno format failed\r\n";
+    const msg = std.mem.print(&buf, "{s}: errno={d}\r\n", .{ prefix, @backingInt(e) }) catch "errno format failed\r\n";
     writeStr(msg);
 }
 
@@ -66,7 +66,7 @@ fn mountIgnoreBusy(special: ?[*:0]const u8, dir: [*:0]const u8, fstype: ?[*:0]co
     const e = linux.errno(rc);
     if (e != .SUCCESS and e != .BUSY) {
         var buf: [80]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "mount {s} failed: errno={d}\r\n", .{ dir, @intFromEnum(e) }) catch "mount failed\r\n";
+        const msg = std.mem.print(&buf, "mount {s} failed: errno={d}\r\n", .{ dir, @backingInt(e) }) catch "mount failed\r\n";
         writeStr(msg);
     }
 }
@@ -100,7 +100,7 @@ fn tryMountEsp() void {
             const e = linux.errno(rc);
             if (e == .SUCCESS) {
                 var buf: [64]u8 = undefined;
-                const msg = std.fmt.bufPrint(&buf, "[mizinit] mounted {s} at /boot/efi\r\n", .{dev}) catch "[mizinit] mounted ESP\r\n";
+                const msg = std.mem.print(&buf, "[mizinit] mounted {s} at /boot/efi\r\n", .{dev}) catch "[mizinit] mounted ESP\r\n";
                 writeStr(msg);
                 return;
             }
@@ -398,25 +398,25 @@ fn readBootConfig() BootConfig {
     var config = parseBootConfig(buf[0..read_rc]);
     if (config.invalid_mode) |value| {
         var msg_buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "[mizinit] invalid mizinit.mode={s}; using immutable mode\r\n", .{value}) catch "[mizinit] invalid mizinit.mode; using immutable mode\r\n";
+        const msg = std.mem.print(&msg_buf, "[mizinit] invalid mizinit.mode={s}; using immutable mode\r\n", .{value}) catch "[mizinit] invalid mizinit.mode; using immutable mode\r\n";
         writeStr(msg);
         config.invalid_mode = null;
     }
     if (config.invalid_azure_policy) |value| {
         var msg_buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "[mizinit] invalid mizinit.azure={s}; using auto\r\n", .{value}) catch "[mizinit] invalid mizinit.azure; using auto\r\n";
+        const msg = std.mem.print(&msg_buf, "[mizinit] invalid mizinit.azure={s}; using auto\r\n", .{value}) catch "[mizinit] invalid mizinit.azure; using auto\r\n";
         writeStr(msg);
         config.invalid_azure_policy = null;
     }
     if (config.invalid_shell) |value| {
         var msg_buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "[mizinit] invalid mizinit.shell={s}; keeping diagnostic shell off\r\n", .{value}) catch "[mizinit] invalid mizinit.shell; keeping diagnostic shell off\r\n";
+        const msg = std.mem.print(&msg_buf, "[mizinit] invalid mizinit.shell={s}; keeping diagnostic shell off\r\n", .{value}) catch "[mizinit] invalid mizinit.shell; keeping diagnostic shell off\r\n";
         writeStr(msg);
         config.invalid_shell = null;
     }
     if (config.invalid_binder_policy) |value| {
         var msg_buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "[mizinit] invalid mizinit.binder={s}; keeping binder disabled\r\n", .{value}) catch "[mizinit] invalid mizinit.binder; keeping binder disabled\r\n";
+        const msg = std.mem.print(&msg_buf, "[mizinit] invalid mizinit.binder={s}; keeping binder disabled\r\n", .{value}) catch "[mizinit] invalid mizinit.binder; keeping binder disabled\r\n";
         writeStr(msg);
         config.invalid_binder_policy = null;
     }
@@ -472,9 +472,9 @@ fn discoverSerialConsolePath(path_buf: *[80:0]u8) [*:0]const u8 {
     const cmdline = readBoundedFile("/proc/cmdline", &cmdline_buf) orelse "";
     var active_buf: [257]u8 = undefined;
     const active = readBoundedFile("/sys/class/tty/console/active", &active_buf) orelse "";
-    const name = selectSerialConsole(cmdline, active, @import("builtin").cpu.arch);
-    return std.fmt.bufPrintZ(path_buf, "/dev/{s}", .{name}) catch blk: {
-        const fallback = if (@import("builtin").cpu.arch == .aarch64) "/dev/ttyAMA0" else "/dev/ttyS0";
+    const name = selectSerialConsole(cmdline, active, @import("builtin").target.cpu.arch);
+    return std.mem.printSentinel(path_buf, "/dev/{s}", .{name}, 0) catch blk: {
+        const fallback = if (@import("builtin").target.cpu.arch == .aarch64) "/dev/ttyAMA0" else "/dev/ttyS0";
         @memcpy(path_buf[0..fallback.len], fallback);
         path_buf[fallback.len] = 0;
         break :blk path_buf;
@@ -561,7 +561,7 @@ fn renderEnvironmentState(buf: []u8, identity: [36]u8, decision: AzureDecision) 
         .non_azure => "non-azure",
         .unknown, .local => return null,
     };
-    return std.fmt.bufPrint(buf, "v1 {s} {s}\n", .{ &identity, decision_text }) catch null;
+    return std.mem.print(buf, "v1 {s} {s}\n", .{ &identity, decision_text }) catch null;
 }
 
 fn readBoundedFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
@@ -755,11 +755,11 @@ fn decompressXzAlloc(gpa: std.mem.Allocator, compressed: []const u8) ?[]u8 {
 // "kernel/drivers/net/hyperv/hv_netvsc.ko.xz".
 fn loadModuleAt(gpa: std.mem.Allocator, release: []const u8, rel_path: []const u8) void {
     var path_buf: [256:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/lib/modules/{s}/{s}", .{ release, rel_path }) catch return;
+    const path = std.mem.printSentinel(&path_buf, "/lib/modules/{s}/{s}", .{ release, rel_path }, 0) catch return;
 
     const compressed = readWholeFileAlloc(gpa, path) orelse {
         var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "[mizinit] module {s} not found (non-fatal)\r\n", .{rel_path}) catch "[mizinit] module not found\r\n";
+        const msg = std.mem.print(&buf, "[mizinit] module {s} not found (non-fatal)\r\n", .{rel_path}) catch "[mizinit] module not found\r\n";
         writeStr(msg);
         return;
     };
@@ -767,7 +767,7 @@ fn loadModuleAt(gpa: std.mem.Allocator, release: []const u8, rel_path: []const u
 
     const image = decompressXzAlloc(gpa, compressed) orelse {
         var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "[mizinit] module {s} decompress failed (non-fatal)\r\n", .{rel_path}) catch "[mizinit] module decompress failed\r\n";
+        const msg = std.mem.print(&buf, "[mizinit] module {s} decompress failed (non-fatal)\r\n", .{rel_path}) catch "[mizinit] module decompress failed\r\n";
         writeStr(msg);
         return;
     };
@@ -777,10 +777,10 @@ fn loadModuleAt(gpa: std.mem.Allocator, release: []const u8, rel_path: []const u
     const e = linux.errno(rc);
     var buf: [160]u8 = undefined;
     if (e == .SUCCESS or e == .EXIST) {
-        const msg = std.fmt.bufPrint(&buf, "[mizinit] loaded module {s}\r\n", .{rel_path}) catch "[mizinit] module loaded\r\n";
+        const msg = std.mem.print(&buf, "[mizinit] loaded module {s}\r\n", .{rel_path}) catch "[mizinit] module loaded\r\n";
         writeStr(msg);
     } else {
-        const msg = std.fmt.bufPrint(&buf, "[mizinit] init_module {s} failed: errno={d}\r\n", .{ rel_path, @intFromEnum(e) }) catch "[mizinit] init_module failed\r\n";
+        const msg = std.mem.print(&buf, "[mizinit] init_module {s} failed: errno={d}\r\n", .{ rel_path, @backingInt(e) }) catch "[mizinit] init_module failed\r\n";
         writeStr(msg);
     }
 }
@@ -928,7 +928,7 @@ fn binderModuleAlreadyLoaded() bool {
 
 fn finitModuleAt(release: []const u8, rel_path: []const u8, flags: u32) linux.E {
     var path_buf: [256:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/lib/modules/{s}/{s}", .{ release, rel_path }) catch return .NAMETOOLONG;
+    const path = std.mem.printSentinel(&path_buf, "/lib/modules/{s}/{s}", .{ release, rel_path }, 0) catch return .NAMETOOLONG;
 
     const fd_rc = linux.open(path, .{ .ACCMODE = .RDONLY }, 0);
     const open_error = linux.errno(fd_rc);
@@ -970,7 +970,7 @@ fn ensureBinderDevice(device: BinderDeviceName) linux.E {
     if (add_error != .SUCCESS and add_error != .EXIST) return add_error;
 
     var path_buf: [64:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ binderfs_mount_point, name }) catch return .NAMETOOLONG;
+    const path = std.mem.printSentinel(&path_buf, "{s}/{s}", .{ binderfs_mount_point, name }, 0) catch return .NAMETOOLONG;
     return linux.errno(linux.chmod(path, binder_device_mode));
 }
 
@@ -1053,13 +1053,16 @@ fn ifUp(fd: i32, name: []const u8) void {
 }
 
 fn sockaddrIn(addr_be: u32) linux.sockaddr {
-    const in: linux.sockaddr.in = .{ .port = 0, .addr = addr_be };
-    return @bitCast(in);
+    return sockaddrInPort(addr_be, 0);
 }
 
 fn sockaddrInPort(addr_be: u32, port_be: u16) linux.sockaddr {
-    const in: linux.sockaddr.in = .{ .port = port_be, .addr = addr_be };
-    return @bitCast(in);
+    // These integers already carry network-order bytes in native memory.
+    // Zig 0.17's bitCast cannot reinterpret extern-structure memory.
+    var result: linux.sockaddr = .{ .family = linux.AF.INET, .data = @splat(0) };
+    std.mem.writeInt(u16, result.data[0..2], port_be, @import("builtin").target.cpu.arch.endian());
+    std.mem.writeInt(u32, result.data[2..6], addr_be, @import("builtin").target.cpu.arch.endian());
+    return result;
 }
 
 fn setIfaceAddr(fd: i32, name: []const u8, request: u32, addr_be: u32) void {
@@ -1082,7 +1085,7 @@ const carrier_settle_seconds: u32 = 5;
 /// The non-loopback interfaces this machine currently has, in a stable order.
 const InterfaceList = struct {
     names: [max_candidate_interfaces][linux.IFNAMESIZE]u8 = undefined,
-    lens: [max_candidate_interfaces]u8 = [_]u8{0} ** max_candidate_interfaces,
+    lens: [max_candidate_interfaces]u8 = @splat(0),
     count: usize = 0,
 
     fn name(self: *const InterfaceList, index: usize) []const u8 {
@@ -1147,7 +1150,7 @@ fn collectInterfaces(list: *InterfaceList) void {
 /// some synthetic NICs never report carrier at all.
 fn readCarrier(iface: []const u8) ?bool {
     var path_buf: [linux.IFNAMESIZE + 32]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/sys/class/net/{s}/carrier", .{iface}) catch return null;
+    const path = std.mem.printSentinel(&path_buf, "/sys/class/net/{s}/carrier", .{iface}, 0) catch return null;
     var value: [8]u8 = undefined;
     const contents = readBoundedFile(path.ptr, &value) orelse return null;
     if (contents.len == 0) return null;
@@ -1165,7 +1168,7 @@ fn interfaceMasterName(target: []const u8) ?[]const u8 {
 /// child devices of the synthetic netvsc interface, where IPs and routes belong.
 fn readInterfaceMaster(iface: []const u8, out: *[linux.IFNAMESIZE]u8) ?[]const u8 {
     var path_buf: [linux.IFNAMESIZE + 32]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/sys/class/net/{s}/master", .{iface}) catch return null;
+    const path = std.mem.printSentinel(&path_buf, "/sys/class/net/{s}/master", .{iface}, 0) catch return null;
     var target_buf: [128]u8 = undefined;
     const rc = linux.readlink(path.ptr, &target_buf, target_buf.len);
     if (linux.errno(rc) != .SUCCESS) return null;
@@ -1444,7 +1447,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
     @memcpy(&mac, hw_req.ifru.hwaddr.data[0..6]);
     {
         var mbuf: [64]u8 = undefined;
-        const m = std.fmt.bufPrint(&mbuf, "[mizinit] dhcp: mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}\r\n", .{ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] }) catch "[mizinit] dhcp: mac read\r\n";
+        const m = std.mem.print(&mbuf, "[mizinit] dhcp: mac={x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}:{x:0>2}\r\n", .{ mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] }) catch "[mizinit] dhcp: mac read\r\n";
         writeStr(m);
     }
 
@@ -1496,7 +1499,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
     const send_rc = linux.sendto(sock, &packet, send_len, 0, &dest_addr, @sizeOf(linux.sockaddr));
     {
         var sbuf: [64]u8 = undefined;
-        const smsg = std.fmt.bufPrint(&sbuf, "[mizinit] dhcp: sent DISCOVER, sendto_rc={d}\r\n", .{send_rc}) catch "[mizinit] dhcp: sent DISCOVER\r\n";
+        const smsg = std.mem.print(&sbuf, "[mizinit] dhcp: sent DISCOVER, sendto_rc={d}\r\n", .{send_rc}) catch "[mizinit] dhcp: sent DISCOVER\r\n";
         writeStr(smsg);
     }
 
@@ -1513,7 +1516,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
         const n_signed: isize = @bitCast(n_rc);
         {
             var rbuf: [80]u8 = undefined;
-            const rmsg = std.fmt.bufPrint(&rbuf, "[mizinit] dhcp: recvfrom attempt {d} -> {d}\r\n", .{ attempt, n_signed }) catch "[mizinit] dhcp: recv attempt\r\n";
+            const rmsg = std.mem.print(&rbuf, "[mizinit] dhcp: recvfrom attempt {d} -> {d}\r\n", .{ attempt, n_signed }) catch "[mizinit] dhcp: recv attempt\r\n";
             writeStr(rmsg);
         }
         const payload: ?[]const u8 = if (n_signed <= 0)
@@ -1526,7 +1529,7 @@ fn runDhcp(iface: []const u8) DhcpAttempt {
             if (parseDhcpReply(data, data.len, xid)) |reply| {
                 recordDhcpEvidence(&result, reply);
                 var pbuf: [64]u8 = undefined;
-                const pmsg = std.fmt.bufPrint(&pbuf, "[mizinit] dhcp: parsed reply msg_type={d}\r\n", .{reply.msg_type}) catch "[mizinit] dhcp: parsed reply\r\n";
+                const pmsg = std.mem.print(&pbuf, "[mizinit] dhcp: parsed reply msg_type={d}\r\n", .{reply.msg_type}) catch "[mizinit] dhcp: parsed reply\r\n";
                 writeStr(pmsg);
                 if (reply.msg_type == 2) { // DHCPOFFER
                     offer_ip = reply.your_ip;
@@ -1637,7 +1640,7 @@ fn writeResolvConf(dns: [2]u32) void {
     for (dns) |d| {
         if (d == 0) continue;
         const be_bytes = std.mem.asBytes(&d);
-        const line = std.fmt.bufPrint(&buf, "nameserver {d}.{d}.{d}.{d}\n", .{ be_bytes[0], be_bytes[1], be_bytes[2], be_bytes[3] }) catch continue;
+        const line = std.mem.print(&buf, "nameserver {d}.{d}.{d}.{d}\n", .{ be_bytes[0], be_bytes[1], be_bytes[2], be_bytes[3] }) catch continue;
         _ = linux.write(fd, line.ptr, line.len);
     }
 }
@@ -1673,7 +1676,7 @@ fn setupNetworking() NetworkResult {
     var index: usize = 0;
     while (index < list.count) : (index += 1) ifUp(ctl, list.name(index));
 
-    var carriers: [max_candidate_interfaces]?bool = [_]?bool{null} ** max_candidate_interfaces;
+    var carriers: [max_candidate_interfaces]?bool = @splat(null);
     var waited: u32 = 0;
     while (true) {
         var any_carrier = false;
@@ -1697,7 +1700,7 @@ fn setupNetworking() NetworkResult {
         var master_buf: [linux.IFNAMESIZE]u8 = undefined;
         const iface = readInterfaceMaster(candidate_iface, &master_buf) orelse candidate_iface;
         var msg_buf: [96]u8 = undefined;
-        const msg = std.fmt.bufPrint(&msg_buf, "[mizinit] running DHCP on {s}\r\n", .{iface}) catch "[mizinit] running DHCP\r\n";
+        const msg = std.mem.print(&msg_buf, "[mizinit] running DHCP on {s}\r\n", .{iface}) catch "[mizinit] running DHCP\r\n";
         writeStr(msg);
 
         const attempt = runDhcp(iface);
@@ -1722,7 +1725,7 @@ fn setupNetworking() NetworkResult {
 
         const ip_bytes = std.mem.asBytes(&lease.your_ip);
         var ok_buf: [96]u8 = undefined;
-        const ok_msg = std.fmt.bufPrint(&ok_buf, "[mizinit] {s} configured: {d}.{d}.{d}.{d}\r\n", .{ iface, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3] }) catch "[mizinit] network configured\r\n";
+        const ok_msg = std.mem.print(&ok_buf, "[mizinit] {s} configured: {d}.{d}.{d}.{d}\r\n", .{ iface, ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3] }) catch "[mizinit] network configured\r\n";
         writeStr(ok_msg);
         return network_result;
     }
@@ -1984,7 +1987,7 @@ fn noteChildExit(supervisor: *Supervisor, pid: linux.pid_t, status: u32) void {
 
 fn reapChildren(supervisor: *Supervisor) void {
     while (true) {
-        var status: u32 = 0;
+        var status: i32 = 0;
         const wait_rc = linux.waitpid(-1, &status, linux.W.NOHANG);
         const wait_error = linux.errno(wait_rc);
         if (wait_error == .INTR) continue;
@@ -1993,7 +1996,7 @@ fn reapChildren(supervisor: *Supervisor) void {
             writeErrno("[mizinit] waitpid() failed", wait_error);
             return;
         }
-        noteChildExit(supervisor, @intCast(wait_rc), status);
+        noteChildExit(supervisor, @intCast(wait_rc), @bitCast(status));
     }
 }
 
@@ -2020,7 +2023,7 @@ fn phaseAfterDrain(phase: ShutdownPhase, state: ChildDrainState) ShutdownPhase {
 
 fn drainExitedChildren(supervisor: *Supervisor) ChildDrainState {
     while (true) {
-        var status: u32 = 0;
+        var status: i32 = 0;
         const wait_rc = linux.waitpid(-1, &status, linux.W.NOHANG);
         const wait_error = linux.errno(wait_rc);
         if (wait_error == .INTR) continue;
@@ -2030,7 +2033,7 @@ fn drainExitedChildren(supervisor: *Supervisor) ChildDrainState {
             writeErrno("[mizinit] shutdown waitpid() failed", wait_error);
             return .remaining;
         }
-        noteChildExit(supervisor, @intCast(wait_rc), status);
+        noteChildExit(supervisor, @intCast(wait_rc), @bitCast(status));
     }
 }
 
@@ -2046,13 +2049,13 @@ fn boundedChildDrain(supervisor: *Supervisor, attempts: u32) ChildDrainState {
 
 fn reapUntilNoChildren(supervisor: *Supervisor) void {
     while (true) {
-        var status: u32 = 0;
+        var status: i32 = 0;
         const wait_rc = linux.waitpid(-1, &status, 0);
         const wait_error = linux.errno(wait_rc);
         if (wait_error == .INTR) continue;
         if (wait_error == .CHILD) return;
         if (wait_error == .SUCCESS) {
-            noteChildExit(supervisor, @intCast(wait_rc), status);
+            noteChildExit(supervisor, @intCast(wait_rc), @bitCast(status));
             continue;
         }
         writeErrno("[mizinit] final shutdown waitpid() failed; retrying", wait_error);
@@ -2197,7 +2200,7 @@ fn supervisorLoop(supervisor: *Supervisor) noreturn {
     if (supervisor.shell_enabled) {
         var buf: [128]u8 = undefined;
         const path = std.mem.span(supervisor.console_path);
-        const msg = std.fmt.bufPrint(&buf, "[mizinit] diagnostic root shell enabled on {s}\r\n", .{path}) catch "[mizinit] diagnostic root shell enabled\r\n";
+        const msg = std.mem.print(&buf, "[mizinit] diagnostic root shell enabled on {s}\r\n", .{path}) catch "[mizinit] diagnostic root shell enabled\r\n";
         writeStr(msg);
     } else {
         writeStr("[mizinit] diagnostic root shell disabled\r\n");
@@ -2323,6 +2326,23 @@ pub fn main(init: std.process.Init.Minimal) noreturn {
         console_path,
     );
     supervisorLoop(&supervisor);
+}
+
+test "IPv4 socket addresses preserve Linux ABI bytes and network order" {
+    const address = std.mem.nativeToBig(u32, 0xc0000201);
+    const port = std.mem.nativeToBig(u16, 8080);
+    var expected: [16]u8 = .{ 0, 0, 0x1f, 0x90, 192, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0 };
+    std.mem.writeInt(u16, expected[0..2], linux.AF.INET, @import("builtin").target.cpu.arch.endian());
+
+    const with_port = sockaddrInPort(address, port);
+    try std.testing.expectEqualSlices(u8, &expected, std.mem.asBytes(&with_port));
+    const in: linux.sockaddr.in = .{ .port = port, .addr = address };
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&in), std.mem.asBytes(&with_port));
+
+    expected[2] = 0;
+    expected[3] = 0;
+    const without_port = sockaddrIn(address);
+    try std.testing.expectEqualSlices(u8, &expected, std.mem.asBytes(&without_port));
 }
 
 test "parseBootConfig defaults to immutable automatic Azure detection and no shell" {
@@ -2552,8 +2572,8 @@ test "parsePersistedHostname trims line endings and rejects invalid content" {
     try std.testing.expectEqual(@as(?[]const u8, null), parsePersistedHostname(" \r\n"));
     try std.testing.expectEqual(@as(?[]const u8, null), parsePersistedHostname("invalid\x00hostname"));
 
-    const too_long = "a" ** (linux.HOST_NAME_MAX + 1);
-    try std.testing.expectEqual(@as(?[]const u8, null), parsePersistedHostname(too_long));
+    const too_long: [linux.HOST_NAME_MAX + 1]u8 = @splat('a');
+    try std.testing.expectEqual(@as(?[]const u8, null), parsePersistedHostname(&too_long));
 }
 
 test "machine-id validation accepts lowercase 128-bit hex only" {

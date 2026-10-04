@@ -593,7 +593,7 @@ fn createUniqueDirectory(io: Io, allocator: std.mem.Allocator, parent: []const u
     for (0..64) |_| {
         try io.randomSecure(&random);
         const suffix = std.fmt.bytesToHex(random, .lower);
-        const name = try std.fmt.allocPrint(allocator, ".{s}.miz-oci-staging-{s}", .{ base, suffix });
+        const name = try allocator.print(".{s}.miz-oci-staging-{s}", .{ base, suffix });
         const path = try std.fs.path.join(allocator, &.{ parent, name });
         allocator.free(name);
         Io.Dir.cwd().createDir(io, path, .default_dir) catch |err| switch (err) {
@@ -615,7 +615,7 @@ fn createUniqueDirectory(io: Io, allocator: std.mem.Allocator, parent: []const u
 fn openBootstrapLock(io: Io, allocator: std.mem.Allocator, parent: []const u8, base: []const u8) !Io.File {
     var parent_dir = try Io.Dir.cwd().openDir(io, parent, .{});
     defer parent_dir.close(io);
-    const name = try std.fmt.allocPrint(allocator, ".{s}.miz-oci-bootstrap.lock", .{base});
+    const name = try allocator.print(".{s}.miz-oci-bootstrap.lock", .{base});
     defer allocator.free(name);
     return try parent_dir.createFile(io, name, .{ .read = true, .truncate = false, .lock = .exclusive });
 }
@@ -625,7 +625,7 @@ fn createUniqueTempFile(io: Io, allocator: std.mem.Allocator, dir: Io.Dir, kind:
     for (0..64) |_| {
         try io.randomSecure(&random);
         const suffix = std.fmt.bytesToHex(random, .lower);
-        const name = try std.fmt.allocPrint(allocator, ".miz-oci-{s}-{s}.tmp", .{ kind, suffix });
+        const name = try allocator.print(".miz-oci-{s}-{s}.tmp", .{ kind, suffix });
         const file = dir.createFile(io, name, .{ .exclusive = true }) catch |err| switch (err) {
             error.PathAlreadyExists => {
                 allocator.free(name);

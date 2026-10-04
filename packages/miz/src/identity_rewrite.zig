@@ -1922,7 +1922,7 @@ test "a stale identifier split across two read windows is still found" {
     const filler = try allocator.alloc(u8, window - 10);
     defer allocator.free(filler);
     @memset(filler, 'z');
-    const contents = try std.fmt.allocPrint(allocator, "{s}{s} tail\n", .{ filler, test_boot_uuid });
+    const contents = try allocator.print("{s}{s} tail\n", .{ filler, test_boot_uuid });
     defer allocator.free(contents);
     try putTestFile(&tree, "boot/grub/fonts/unicode.pf2", contents);
 

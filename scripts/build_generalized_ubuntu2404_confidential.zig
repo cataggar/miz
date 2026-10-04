@@ -179,7 +179,7 @@ fn joinedPath(allocator: Allocator, parent: []const u8, child: []const u8) ![]u8
 }
 
 fn publicationUrl(allocator: Allocator, name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ publication_base, name });
+    return allocator.print("{s}/{s}", .{ publication_base, name });
 }
 
 fn requireMetadata(
@@ -324,8 +324,7 @@ fn validateManifest(
     const kernel = try findKernelPackage(manifest);
     if (!kernelVersionAtLeast(kernel.release, 5, 15))
         return error.UnsupportedKernelVersion;
-    const modules_name = try std.fmt.allocPrint(
-        allocator,
+    const modules_name = try allocator.print(
         "linux-modules-{s}",
         .{kernel.release},
     );
@@ -706,8 +705,7 @@ fn validateBootPartition(
         .{ .offset = region.offset },
     );
     defer boot.deinit();
-    const boot_config_path = try std.fmt.allocPrint(
-        allocator,
+    const boot_config_path = try allocator.print(
         "config-{s}",
         .{manifest_contract.kernel_release},
     );
@@ -716,8 +714,7 @@ fn validateBootPartition(
     defer allocator.free(config);
     try validateKernelConfig(config);
     for (&[_][]const u8{ "vmlinuz-", "initrd.img-" }) |prefix| {
-        const path = try std.fmt.allocPrint(
-            allocator,
+        const path = try allocator.print(
             "{s}{s}",
             .{ prefix, manifest_contract.kernel_release },
         );
@@ -849,8 +846,7 @@ fn publishQcow2(
     source_path: []const u8,
     output_path: []const u8,
 ) !miz.gpt.RelocationResult {
-    const stage_path = try std.fmt.allocPrint(
-        allocator,
+    const stage_path = try allocator.print(
         "{s}.miz-stage",
         .{output_path},
     );
@@ -1185,7 +1181,7 @@ pub fn main(init: std.process.Init) !void {
     const provenance_path = if (args.provenance) |path|
         try allocator.dupe(u8, path)
     else
-        try std.fmt.allocPrint(allocator, "{s}.provenance.json", .{args.output});
+        try allocator.print("{s}.provenance.json", .{args.output});
     defer allocator.free(provenance_path);
     if (std.fs.path.dirname(provenance_path)) |parent|
         try Dir.cwd().createDirPath(io, parent);
@@ -1269,7 +1265,7 @@ test "signed checksum entry must be unique and exact" {
     try requireSignedEntry(good, archive_name, archive_sha256);
     try std.testing.expectError(
         error.SignedDigestMismatch,
-        requireSignedEntry("0" ** 64 ++ " *" ++ archive_name ++ "\n", archive_name, archive_sha256),
+        requireSignedEntry(&@as([64:0]u8, @splat('0')) ++ " *" ++ archive_name ++ "\n", archive_name, archive_sha256),
     );
     try std.testing.expectError(
         error.SignedEntryMissingOrDuplicate,

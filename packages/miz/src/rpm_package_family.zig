@@ -129,8 +129,7 @@ fn executeRpmzImpl(
     defer opened_bundle.destroy();
     if (!repositoriesMatch(options.repositories, opened_bundle.model().repositories))
         return failure(.bundle_invalid, "rpmz bundle repository identity does not match the request", .disposable);
-    const plan_path = try std.fmt.allocPrint(
-        allocator,
+    const plan_path = try allocator.print(
         "{s}/{s}",
         .{ bundle, opened_bundle.model().plan.path },
     );
@@ -184,16 +183,14 @@ fn executeRpmzImpl(
         error.PathAlreadyExists => {},
         else => return err,
     };
-    const provenance_path = try std.fmt.allocPrint(
-        allocator,
+    const provenance_path = try allocator.print(
         "{s}/transaction-result.json",
         .{request.inputs.state_path},
     );
     errdefer allocator.free(provenance_path);
     const replay_json = try replay.canonicalJsonAlloc(allocator);
     defer allocator.free(replay_json);
-    const json = try std.fmt.allocPrint(
-        allocator,
+    const json = try allocator.print(
         "{{\"backend\":\"rpmz\",\"backend_commit\":\"{s}\",\"bundle_digest\":\"{s}\",\"replay\":{s},\"schema\":\"{s}\"}}",
         .{ core.rpmz_api_commit, &bundle_digest, replay_json, core.rpm_provenance_schema },
     );
@@ -328,7 +325,7 @@ fn writeAtomically(
     path: []const u8,
     bytes: []const u8,
 ) !void {
-    const temporary = try std.fmt.allocPrint(allocator, "{s}.part", .{path});
+    const temporary = try allocator.print("{s}.part", .{path});
     defer allocator.free(temporary);
     errdefer Dir.cwd().deleteFile(io, temporary) catch {};
     {
@@ -406,8 +403,7 @@ fn lockedSubjects(
     const result = try allocator.alloc([]const u8, subjects.len);
     for (subjects, result) |subject, *target| {
         const lock = findLock(locks, subject) orelse return error.ExactLockMissing;
-        target.* = try std.fmt.allocPrint(
-            allocator,
+        target.* = try allocator.print(
             "{s}-{s}.{s}",
             .{ lock.name, lock.evr, lock.architecture },
         );
@@ -605,10 +601,10 @@ test "bundle tamper rpmdb drift and inventory mismatch remain distinct" {
 }
 
 test "ambient repository configuration has no adapter input" {
-    const fields = @typeInfo(rpmz.resolver.ResolveInput).@"struct".fields;
-    inline for (fields) |field| {
-        try std.testing.expect(!std.mem.eql(u8, field.name, "config_path"));
-        try std.testing.expect(!std.mem.eql(u8, field.name, "repos_dir"));
+    const names = @typeInfo(rpmz.resolver.ResolveInput).@"struct".field_names;
+    inline for (names) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "config_path"));
+        try std.testing.expect(!std.mem.eql(u8, name, "repos_dir"));
     }
 }
 

@@ -321,8 +321,7 @@ fn describeFailure(
         var message_buffer: [miz.limits.Exceeded.max_message_bytes]u8 = undefined;
         var remediation_buffer: [miz.limits.Exceeded.max_remediation_bytes]u8 = undefined;
         if (breach.limit.err() == err) {
-            return std.fmt.allocPrint(
-                allocator,
+            return allocator.print(
                 "build-iso: failed: {s}\n{s}, or import less content.",
                 .{
                     breach.describe(&message_buffer) catch unreachable,
@@ -352,7 +351,7 @@ fn describeFailure(
             u8,
             "build-iso: failed: no LiveOS rootfs payload was found in the source ISO. Pass --rootfs-path naming the squashfs/rootfs payload.",
         ),
-        else => std.fmt.allocPrint(allocator, "build-iso: failed: {s}", .{@errorName(err)}),
+        else => allocator.print("build-iso: failed: {s}", .{@errorName(err)}),
     };
 }
 

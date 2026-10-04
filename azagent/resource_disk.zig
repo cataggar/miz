@@ -570,7 +570,7 @@ fn isSwapActive(swapfile_path: []const u8) bool {
 /// direct `swapon(2)` syscall. Idempotent via `isSwapActive`.
 pub fn enableSwap(allocator: Allocator, io: std.Io, mount_dir: std.Io.Dir, mount_point: []const u8, size_mb: u32) !void {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const swapfile_path = try std.fmt.bufPrintZ(&path_buf, "{s}/swapfile", .{mount_point});
+    const swapfile_path = try std.mem.printSentinel(&path_buf, "{s}/swapfile", .{mount_point}, 0);
 
     if (isSwapActive(swapfile_path)) return;
 
@@ -611,7 +611,7 @@ pub fn enableSwap(allocator: Allocator, io: std.Io, mount_dir: std.Io.Dir, mount
 /// holes -- the fallback path for `enableSwap` when `fallocate(2)` isn't
 /// supported by the underlying filesystem.
 fn zeroFillFile(io: std.Io, file: std.Io.File, size_bytes: u64) !void {
-    var zero_buf: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024);
+    var zero_buf: [64 * 1024]u8 = @as([(64 * 1024)]u8, @splat(0));
     var written: u64 = 0;
     while (written < size_bytes) {
         const chunk = @min(zero_buf.len, size_bytes - written);
@@ -687,16 +687,16 @@ pub const SetupDeviceOptions = struct {
 
 fn partitionDevicePath(buf: []u8, device_name: []const u8) ![:0]const u8 {
     const separator = if (device_name.len > 0 and std.ascii.isDigit(device_name[device_name.len - 1])) "p" else "";
-    return std.fmt.bufPrintZ(buf, "/dev/{s}{s}1", .{ device_name, separator });
+    return std.mem.printSentinel(buf, "/dev/{s}{s}1", .{ device_name, separator }, 0);
 }
 
 pub fn setupDevice(options: SetupDeviceOptions) !void {
     var dev_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dev_path = try std.fmt.bufPrintZ(&dev_path_buf, "/dev/{s}", .{options.device_name});
+    const dev_path = try std.mem.printSentinel(&dev_path_buf, "/dev/{s}", .{options.device_name}, 0);
     var part_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const part_path = try partitionDevicePath(&part_path_buf, options.device_name);
     var mount_point_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const mount_point = try std.fmt.bufPrintZ(&mount_point_buf, "{s}", .{options.mount_point});
+    const mount_point = try std.mem.printSentinel(&mount_point_buf, "{s}", .{options.mount_point}, 0);
 
     {
         const device_file = try std.Io.Dir.cwd().openFile(options.io, dev_path, .{ .mode = .read_write });
@@ -734,7 +734,7 @@ fn openMountDir(parent: std.Io.Dir, io: std.Io, path: []const u8) !std.Io.Dir {
 }
 
 test "mount directory handle supports ownership updates" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});

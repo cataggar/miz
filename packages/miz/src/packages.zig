@@ -123,7 +123,7 @@ pub const repository_directory = "/run/miz-repos";
 /// `<root>` would be a shared module with opinions about the host's
 /// filesystem.
 pub fn repositoryPath(allocator: std.mem.Allocator, id: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, repository_directory ++ "/{s}.repo", .{id});
+    return allocator.print(repository_directory ++ "/{s}.repo", .{id});
 }
 
 /// Where a repository's trust key is staged for `rpm --import`, inside the
@@ -133,7 +133,7 @@ pub fn repositoryPath(allocator: std.mem.Allocator, id: []const u8) ![]u8 {
 /// key, so that two repositories declaring the same key still get two files and
 /// neither backend has to parse a key to name the file it writes.
 pub fn trustPath(allocator: std.mem.Allocator, index: usize) ![]u8 {
-    return std.fmt.allocPrint(allocator, "/run/miz-trust-{d}.asc", .{index});
+    return allocator.print("/run/miz-trust-{d}.asc", .{index});
 }
 
 /// The `--qf` both backends ask rpm for.
@@ -160,8 +160,7 @@ pub fn importTrustArgv(staged_path: []const u8) [3][]const u8 {
 /// `parseInstalledRecord` splits, which is what lets a run ask for the pinned
 /// release outright instead of asking for the name and complaining afterwards.
 pub fn pinnedSpec(allocator: std.mem.Allocator, pin: VersionLock) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}-{s}.{s}",
         .{ pin.name, pin.evr, pin.architecture },
     );
@@ -188,8 +187,7 @@ pub fn configBody(
 ) ![]u8 {
     const head = "[main]\ngpgcheck=1\nreposdir=" ++ repository_directory ++ "\n";
     if (cache_directory) |directory| {
-        return std.fmt.allocPrint(
-            allocator,
+        return allocator.print(
             head ++ "cachedir={s}\nkeepcache=1\n",
             .{directory},
         );
@@ -276,8 +274,7 @@ pub fn appendTransactionArgv(
     try argv.appendSlice(&.{ tool_path, "--config", config_path, "--disablerepo=*" });
     if (transaction.cache_only) try argv.append("--cacheonly");
     for (transaction.repository_ids) |id| {
-        try argv.append(try std.fmt.allocPrint(
-            argv.allocator,
+        try argv.append(try argv.allocator.print(
             "--enablerepo={s}",
             .{id},
         ));

@@ -115,10 +115,10 @@ pub fn main(init: std.process.Init) !void {
 
 fn formatCatalogSuffix(arena: std.mem.Allocator, diagnostic: miz.recustomize_iso.RecustomizeDiagnostic) []const u8 {
     if (diagnostic.catalog_index) |index| {
-        return std.fmt.allocPrint(arena, " (boot catalog entry #{d}) [{s}]", .{ index, diagnostic.detail }) catch "";
+        return arena.print(" (boot catalog entry #{d}) [{s}]", .{ index, diagnostic.detail }) catch "";
     }
     if (diagnostic.detail.len > 0) {
-        return std.fmt.allocPrint(arena, " [{s}]", .{diagnostic.detail}) catch "";
+        return arena.print(" [{s}]", .{diagnostic.detail}) catch "";
     }
     return "";
 }

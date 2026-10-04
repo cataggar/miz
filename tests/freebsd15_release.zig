@@ -147,8 +147,7 @@ test "candidate refuses every unpinned source claim" {
     const key = "aarch64-zfs-full";
     const variant = profiles.findVariant(key).?;
 
-    const asset_relative = try std.fmt.allocPrint(
-        tree.allocator(),
+    const asset_relative = try tree.allocator().print(
         "loose/{s}",
         .{variant.asset_name},
     );
@@ -186,7 +185,7 @@ test "candidate refuses every unpinned source claim" {
     };
 
     var bad_digest = base;
-    bad_digest.source_sha256 = "0" ** 64;
+    bad_digest.source_sha256 = &@as([64:0]u8, @splat('0'));
     try std.testing.expectError(
         error.Invalid,
         candidate_support.candidateCommand(&context, bad_digest),
@@ -218,7 +217,7 @@ test "candidate refuses every unpinned source claim" {
     try expectFailure(&context, "virtual size does not match");
 
     var bad_validation = base;
-    bad_validation.validated_sha256 = "0" ** 64;
+    bad_validation.validated_sha256 = &@as([64:0]u8, @splat('0'));
     try std.testing.expectError(
         error.Invalid,
         candidate_support.candidateCommand(&context, bad_validation),
@@ -237,8 +236,7 @@ test "candidate refuses a qemu-img document without an allocated size" {
     const key = "aarch64-ufs-core";
     const variant = profiles.findVariant(key).?;
 
-    const asset_relative = try std.fmt.allocPrint(
-        tree.allocator(),
+    const asset_relative = try tree.allocator().print(
         "loose/{s}",
         .{variant.asset_name},
     );
@@ -288,8 +286,7 @@ test "candidate refuses a cross-filesystem asset name" {
     const key = "aarch64-zfs-core";
     const wrong = profiles.findVariant("aarch64-zfs-full").?;
 
-    const asset_relative = try std.fmt.allocPrint(
-        tree.allocator(),
+    const asset_relative = try tree.allocator().print(
         "loose/{s}",
         .{wrong.asset_name},
     );
@@ -356,9 +353,8 @@ test "core candidates refuse a manifest that broke the reviewed contract" {
     };
     for (cases, 0..) |case, index| {
         const variant = profiles.findVariant(case.key).?;
-        const directory = try std.fmt.allocPrint(tree.allocator(), "case{d}", .{index});
-        const asset_relative = try std.fmt.allocPrint(
-            tree.allocator(),
+        const directory = try tree.allocator().print("case{d}", .{index});
+        const asset_relative = try tree.allocator().print(
             "{s}/{s}",
             .{ directory, variant.asset_name },
         );
@@ -556,7 +552,7 @@ test "staging refuses a changed or cross-commit candidate" {
     for (zfs_variants) |key| {
         const cross = std.mem.eql(u8, key, "x86_64-zfs-full");
         _ = try support.makeCandidate(&second, gpa, key, .{
-            .source_commit = if (cross) "b" ** 40 else support.source_commit,
+            .source_commit = if (cross) &@as([40:0]u8, @splat('b')) else support.source_commit,
         });
         _ = try support.makeAzureResult(&second, gpa, key);
     }
@@ -644,7 +640,7 @@ test "staging refuses a candidate whose recorded manifest was edited" {
     const count = document.integerOf(
         parsed.value.object.get("packages").?.object.get("count"),
     ).?;
-    const bumped = try std.fmt.allocPrint(tree.allocator(), "{d}", .{count + 1});
+    const bumped = try tree.allocator().print("{d}", .{count + 1});
     try support.mutateDocument(&tree, manifest, "packages.count", bumped);
 
     try std.testing.expectError(error.Invalid, stage(&tree, &context, "zfs", .{}));
@@ -656,7 +652,7 @@ test "staging refuses a candidate whose recorded manifest was edited" {
 const AzureResultOptions = struct {
     key: []const u8 = "x86_64-zfs-full",
     contracts: ?[]const u8 = null,
-    vhd_sha256: []const u8 = "f" ** 64,
+    vhd_sha256: []const u8 = &@as([64:0]u8, @splat('f')),
     location: []const u8 = "westus3",
     manifest_key: ?[]const u8 = null,
 };
@@ -676,8 +672,7 @@ fn runAzureResult(
     }
     const variant = profiles.findVariant(manifest_key).?;
     const asset = try tree.path(&.{ "candidates", manifest_key, variant.asset_name });
-    const output = try std.fmt.allocPrint(
-        tree.allocator(),
+    const output = try tree.allocator().print(
         "{s}-azure-result.json",
         .{options.key},
     );
@@ -779,7 +774,7 @@ test "azure-result emits a complete, candidate-bound document" {
     }
     try std.testing.expect(root.get("azure_accepted_sha256") == null);
     try std.testing.expectEqualStrings(
-        "f" ** 64,
+        &@as([64:0]u8, @splat('f')),
         document.stringOf(root.get("derived_vhd_sha256")).?,
     );
     try std.testing.expectEqual(
@@ -892,7 +887,7 @@ test "staging binds every Azure result to its candidate and workflow" {
         .{
             .key = "x86_64-zfs-full",
             .field = "qcow_sha256",
-            .value = "\"" ++ "0" ** 64 ++ "\"",
+            .value = "\"" ++ &@as([64:0]u8, @splat('0')) ++ "\"",
             .message = "QCOW SHA-256",
         },
         .{
@@ -910,7 +905,7 @@ test "staging binds every Azure result to its candidate and workflow" {
         .{
             .key = "x86_64-zfs-full",
             .field = "source_commit",
-            .value = "\"" ++ "b" ** 40 ++ "\"",
+            .value = "\"" ++ &@as([40:0]u8, @splat('b')) ++ "\"",
             .message = "source commit mismatch",
         },
         .{
@@ -1183,8 +1178,7 @@ test "the build matrix covers exactly the release assets" {
         );
         const url = document.stringOf(entry.get("source_url")).?;
         try std.testing.expect(std.mem.startsWith(u8, url, profiles.source_url_prefix));
-        const suffix = try std.fmt.allocPrint(
-            tree.allocator(),
+        const suffix = try tree.allocator().print(
             "/{s}",
             .{document.stringOf(entry.get("source_name")).?},
         );
@@ -1441,8 +1435,7 @@ test "the retained contract covers every required capability" {
                     without.items,
                 ),
             );
-            const expected = try std.fmt.allocPrint(
-                tree.allocator(),
+            const expected = try tree.allocator().print(
                 "missing {s}",
                 .{package},
             );
@@ -1559,8 +1552,7 @@ fn zigStringList(
     source: []const u8,
     name: []const u8,
 ) ![]const []const u8 {
-    const header = try std.fmt.allocPrint(
-        allocator,
+    const header = try allocator.print(
         "pub const {s} = [_][]const u8{{",
         .{name},
     );
@@ -1587,8 +1579,7 @@ fn zigField(source: []const u8, field: []const u8, from: usize) !struct {
     value: []const u8,
     end: usize,
 } {
-    const marker = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const marker = try std.testing.allocator.print(
         ".{s} = ",
         .{field},
     );
@@ -1726,7 +1717,7 @@ test "the pinned package tables match the reviewed Zig manifest" {
         try std.testing.expectEqualStrings(wanted, claimed);
     }
     for (filesystem_packages) |package| {
-        const marker = try std.fmt.allocPrint(allocator, ".name = \"{s}\"", .{package});
+        const marker = try allocator.print(".name = \"{s}\"", .{package});
         try support.expectContains(source, marker);
     }
     try std.testing.expectEqual(
@@ -1884,7 +1875,7 @@ test "the publish expectation binds the manifest to its dispatch" {
         },
         .{
             .tag = tag,
-            .commit = "b" ** 40,
+            .commit = &@as([40:0]u8, @splat('b')),
             .count = 4,
             .message = "publish manifest source commit mismatch",
         },
@@ -1987,13 +1978,12 @@ test "remote, downloaded, and published releases must match the expectation" {
     );
     _ = digest;
 
-    const expected_path = try tree.write("expected.tsv", try std.fmt.allocPrint(
-        tree.allocator(),
+    const expected_path = try tree.write("expected.tsv", try tree.allocator().print(
         "asset.qcow2\t{s}\t{d}\n",
         .{ &real_digest, body.len },
     ));
 
-    const release_json = try std.fmt.allocPrint(tree.allocator(),
+    const release_json = try tree.allocator().print(
         \\{{"draft": true, "immutable": false, "assets": [
         \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "state": "uploaded", "size": {d}}}]}}
     , .{ &real_digest, body.len });
@@ -2486,8 +2476,7 @@ test "a published release must report leaving the draft state" {
         &context,
         try tree.path(&.{ "remote", "asset.qcow2" }),
     );
-    const expected_path = try tree.write("expected.tsv", try std.fmt.allocPrint(
-        tree.allocator(),
+    const expected_path = try tree.write("expected.tsv", try tree.allocator().print(
         "asset.qcow2\t{s}\t{d}\n",
         .{ &digest, body.len },
     ));
@@ -2504,14 +2493,12 @@ test "a published release must report leaving the draft state" {
         "[]",
     };
     for (refused) |draft| {
-        const release_path = try tree.write("release.json", try std.fmt.allocPrint(
-            tree.allocator(),
+        const release_path = try tree.write("release.json", try tree.allocator().print(
             \\{{{s}"assets": [
             \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "state": "uploaded", "size": {d}}}]}}
         ,
             .{
-                if (draft) |value| try std.fmt.allocPrint(
-                    tree.allocator(),
+                if (draft) |value| try tree.allocator().print(
                     "\"draft\": {s}, ",
                     .{value},
                 ) else "",
@@ -2542,8 +2529,7 @@ test "a published release must report leaving the draft state" {
         }
     }
 
-    const published = try tree.write("release.json", try std.fmt.allocPrint(
-        tree.allocator(),
+    const published = try tree.write("release.json", try tree.allocator().print(
         \\{{"draft": false, "immutable": true, "assets": [
         \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "state": "uploaded", "size": {d}}}]}}
     ,
@@ -2552,8 +2538,7 @@ test "a published release must report leaving the draft state" {
     try publication.verifyPublishedRelease(&context, published, expected_path);
     const mutable_published = try tree.write(
         "release-mutable.json",
-        try std.fmt.allocPrint(
-            tree.allocator(),
+        try tree.allocator().print(
             \\{{"draft": false, "immutable": false, "assets": [
             \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "state": "uploaded", "size": {d}}}]}}
         ,
@@ -2569,8 +2554,7 @@ test "a published release must report leaving the draft state" {
 
     // A non-draft release that lost or gained an asset is still refused, and
     // says so precisely.
-    const wrong = try tree.write("release-wrong.json", try std.fmt.allocPrint(
-        tree.allocator(),
+    const wrong = try tree.write("release-wrong.json", try tree.allocator().print(
         \\{{"draft": false, "immutable": true, "assets": [
         \\  {{"name": "asset.qcow2", "digest": "sha256:{s}", "state": "uploaded", "size": {d}}},
         \\  {{"name": "stray.qcow2", "digest": "sha256:{s}", "state": "uploaded", "size": {d}}}]}}
@@ -2599,8 +2583,7 @@ test "a published release must report leaving the draft state" {
     }) |invalid| {
         const invalid_release = try tree.write(
             "release-invalid.json",
-            try std.fmt.allocPrint(
-                tree.allocator(),
+            try tree.allocator().print(
                 "{{\"draft\":false,\"immutable\":true,\"assets\":[{{\"name\":\"asset.qcow2\",\"digest\":{s},\"state\":\"{s}\",\"size\":{d}}}]}}",
                 .{ invalid.digest_value, invalid.state, body.len },
             ),
@@ -2617,8 +2600,7 @@ test "a published release must report leaving the draft state" {
     }
     const starter_release = try tree.write(
         "release-starter.json",
-        try std.fmt.allocPrint(
-            tree.allocator(),
+        try tree.allocator().print(
             "{{\"draft\":false,\"immutable\":true,\"assets\":[{{\"name\":\"asset.qcow2\",\"digest\":\"sha256:{s}\",\"state\":\"starter\",\"size\":{d}}}]}}",
             .{ &digest, body.len },
         ),

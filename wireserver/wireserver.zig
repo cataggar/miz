@@ -262,7 +262,7 @@ pub const Client = struct {
     }
 
     fn getXml(self: *Client, allocator: std.mem.Allocator, path: []const u8) FetchError![]u8 {
-        const url = try std.fmt.allocPrint(allocator, "http://{s}{s}", .{ self.endpoint, path });
+        const url = try allocator.print("http://{s}{s}", .{ self.endpoint, path });
         defer allocator.free(url);
 
         var body: std.Io.Writer.Allocating = .init(allocator);
@@ -284,7 +284,7 @@ pub const Client = struct {
         const body = try buildHealthReportXml(allocator, report);
         defer allocator.free(body);
 
-        const url = try std.fmt.allocPrint(allocator, "http://{s}/machine?comp=health", .{self.endpoint});
+        const url = try allocator.print("http://{s}/machine?comp=health", .{self.endpoint});
         defer allocator.free(url);
 
         const result = try self.http_client.fetch(.{

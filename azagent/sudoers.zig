@@ -12,7 +12,7 @@ const includedir_line = "#includedir /etc/sudoers.d\n";
 
 /// The sudoers rule line granting `username` passwordless sudo.
 pub fn sudoerLine(allocator: Allocator, username: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s} ALL=(ALL) NOPASSWD: ALL\n", .{username});
+    return allocator.print("{s} ALL=(ALL) NOPASSWD: ALL\n", .{username});
 }
 
 /// True if `content` already grants `username` a sudoers rule (matching

@@ -1844,9 +1844,9 @@ fn testExpected() Expected {
             .run_attempt = "1",
             .staging_image_version_id = test_staging_version,
             .artifact = .{
-                .qcow_sha256 = "1" ** 64,
+                .qcow_sha256 = &@as([64:0]u8, @splat('1')),
                 .qcow_size = 1024,
-                .vhd_sha256 = "2" ** 64,
+                .vhd_sha256 = &@as([64:0]u8, @splat('2')),
                 .vhd_size = 4096,
                 .virtual_size = 3584,
             },
@@ -1987,8 +1987,8 @@ const test_scratch_inventory =
     "\",\"subscription_id\":\"" ++ test_subscription ++ "\"}";
 
 const test_source_acceptance =
-    "{\"artifact\":{\"qcow_sha256\":\"" ++ "1" ** 64 ++
-    "\",\"qcow_size\":1024,\"vhd_sha256\":\"" ++ "2" ** 64 ++
+    "{\"artifact\":{\"qcow_sha256\":\"" ++ &@as([64:0]u8, @splat('1')) ++
+    "\",\"qcow_size\":1024,\"vhd_sha256\":\"" ++ &@as([64:0]u8, @splat('2')) ++
     "\",\"vhd_size\":4096,\"virtual_size\":3584}," ++
     "\"attestation\":{},\"azure\":{\"gallery_image_version_id\":\"" ++
     test_source_version ++ "\",\"location\":\"eastus2\"," ++
@@ -2247,8 +2247,8 @@ test "capture result independently rejects provenance substitutions" {
 
     const substitutions = [_][2][]const u8{
         .{
-            "\"qcow_sha256\":\"" ++ "1" ** 64 ++ "\"",
-            "\"qcow_sha256\":\"" ++ "9" ** 64 ++ "\"",
+            "\"qcow_sha256\":\"" ++ &@as([64:0]u8, @splat('1')) ++ "\"",
+            "\"qcow_sha256\":\"" ++ &@as([64:0]u8, @splat('9')) ++ "\"",
         },
         .{
             "\"accepted_gallery_image_version_id\":\"" ++ test_source_version ++ "\"",
@@ -2317,13 +2317,11 @@ test "capture result independently rejects provenance substitutions" {
         evidence,
     );
 
-    const digest_needle = try std.fmt.allocPrint(
-        allocator,
+    const digest_needle = try allocator.print(
         "\"capture_vm_sha256\":\"{s}\"",
         .{&evidence.capture_vm_sha256},
     );
-    const digest_replacement = try std.fmt.allocPrint(
-        allocator,
+    const digest_replacement = try allocator.print(
         "\"capture_vm_sha256\":\"{s}\"",
         .{&release.digest.hexBytes("substituted capture VM digest")},
     );

@@ -375,7 +375,7 @@ pub const Source = struct {
             .digest => |value| value,
         };
         const digest_text = root_digest.format();
-        const descriptor_json = try std.fmt.allocPrint(
+        const descriptor_json = try Allocator.print(
             self.allocator,
             "{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}",
             .{ media_type, &digest_text, response.body.len },
@@ -795,7 +795,7 @@ pub const Source = struct {
         // platform to learn nothing the pin records.
         var node = try inspector.inspectDocument(resolved.descriptor, resolved.bytes, 0, 0, &active, false);
         defer node.deinit(self.allocator);
-        const reference_text = try std.fmt.allocPrint(
+        const reference_text = try Allocator.print(
             self.allocator,
             "docker://{s}/{s}@{s}",
             .{ self.authority, self.repository, resolved.descriptor.digest },
@@ -840,7 +840,7 @@ pub const Source = struct {
     }
 
     fn urlFor(self: *const Source, suffix: []const u8) ![]u8 {
-        return std.fmt.allocPrint(
+        return Allocator.print(
             self.allocator,
             "{s}://{s}{s}",
             .{ if (self.plain_http) "http" else "https", self.authority, suffix },
@@ -848,7 +848,7 @@ pub const Source = struct {
     }
 
     fn manifestUrl(self: *const Source, selector: []const u8) ![]u8 {
-        return std.fmt.allocPrint(
+        return Allocator.print(
             self.allocator,
             "{s}://{s}/v2/{s}/manifests/{s}",
             .{ if (self.plain_http) "http" else "https", self.authority, self.repository, selector },
@@ -856,7 +856,7 @@ pub const Source = struct {
     }
 
     fn blobUrl(self: *const Source, digest: []const u8) ![]u8 {
-        return std.fmt.allocPrint(
+        return Allocator.print(
             self.allocator,
             "{s}://{s}/v2/{s}/blobs/{s}",
             .{ if (self.plain_http) "http" else "https", self.authority, self.repository, digest },
@@ -864,7 +864,7 @@ pub const Source = struct {
     }
 
     fn tagsUrl(self: *const Source) ![]u8 {
-        return std.fmt.allocPrint(
+        return Allocator.print(
             self.allocator,
             "{s}://{s}/v2/{s}/tags/list",
             .{ if (self.plain_http) "http" else "https", self.authority, self.repository },
@@ -980,7 +980,7 @@ pub const Source = struct {
             header_count += 1;
         }
         if (authorization) |value| {
-            // Zig 0.16 does not write privileged_headers on the initial
+            // Zig 0.17 does not write privileged_headers on the initial
             // request, so this must remain an extra header.
             headers[header_count] = .{ .name = "Authorization", .value = value };
             header_count += 1;
@@ -1116,7 +1116,7 @@ pub const Source = struct {
 
         var extra_headers: [1]std.http.Header = undefined;
         const headers: []const std.http.Header = if (authorization) |value| blk: {
-            // Zig 0.16 does not write privileged_headers on the initial
+            // Zig 0.17 does not write privileged_headers on the initial
             // request, so this remains an extra header.
             extra_headers[0] = .{ .name = "Authorization", .value = value };
             break :blk &extra_headers;
@@ -1342,7 +1342,7 @@ pub const Source = struct {
                 defer token.deinit(self.allocator);
                 token_value = try self.token_cache.put(self.io, realm, bearer_service, scopes.items, token);
             }
-            const header = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{token_value.?});
+            const header = try Allocator.print(self.allocator, "Bearer {s}", .{token_value.?});
             self.setAuthorization(header);
             return;
         }
@@ -1417,7 +1417,7 @@ pub const Source = struct {
     }
 
     fn openTemporaryDirectory(self: *Source) !Io.Dir {
-        if (@import("builtin").os.tag == .windows) {
+        if (builtin.target.os.tag == .windows) {
             if (try self.openEnvironmentDirectory("TEMP")) |dir| return dir;
             if (try self.openEnvironmentDirectory("TMP")) |dir| return dir;
             return Io.Dir.cwd().openDir(self.io, ".", .{});
@@ -1635,7 +1635,7 @@ pub const Source = struct {
         const body = try readResponseBodyAlloc(self.allocator, response, error_body_limit, true);
         defer self.allocator.free(body);
         if (self.last_error) |*value| value.deinit(self.allocator);
-        self.last_error = .{ .status = @intFromEnum(response.head.status) };
+        self.last_error = .{ .status = @backingInt(response.head.status) };
         if (body.len == 0) return;
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return;
         defer parsed.deinit();
@@ -2282,7 +2282,7 @@ pub const Destination = struct {
     }
 
     fn uploadUrl(self: *const Destination) ![]u8 {
-        return std.fmt.allocPrint(
+        return Allocator.print(
             self.remote.allocator,
             "{s}://{s}/v2/{s}/blobs/uploads/",
             .{
@@ -2298,7 +2298,7 @@ pub const Destination = struct {
         defer self.remote.allocator.free(digest);
         const source = try percentEncodeAlloc(self.remote.allocator, source_repository);
         defer self.remote.allocator.free(source);
-        return std.fmt.allocPrint(
+        return Allocator.print(
             self.remote.allocator,
             "{s}://{s}/v2/{s}/blobs/uploads/?mount={s}&from={s}",
             .{
@@ -2602,7 +2602,7 @@ fn acceptsStatus(spec: RequestSpec, status: std.http.Status) bool {
 }
 
 fn isRetryableStatus(status: std.http.Status) bool {
-    return switch (@intFromEnum(status)) {
+    return switch (@backingInt(status)) {
         408, 429, 500, 502, 503, 504 => true,
         else => false,
     };
@@ -2875,8 +2875,8 @@ fn sameOriginUrl(left_text: []const u8, right_text: []const u8) bool {
     if (!std.ascii.eqlIgnoreCase(left.scheme, right.scheme)) return false;
     var left_host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
     var right_host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const left_host = left.getHost(&left_host_buffer) catch return false;
-    const right_host = right.getHost(&right_host_buffer) catch return false;
+    const left_host = std.Io.net.HostName.fromUri(left, &left_host_buffer) catch return false;
+    const right_host = std.Io.net.HostName.fromUri(right, &right_host_buffer) catch return false;
     if (!std.ascii.eqlIgnoreCase(left_host.bytes, right_host.bytes)) return false;
     return uriPort(left) == uriPort(right);
 }
@@ -2943,7 +2943,7 @@ fn createUniqueTempFile(io: Io, allocator: Allocator, dir: Io.Dir, kind: []const
     for (0..64) |_| {
         try io.randomSecure(&random);
         const suffix = std.fmt.bytesToHex(random, .lower);
-        const name = try std.fmt.allocPrint(allocator, ".miz-oci-{s}-{s}.tmp", .{ kind, suffix });
+        const name = try Allocator.print(allocator, ".miz-oci-{s}-{s}.tmp", .{ kind, suffix });
         const file = dir.createFile(io, name, .{
             .read = true,
             .exclusive = true,
@@ -2964,7 +2964,7 @@ fn createUniqueTempFile(io: Io, allocator: Allocator, dir: Io.Dir, kind: []const
 }
 
 fn privateFilePermissions() Io.File.Permissions {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows => .default_file,
         else => .fromMode(0o600),
     };
@@ -2997,7 +2997,7 @@ fn appendDigestQueryAlloc(allocator: Allocator, url: []const u8, digest: []const
         if (question + 1 == url.len or url[url.len - 1] == '&') "" else "&"
     else
         "?";
-    return std.fmt.allocPrint(allocator, "{s}{s}digest={s}", .{ url, separator, encoded });
+    return Allocator.print(allocator, "{s}{s}digest={s}", .{ url, separator, encoded });
 }
 
 fn uriPort(uri: std.Uri) u16 {
@@ -3007,7 +3007,7 @@ fn uriPort(uri: std.Uri) u16 {
 fn isPlainNonLoopback(uri: std.Uri) bool {
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "http")) return false;
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const host = uri.getHost(&host_buffer) catch return true;
+    const host = std.Io.net.HostName.fromUri(uri, &host_buffer) catch return true;
     return !isLoopbackHost(host.bytes);
 }
 
@@ -3238,12 +3238,12 @@ fn descriptorMayMatchRequested(descriptor: model.Platform, requested: model.Plat
 }
 
 fn registryReferenceText(allocator: Allocator, source: reference.RegistryReference) ![]u8 {
-    const selection = source.selection orelse return std.fmt.allocPrint(allocator, "docker://{s}/{s}", .{ source.authority, source.repository });
+    const selection = source.selection orelse return Allocator.print(allocator, "docker://{s}/{s}", .{ source.authority, source.repository });
     return switch (selection) {
-        .tag => |tag| std.fmt.allocPrint(allocator, "docker://{s}/{s}:{s}", .{ source.authority, source.repository, tag }),
+        .tag => |tag| Allocator.print(allocator, "docker://{s}/{s}:{s}", .{ source.authority, source.repository, tag }),
         .digest => |digest| blk: {
             const text = digest.format();
-            break :blk std.fmt.allocPrint(allocator, "docker://{s}/{s}@{s}", .{ source.authority, source.repository, &text });
+            break :blk Allocator.print(allocator, "docker://{s}/{s}@{s}", .{ source.authority, source.repository, &text });
         },
     };
 }
@@ -3265,6 +3265,114 @@ test "only concrete loopback hosts permit plain credentials" {
     try std.testing.expect(isLoopbackHost("localhost"));
     try std.testing.expect(!isLoopbackHost("127.evil.example"));
     try std.testing.expect(!isLoopbackHost("127.0.0.999"));
+}
+
+test "origin comparisons decode and validate hosts before retaining authorization" {
+    try std.testing.expect(sameOriginUrl("https://registry.example/v2/", "https://REGISTRY.example:443/blob"));
+    try std.testing.expect(sameOriginUrl("https://registry.example/v2/", "https://%72egistry.example/blob"));
+    try std.testing.expect(!sameOriginUrl("https://registry.example/v2/", "https://registry.example:444/blob"));
+    try std.testing.expect(!sameOriginUrl("https://registry.example/v2/", "https://upload.example/blob"));
+    for ([_][]const u8{
+        "https://registry..example/blob",
+        "https://registry.example%2fother/blob",
+        "https://-registry.example/blob",
+        "https://registry.example:65536/blob",
+        "https://registry.example:bad/blob",
+        "https:///blob",
+    }) |invalid| {
+        try std.testing.expect(!sameOriginUrl(invalid, invalid));
+    }
+
+    try std.testing.expect(!isPlainNonLoopback(try std.Uri.parse("http://%6cocalhost:5000/v2/")));
+    try std.testing.expect(isPlainNonLoopback(try std.Uri.parse("http://localhost%2fevil/v2/")));
+}
+
+test "initial registry authorization is emitted once and stripped on a cross-origin blob redirect" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const address: Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } };
+    var origin = try address.listen(io, .{});
+    defer origin.deinit(io);
+    var redirected = try address.listen(io, .{});
+    defer redirected.deinit(io);
+    const authority = try allocator.print("127.0.0.1:{d}", .{origin.socket.address.getPort()});
+    defer allocator.free(authority);
+    const origin_url = try allocator.print("http://{s}/blob", .{authority});
+    defer allocator.free(origin_url);
+    const redirect_url = try allocator.print("http://127.0.0.1:{d}/blob", .{redirected.socket.address.getPort()});
+    defer allocator.free(redirect_url);
+    var source = try Source.init(
+        io,
+        allocator,
+        std.process.Environ.empty,
+        .{ .authority = authority, .repository = "test", .selection = null },
+        .{ .plain_http = true, .discover_credential = false },
+    );
+    defer source.deinit();
+    source.authorization = try allocator.dupe(u8, "Bearer test-token");
+
+    const Server = struct {
+        io: Io,
+        listeners: [3]*Io.net.Server,
+        redirect_url: []const u8,
+        authorization_count: [3]usize = @splat(0),
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.serve() catch |err| {
+                self.err = err;
+            };
+        }
+
+        fn serve(self: *@This()) !void {
+            for (self.listeners, 0..) |listener, index| {
+                var stream = try listener.accept(self.io);
+                defer stream.close(self.io);
+                var read_buffer: [4096]u8 = undefined;
+                var write_buffer: [4096]u8 = undefined;
+                var reader = stream.reader(self.io, &read_buffer);
+                var writer = stream.writer(self.io, &write_buffer);
+                var server: std.http.Server = .init(&reader.interface, &writer.interface);
+                var request = try server.receiveHead();
+                var headers = request.iterateHeaders();
+                while (headers.next()) |header| {
+                    if (std.ascii.eqlIgnoreCase(header.name, "Authorization")) {
+                        self.authorization_count[index] += 1;
+                        if (!std.mem.eql(u8, header.value, "Bearer test-token"))
+                            self.err = error.UnexpectedAuthorization;
+                    }
+                }
+                if (index == 0) {
+                    try request.respond("", .{ .status = .accepted });
+                } else if (index == 1) {
+                    try request.respond("", .{
+                        .status = .temporary_redirect,
+                        .extra_headers = &.{.{ .name = "Location", .value = self.redirect_url }},
+                    });
+                } else {
+                    try request.respond("ok", .{});
+                }
+            }
+        }
+    };
+    var server: Server = .{ .io = io, .listeners = .{ &origin, &origin, &redirected }, .redirect_url = redirect_url };
+    const thread = try std.Thread.spawn(.{}, Server.run, .{&server});
+    const mutation_result = source.mutate(.POST, origin_url, .empty, false);
+    const result = source.fetchBounded(.GET, origin_url, .{ .class = .blob, .limit = 16 });
+    thread.join();
+    if (server.err) |err| return err;
+    var mutation = try mutation_result;
+    switch (mutation) {
+        .response => |*response| {
+            defer response.deinit(allocator);
+            try std.testing.expectEqual(std.http.Status.accepted, response.status);
+        },
+        else => return error.UnexpectedMutationOutcome,
+    }
+    var response = try result;
+    defer response.deinit(allocator);
+    try std.testing.expectEqualStrings("ok", response.body);
+    try std.testing.expectEqual(@as([3]usize, .{ 1, 1, 0 }), server.authorization_count);
 }
 
 test "Link parser accepts repeated list fields and quoted pairs" {

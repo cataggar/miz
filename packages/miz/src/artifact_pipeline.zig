@@ -81,7 +81,7 @@ pub const CurlDownloader = struct {
         output: *Io.Writer,
     ) !void {
         const self: *CurlDownloader = @ptrCast(@alignCast(context_ptr.?));
-        const retries = try std.fmt.allocPrint(
+        const retries = try Allocator.print(
             allocator,
             "{d}",
             .{self.retries},
@@ -359,7 +359,7 @@ fn fetchNativeHttps(
     var response = try request.receiveHead(&.{});
     if (response.head.content_encoding != .identity)
         return error.InvalidResponseContentEncoding;
-    const status = @intFromEnum(response.head.status);
+    const status = @backingInt(response.head.status);
     if (status != 200) {
         const location: ?[]u8 = if (isRedirectStatus(status)) blk: {
             const raw_location = response.head.location orelse return error.InvalidRedirect;
@@ -871,7 +871,7 @@ pub fn finalizeQcow2(
     io: Io,
     options: FinalizeQcow2Options,
 ) !FinalizedQcow2 {
-    if (builtin.os.tag != .linux) return error.UnsupportedHost;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedHost;
     if (options.compression != .zstd and options.qemu_img_path.len == 0) {
         return error.InvalidQemuImgPath;
     }
@@ -987,19 +987,19 @@ pub fn finalizeQcow2(
         try validateStageBounded(io, stage.file, options.max_output_size);
     } else {
         const create_options = if (options.compression.qemuName()) |compression|
-            try std.fmt.allocPrint(
+            try Allocator.print(
                 allocator,
                 "compression_type={s},cluster_size={d}",
                 .{ compression, options.cluster_size },
             )
         else
-            try std.fmt.allocPrint(
+            try Allocator.print(
                 allocator,
                 "cluster_size={d}",
                 .{options.cluster_size},
             );
         defer allocator.free(create_options);
-        const virtual_size_text = try std.fmt.allocPrint(
+        const virtual_size_text = try Allocator.print(
             allocator,
             "{d}",
             .{virtual_size},
@@ -1130,7 +1130,7 @@ pub fn deriveFixedVhd(
     io: Io,
     options: DeriveFixedVhdOptions,
 ) !DerivedFixedVhd {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .linux, .macos => {},
         else => return error.UnsupportedHost,
     }
@@ -1535,7 +1535,7 @@ pub fn sameFileIdentity(io: Io, a: File, b: File) !bool {
 }
 
 fn fileSystemId(file: File) !u64 {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .linux => linuxFileSystemId(file),
         .windows => windowsFileSystemId(file),
         .wasi => error.FileIdentityUnavailable,
@@ -1598,7 +1598,7 @@ fn posixFileSystemId(file: File) !u64 {
     }
 }
 
-/// The Zig 0.16 XZ decoder validates stream framing but does not compare the
+/// The Zig 0.17 XZ decoder validates stream framing but does not compare the
 /// per-block check bytes.  Verify the checked output independently, using the
 /// XZ index to bind each stored check to its exact decoded byte range.
 fn validateXzIntegrity(
@@ -1780,7 +1780,7 @@ fn validateXzCheck(
             if (hasher.final() != readU32Le(expected[0..4])) return error.XzDecompressionFailed;
         },
         4 => {
-            var hasher = std.hash.crc.Crc64Xz.init();
+            var hasher = std.hash.crc.@"CRC-64/XZ".init();
             while (current - offset < len) {
                 const amount: usize = @intCast(@min(len - (current - offset), buffer.len));
                 if (try output.readPositionalAll(io, buffer[0..amount], current) != amount) return error.XzDecompressionFailed;
@@ -2006,7 +2006,7 @@ test "parse and format SHA-256" {
     try std.testing.expectError(error.InvalidSha256, parseSha256("short"));
     try std.testing.expectError(
         error.InvalidSha256,
-        parseSha256("z" ** 64),
+        parseSha256(&@as([64]u8, @splat('z'))),
     );
 }
 
@@ -2688,7 +2688,7 @@ test "XZ decompression rejects hard-linked input and output" {
 }
 
 test "QCOW2 finalization publishes standalone zstd output" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     if (!qemuImgAvailable(std.testing.allocator, std.testing.io)) {
         return error.SkipZigTest;
     }
@@ -2743,7 +2743,7 @@ test "QCOW2 finalization publishes standalone zstd output" {
 }
 
 test "QCOW2 finalization honors an explicit raw source format" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     if (!qemuImgAvailable(std.testing.allocator, std.testing.io)) {
         return error.SkipZigTest;
     }
@@ -2790,7 +2790,7 @@ test "QCOW2 finalization honors an explicit raw source format" {
 }
 
 test "QCOW2 finalization preserves output when the qemu-img fallback cannot start" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const input_path = "test-finalize-failure-input.qcow2";
     const output_path = "test-finalize-failure-output.qcow2";
@@ -2834,7 +2834,7 @@ test "QCOW2 finalization preserves output when the qemu-img fallback cannot star
 }
 
 test "QCOW2 finalization emits standalone zstd output natively without qemu-img" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const input_path = "test-finalize-native-input.qcow2";
     const output_path = "test-finalize-native-output.qcow2";
@@ -2889,7 +2889,7 @@ test "QCOW2 finalization emits standalone zstd output natively without qemu-img"
 }
 
 test "QCOW2 finalization rejects hard-linked input and output" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
     const input_path = "test-finalize-alias-input.qcow2";
     const output_path = "test-finalize-alias-output.qcow2";
@@ -2933,7 +2933,7 @@ test "QCOW2 finalization rejects hard-linked input and output" {
 }
 
 test "fixed VHD derivation relocates mirrored GPT transactionally" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) {
         return error.SkipZigTest;
     }
     const io = std.testing.io;
@@ -2986,7 +2986,7 @@ test "fixed VHD derivation relocates mirrored GPT transactionally" {
             .max_virtual_size = 32 * 1024 * 1024,
             .output_path = output_path,
             .max_output_size = 32 * 1024 * 1024,
-            .unique_id = [_]u8{0x42} ** 16,
+            .unique_id = @splat(0x42),
             .timestamp_unix = 0,
         },
     );
@@ -3042,7 +3042,7 @@ test "fixed VHD derivation relocates mirrored GPT transactionally" {
 }
 
 test "fixed VHD derivation preserves output on digest failure and rejects aliases" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) {
         return error.SkipZigTest;
     }
     const io = std.testing.io;
@@ -3107,7 +3107,7 @@ test "fixed VHD derivation preserves output on digest failure and rejects aliase
 }
 
 test "fixed VHD derivation rejects backing paths before opening them" {
-    if (builtin.os.tag != .linux and builtin.os.tag != .macos) {
+    if (builtin.target.os.tag != .linux and builtin.target.os.tag != .macos) {
         return error.SkipZigTest;
     }
     const io = std.testing.io;
@@ -3167,7 +3167,7 @@ test "fixed VHD derivation rejects backing paths before opening them" {
 }
 
 test "QCOW2 finalization enforces virtual and output size limits" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     if (!qemuImgAvailable(std.testing.allocator, std.testing.io)) {
         return error.SkipZigTest;
     }
@@ -3277,7 +3277,7 @@ const TestNativeHttpsStep = union(enum) {
 const TestNativeHttpsTransport = struct {
     steps: []const TestNativeHttpsStep,
     calls: usize = 0,
-    urls: [8]?[]u8 = .{null} ** 8,
+    urls: [8]?[]u8 = @splat(null),
 
     fn deinit(self: *TestNativeHttpsTransport, allocator: Allocator) void {
         for (&self.urls) |*url| {
@@ -3321,7 +3321,7 @@ const TestNativeHttpsTransport = struct {
 
 const TestNativeHttpsSleep = struct {
     calls: usize = 0,
-    seconds: [8]u64 = .{0} ** 8,
+    seconds: [8]u64 = @splat(0),
 
     fn call(context_ptr: ?*anyopaque, _: Io, seconds: u64) !void {
         const context: *TestNativeHttpsSleep = @ptrCast(@alignCast(context_ptr.?));

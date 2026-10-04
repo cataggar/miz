@@ -194,11 +194,11 @@ pub fn generate(
 }
 
 fn currentUid() u32 {
-    return if (@import("builtin").os.tag == .linux) std.os.linux.geteuid() else 0;
+    return if (@import("builtin").target.os.tag == .linux) std.os.linux.geteuid() else 0;
 }
 
 fn currentGid() u32 {
-    return if (@import("builtin").os.tag == .linux) std.os.linux.getegid() else 0;
+    return if (@import("builtin").target.os.tag == .linux) std.os.linux.getegid() else 0;
 }
 
 const ResolvedUser = struct {
@@ -344,7 +344,7 @@ fn environment(
     for (source) |value| {
         if (std.mem.startsWith(u8, value, "HOME=")) return env.toOwnedSlice();
     }
-    try env.append(try std.fmt.allocPrint(allocator, "HOME={s}", .{home}));
+    try env.append(try allocator.print("HOME={s}", .{home}));
     return env.toOwnedSlice();
 }
 

@@ -139,7 +139,7 @@ fn pathExecutable(io: Io, path: []const u8) bool {
 }
 
 fn hardwareAccelerationAvailable(io: Io) bool {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .linux => blk: {
             Io.Dir.cwd().access(io, "/dev/kvm", .{ .read = true, .write = true }) catch
                 break :blk false;
@@ -678,7 +678,7 @@ test "guest agent validation requires an executable bounded static image" {
 }
 
 fn testGuestAgentElf(machine: u16) [120]u8 {
-    var bytes = [_]u8{0} ** 120;
+    var bytes = @as([120]u8, @splat(0));
     @memcpy(bytes[0..4], "\x7fELF");
     bytes[4] = 2;
     bytes[5] = 1;
@@ -698,7 +698,7 @@ fn testGuestAgentElf(machine: u16) [120]u8 {
 }
 
 fn testGuestAgentElfWithDynamicDependency(machine: u16) [224]u8 {
-    var bytes = [_]u8{0} ** 224;
+    var bytes = @as([224]u8, @splat(0));
     @memcpy(bytes[0..4], "\x7fELF");
     bytes[4] = 2;
     bytes[5] = 1;
@@ -784,7 +784,7 @@ fn rootDevicePath(
         .logical_volume => return error.UnsupportedRootPartitionInVm,
     };
     if (index == 0 or index > 128) return error.UnsupportedRootPartition;
-    return std.fmt.allocPrint(allocator, "{s}{d}", .{ stage_device, index });
+    return allocator.print("{s}{d}", .{ stage_device, index });
 }
 
 fn requestedKernelRelease(initramfs: customize.InitramfsPolicy) ?[]const u8 {
@@ -815,7 +815,7 @@ const CredentialDevice = struct {
     path: []const u8,
 
     fn create(allocator: Allocator, sealed: []const u8) !CredentialDevice {
-        if (builtin.os.tag != .linux) return error.UnsupportedCredentialTransport;
+        if (builtin.target.os.tag != .linux) return error.UnsupportedCredentialTransport;
         const rc = std.os.linux.memfd_create("miz-credential", 0);
         switch (std.os.linux.errno(rc)) {
             .SUCCESS => {},
@@ -848,7 +848,7 @@ const CredentialDevice = struct {
         }
         return .{
             .fd = fd,
-            .path = try std.fmt.allocPrint(allocator, "/proc/self/fd/{d}", .{fd}),
+            .path = try allocator.print("/proc/self/fd/{d}", .{fd}),
         };
     }
 
@@ -856,7 +856,7 @@ const CredentialDevice = struct {
     /// frees the pages anyway, but a zeroed page is zeroed at a moment this
     /// code chose rather than one the allocator did.
     fn close(self: CredentialDevice) void {
-        const zeros = [_]u8{0} ** 4096;
+        const zeros = @as([4096]u8, @splat(0));
         var offset: u64 = 0;
         while (offset < vm_control.credential_device_bytes) : (offset += zeros.len) {
             const rc = std.os.linux.pwrite(self.fd, &zeros, zeros.len, @intCast(offset));
@@ -1251,14 +1251,13 @@ fn buildArgv(allocator: Allocator, input: ArgvInput) ![]const []const u8 {
         "-rtc",
         "base=utc",
     });
-    try argv.appendSlice(&.{ "-machine", try std.fmt.allocPrint(
-        allocator,
+    try argv.appendSlice(&.{ "-machine", try allocator.print(
         "{s},accel={s}",
         .{ machineName(policy, architecture), accelerationName(policy.acceleration) },
     ) });
     try argv.appendSlice(&.{ "-cpu", cpuName(policy, architecture) });
-    try argv.appendSlice(&.{ "-smp", try std.fmt.allocPrint(allocator, "{d}", .{policy.vcpus}) });
-    try argv.appendSlice(&.{ "-m", try std.fmt.allocPrint(allocator, "{d}", .{policy.memory_mib}) });
+    try argv.appendSlice(&.{ "-smp", try allocator.print("{d}", .{policy.vcpus}) });
+    try argv.appendSlice(&.{ "-m", try allocator.print("{d}", .{policy.memory_mib}) });
     try argv.appendSlice(&.{ "-kernel", layout.kernel_path });
     try argv.appendSlice(&.{ "-initrd", layout.initrd_path });
     try argv.appendSlice(&.{ "-append", try kernelCommandLine(allocator, architecture) });
@@ -1301,14 +1300,12 @@ fn appendDisks(
     switch (input.disk) {
         .virtio_blk => for (paths, 0..) |path, index| {
             try argv.appendSlice(&.{ "-drive", if (index == credential_disk_index)
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "file={s},format=raw,if=virtio,{s}",
                     .{ path, readonly },
                 )
             else
-                try std.fmt.allocPrint(
-                    allocator,
+                try allocator.print(
                     "file={s},format=raw,if=virtio,cache=writeback",
                     .{path},
                 ) });
@@ -1317,19 +1314,16 @@ fn appendDisks(
             try argv.appendSlice(&.{ "-device", "virtio-scsi-pci,id=mizscsi" });
             for (paths, 0..) |path, index| {
                 try argv.appendSlice(&.{ "-drive", if (index == credential_disk_index)
-                    try std.fmt.allocPrint(
-                        allocator,
+                    try allocator.print(
                         "file={s},format=raw,if=none,id=mizdisk{d},{s}",
                         .{ path, index, readonly },
                     )
                 else
-                    try std.fmt.allocPrint(
-                        allocator,
+                    try allocator.print(
                         "file={s},format=raw,if=none,id=mizdisk{d},cache=writeback",
                         .{ path, index },
                     ) });
-                try argv.appendSlice(&.{ "-device", try std.fmt.allocPrint(
-                    allocator,
+                try argv.appendSlice(&.{ "-device", try allocator.print(
                     "scsi-hd,drive=mizdisk{d},bus=mizscsi.0,channel=0,scsi-id={d},lun=0",
                     .{ index, index },
                 ) });
@@ -1535,18 +1529,16 @@ fn buildFirmwareArgv(allocator: Allocator, input: FirmwareArgvInput) ![]const []
     try machine.appendSlice(accelerationName(policy.acceleration));
     try argv.appendSlice(&.{ "-machine", try machine.toOwnedSlice() });
     try argv.appendSlice(&.{ "-cpu", cpuName(policy, input.architecture) });
-    try argv.appendSlice(&.{ "-smp", try std.fmt.allocPrint(allocator, "{d}", .{policy.vcpus}) });
-    try argv.appendSlice(&.{ "-m", try std.fmt.allocPrint(allocator, "{d}", .{policy.memory_mib}) });
+    try argv.appendSlice(&.{ "-smp", try allocator.print("{d}", .{policy.vcpus}) });
+    try argv.appendSlice(&.{ "-m", try allocator.print("{d}", .{policy.memory_mib}) });
 
     // Unit 0 is the code, unit 1 the variable store, in that order: EDK2 reads
     // its own layout positionally and a swapped pair simply does not boot.
-    try argv.appendSlice(&.{ "-drive", try std.fmt.allocPrint(
-        allocator,
+    try argv.appendSlice(&.{ "-drive", try allocator.print(
         "if=pflash,format=raw,unit=0,readonly=on,file={s}",
         .{input.code_path},
     ) });
-    try argv.appendSlice(&.{ "-drive", try std.fmt.allocPrint(
-        allocator,
+    try argv.appendSlice(&.{ "-drive", try allocator.print(
         "if=pflash,format=raw,unit=1,file={s}",
         .{input.vars_path},
     ) });
@@ -1561,8 +1553,7 @@ fn buildFirmwareArgv(allocator: Allocator, input: FirmwareArgvInput) ![]const []
 
     // `snapshot=on` is what makes the attestation read-only. The guest boots
     // and writes as it pleases; none of it reaches the file that is published.
-    try argv.appendSlice(&.{ "-drive", try std.fmt.allocPrint(
-        allocator,
+    try argv.appendSlice(&.{ "-drive", try allocator.print(
         "file={s},format=raw,if=virtio,snapshot=on",
         .{input.stage_path},
     ) });
@@ -1769,8 +1760,7 @@ fn kernelCommandLine(
     allocator: Allocator,
     architecture: customize.Architecture,
 ) ![]const u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "console={s},115200n8 rdinit=/{s} panic=-1 loglevel=4",
         .{ consoleDevice(architecture), vm_control.agent_path },
     );
@@ -1837,16 +1827,15 @@ fn reportConsole(
 fn describeFailure(allocator: Allocator, failure: vm_control.Failure) ![]const u8 {
     var text: std.array_list.Managed(u8) = .init(allocator);
     errdefer text.deinit();
-    try text.appendSlice(try std.fmt.allocPrint(
-        allocator,
+    try text.appendSlice(try allocator.print(
         "guest failed at stage '{s}'",
         .{failure.stage},
     ));
     if (failure.exit_code) |code| {
-        try text.appendSlice(try std.fmt.allocPrint(allocator, " (exit {d})", .{code}));
+        try text.appendSlice(try allocator.print(" (exit {d})", .{code}));
     }
     if (failure.detail.len != 0) {
-        try text.appendSlice(try std.fmt.allocPrint(allocator, ": {s}", .{failure.detail}));
+        try text.appendSlice(try allocator.print(": {s}", .{failure.detail}));
     }
     try text.append('\n');
     return text.toOwnedSlice();
@@ -2899,15 +2888,17 @@ test "the guest's hook bounds are exactly the library's" {
     // And the phases must agree in order, because both sides decide "may not
     // move earlier than" by comparing tag values.
     try std.testing.expectEqual(
-        @typeInfo(customize.HookPhase).@"enum".fields.len,
-        @typeInfo(vm_control.HookPhase).@"enum".fields.len,
+        @typeInfo(customize.HookPhase).@"enum".field_names.len,
+        @typeInfo(vm_control.HookPhase).@"enum".field_names.len,
     );
     inline for (
-        @typeInfo(customize.HookPhase).@"enum".fields,
-        @typeInfo(vm_control.HookPhase).@"enum".fields,
-    ) |library, guest| {
-        try std.testing.expectEqualStrings(library.name, guest.name);
-        try std.testing.expectEqual(library.value, guest.value);
+        @typeInfo(customize.HookPhase).@"enum".field_names,
+        @typeInfo(vm_control.HookPhase).@"enum".field_names,
+        @typeInfo(customize.HookPhase).@"enum".field_values,
+        @typeInfo(vm_control.HookPhase).@"enum".field_values,
+    ) |library_name, guest_name, library_value, guest_value| {
+        try std.testing.expectEqualStrings(library_name, guest_name);
+        try std.testing.expectEqual(library_value, guest_value);
     }
 }
 
@@ -2959,8 +2950,8 @@ test "a hook source is read on the host and carried to the guest verbatim" {
     // not carried at all: the guest names the file from the hook's position,
     // so the document has no way to say where a script lands.
     try std.testing.expectEqualStrings("--first", built.carried[0].arguments[0]);
-    inline for (@typeInfo(vm_control.Hook).@"struct".fields) |field| {
-        try std.testing.expect(!std.mem.eql(u8, field.name, "path"));
+    inline for (@typeInfo(vm_control.Hook).@"struct".field_names) |name| {
+        try std.testing.expect(!std.mem.eql(u8, name, "path"));
     }
 }
 

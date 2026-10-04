@@ -38,7 +38,7 @@ pub fn writeAtomicProtected(
 }
 
 fn privateFilePermissions() Io.File.Permissions {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .windows => .default_file,
         else => .fromMode(0o600),
     };

@@ -850,8 +850,7 @@ const Publisher = struct {
                 "remote release asset {s} has no digest",
                 .{local.name},
             );
-            const expected = try std.fmt.allocPrint(
-                self.allocator,
+            const expected = try self.allocator.print(
                 "sha256:{s}",
                 .{&local.digest_hex},
             );
@@ -1179,14 +1178,12 @@ pub fn publish(
     );
     try validateVersionTag(options.version, options.tag, diagnostic);
 
-    const title = std.fmt.allocPrint(
-        allocator,
+    const title = allocator.print(
         "miz {s}",
         .{options.version},
     ) catch return error.OutOfMemory;
     defer allocator.free(title);
-    const install_preamble = std.fmt.allocPrint(
-        allocator,
+    const install_preamble = allocator.print(
         "**Install:**\n\n```console\nghr install {s}@{s}\n```\n",
         .{ options.repository_name, options.tag },
     ) catch return error.OutOfMemory;
@@ -2270,8 +2267,7 @@ pub fn validateDraftAssetTableFiles(
                 if (value == .string) value.string else null
             else
                 null;
-            const expected_digest = std.fmt.allocPrint(
-                allocator,
+            const expected_digest = allocator.print(
                 "sha256:{s}",
                 .{expected.items[index].digest_hex},
             ) catch return error.OutOfMemory;
@@ -2445,8 +2441,7 @@ pub fn validateSingleDraftAssetFiles(
         .{},
     );
 
-    const expected_digest = std.fmt.allocPrint(
-        allocator,
+    const expected_digest = allocator.print(
         "sha256:{s}",
         .{expected_digest_hex},
     ) catch return error.OutOfMemory;
@@ -2612,8 +2607,7 @@ fn validateLocalAssets(
     var expected_count: usize = 0;
     defer for (expected_names[0..expected_count]) |name| allocator.free(name);
     for (platforms) |platform| {
-        expected_names[expected_count] = std.fmt.allocPrint(
-            allocator,
+        expected_names[expected_count] = allocator.print(
             "miz-{s}-{s}.tar.gz",
             .{ version, platform },
         ) catch return error.OutOfMemory;
@@ -2628,8 +2622,7 @@ fn validateLocalAssets(
         .{err},
     );
     defer directory.close(io);
-    const prefix = std.fmt.allocPrint(
-        allocator,
+    const prefix = allocator.print(
         "miz-{s}-",
         .{version},
     ) catch return error.OutOfMemory;
@@ -2721,8 +2714,7 @@ fn fieldAlloc(
     name: []const u8,
     value: []const u8,
 ) Error![]const u8 {
-    return std.fmt.allocPrint(
-        self.allocator,
+    return self.allocator.print(
         "{s}={s}",
         .{ name, value },
     ) catch error.OutOfMemory;
@@ -3059,14 +3051,12 @@ test "single draft asset repair plans fail closed and replace invalid sets" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const notes_path = try std.fmt.allocPrint(
-        allocator,
+    const notes_path = try allocator.print(
         ".zig-cache/tmp/{s}/notes.md",
         .{&tmp.sub_path},
     );
     defer allocator.free(notes_path);
-    const release_path = try std.fmt.allocPrint(
-        allocator,
+    const release_path = try allocator.print(
         ".zig-cache/tmp/{s}/release.json",
         .{&tmp.sub_path},
     );
@@ -3182,14 +3172,12 @@ test "single draft asset final validation requires one uploaded exact asset" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const notes_path = try std.fmt.allocPrint(
-        allocator,
+    const notes_path = try allocator.print(
         ".zig-cache/tmp/{s}/notes.md",
         .{&tmp.sub_path},
     );
     defer allocator.free(notes_path);
-    const release_path = try std.fmt.allocPrint(
-        allocator,
+    const release_path = try allocator.print(
         ".zig-cache/tmp/{s}/release.json",
         .{&tmp.sub_path},
     );
@@ -3326,8 +3314,7 @@ test "asset table mutation gates require exact uploaded API digests" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const root = try std.fmt.allocPrint(
-        allocator,
+    const root = try allocator.print(
         ".zig-cache/tmp/{s}",
         .{&tmp.sub_path},
     );
@@ -3341,7 +3328,7 @@ test "asset table mutation gates require exact uploaded API digests" {
     try Dir.cwd().writeFile(io, .{ .sub_path = notes_path, .data = "notes" });
     try Dir.cwd().writeFile(io, .{
         .sub_path = expected_path,
-        .data = "result.json\t" ++ "a" ** 64 ++ "\t7\n",
+        .data = "result.json\t" ++ &@as([64:0]u8, @splat('a')) ++ "\t7\n",
     });
     const metadata =
         "\"id\":42,\"tag_name\":\"capture-v1\",\"target_commitish\":" ++
@@ -3379,7 +3366,7 @@ test "asset table mutation gates require exact uploaded API digests" {
 
     const exact_asset =
         "{\"id\":1,\"name\":\"result.json\",\"size\":7,\"state\":\"uploaded\"," ++
-        "\"digest\":\"sha256:" ++ "a" ** 64 ++ "\"}";
+        "\"digest\":\"sha256:" ++ &@as([64:0]u8, @splat('a')) ++ "\"}";
     try Dir.cwd().writeFile(io, .{
         .sub_path = release_path,
         .data = "{" ++ metadata ++ ",\"draft\":true,\"assets\":[" ++
@@ -3409,11 +3396,11 @@ test "asset table mutation gates require exact uploaded API digests" {
             .plan = "2\n",
         },
         .{
-            .json = "{\"id\":3,\"name\":\"result.json\",\"size\":7,\"state\":\"starter\",\"digest\":\"sha256:" ++ "a" ** 64 ++ "\"}",
+            .json = "{\"id\":3,\"name\":\"result.json\",\"size\":7,\"state\":\"starter\",\"digest\":\"sha256:" ++ &@as([64:0]u8, @splat('a')) ++ "\"}",
             .plan = "3\n",
         },
         .{
-            .json = "{\"id\":4,\"name\":\"result.json\",\"size\":7,\"state\":\"uploaded\",\"digest\":\"sha256:" ++ "b" ** 64 ++ "\"}",
+            .json = "{\"id\":4,\"name\":\"result.json\",\"size\":7,\"state\":\"uploaded\",\"digest\":\"sha256:" ++ &@as([64:0]u8, @splat('b')) ++ "\"}",
             .plan = "4\n",
         },
     };

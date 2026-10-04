@@ -786,7 +786,7 @@ fn removeOpaqueLowerEntries(
 
 fn joinPath(allocator: Allocator, parent: []const u8, child: []const u8) LoadError![]u8 {
     if (parent.len == 0) return allocator.dupe(u8, child);
-    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ parent, child });
+    return allocator.print("{s}/{s}", .{ parent, child });
 }
 
 fn isDescendant(candidate: []const u8, parent: []const u8) bool {
@@ -867,7 +867,7 @@ fn readBlob(io: Io, allocator: Allocator, layout_dir: Io.Dir, descriptor: Descri
     };
     if (descriptor.size > max_size) return error.BlobTooLarge;
     const hex = digest.blobPathComponent();
-    const path = try std.fmt.allocPrint(allocator, "blobs/sha256/{s}", .{hex});
+    const path = try allocator.print("blobs/sha256/{s}", .{hex});
     defer allocator.free(path);
     const bytes = try readFileAtMost(io, allocator, layout_dir, path, max_size);
     errdefer allocator.free(bytes);
@@ -896,7 +896,7 @@ fn sha256DigestString(allocator: Allocator, data: []const u8) ![]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(data, &digest, .{});
     const hex = std.fmt.bytesToHex(digest, .lower);
-    return std.fmt.allocPrint(allocator, "sha256:{s}", .{hex});
+    return allocator.print("sha256:{s}", .{hex});
 }
 
 test "load auto-detects OCI layouts and merges gzip layers, whiteouts, and opaque directories" {
@@ -1006,7 +1006,7 @@ test "bundle unpack securely publishes a verified runtime bundle" {
 }
 
 test "forced bundle unpack rejects a symlink destination" {
-    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    if (@import("builtin").target.os.tag != .linux) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const fixture_root = "test-oci-bundle-symlink-layout";
@@ -1039,7 +1039,7 @@ test "forced bundle unpack rejects a symlink destination" {
         ),
     );
     const outside = try Io.Dir.cwd().statFile(io, outside_root, .{});
-    try std.testing.expectEqual(@as(u32, 0o755), @intFromEnum(outside.permissions) & 0o7777);
+    try std.testing.expectEqual(@as(u32, 0o755), @backingInt(outside.permissions) & 0o7777);
 }
 
 test "bundle repack publishes deterministic additions changes and whiteouts" {
@@ -1080,7 +1080,7 @@ test "bundle repack publishes deterministic additions changes and whiteouts" {
     try editable.writeFile(io, .{ .sub_path = "hello.txt", .data = "edited\n" });
     try editable.deleteFile(io, "etc/keep.txt");
     try editable.writeFile(io, .{ .sub_path = "added.txt", .data = "new\n" });
-    if (@import("builtin").os.tag == .linux) {
+    if (@import("builtin").target.os.tag == .linux) {
         var added_file = try editable.openFile(io, "added.txt", .{});
         defer added_file.close(io);
         const xattr_result = std.os.linux.fsetxattr(
@@ -1148,7 +1148,7 @@ test "bundle repack publishes deterministic additions changes and whiteouts" {
     const added = try verified.readFileAlloc(io, "added.txt", allocator, .limited(32));
     defer allocator.free(added);
     try std.testing.expectEqualStrings("new\n", added);
-    if (@import("builtin").os.tag == .linux) {
+    if (@import("builtin").target.os.tag == .linux) {
         var added_file = try verified.openFile(io, "added.txt", .{});
         defer added_file.close(io);
         var value: [32]u8 = undefined;
@@ -1162,7 +1162,7 @@ test "bundle repack publishes deterministic additions changes and whiteouts" {
         try std.testing.expectEqualStrings("round-trip", value[0..xattr_result]);
     }
     const verified_root = try verified.stat(io);
-    try std.testing.expectEqual(@as(u32, 0o750), @intFromEnum(verified_root.permissions) & 0o7777);
+    try std.testing.expectEqual(@as(u32, 0o750), @backingInt(verified_root.permissions) & 0o7777);
     try std.testing.expectError(error.FileNotFound, verified.statFile(io, "etc/keep.txt", .{}));
     try verified.writeFile(io, .{ .sub_path = ".wh.reserved", .data = "not a whiteout" });
     const reserved_target = (try reference.parse(
@@ -1299,8 +1299,7 @@ test "loadLayout validates OCI schema and descriptor media types" {
     {
         var fixture = try createFixtureLayout(allocator, io, fixture_root, .gzip);
         defer fixture.deinit(allocator);
-        const index_json = try std.fmt.allocPrint(
-            allocator,
+        const index_json = try allocator.print(
             "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.docker.distribution.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
             .{ fixture.manifest_digest, fixture.manifest_json.len },
         );
@@ -1315,16 +1314,14 @@ test "loadLayout validates OCI schema and descriptor media types" {
         defer fixture.deinit(allocator);
         var dir = try Io.Dir.cwd().openDir(io, fixture_root, .{});
         defer dir.close(io);
-        const invalid_manifest = try std.fmt.allocPrint(
-            allocator,
+        const invalid_manifest = try allocator.print(
             "{{\"schemaVersion\":1,\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[]}}",
             .{ fixture.config_digest, fixture.config_json.len },
         );
         defer allocator.free(invalid_manifest);
         const manifest_digest = try writeBlobAndDigest(allocator, io, dir, invalid_manifest);
         defer allocator.free(manifest_digest);
-        const index_json = try std.fmt.allocPrint(
-            allocator,
+        const index_json = try allocator.print(
             "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
             .{ manifest_digest, invalid_manifest.len },
         );
@@ -1342,14 +1339,14 @@ test "OCI layers preserve ownership and PAX xattrs across whiteouts and hardlink
     defer allocator.free(gid);
     const capability = try buildPaxRecord(allocator, "SCHILY.xattr.security.capability", "cap-v3");
     defer allocator.free(capability);
-    const base_pax = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ uid, gid, capability });
+    const base_pax = try allocator.print("{s}{s}{s}", .{ uid, gid, capability });
     defer allocator.free(base_pax);
 
     const hardlink_uid = try buildPaxRecord(allocator, "uid", "777");
     defer allocator.free(hardlink_uid);
     const hardlink_xattr = try buildPaxRecord(allocator, "SCHILY.xattr.user.hardlink", "metadata");
     defer allocator.free(hardlink_xattr);
-    const hardlink_pax = try std.fmt.allocPrint(allocator, "{s}{s}", .{ hardlink_uid, hardlink_xattr });
+    const hardlink_pax = try allocator.print("{s}{s}", .{ hardlink_uid, hardlink_xattr });
     defer allocator.free(hardlink_pax);
 
     const layer_one = try buildTarArchive(allocator, &.{
@@ -1396,13 +1393,13 @@ test "OCI parent synthesis does not overwrite lower directory metadata" {
     defer allocator.free(lower_gid);
     const lower_xattr = try buildPaxRecord(allocator, "SCHILY.xattr.user.lower", "preserve");
     defer allocator.free(lower_xattr);
-    const lower_pax = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ lower_uid, lower_gid, lower_xattr });
+    const lower_pax = try allocator.print("{s}{s}{s}", .{ lower_uid, lower_gid, lower_xattr });
     defer allocator.free(lower_pax);
     const upper_uid = try buildPaxRecord(allocator, "uid", "0");
     defer allocator.free(upper_uid);
     const upper_xattr = try buildPaxRecord(allocator, "SCHILY.xattr.user.upper", "replace");
     defer allocator.free(upper_xattr);
-    const upper_pax = try std.fmt.allocPrint(allocator, "{s}{s}", .{ upper_uid, upper_xattr });
+    const upper_pax = try allocator.print("{s}{s}", .{ upper_uid, upper_xattr });
     defer allocator.free(upper_pax);
 
     const lower = try buildTarArchive(allocator, &.{
@@ -1578,8 +1575,7 @@ fn createFixtureLayout(allocator: Allocator, io: Io, root: []const u8, compressi
     defer allocator.free(layer1_diff_id);
     const layer2_diff_id = try sha256DigestString(allocator, layer2_tar);
     defer allocator.free(layer2_diff_id);
-    const config_json = try std.fmt.allocPrint(
-        allocator,
+    const config_json = try allocator.print(
         "{{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[\"{s}\",\"{s}\"]}}}}",
         .{ layer1_diff_id, layer2_diff_id },
     );
@@ -1589,15 +1585,13 @@ fn createFixtureLayout(allocator: Allocator, io: Io, root: []const u8, compressi
     const layer2_digest = try writeBlobAndDigest(allocator, io, dir, layer2_blob);
     const layer_media_type = fixtureLayerMediaType(compression);
 
-    const manifest_json = try std.fmt.allocPrint(
-        allocator,
+    const manifest_json = try allocator.print(
         "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"application/vnd.oci.image.config.v1+json\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ config_digest, config_json.len, layer_media_type, layer1_digest, layer1_blob.len, layer_media_type, layer2_digest, layer2_blob.len },
     );
     const manifest_digest = try writeBlobAndDigest(allocator, io, dir, manifest_json);
 
-    const index_json = try std.fmt.allocPrint(
-        allocator,
+    const index_json = try allocator.print(
         "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"{s}\",\"size\":{d}}}]}}",
         .{ manifest_digest, manifest_json.len },
     );
@@ -1641,8 +1635,7 @@ fn createDockerSaveFixture(allocator: Allocator, io: Io, tarball_path: []const u
     });
     defer allocator.free(layer2_tar);
 
-    const config_json = try std.fmt.allocPrint(
-        allocator,
+    const config_json = try allocator.print(
         "{{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[]}}}}",
         .{},
     );
@@ -1696,22 +1689,19 @@ fn createDockerSaveMultiManifestFixture(allocator: Allocator, io: Io, tarball_pa
     });
     defer allocator.free(alt_layer_tar);
 
-    const base_config_json = try std.fmt.allocPrint(
-        allocator,
+    const base_config_json = try allocator.print(
         "{{\"architecture\":\"amd64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[]}}}}",
         .{},
     );
     defer allocator.free(base_config_json);
 
-    const alt_config_json = try std.fmt.allocPrint(
-        allocator,
+    const alt_config_json = try allocator.print(
         "{{\"architecture\":\"arm64\",\"os\":\"linux\",\"rootfs\":{{\"type\":\"layers\",\"diff_ids\":[]}}}}",
         .{},
     );
     defer allocator.free(alt_config_json);
 
-    const manifest_json = try std.fmt.allocPrint(
-        allocator,
+    const manifest_json = try allocator.print(
         \\[
         \\  {{"Config":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json","RepoTags":["example.com/test:latest"],"Layers":["1111111111111111111111111111111111111111111111111111111111111111/layer.tar","2222222222222222222222222222222222222222222222222222222222222222/layer.tar"]}},
         \\  {{"Config":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json","RepoTags":["example.com/alt:latest","example.com/alt:stable"],"Layers":["3333333333333333333333333333333333333333333333333333333333333333/layer.tar"]}}
@@ -1754,7 +1744,7 @@ fn compressFixtureLayer(allocator: Allocator, compression: FixtureCompression, d
 
 fn writeBlobAndDigest(allocator: Allocator, io: Io, dir: Io.Dir, data: []const u8) ![]u8 {
     const digest_string = try sha256DigestString(allocator, data);
-    const blob_path = try std.fmt.allocPrint(allocator, "blobs/sha256/{s}", .{digest_string[7..]});
+    const blob_path = try allocator.print("blobs/sha256/{s}", .{digest_string[7..]});
     defer allocator.free(blob_path);
     try dir.writeFile(io, .{ .sub_path = blob_path, .data = data });
     return digest_string;
@@ -1764,13 +1754,13 @@ fn corruptFixtureBlob(io: Io, root: []const u8, digest: []const u8, original: []
     const mutated = try std.testing.allocator.dupe(u8, original);
     defer std.testing.allocator.free(mutated);
     mutated[0] ^= 1;
-    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/blobs/sha256/{s}", .{ root, digest["sha256:".len..] });
+    const path = try std.testing.allocator.print("{s}/blobs/sha256/{s}", .{ root, digest["sha256:".len..] });
     defer std.testing.allocator.free(path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = mutated });
 }
 
 fn writeFixtureIndex(io: Io, root: []const u8, index_json: []const u8) !void {
-    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/index.json", .{root});
+    const path = try std.testing.allocator.print("{s}/index.json", .{root});
     defer std.testing.allocator.free(path);
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = index_json });
 }
@@ -1795,7 +1785,7 @@ fn buildTarArchive(allocator: Allocator, specs: []const TarSpec) ![]u8 {
 }
 
 fn appendTarSpec(out: *std.Io.Writer.Allocating, spec: TarSpec) !void {
-    var header: [512]u8 = [_]u8{0} ** 512;
+    var header: [512]u8 = @as([512]u8, @splat(0));
     if (spec.path.len > 100) return error.InvalidHeader;
     @memcpy(header[0..spec.path.len], spec.path);
     try writeOctalField(header[100..108], spec.mode);
@@ -1825,7 +1815,7 @@ fn appendTarSpec(out: *std.Io.Writer.Allocating, spec: TarSpec) !void {
 fn buildPaxRecord(allocator: Allocator, key: []const u8, value: []const u8) ![]u8 {
     var record_len: usize = 0;
     while (true) {
-        const record = try std.fmt.allocPrint(allocator, "{d} {s}={s}\n", .{ record_len, key, value });
+        const record = try allocator.print("{d} {s}={s}\n", .{ record_len, key, value });
         if (record.len == record_len) return record;
         record_len = record.len;
         allocator.free(record);

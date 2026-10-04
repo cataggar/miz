@@ -1,7 +1,7 @@
 //! Build a generalized Azure Linux 4 Gen2 QCOW2 image.
 //!
 //! Equivalent to scripts/build-generalized-azurelinux4.py but implemented as
-//! native Zig 0.16 code. Invoked via `zig build generalized-azurelinux4 -- [args]`
+//! native Zig 0.17 code. Invoked via `zig build generalized-azurelinux4 -- [args]`
 //! rather than directly; the build system passes pre-built tool paths so this
 //! binary does not invoke `zig build` internally.
 //!
@@ -561,7 +561,7 @@ fn systemdBootRpmCachePath(
     work_dir: []const u8,
     architecture: *const ArchitectureDescriptor,
 ) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{s}/downloads/{s}", .{ work_dir, architecture.systemd_boot_rpm_name });
+    return gpa.print("{s}/downloads/{s}", .{ work_dir, architecture.systemd_boot_rpm_name });
 }
 
 fn isRegularNonemptyFile(kind: Io.File.Kind, size: u64) bool {
@@ -645,7 +645,7 @@ pub fn selectLinuxManifest(
 /// Returns owned stdout bytes on HTTP 200; caller frees.
 fn fetchBytes(gpa: Allocator, io: Io, url: []const u8, accept: ?[]const u8) ![]u8 {
     if (accept) |a| {
-        const hdr = try std.fmt.allocPrint(gpa, "Accept: {s}", .{a});
+        const hdr = try gpa.print("Accept: {s}", .{a});
         defer gpa.free(hdr);
         return capture(gpa, io, &.{ "curl", "-fsSL", "-H", hdr, url });
     }
@@ -662,7 +662,7 @@ fn resolveManifest(
     reference: []const u8,
     architecture: *const ArchitectureDescriptor,
 ) !struct { bytes: []u8, digest: []u8 } {
-    const url = try std.fmt.allocPrint(gpa, "{s}/{s}/manifests/{s}", .{ mcr_base, repository, reference });
+    const url = try gpa.print("{s}/{s}/manifests/{s}", .{ mcr_base, repository, reference });
     defer gpa.free(url);
 
     const manifest_bytes = try fetchBytes(gpa, io, url, accept_header);
@@ -685,7 +685,7 @@ fn resolveManifest(
 
     if (!is_index) {
         const hex = sha256Bytes(manifest_bytes);
-        const digest = try std.fmt.allocPrint(gpa, "sha256:{s}", .{&hex});
+        const digest = try gpa.print("sha256:{s}", .{&hex});
         return_manifest_bytes = true;
         return .{ .bytes = manifest_bytes, .digest = digest };
     }
@@ -694,14 +694,14 @@ fn resolveManifest(
     const platform_digest = try selectLinuxManifest(gpa, parsed.value, architecture.oci_architecture);
     defer gpa.free(platform_digest);
 
-    const m_url = try std.fmt.allocPrint(gpa, "{s}/{s}/manifests/{s}", .{ mcr_base, repository, platform_digest });
+    const m_url = try gpa.print("{s}/{s}/manifests/{s}", .{ mcr_base, repository, platform_digest });
     defer gpa.free(m_url);
 
     const platform_bytes = try fetchBytes(gpa, io, m_url, accept_header);
     errdefer gpa.free(platform_bytes);
 
     const actual_hex = sha256Bytes(platform_bytes);
-    const actual_digest = try std.fmt.allocPrint(gpa, "sha256:{s}", .{&actual_hex});
+    const actual_digest = try gpa.print("sha256:{s}", .{&actual_hex});
     defer gpa.free(actual_digest);
 
     if (!std.mem.eql(u8, actual_digest, platform_digest)) {
@@ -709,7 +709,7 @@ fn resolveManifest(
         return error.DigestMismatch;
     }
 
-    const return_digest = try std.fmt.allocPrint(gpa, "sha256:{s}", .{&actual_hex});
+    const return_digest = try gpa.print("sha256:{s}", .{&actual_hex});
     return .{ .bytes = platform_bytes, .digest = return_digest };
 }
 
@@ -732,7 +732,7 @@ fn downloadBlob(
         };
     }
 
-    const url = try std.fmt.allocPrint(gpa, "{s}/{s}/blobs/{s}", .{ mcr_base, repository, digest });
+    const url = try gpa.print("{s}/{s}/blobs/{s}", .{ mcr_base, repository, digest });
     defer gpa.free(url);
 
     const expected_digest = artifact_pipeline.parseSha256(digest) catch
@@ -817,7 +817,7 @@ fn extractLayer(gpa: Allocator, io: Io, layer_path: []const u8, rootfs_path: []c
         if (std.mem.eql(u8, basename, ".wh..wh..opq")) {
             // Opaque whiteout: remove all children of the parent directory.
             const parent_rel = std.fs.path.dirname(rel) orelse ".";
-            const target = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, parent_rel });
+            const target = try gpa.print("{s}/{s}", .{ rootfs_path, parent_rel });
             defer gpa.free(target);
             if (Dir.cwd().statFile(io, target, .{})) |_| {
                 try sudo(gpa, io, &.{
@@ -829,9 +829,9 @@ fn extractLayer(gpa: Allocator, io: Io, layer_path: []const u8, rootfs_path: []c
             const real_name = basename[".wh.".len..];
             const parent_rel = std.fs.path.dirname(rel) orelse ".";
             const target = if (std.mem.eql(u8, parent_rel, "."))
-                try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, real_name })
+                try gpa.print("{s}/{s}", .{ rootfs_path, real_name })
             else
-                try std.fmt.allocPrint(gpa, "{s}/{s}/{s}", .{ rootfs_path, parent_rel, real_name });
+                try gpa.print("{s}/{s}/{s}", .{ rootfs_path, parent_rel, real_name });
             defer gpa.free(target);
             try sudo(gpa, io, &.{ "rm", "-rf", "--", target });
         }
@@ -880,7 +880,7 @@ fn pullRootfs(
         else => return error.MissingLayers,
     };
 
-    const blobs_dir = try std.fmt.allocPrint(gpa, "{s}/downloads/blobs", .{work_dir});
+    const blobs_dir = try gpa.print("{s}/downloads/blobs", .{work_dir});
     defer gpa.free(blobs_dir);
     try Dir.cwd().createDirPath(io, blobs_dir);
 
@@ -894,7 +894,7 @@ fn pullRootfs(
             else => return error.MissingDigest,
         };
         const hex = try parseDigestHex(digest);
-        const layer_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ blobs_dir, hex });
+        const layer_path = try gpa.print("{s}/{s}", .{ blobs_dir, hex });
         defer gpa.free(layer_path);
         try downloadBlob(gpa, io, base_image, digest, layer_path);
         std.debug.print("Extracting layer {s}...\n", .{hex[0..12]});
@@ -917,10 +917,10 @@ fn writeRootFile(
     mode: []const u8,
 ) !void {
     const basename = std.fs.path.basename(relative_path);
-    const tmp_path = try std.fmt.allocPrint(gpa, "{s}/{s}.tmp", .{ work_dir, basename });
+    const tmp_path = try gpa.print("{s}/{s}.tmp", .{ work_dir, basename });
     defer gpa.free(tmp_path);
     try Dir.cwd().writeFile(io, .{ .sub_path = tmp_path, .data = content });
-    const dest = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, relative_path });
+    const dest = try gpa.print("{s}/{s}", .{ rootfs_path, relative_path });
     defer gpa.free(dest);
     try sudo(gpa, io, &.{ "install", "-D", "-o", "root", "-g", "root", "-m", mode, tmp_path, dest });
     Dir.cwd().deleteFile(io, tmp_path) catch {};
@@ -945,8 +945,7 @@ fn verifyRemoteRepositoryMetadata(
     work_dir: []const u8,
     architecture: *const ArchitectureDescriptor,
 ) !void {
-    const metadata_path = try std.fmt.allocPrint(
-        gpa,
+    const metadata_path = try gpa.print(
         "{s}/downloads/repomd-{s}.xml",
         .{ work_dir, architecture.dnf_architecture },
     );
@@ -1062,41 +1061,37 @@ fn prepareDnfCache(
     architecture: *const ArchitectureDescriptor,
     flavor: *const FlavorDescriptor,
 ) !DnfCachePaths {
-    const cache_guest_dir = try std.fmt.allocPrint(
-        gpa,
+    const cache_guest_dir = try gpa.print(
         "/var/cache/miz-dnf-{s}-{s}",
         .{ @tagName(flavor.flavor), architecture.dnf_architecture },
     );
     defer gpa.free(cache_guest_dir);
-    const persist_guest_dir = try std.fmt.allocPrint(
-        gpa,
+    const persist_guest_dir = try gpa.print(
         "/var/lib/miz-dnf-{s}-{s}",
         .{ @tagName(flavor.flavor), architecture.dnf_architecture },
     );
     defer gpa.free(persist_guest_dir);
-    const cache_dir = try std.fmt.allocPrint(gpa, "{s}{s}", .{ rootfs_path, cache_guest_dir });
+    const cache_dir = try gpa.print("{s}{s}", .{ rootfs_path, cache_guest_dir });
     errdefer gpa.free(cache_dir);
-    const persist_dir = try std.fmt.allocPrint(gpa, "{s}{s}", .{ rootfs_path, persist_guest_dir });
+    const persist_dir = try gpa.print("{s}{s}", .{ rootfs_path, persist_guest_dir });
     errdefer gpa.free(persist_dir);
-    const cache_opt = try std.fmt.allocPrint(gpa, "--setopt=cachedir={s}", .{cache_guest_dir});
+    const cache_opt = try gpa.print("--setopt=cachedir={s}", .{cache_guest_dir});
     errdefer gpa.free(cache_opt);
-    const persist_opt = try std.fmt.allocPrint(gpa, "--setopt=persistdir={s}", .{persist_guest_dir});
+    const persist_opt = try gpa.print("--setopt=persistdir={s}", .{persist_guest_dir});
     errdefer gpa.free(persist_opt);
-    const metadata_cache_dir = try std.fmt.allocPrint(
-        gpa,
+    const metadata_cache_dir = try gpa.print(
         "{s}/dnf-metadata-{s}-{s}",
         .{ work_dir, @tagName(flavor.flavor), architecture.dnf_architecture },
     );
     errdefer gpa.free(metadata_cache_dir);
-    const metadata_persist_dir = try std.fmt.allocPrint(
-        gpa,
+    const metadata_persist_dir = try gpa.print(
         "{s}/dnf-metadata-persist-{s}-{s}",
         .{ work_dir, @tagName(flavor.flavor), architecture.dnf_architecture },
     );
     errdefer gpa.free(metadata_persist_dir);
-    const metadata_cache_opt = try std.fmt.allocPrint(gpa, "--setopt=cachedir={s}", .{metadata_cache_dir});
+    const metadata_cache_opt = try gpa.print("--setopt=cachedir={s}", .{metadata_cache_dir});
     errdefer gpa.free(metadata_cache_opt);
-    const metadata_persist_opt = try std.fmt.allocPrint(gpa, "--setopt=persistdir={s}", .{metadata_persist_dir});
+    const metadata_persist_opt = try gpa.print("--setopt=persistdir={s}", .{metadata_persist_dir});
     errdefer gpa.free(metadata_persist_opt);
 
     // DNF runs under sudo, so remove stale root-owned directories explicitly
@@ -1178,11 +1173,10 @@ fn writeNevraProvenance(
     flavor: *const FlavorDescriptor,
     closure: []const u8,
 ) !void {
-    const provenance_dir = try std.fmt.allocPrint(gpa, "{s}/provenance", .{work_dir});
+    const provenance_dir = try gpa.print("{s}/provenance", .{work_dir});
     defer gpa.free(provenance_dir);
     try Dir.cwd().createDirPath(io, provenance_dir);
-    const provenance_path = try std.fmt.allocPrint(
-        gpa,
+    const provenance_path = try gpa.print(
         "{s}/installed-nevra-{s}-{s}.txt",
         .{ provenance_dir, @tagName(flavor.flavor), architecture.dnf_architecture },
     );
@@ -1391,7 +1385,7 @@ fn validateForbiddenPackages(
 }
 
 fn rootfsPath(rootfs_path: []const u8, gpa: Allocator, relative_path: []const u8) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, relative_path });
+    return gpa.print("{s}/{s}", .{ rootfs_path, relative_path });
 }
 
 fn validateFlavorPaths(
@@ -1427,8 +1421,7 @@ fn trustedSigningKeyPath(
     work_dir: []const u8,
     architecture: *const ArchitectureDescriptor,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        gpa,
+    return gpa.print(
         "{s}/trusted-rpm-gpg-{s}.asc",
         .{ work_dir, architecture.dnf_architecture },
     );
@@ -1490,8 +1483,7 @@ fn extractTrustedSigningKey(
     work_dir: []const u8,
     architecture: *const ArchitectureDescriptor,
 ) ![:0]u8 {
-    const signing_key_guest = try std.fmt.allocPrint(
-        gpa,
+    const signing_key_guest = try gpa.print(
         "{s}/{s}",
         .{ rootfs_path, architecture.signing_key_path },
     );
@@ -1512,7 +1504,7 @@ fn bootstrapFullRootfs(
     rootfs_path: []const u8,
     architecture: *const ArchitectureDescriptor,
 ) ![]u8 {
-    const key_source_path = try std.fmt.allocPrint(gpa, "{s}/core-key-source", .{work_dir});
+    const key_source_path = try gpa.print("{s}/core-key-source", .{work_dir});
     defer gpa.free(key_source_path);
     const core_digest = try pullRootfs(gpa, io, work_dir, key_source_path, architecture);
     errdefer gpa.free(core_digest);
@@ -1534,11 +1526,11 @@ fn initializeFreshFullInstallroot(
     io: Io,
     rootfs_path: []const u8,
 ) !void {
-    const rpm_db = try std.fmt.allocPrint(gpa, "{s}/var/lib/rpm", .{rootfs_path});
+    const rpm_db = try gpa.print("{s}/var/lib/rpm", .{rootfs_path});
     defer gpa.free(rpm_db);
-    const dnf_state = try std.fmt.allocPrint(gpa, "{s}/var/lib/dnf", .{rootfs_path});
+    const dnf_state = try gpa.print("{s}/var/lib/dnf", .{rootfs_path});
     defer gpa.free(dnf_state);
-    const etc = try std.fmt.allocPrint(gpa, "{s}/etc", .{rootfs_path});
+    const etc = try gpa.print("{s}/etc", .{rootfs_path});
     defer gpa.free(etc);
     try sudo(gpa, io, &.{ "install", "-d", "-m", "0755", rootfs_path, etc, rpm_db, dnf_state });
 }
@@ -1628,7 +1620,7 @@ fn validateFullServiceFiles(
     rootfs_path: []const u8,
 ) !void {
     for (full_required_systemd_units) |unit| {
-        const path = try std.fmt.allocPrint(gpa, "{s}/usr/lib/systemd/system/{s}", .{ rootfs_path, unit });
+        const path = try gpa.print("{s}/usr/lib/systemd/system/{s}", .{ rootfs_path, unit });
         defer gpa.free(path);
         const stat = Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch {
             std.debug.print("error: full rootfs is missing systemd unit {s}\n", .{unit});
@@ -1737,16 +1729,16 @@ fn configureCoreGuest(
     mizinit_path: []const u8,
     azagent_path: []const u8,
 ) !void {
-    const sbin_mizinit = try std.fmt.allocPrint(gpa, "{s}/sbin/mizinit", .{rootfs_path});
+    const sbin_mizinit = try gpa.print("{s}/sbin/mizinit", .{rootfs_path});
     defer gpa.free(sbin_mizinit);
     try sudo(gpa, io, &.{ "install", "-m", "0755", mizinit_path, sbin_mizinit });
     for (&[_][]const u8{ "init", "poweroff", "reboot", "shutdown" }) |cmd| {
-        const link = try std.fmt.allocPrint(gpa, "{s}/sbin/{s}", .{ rootfs_path, cmd });
+        const link = try gpa.print("{s}/sbin/{s}", .{ rootfs_path, cmd });
         defer gpa.free(link);
         try sudo(gpa, io, &.{ "rm", "-f", link });
         try sudo(gpa, io, &.{ "ln", "-s", "mizinit", link });
     }
-    const azagent_dest = try std.fmt.allocPrint(gpa, "{s}/usr/sbin/azagent", .{rootfs_path});
+    const azagent_dest = try gpa.print("{s}/usr/sbin/azagent", .{rootfs_path});
     defer gpa.free(azagent_dest);
     try sudo(gpa, io, &.{ "install", "-m", "0755", azagent_path, azagent_dest });
     try writeRootFile(gpa, io, rootfs_path, work_dir, "etc/ssh/sshd_config.d/10-mizinit.conf", "PasswordAuthentication no\n" ++
@@ -1768,23 +1760,23 @@ fn generalizeRootfs(
     rootfs_path: []const u8,
     flavor: *const FlavorDescriptor,
 ) !void {
-    const etc_ssh = try std.fmt.allocPrint(gpa, "{s}/etc/ssh", .{rootfs_path});
+    const etc_ssh = try gpa.print("{s}/etc/ssh", .{rootfs_path});
     defer gpa.free(etc_ssh);
-    const machine_id = try std.fmt.allocPrint(gpa, "{s}/etc/machine-id", .{rootfs_path});
+    const machine_id = try gpa.print("{s}/etc/machine-id", .{rootfs_path});
     defer gpa.free(machine_id);
-    const hostname = try std.fmt.allocPrint(gpa, "{s}/etc/hostname", .{rootfs_path});
+    const hostname = try gpa.print("{s}/etc/hostname", .{rootfs_path});
     defer gpa.free(hostname);
-    const dbus_machine_id = try std.fmt.allocPrint(gpa, "{s}/var/lib/dbus/machine-id", .{rootfs_path});
+    const dbus_machine_id = try gpa.print("{s}/var/lib/dbus/machine-id", .{rootfs_path});
     defer gpa.free(dbus_machine_id);
-    const cloud_state = try std.fmt.allocPrint(gpa, "{s}/var/lib/cloud", .{rootfs_path});
+    const cloud_state = try gpa.print("{s}/var/lib/cloud", .{rootfs_path});
     defer gpa.free(cloud_state);
-    const waagent_state = try std.fmt.allocPrint(gpa, "{s}/var/lib/waagent", .{rootfs_path});
+    const waagent_state = try gpa.print("{s}/var/lib/waagent", .{rootfs_path});
     defer gpa.free(waagent_state);
-    const azagent_state = try std.fmt.allocPrint(gpa, "{s}/var/lib/azagent", .{rootfs_path});
+    const azagent_state = try gpa.print("{s}/var/lib/azagent", .{rootfs_path});
     defer gpa.free(azagent_state);
-    const random_seed = try std.fmt.allocPrint(gpa, "{s}/var/lib/systemd/random-seed", .{rootfs_path});
+    const random_seed = try gpa.print("{s}/var/lib/systemd/random-seed", .{rootfs_path});
     defer gpa.free(random_seed);
-    const leases = try std.fmt.allocPrint(gpa, "{s}/var/lib/NetworkManager", .{rootfs_path});
+    const leases = try gpa.print("{s}/var/lib/NetworkManager", .{rootfs_path});
     defer gpa.free(leases);
     try sudo(gpa, io, &.{ "find", etc_ssh, "-maxdepth", "1", "-name", "ssh_host_*", "-delete" });
     try sudo(gpa, io, &.{ "find", rootfs_path, "-type", "f", "-name", "authorized_keys", "-delete" });
@@ -1930,7 +1922,7 @@ fn installGuestContent(
         defer gpa.free(qemu_static_bytes);
         const qemu_static = std.mem.trimEnd(u8, qemu_static_bytes, "\n\r ");
         const interp_rel = std.mem.trimStart(u8, interp, "/");
-        const guest_interp = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, interp_rel });
+        const guest_interp = try gpa.print("{s}/{s}", .{ rootfs_path, interp_rel });
         defer gpa.free(guest_interp);
         try sudo(gpa, io, &.{ "install", "-D", "-m", "0755", qemu_static, guest_interp });
     }
@@ -1938,13 +1930,12 @@ fn installGuestContent(
     try validateTrustedSigningKey(gpa, io, trusted_key_path);
     const signing_key_uri = try fileUriFromAbsolutePath(gpa, trusted_key_path);
     defer gpa.free(signing_key_uri);
-    const gpgkey_opt = try std.fmt.allocPrint(
-        gpa,
+    const gpgkey_opt = try gpa.print(
         "--setopt=" ++ dnf_repository_id ++ ".gpgkey={s}",
         .{signing_key_uri},
     );
     defer gpa.free(gpgkey_opt);
-    const forcearch_opt = try std.fmt.allocPrint(gpa, "--forcearch={s}", .{architecture.dnf_architecture});
+    const forcearch_opt = try gpa.print("--forcearch={s}", .{architecture.dnf_architecture});
     defer gpa.free(forcearch_opt);
 
     // Resolve only against a new, private cache. First pin the live endpoint,
@@ -1954,14 +1945,12 @@ fn installGuestContent(
     try verifyRemoteRepositoryMetadata(gpa, io, work_dir, architecture);
     var dnf_cache = try prepareDnfCache(gpa, io, rootfs_path, work_dir, architecture, flavor);
     defer dnf_cache.deinit(gpa);
-    const baseurl_opt = try std.fmt.allocPrint(
-        gpa,
+    const baseurl_opt = try gpa.print(
         "--setopt=" ++ dnf_repository_id ++ ".baseurl={s}",
         .{architecture.repository_base_url},
     );
     defer gpa.free(baseurl_opt);
-    const repofrompath_opt = try std.fmt.allocPrint(
-        gpa,
+    const repofrompath_opt = try gpa.print(
         "--repofrompath=" ++ dnf_repository_id ++ ",{s}",
         .{architecture.repository_base_url},
     );
@@ -1988,13 +1977,13 @@ fn installGuestContent(
     );
     try sudo(gpa, io, &makecache_argv);
     try verifyCachedRepositoryMetadata(gpa, io, dnf_cache.metadata_cache_dir, architecture);
-    const metadata_cache_contents = try std.fmt.allocPrint(gpa, "{s}/.", .{dnf_cache.metadata_cache_dir});
+    const metadata_cache_contents = try gpa.print("{s}/.", .{dnf_cache.metadata_cache_dir});
     defer gpa.free(metadata_cache_contents);
-    const metadata_persist_contents = try std.fmt.allocPrint(gpa, "{s}/.", .{dnf_cache.metadata_persist_dir});
+    const metadata_persist_contents = try gpa.print("{s}/.", .{dnf_cache.metadata_persist_dir});
     defer gpa.free(metadata_persist_contents);
-    const cache_contents = try std.fmt.allocPrint(gpa, "{s}/.", .{dnf_cache.cache_dir});
+    const cache_contents = try gpa.print("{s}/.", .{dnf_cache.cache_dir});
     defer gpa.free(cache_contents);
-    const persist_contents = try std.fmt.allocPrint(gpa, "{s}/.", .{dnf_cache.persist_dir});
+    const persist_contents = try gpa.print("{s}/.", .{dnf_cache.persist_dir});
     defer gpa.free(persist_contents);
     try sudo(gpa, io, &.{ "cp", "-a", metadata_cache_contents, cache_contents });
     try sudo(gpa, io, &.{ "cp", "-a", metadata_persist_contents, persist_contents });
@@ -2053,7 +2042,7 @@ fn installGuestContent(
         dnf_cache.metadata_persist_dir,
     });
 
-    const stub_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, architecture.systemd_boot_stub_path });
+    const stub_path = try gpa.print("{s}/{s}", .{ rootfs_path, architecture.systemd_boot_stub_path });
     defer gpa.free(stub_path);
     const stub_stat = try Dir.cwd().statFile(io, stub_path, .{ .follow_symlinks = false });
     if (!isRegularNonemptyFile(stub_stat.kind, stub_stat.size)) {
@@ -2082,16 +2071,16 @@ fn installGuestContent(
     // Remove binfmt interpreter from guest.
     if (binfmt_interpreter) |interp| {
         const interp_rel = std.mem.trimStart(u8, interp, "/");
-        const guest_interp = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ rootfs_path, interp_rel });
+        const guest_interp = try gpa.print("{s}/{s}", .{ rootfs_path, interp_rel });
         defer gpa.free(guest_interp);
         try sudo(gpa, io, &.{ "rm", "-f", guest_interp });
     }
 
     // Clean any cache or log that a DNF version still places in the install
     // root despite the isolated cache/persist options above.
-    const rootfs_dnf_cache = try std.fmt.allocPrint(gpa, "{s}/var/cache/dnf", .{rootfs_path});
+    const rootfs_dnf_cache = try gpa.print("{s}/var/cache/dnf", .{rootfs_path});
     defer gpa.free(rootfs_dnf_cache);
-    const dnf_log = try std.fmt.allocPrint(gpa, "{s}/var/log/dnf.log", .{rootfs_path});
+    const dnf_log = try gpa.print("{s}/var/log/dnf.log", .{rootfs_path});
     defer gpa.free(dnf_log);
     try sudo(gpa, io, &.{ "rm", "-rf", rootfs_dnf_cache });
     try sudo(gpa, io, &.{ "rm", "-f", dnf_log });
@@ -2108,10 +2097,10 @@ fn installGuestContent(
 /// Write `bytes` as a blob under `blobs_dir`.  Returns heap-allocated "sha256:<hex>".
 fn writeBlobBytesAlloc(gpa: Allocator, io: Io, blobs_dir: []const u8, bytes: []const u8) ![]u8 {
     const hex = sha256Bytes(bytes);
-    const blob_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ blobs_dir, &hex });
+    const blob_path = try gpa.print("{s}/{s}", .{ blobs_dir, &hex });
     defer gpa.free(blob_path);
     try Dir.cwd().writeFile(io, .{ .sub_path = blob_path, .data = bytes });
-    return std.fmt.allocPrint(gpa, "sha256:{s}", .{&hex});
+    return gpa.print("sha256:{s}", .{&hex});
 }
 
 fn formatOciHistoryComment(
@@ -2123,11 +2112,10 @@ fn formatOciHistoryComment(
 ) ![]u8 {
     const closure_sha256 = sha256Bytes(installed_closure);
     return switch (flavor.flavor) {
-        .core => std.fmt.allocPrint(gpa, "Based on mcr.microsoft.com/{s}:{s} ({s})", .{
+        .core => gpa.print("Based on mcr.microsoft.com/{s}:{s} ({s})", .{
             base_image, base_tag, source_digest,
         }),
-        .full => std.fmt.allocPrint(
-            gpa,
+        .full => gpa.print(
             "Based on {s}@{s} {s} ({s}, blob {s}); repomd/{s}={s}; installed-nevra-sha256={s}",
             .{
                 vm_base_upstream_repository,
@@ -2201,7 +2189,7 @@ fn createOciLayer(
         "--format=pax", "--xattrs",    "--xattrs-include=*", "--pax-option=delete=atime,delete=ctime",
     });
     for (excludes) |e| {
-        const flag = try std.fmt.allocPrint(gpa, "--exclude={s}", .{e});
+        const flag = try gpa.print("--exclude={s}", .{e});
         defer gpa.free(flag);
         try argv.append(try gpa.dupe(u8, flag));
     }
@@ -2219,7 +2207,7 @@ fn createOciLayer(
         var gid_buf: [32]u8 = undefined;
         const uid_str = try std.fmt.bufPrint(&uid_buf, "{d}", .{std.os.linux.getuid()});
         const gid_str = try std.fmt.bufPrint(&gid_buf, "{d}", .{std.os.linux.getgid()});
-        const own = try std.fmt.allocPrint(gpa, "{s}:{s}", .{ uid_str, gid_str });
+        const own = try gpa.print("{s}:{s}", .{ uid_str, gid_str });
         defer gpa.free(own);
         try sudo(gpa, io, &.{ "chown", own, layer_tar });
     }
@@ -2235,7 +2223,7 @@ fn createOciLayer(
 
     // diff_id = sha256 of uncompressed tar.
     const diff_hex = try sha256File(io, layer_tar);
-    const diff_id = try std.fmt.allocPrint(gpa, "sha256:{s}", .{&diff_hex});
+    const diff_id = try gpa.print("sha256:{s}", .{&diff_hex});
     errdefer gpa.free(diff_id);
 
     // Zig's Reader.stream() copies only one chunk. Use streamRemaining() so
@@ -2244,12 +2232,12 @@ fn createOciLayer(
     if (streamed != tar_stat.size) return error.IncompleteOciLayer;
 
     const gz_hex = try sha256File(io, layer_gz);
-    const compressed_digest = try std.fmt.allocPrint(gpa, "sha256:{s}", .{&gz_hex});
+    const compressed_digest = try gpa.print("sha256:{s}", .{&gz_hex});
     errdefer gpa.free(compressed_digest);
     const gz_stat = try Dir.cwd().statFile(io, layer_gz, .{});
 
     // Copy blob to blobs_dir.
-    const blob_dest = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ blobs_dir, &gz_hex });
+    const blob_dest = try gpa.print("{s}/{s}", .{ blobs_dir, &gz_hex });
     defer gpa.free(blob_dest);
     try Dir.copyFile(Dir.cwd(), layer_gz, Dir.cwd(), blob_dest, io, .{});
 
@@ -2271,13 +2259,13 @@ fn createOciLayout(
     flavor: *const FlavorDescriptor,
     installed_closure: []const u8,
 ) ![]u8 {
-    const layout_dir = try std.fmt.allocPrint(gpa, "{s}/oci-generalized", .{work_dir});
+    const layout_dir = try gpa.print("{s}/oci-generalized", .{work_dir});
 
     // Remove stale layout.
     if (Dir.cwd().statFile(io, layout_dir, .{})) |_| {
         try run(gpa, io, &.{ "rm", "-rf", "--", layout_dir });
     } else |_| {}
-    const blobs_dir = try std.fmt.allocPrint(gpa, "{s}/blobs/sha256", .{layout_dir});
+    const blobs_dir = try gpa.print("{s}/blobs/sha256", .{layout_dir});
     defer gpa.free(blobs_dir);
     try Dir.cwd().createDirPath(io, blobs_dir);
 
@@ -2363,7 +2351,7 @@ fn createOciLayout(
     const yd = day.calculateYearDay();
     const md = yd.calculateMonthDay();
     const ds = epoch.getDaySeconds();
-    const created_ts = try std.fmt.allocPrint(gpa, "{d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+    const created_ts = try gpa.print("{d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
         yd.year,              md.month.numeric(),      md.day_index + 1,
         ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
     });
@@ -2456,7 +2444,7 @@ fn createOciLayout(
     defer gpa.free(manifest_digest);
 
     // oci-layout file.
-    const oci_layout_path = try std.fmt.allocPrint(gpa, "{s}/oci-layout", .{layout_dir});
+    const oci_layout_path = try gpa.print("{s}/oci-layout", .{layout_dir});
     defer gpa.free(oci_layout_path);
     try Dir.cwd().writeFile(io, .{
         .sub_path = oci_layout_path,
@@ -2489,7 +2477,7 @@ fn createOciLayout(
     const index_json = try index_buf.toOwnedSlice();
     defer gpa.free(index_json);
 
-    const index_path = try std.fmt.allocPrint(gpa, "{s}/index.json", .{layout_dir});
+    const index_path = try gpa.print("{s}/index.json", .{layout_dir});
     defer gpa.free(index_path);
     try Dir.cwd().writeFile(io, .{ .sub_path = index_path, .data = index_json });
 
@@ -2702,7 +2690,7 @@ fn signGeneralizedImage(
 
     for (linux_entries) |entry| {
         if (entry.kind != .file or !isEfiFile(entry.name)) continue;
-        const path = try std.fmt.allocPrint(gpa, "EFI/Linux/{s}", .{entry.name});
+        const path = try gpa.print("EFI/Linux/{s}", .{entry.name});
         errdefer gpa.free(path);
         const unsigned = try esp.readFileAlloc(io, gpa, path);
         defer gpa.free(unsigned);
@@ -2899,7 +2887,7 @@ fn writeSigningProvenance(
     );
     defer gpa.free(json);
 
-    const provenance_dir = try std.fmt.allocPrint(gpa, "{s}/provenance", .{work_dir});
+    const provenance_dir = try gpa.print("{s}/provenance", .{work_dir});
     defer gpa.free(provenance_dir);
     try Dir.cwd().createDirPath(io, provenance_dir);
     const path = try signingProvenancePath(gpa, work_dir, architecture, flavor);
@@ -2917,8 +2905,7 @@ fn signingProvenancePath(
     architecture: *const ArchitectureDescriptor,
     flavor: *const FlavorDescriptor,
 ) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "{s}/provenance/uki-signing-{s}-{s}.json",
         .{ work_dir, @tagName(flavor.flavor), architecture.dnf_architecture },
     );
@@ -3026,7 +3013,7 @@ fn requireNoGeneratedGrubConfigs(esp: *miz.fat32.FileSystem, gpa: Allocator, io:
     defer miz.fat32.freeDirEntries(gpa, efi_entries);
     for (efi_entries) |entry| {
         if (entry.kind != .directory or std.ascii.eqlIgnoreCase(entry.name, "BOOT")) continue;
-        const path = try std.fmt.allocPrint(gpa, "EFI/{s}/grub.cfg", .{entry.name});
+        const path = try gpa.print("EFI/{s}/grub.cfg", .{entry.name});
         defer gpa.free(path);
         try requireAbsentFile(esp, gpa, io, path);
     }
@@ -3040,13 +3027,11 @@ fn expectedUkiCmdline(
 ) ![]u8 {
     var root_guid_text: [36]u8 = undefined;
     return switch (flavor.pid1) {
-        .mizinit => std.fmt.allocPrint(
-            gpa,
+        .mizinit => gpa.print(
             "root=PARTUUID={s} {s}",
             .{ miz.guid.formatLower(&root_guid_text, root_guid), architecture.extra_kernel_options },
         ),
-        .systemd => std.fmt.allocPrint(
-            gpa,
+        .systemd => gpa.print(
             "root=PARTUUID={s} {s}",
             .{ miz.guid.formatLower(&root_guid_text, root_guid), architecture.serial_console },
         ),
@@ -3151,7 +3136,7 @@ fn validateFinalizedImageRootfs(
     defer if (homes) |entries| miz.ext4.freeDirEntries(gpa, entries);
     for (homes orelse &.{}) |home| {
         if (home.kind != .directory) continue;
-        const authorized_keys = try std.fmt.allocPrint(gpa, "home/{s}/.ssh/authorized_keys", .{home.name});
+        const authorized_keys = try gpa.print("home/{s}/.ssh/authorized_keys", .{home.name});
         defer gpa.free(authorized_keys);
         try requireImageRootfsPathAbsent(&rootfs, io, authorized_keys);
     }
@@ -3246,7 +3231,7 @@ fn validateGeneralizedImage(
         if (entry.kind != .file or entry.name.len < 4 or
             !std.ascii.eqlIgnoreCase(entry.name[entry.name.len - 4 ..], ".efi")) continue;
         found_named_uki = true;
-        const path = try std.fmt.allocPrint(gpa, "EFI/Linux/{s}", .{entry.name});
+        const path = try gpa.print("EFI/Linux/{s}", .{entry.name});
         defer gpa.free(path);
         const bytes = try esp.readFileAlloc(io, gpa, path);
         defer gpa.free(bytes);
@@ -3366,11 +3351,11 @@ fn validateFullIsoKernelCompatibility(
     work_dir: []const u8,
     architecture: *const ArchitectureDescriptor,
 ) !void {
-    const iso_mount_path = try std.fmt.allocPrint(gpa, "{s}/iso-boot-assets", .{work_dir});
+    const iso_mount_path = try gpa.print("{s}/iso-boot-assets", .{work_dir});
     defer gpa.free(iso_mount_path);
-    const squashfs_mount_path = try std.fmt.allocPrint(gpa, "{s}/iso-live-squashfs", .{work_dir});
+    const squashfs_mount_path = try gpa.print("{s}/iso-live-squashfs", .{work_dir});
     defer gpa.free(squashfs_mount_path);
-    const nested_rootfs_mount_path = try std.fmt.allocPrint(gpa, "{s}/iso-live-rootfs", .{work_dir});
+    const nested_rootfs_mount_path = try gpa.print("{s}/iso-live-rootfs", .{work_dir});
     defer gpa.free(nested_rootfs_mount_path);
     try Dir.cwd().createDirPath(io, iso_mount_path);
     try Dir.cwd().createDirPath(io, squashfs_mount_path);
@@ -3378,23 +3363,21 @@ fn validateFullIsoKernelCompatibility(
 
     try sudo(gpa, io, &.{ "mount", "-o", "loop,ro", iso_path, iso_mount_path });
     defer sudo(gpa, io, &.{ "umount", iso_mount_path }) catch {};
-    const squashfs_path = try std.fmt.allocPrint(
-        gpa,
+    const squashfs_path = try gpa.print(
         "{s}/{s}",
         .{ iso_mount_path, architecture.iso_squashfs_path },
     );
     defer gpa.free(squashfs_path);
     try sudo(gpa, io, &.{ "mount", "-t", "squashfs", "-o", "loop,ro", squashfs_path, squashfs_mount_path });
     defer sudo(gpa, io, &.{ "umount", squashfs_mount_path }) catch {};
-    const nested_rootfs_path = try std.fmt.allocPrint(
-        gpa,
+    const nested_rootfs_path = try gpa.print(
         "{s}/{s}",
         .{ squashfs_mount_path, architecture.iso_nested_rootfs_path },
     );
     defer gpa.free(nested_rootfs_path);
     try sudo(gpa, io, &.{ "mount", "-t", "ext4", "-o", "loop,ro", nested_rootfs_path, nested_rootfs_mount_path });
     defer sudo(gpa, io, &.{ "umount", nested_rootfs_mount_path }) catch {};
-    const nested_boot_path = try std.fmt.allocPrint(gpa, "{s}/boot", .{nested_rootfs_mount_path});
+    const nested_boot_path = try gpa.print("{s}/boot", .{nested_rootfs_mount_path});
     defer gpa.free(nested_boot_path);
 
     const iso_kernels = try capture(gpa, io, &.{
@@ -3430,7 +3413,7 @@ fn downloadIso(
     work_dir: []const u8,
     architecture: *const ArchitectureDescriptor,
 ) ![]u8 {
-    const iso_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ work_dir, architecture.iso_name });
+    const iso_path = try gpa.print("{s}/{s}", .{ work_dir, architecture.iso_name });
     errdefer gpa.free(iso_path);
 
     const expected_digest = artifact_pipeline.parseSha256(architecture.iso_sha256) catch
@@ -3788,7 +3771,7 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(signing_provenance_path);
     Dir.cwd().deleteFile(io, signing_provenance_path) catch {};
     const signing_scratch = if (signing_config != null)
-        try std.fmt.allocPrint(gpa, "{s}/uki-signing-scratch", .{work_dir})
+        try gpa.print("{s}/uki-signing-scratch", .{work_dir})
     else
         null;
     defer if (signing_scratch) |path| gpa.free(path);
@@ -3813,7 +3796,7 @@ pub fn main(init: std.process.Init) !void {
     };
     try validateIso(io, iso_path, architecture);
 
-    const rootfs_path = try std.fmt.allocPrint(gpa, "{s}/rootfs", .{work_dir});
+    const rootfs_path = try gpa.print("{s}/rootfs", .{work_dir});
     defer gpa.free(rootfs_path);
 
     const core_digest = switch (flavor.flavor) {
@@ -3873,15 +3856,15 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Build the raw QCOW2 first (no compression).
-    const raw_qcow2 = try std.fmt.allocPrint(gpa, "{s}.raw.qcow2", .{output_path});
+    const raw_qcow2 = try gpa.print("{s}.raw.qcow2", .{output_path});
     defer gpa.free(raw_qcow2);
     Dir.cwd().deleteFile(io, raw_qcow2) catch {};
     const oci_load_options = ociLoadOptionsForFlavor(flavor);
-    const max_oci_blob_size_arg = try std.fmt.allocPrint(gpa, "{d}", .{oci_load_options.max_blob_size});
+    const max_oci_blob_size_arg = try gpa.print("{d}", .{oci_load_options.max_blob_size});
     defer gpa.free(max_oci_blob_size_arg);
-    const max_oci_layer_size_arg = try std.fmt.allocPrint(gpa, "{d}", .{oci_load_options.max_layer_size});
+    const max_oci_layer_size_arg = try gpa.print("{d}", .{oci_load_options.max_layer_size});
     defer gpa.free(max_oci_layer_size_arg);
-    const max_oci_archive_size_arg = try std.fmt.allocPrint(gpa, "{d}", .{oci_load_options.max_archive_size});
+    const max_oci_archive_size_arg = try gpa.print("{d}", .{oci_load_options.max_archive_size});
     defer gpa.free(max_oci_archive_size_arg);
 
     std.debug.print("Building disk image...\n", .{});
@@ -3951,7 +3934,7 @@ pub fn main(init: std.process.Init) !void {
     defer env_map.deinit();
     try env_map.put("LD_PRELOAD", preload_path);
 
-    const staged_qcow2 = try std.fmt.allocPrint(gpa, "{s}.validated-stage", .{output_path});
+    const staged_qcow2 = try gpa.print("{s}.validated-stage", .{output_path});
     defer gpa.free(staged_qcow2);
     const raw_metadata = try artifact_pipeline.hashFile(io, raw_qcow2);
     const finalized = artifact_pipeline.finalizeQcow2(
@@ -4082,17 +4065,17 @@ test "safeLayerPath rejects .." {
 }
 
 test "parseDigestHex accepts sha256: prefix" {
-    const hex = try parseDigestHex("sha256:" ++ "a" ** 64);
-    try std.testing.expectEqualStrings("a" ** 64, hex);
+    const hex = try parseDigestHex("sha256:" ++ &@as([64:0]u8, @splat('a')));
+    try std.testing.expectEqualStrings(&@as([64:0]u8, @splat('a')), hex);
 }
 
 test "parseDigestHex accepts bare hex" {
-    try std.testing.expectEqualStrings("b" ** 64, try parseDigestHex("b" ** 64));
+    try std.testing.expectEqualStrings(&@as([64:0]u8, @splat('b')), try parseDigestHex(&@as([64:0]u8, @splat('b'))));
 }
 
 test "parseDigestHex rejects short and invalid chars" {
     try std.testing.expectError(error.InvalidDigest, parseDigestHex("sha256:short"));
-    try std.testing.expectError(error.InvalidDigest, parseDigestHex("sha256:" ++ "g" ** 64));
+    try std.testing.expectError(error.InvalidDigest, parseDigestHex("sha256:" ++ &@as([64:0]u8, @splat('g'))));
     try std.testing.expectError(error.InvalidDigest, parseDigestHex("notahex"));
 }
 
@@ -4139,8 +4122,7 @@ test "architecture and flavor descriptors pin inputs and output namespaces" {
     for (cases) |architecture| {
         const cache_path = try systemdBootRpmCachePath(gpa, ".scratch/work", architecture);
         defer gpa.free(cache_path);
-        const expected_cache_path = try std.fmt.allocPrint(
-            gpa,
+        const expected_cache_path = try gpa.print(
             ".scratch/work/downloads/{s}",
             .{architecture.systemd_boot_rpm_name},
         );

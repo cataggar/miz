@@ -28,7 +28,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: zig fmt --check
         run: zig fmt --check .
@@ -51,7 +51,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build production artifacts and run Zig tests
         run: |
@@ -60,7 +60,42 @@ jobs:
             exit 1
           fi
           zig build check-ci-production-entrypoints test-package-family test-ci \
-            -Doptimize=Debug --summary all
+            -Doptimize=debug --summary all
+
+  native-smoke:
+    name: native CLI + library (${{ matrix.os }}, ${{ matrix.optimize }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+        optimize: [debug, safe, fast, small]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Zig via ghr
+        uses: cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          ghr-version: 0.6.6
+          tools: |
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+
+      # The portable gate does not run Linux-only package, mount or VM tests
+      # on macOS/Windows. Each binary is executed on the host that built it.
+      - name: Build and run portable CLI/library smoke tests
+        run: zig build install-miz test-native-smoke -Doptimize=${{ matrix.optimize }} -j2 --summary all
+
+      - name: Run the native CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          executable=zig-out/bin/miz
+          if [[ "$RUNNER_OS" == Windows ]]; then executable+=.exe; fi
+          "$executable" version
+          "$executable" --help
 
   vm-backend:
     name: VM backend integration
@@ -76,10 +111,10 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: zig build test-vm-backend
-        run: zig build test-vm-backend -Doptimize=Debug --summary all
+        run: zig build test-vm-backend -Doptimize=debug --summary all
 
   windows:
     name: Windows release build (${{ matrix.target }})
@@ -101,10 +136,10 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build ${{ matrix.target }}
-        run: zig build install-miz -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+        run: zig build install-miz -Doptimize=safe -Dtarget=${{ matrix.target }}
 
   unsafe-chroot:
     name: privileged integrations
@@ -120,17 +155,17 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: privileged device-write integration
         env:
           MIZ_RUN_PRIVILEGED_TEST: "1"
-        run: zig build test-device-write-integration -Doptimize=Debug --summary all
+        run: zig build test-device-write-integration -Doptimize=debug --summary all
 
       - name: privileged unsafe-chroot integration
         env:
           MIZ_RUN_PRIVILEGED_TEST: "1"
-        run: zig build test-unsafe-chroot-integration -Doptimize=Debug --summary all
+        run: zig build test-unsafe-chroot-integration -Doptimize=debug --summary all
 
   vm-boot:
     name: VM boot (${{ matrix.name }})
@@ -142,19 +177,19 @@ jobs:
         include:
           - name: native x86_64
             shard: native
-            optimize: Debug
+            optimize: debug
             kernel_cache_path: fixtures/vm-boot-kernel
             kernel_cache_key: vm-boot-kernel-6.6.139.1-1.azl3-both-v1
           - name: cross-architecture aarch64
             shard: cross
-            optimize: Debug
+            optimize: debug
             kernel_cache_path: fixtures/vm-boot-kernel
             kernel_cache_key: vm-boot-kernel-6.6.139.1-1.azl3-both-v1
           - name: modular x86_64
             shard: modular
-            # ReleaseSafe saves more execution time than it adds at compile
+            # safe saves more execution time than it adds at compile
             # time for the module-heavy boot path.
-            optimize: ReleaseSafe
+            optimize: safe
             kernel_cache_path: fixtures/vm-boot-modular-kernel
             kernel_cache_key: vm-boot-modular-kernel-6.1.176-1-v1
     steps:
@@ -167,7 +202,7 @@ jobs:
         with:
           ghr-version: 0.6.6
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
             cataggar/qemu@v11.0.91-z.15
 
       # The VM backend boots the image's own kernel with `rdinit=`. Drivers it

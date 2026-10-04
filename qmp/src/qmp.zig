@@ -568,7 +568,7 @@ pub fn spawnAndConnect(allocator: std.mem.Allocator, io: Io, options: SpawnOptio
         try randomTempSocketPath(allocator, io);
     errdefer allocator.free(sock_path);
 
-    const qmp_arg = try std.fmt.allocPrint(allocator, "unix:{s},server=on,wait=off", .{sock_path});
+    const qmp_arg = try allocator.print("unix:{s},server=on,wait=off", .{sock_path});
     defer allocator.free(qmp_arg);
 
     var argv: std.ArrayList([]const u8) = .empty;
@@ -626,7 +626,7 @@ fn randomTempSocketPath(allocator: std.mem.Allocator, io: Io) ![]u8 {
     var rand_bytes: [8]u8 = undefined;
     Io.random(io, &rand_bytes);
     const hex = std.fmt.bytesToHex(rand_bytes, .lower);
-    return std.fmt.allocPrint(allocator, "/tmp/qmp-{s}.sock", .{&hex});
+    return allocator.print("/tmp/qmp-{s}.sock", .{&hex});
 }
 
 test "readFrame: classifies the server greeting" {
@@ -741,7 +741,7 @@ test "writeCommand: omits arguments when null" {
 }
 
 test "spawnAndConnect bounds an exited child without a QMP socket" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     Io.Dir.cwd().access(std.testing.io, "/bin/false", .{
         .execute = true,
     }) catch return error.SkipZigTest;
@@ -766,8 +766,8 @@ test "spawnAndConnect bounds an exited child without a QMP socket" {
 test "qapi: generated module fully type-checks" {
     comptime {
         @setEvalBranchQuota(100_000);
-        for (@typeInfo(qapi).@"struct".decls) |decl| {
-            _ = @field(qapi, decl.name);
+        for (@typeInfo(qapi).@"struct".decl_names) |name| {
+            _ = @field(qapi, name);
         }
     }
 }

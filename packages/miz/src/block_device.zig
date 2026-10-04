@@ -114,7 +114,7 @@ pub const FilesystemIdentityKind = enum {
 pub const FilesystemIdentity = struct {
     kind: FilesystemIdentityKind = .none,
     identifier: [identity_rewrite.canonical_uuid_bytes]u8 =
-        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+        @as([identity_rewrite.canonical_uuid_bytes]u8, @splat(0)),
     identifier_len: u8 = 0,
 
     pub fn identifierText(self: *const FilesystemIdentity) ?[]const u8 {
@@ -132,10 +132,10 @@ pub const PartitionReport = struct {
     table_index: u32,
     first_lba: u64,
     last_lba: u64,
-    name: [72]u8 = [_]u8{0} ** 72,
+    name: [72]u8 = @as([72]u8, @splat(0)),
     name_len: u8 = 0,
     gpt_unique_guid: [identity_rewrite.canonical_uuid_bytes]u8 =
-        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+        @as([identity_rewrite.canonical_uuid_bytes]u8, @splat(0)),
     gpt_unique_guid_len: u8 = 0,
     filesystem: FilesystemIdentity = .{},
     signatures: Signatures = .{},
@@ -157,7 +157,7 @@ pub const IdentityInventory = struct {
     partitions: []PartitionReport,
     device_signatures: Signatures,
     gpt_disk_guid: [identity_rewrite.canonical_uuid_bytes]u8 =
-        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+        @as([identity_rewrite.canonical_uuid_bytes]u8, @splat(0)),
     gpt_disk_guid_len: u8 = 0,
     device_filesystem: FilesystemIdentity = .{},
 
@@ -187,7 +187,7 @@ pub const PreflightReport = struct {
     partitions: []PartitionReport,
     device_signatures: Signatures,
     gpt_disk_guid: [identity_rewrite.canonical_uuid_bytes]u8 =
-        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+        @as([identity_rewrite.canonical_uuid_bytes]u8, @splat(0)),
     gpt_disk_guid_len: u8 = 0,
     device_filesystem: FilesystemIdentity = .{},
 
@@ -230,7 +230,7 @@ pub const CollisionKind = enum {
 pub const Collision = struct {
     kind: CollisionKind,
     identifier: [identity_rewrite.canonical_uuid_bytes]u8 =
-        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes,
+        @as([identity_rewrite.canonical_uuid_bytes]u8, @splat(0)),
     identifier_len: u8 = 0,
     source_partition_table_index: ?u32 = null,
     source_filesystem: FilesystemIdentityKind = .none,
@@ -326,7 +326,7 @@ pub fn describePreflightFailure(err: anyerror) ?[]const u8 {
 /// block-device node (`Io.File.Stat.kind == .block_device`); the ioctls are
 /// not meaningful on anything else.
 pub fn probe(file: Io.File) ProbeError!Geometry {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .linux => probeLinux(file),
         else => error.UnsupportedBlockDevice,
     };
@@ -377,7 +377,7 @@ fn reReadPartitionTableLinux(
 /// is still in use; every other ioctl failure is reported without being
 /// silently treated as success.
 pub fn reReadPartitionTable(file: Io.File) ReReadPartitionTableError!void {
-    return switch (builtin.os.tag) {
+    return switch (builtin.target.os.tag) {
         .linux => reReadPartitionTableLinux(file, null, systemIoctl),
         else => error.UnsupportedBlockDevice,
     };
@@ -387,7 +387,7 @@ pub fn reReadPartitionTable(file: Io.File) ReReadPartitionTableError!void {
 /// descriptor. Using `AT_EMPTY_PATH` binds the identity to the descriptor
 /// rather than re-resolving a path that could have changed.
 pub fn deviceNumber(file: Io.File) PreflightError!DeviceNumber {
-    if (builtin.os.tag != .linux) return error.UnsupportedBlockDevicePreflight;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedBlockDevicePreflight;
 
     const linux = std.os.linux;
     var statx_buf: linux.Statx = undefined;
@@ -404,7 +404,7 @@ pub fn deviceNumber(file: Io.File) PreflightError!DeviceNumber {
 
 /// Reads `/proc/self/mountinfo` without trusting procfs' synthetic stat size.
 pub fn readMountInfo(allocator: std.mem.Allocator) PreflightError![]u8 {
-    if (builtin.os.tag != .linux) return error.UnsupportedBlockDevicePreflight;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedBlockDevicePreflight;
 
     const linux = std.os.linux;
     const open_rc = linux.open("/proc/self/mountinfo", .{ .ACCMODE = .RDONLY }, 0);
@@ -1032,7 +1032,7 @@ pub fn inspectIdentityInventory(
     const table: PartitionTable = if (has_gpt) .gpt else if (has_mbr) .mbr else .none;
     var gpt_disk_guid_len: u8 = 0;
     var gpt_disk_guid: [identity_rewrite.canonical_uuid_bytes]u8 =
-        [_]u8{0} ** identity_rewrite.canonical_uuid_bytes;
+        @as([identity_rewrite.canonical_uuid_bytes]u8, @splat(0));
     if (has_gpt) {
         const entry_lba = std.mem.readInt(u64, gpt_header[72..80], .little);
         const entry_count = std.mem.readInt(u32, gpt_header[80..84], .little);
@@ -1470,7 +1470,7 @@ pub fn findLinuxVisibleIdentityCollisions(
     source: *const IdentityInventory,
     excluded_whole_disk_name: []const u8,
 ) CollisionError!CollisionReport {
-    if (builtin.os.tag != .linux) return error.UnsupportedBlockDevicePreflight;
+    if (builtin.target.os.tag != .linux) return error.UnsupportedBlockDevicePreflight;
 
     var class_block_dir = Io.Dir.openDirAbsolute(io, "/sys/class/block", .{ .iterate = true }) catch
         return error.BlockDeviceSysfsUnavailable;
@@ -1545,7 +1545,7 @@ const TestIoctl = struct {
         self.request = request;
         self.argument = argument;
         if (self.result == .SUCCESS) return 0;
-        const errno_value: isize = @intCast(@intFromEnum(self.result));
+        const errno_value: isize = @intCast(@backingInt(self.result));
         return @bitCast(-errno_value);
     }
 };
@@ -1590,17 +1590,17 @@ fn addTestSysfsDevice(
     holders: []const []const u8,
     slaves: []const []const u8,
 ) !void {
-    const device_path = try std.fmt.allocPrint(allocator, "devices/{s}", .{relative_device_path});
+    const device_path = try allocator.print("devices/{s}", .{relative_device_path});
     defer allocator.free(device_path);
     try root.createDirPath(io, device_path);
 
-    const dev_path = try std.fmt.allocPrint(allocator, "{s}/dev", .{device_path});
+    const dev_path = try allocator.print("{s}/dev", .{device_path});
     defer allocator.free(dev_path);
-    const dev_content = try std.fmt.allocPrint(allocator, "{d}:{d}\n", .{ number.major, number.minor });
+    const dev_content = try allocator.print("{d}:{d}\n", .{ number.major, number.minor });
     defer allocator.free(dev_content);
     try root.writeFile(io, .{ .sub_path = dev_path, .data = dev_content });
 
-    const removable_path = try std.fmt.allocPrint(allocator, "{s}/removable", .{device_path});
+    const removable_path = try allocator.print("{s}/removable", .{device_path});
     defer allocator.free(removable_path);
     try root.writeFile(io, .{
         .sub_path = removable_path,
@@ -1608,34 +1608,34 @@ fn addTestSysfsDevice(
     });
 
     if (partition_number) |partition| {
-        const partition_path = try std.fmt.allocPrint(allocator, "{s}/partition", .{device_path});
+        const partition_path = try allocator.print("{s}/partition", .{device_path});
         defer allocator.free(partition_path);
-        const partition_content = try std.fmt.allocPrint(allocator, "{d}\n", .{partition});
+        const partition_content = try allocator.print("{d}\n", .{partition});
         defer allocator.free(partition_content);
         try root.writeFile(io, .{ .sub_path = partition_path, .data = partition_content });
     }
 
-    const holders_path = try std.fmt.allocPrint(allocator, "{s}/holders", .{device_path});
+    const holders_path = try allocator.print("{s}/holders", .{device_path});
     defer allocator.free(holders_path);
     try root.createDirPath(io, holders_path);
     for (holders) |holder| {
-        const holder_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ holders_path, holder });
+        const holder_path = try allocator.print("{s}/{s}", .{ holders_path, holder });
         defer allocator.free(holder_path);
         try root.writeFile(io, .{ .sub_path = holder_path, .data = "" });
     }
 
-    const slaves_path = try std.fmt.allocPrint(allocator, "{s}/slaves", .{device_path});
+    const slaves_path = try allocator.print("{s}/slaves", .{device_path});
     defer allocator.free(slaves_path);
     try root.createDirPath(io, slaves_path);
     for (slaves) |slave| {
-        const slave_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ slaves_path, slave });
+        const slave_path = try allocator.print("{s}/{s}", .{ slaves_path, slave });
         defer allocator.free(slave_path);
         try root.writeFile(io, .{ .sub_path = slave_path, .data = "" });
     }
 
-    const link_target = try std.fmt.allocPrint(allocator, "../{s}", .{device_path});
+    const link_target = try allocator.print("../{s}", .{device_path});
     defer allocator.free(link_target);
-    const link_path = try std.fmt.allocPrint(allocator, "class_block/{s}", .{name});
+    const link_path = try allocator.print("class_block/{s}", .{name});
     defer allocator.free(link_path);
     try root.symLink(io, link_target, link_path, .{});
 }
@@ -1647,14 +1647,13 @@ fn addTestSysfsSerial(
     relative_device_path: []const u8,
     serial: []const u8,
 ) !void {
-    const device_dir = try std.fmt.allocPrint(
-        allocator,
+    const device_dir = try allocator.print(
         "devices/{s}/device",
         .{relative_device_path},
     );
     defer allocator.free(device_dir);
     try root.createDirPath(io, device_dir);
-    const serial_path = try std.fmt.allocPrint(allocator, "{s}/serial", .{device_dir});
+    const serial_path = try allocator.print("{s}/serial", .{device_dir});
     defer allocator.free(serial_path);
     try root.writeFile(io, .{ .sub_path = serial_path, .data = serial });
 }
@@ -1666,8 +1665,7 @@ fn addTestSysfsDirectSerial(
     relative_device_path: []const u8,
     serial: []const u8,
 ) !void {
-    const serial_path = try std.fmt.allocPrint(
-        allocator,
+    const serial_path = try allocator.print(
         "devices/{s}/serial",
         .{relative_device_path},
     );
@@ -1709,14 +1707,14 @@ const test_xfs_uuid = [16]u8{
 };
 
 fn writeTestExt4Identity(io: Io, file: Io.File, region_offset: u64) !void {
-    var superblock = [_]u8{0} ** 0x78;
+    var superblock = @as([0x78]u8, @splat(0));
     std.mem.writeInt(u16, superblock[0x38..0x3A], 0xEF53, .little);
     @memcpy(superblock[0x68..0x78], &test_ext4_uuid);
     try file.writePositionalAll(io, &superblock, region_offset + 1024);
 }
 
 fn writeTestFatIdentity(io: Io, file: Io.File, region_offset: u64) !void {
-    var boot = [_]u8{0} ** 512;
+    var boot = @as([512]u8, @splat(0));
     boot[510] = 0x55;
     boot[511] = 0xAA;
     boot[66] = 0x29;
@@ -1726,7 +1724,7 @@ fn writeTestFatIdentity(io: Io, file: Io.File, region_offset: u64) !void {
 }
 
 fn writeTestXfsIdentity(io: Io, file: Io.File, region_offset: u64) !void {
-    var superblock = [_]u8{0} ** 120;
+    var superblock = @as([120]u8, @splat(0));
     @memcpy(superblock[0..4], "XFSB");
     @memcpy(superblock[32..48], &test_xfs_uuid);
     try file.writePositionalAll(io, &superblock, region_offset);
@@ -1736,7 +1734,7 @@ fn writeTestGpt(io: Io, file: Io.File) !void {
     const protective = mbr.protectiveMbr(4096).encode();
     try file.writePositionalAll(io, &protective, 0);
 
-    var header = [_]u8{0} ** mbr.sector_size;
+    var header = @as([mbr.sector_size]u8, @splat(0));
     header[0..8].* = "EFI PART".*;
     @memcpy(header[56..72], &test_gpt_disk_guid);
     std.mem.writeInt(u64, header[72..80], 2, .little);
@@ -1744,7 +1742,7 @@ fn writeTestGpt(io: Io, file: Io.File) !void {
     std.mem.writeInt(u32, header[84..88], 128, .little);
     try file.writePositionalAll(io, &header, mbr.sector_size);
 
-    var entry = [_]u8{0} ** 128;
+    var entry = @as([128]u8, @splat(0));
     entry[0] = 1;
     @memcpy(entry[16..32], &test_gpt_partition_guid);
     std.mem.writeInt(u64, entry[32..40], 2048, .little);

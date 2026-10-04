@@ -42,7 +42,7 @@ const Allocator = std.mem.Allocator;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
-    if (builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .linux) {
         std.debug.print("skipping vm firmware boot: Linux is required\n", .{});
         return;
     }
@@ -71,7 +71,7 @@ const Settings = struct {
             );
             return null;
         }
-        const host_architecture: miz.customize.Architecture = switch (builtin.cpu.arch) {
+        const host_architecture: miz.customize.Architecture = switch (builtin.target.cpu.arch) {
             .x86_64 => .x86_64,
             .aarch64 => .aarch64,
             else => {
@@ -148,8 +148,7 @@ fn runAttestation(allocator: Allocator, io: Io, settings: Settings) !void {
     var random: [8]u8 = undefined;
     Io.random(io, &random);
     const random_hex = std.fmt.bytesToHex(random, .lower);
-    const transaction_path = try std.fmt.allocPrint(
-        allocator,
+    const transaction_path = try allocator.print(
         "{s}/miz-vm-firmware-{s}",
         .{ settings.work_root, &random_hex },
     );

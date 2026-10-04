@@ -490,7 +490,7 @@ pub fn populateEsp(
         for (plan.boot_entries) |entry| {
             const bls_text = try renderBlsEntry(allocator, entry, kernel_command_line);
             defer allocator.free(bls_text);
-            const bls_path = try std.fmt.allocPrint(allocator, "loader/entries/{s}.conf", .{entry.id});
+            const bls_path = try allocator.print("loader/entries/{s}.conf", .{entry.id});
             defer allocator.free(bls_path);
             try writeGeneratedFile(io, esp, bls_path, bls_text);
         }
@@ -823,7 +823,7 @@ fn efiDestinationPath(allocator: std.mem.Allocator, path: []const u8) std.mem.Al
         const end = std.mem.indexOfScalarPos(u8, path, start, '/') orelse path.len;
         if (std.ascii.eqlIgnoreCase(path[start..end], "EFI")) {
             if (end == path.len) return null;
-            const out = try std.fmt.allocPrint(allocator, "EFI/{s}", .{path[end + 1 ..]});
+            const out = try allocator.print("EFI/{s}", .{path[end + 1 ..]});
             return out;
         }
         if (end == path.len) break;
@@ -909,7 +909,7 @@ fn makeConfigPath(allocator: std.mem.Allocator, source_path: []const u8, strip_p
             remainder = remainder[trimmed_prefix.len + 1 ..];
         }
     }
-    return std.fmt.allocPrint(allocator, "/{s}", .{remainder});
+    return allocator.print("/{s}", .{remainder});
 }
 
 fn trimSlashes(value: []const u8) []const u8 {
@@ -1295,7 +1295,7 @@ fn buildBootEntries(
         const title = if (title_prefix.len == 0)
             try allocator.dupe(u8, basename)
         else
-            try std.fmt.allocPrint(allocator, "{s} {s}", .{ title_prefix, basename });
+            try allocator.print("{s} {s}", .{ title_prefix, basename });
         errdefer allocator.free(title);
 
         const initrd = bestMatchingInitrd(kernel, initrds);
@@ -1336,7 +1336,7 @@ fn makeUniqueId(
 
     var suffix: usize = 2;
     while (true) : (suffix += 1) {
-        const candidate = try std.fmt.allocPrint(allocator, "{s}-{d}", .{ base_id, suffix });
+        const candidate = try allocator.print("{s}-{d}", .{ base_id, suffix });
         errdefer allocator.free(candidate);
         if (!containsString(existing_ids, candidate)) return candidate;
         allocator.free(candidate);
@@ -1472,7 +1472,7 @@ fn generateUkis(
         });
         defer allocator.free(uki_bytes);
 
-        const destination_path = try std.fmt.allocPrint(allocator, "{s}/{s}.efi", .{ output_directory, entry.id });
+        const destination_path = try allocator.print("{s}/{s}.efi", .{ output_directory, entry.id });
         defer allocator.free(destination_path);
 
         // The `uki_only` fallback is the same bytes at a second path, not a
@@ -1639,8 +1639,7 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 
 fn synthesizeOsRelease(allocator: std.mem.Allocator, title_prefix: []const u8) std.mem.Allocator.Error![]u8 {
     const pretty_name = if (title_prefix.len != 0) title_prefix else "miz";
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         "ID=miz\nNAME=\"miz\"\nPRETTY_NAME=\"{s}\"\n",
         .{pretty_name},
     );
@@ -1658,8 +1657,7 @@ pub fn renderKernelOptions(
     const base = if (verity_info) |info| blk: {
         var root_hash_buf: [verity.digest_size * 2]u8 = undefined;
         var salt_buf: [verity.salt_size * 2]u8 = undefined;
-        break :blk try std.fmt.allocPrint(
-            allocator,
+        break :blk try allocator.print(
             "root=/dev/mapper/root ro roothash={s} systemd.verity_root_data=PARTUUID={s} systemd.verity_root_hash=PARTUUID={s} systemd.verity_root_options=superblock=0,format={d},data-block-size={d},hash-block-size={d},data-blocks={d},hash-offset={d},salt={s},hash={s}",
             .{
                 info.formatRootHash(&root_hash_buf),
@@ -1674,13 +1672,13 @@ pub fn renderKernelOptions(
                 info.hashAlgorithm,
             },
         );
-    } else try std.fmt.allocPrint(allocator, "root=PARTUUID={s}", .{root_partuuid_text});
+    } else try allocator.print("root=PARTUUID={s}", .{root_partuuid_text});
     defer allocator.free(base);
 
     return if (extra_kernel_options.len == 0)
         allocator.dupe(u8, base)
     else
-        std.fmt.allocPrint(allocator, "{s} {s}", .{ base, extra_kernel_options });
+        allocator.print("{s} {s}", .{ base, extra_kernel_options });
 }
 
 fn effectiveUkiOutputDirectory(output_directory: []const u8) []const u8 {
@@ -1700,7 +1698,7 @@ fn renderLoaderConf(
     timeout_seconds: u32,
 ) std.mem.Allocator.Error![]u8 {
     std.debug.assert(entries.len != 0);
-    return std.fmt.allocPrint(allocator, "default {s}\ntimeout {d}\n", .{ entries[0].id, timeout_seconds });
+    return allocator.print("default {s}\ntimeout {d}\n", .{ entries[0].id, timeout_seconds });
 }
 
 fn renderGrubCfg(
@@ -1825,7 +1823,7 @@ fn collectVendorGrubCfgPaths(
     for (copy_plan) |entry| {
         const vendor = efiVendor(entry.destination_path) orelse continue;
         if (std.ascii.eqlIgnoreCase(vendor, "BOOT")) continue;
-        const cfg_path = try std.fmt.allocPrint(allocator, "EFI/{s}/grub.cfg", .{vendor});
+        const cfg_path = try allocator.print("EFI/{s}/grub.cfg", .{vendor});
         errdefer allocator.free(cfg_path);
         if (containsSliceIgnoreCase(paths.items, cfg_path)) {
             allocator.free(cfg_path);
@@ -2203,8 +2201,7 @@ test "populateEsp appends dm-verity kernel arguments to grub.cfg and BLS entries
         .salt = salt,
         .rootHash = root_hash,
     };
-    const expected_options = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const expected_options = try std.testing.allocator.print(
         "root=/dev/mapper/root ro roothash={s} systemd.verity_root_data=PARTUUID=bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb systemd.verity_root_hash=PARTUUID=bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb systemd.verity_root_options=superblock=0,format=1,data-block-size=4096,hash-block-size=4096,data-blocks=1234,hash-offset=5054464,salt={s},hash=sha256 console=ttyS0 quiet",
         .{
             expected_verity.formatRootHash(&root_hash_buf),

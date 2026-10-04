@@ -3,14 +3,12 @@
 //! Compressed frames pin every setting that affects their wire representation.
 //! Raw stored frames remain native so callers can request framing without
 //! compression. Compressed operations return `error.ZstdUnavailable` in
-//! libc-free module graphs that intentionally include headers without linking
+//! libc-free module graphs that intentionally import bindings without linking
 //! libzstd; raw framing remains available there.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const c = @cImport({
-    @cInclude("zstd.h");
-});
+const c = @import("zstd_c");
 const Context = if (builtin.link_libc) ?*c.ZSTD_CCtx else ?*anyopaque;
 
 pub const zstd_magic: u32 = 0xFD2F_B528;
@@ -20,7 +18,7 @@ pub const max_block_size: usize = 128 * 1024;
 
 const compression_level: c_int = 3;
 const window_log: c_int = 21;
-const zero_chunk = [_]u8{0} ** 4096;
+const zero_chunk: [4096]u8 = @splat(0);
 
 pub const ZstdError = error{
     ZstdGeneric,
@@ -642,6 +640,11 @@ fn writeAndCheck(
     return try out.toOwnedSlice();
 }
 
+fn repeatText(comptime text: []const u8, comptime count: usize) *const [count * text.len]u8 {
+    const repeated = comptime @as([count][text.len]u8, @splat(text[0..text.len].*));
+    return @ptrCast(&repeated);
+}
+
 test "compressed frame shrinks zeros and round-trips through linked libzstd" {
     var input: [max_block_size]u8 = undefined;
     @memset(&input, 0);
@@ -656,7 +659,7 @@ test "compressed frame shrinks zeros and round-trips through linked libzstd" {
 }
 
 test "compressed frame shrinks repeated text and round-trips" {
-    const input = ("The quick brown fox jumps over the lazy dog.\n" ** 2048);
+    const input = repeatText("The quick brown fox jumps over the lazy dog.\n", 2048);
     const encoded = try writeAndCheck(input[0..], null);
     defer std.testing.allocator.free(encoded);
 
@@ -672,7 +675,7 @@ test "compressed frame shrinks mixed repeated and noisy data" {
         byte.* = @truncate(x >> 24);
     }
 
-    const repeated = "root=/dev/dm-0 ro quiet splash console=ttyS0\n" ** 512;
+    const repeated = repeatText("root=/dev/dm-0 ro quiet splash console=ttyS0\n", 512);
     var input: [repeated.len + noise.len + repeated.len]u8 = undefined;
     @memcpy(input[0..repeated.len], repeated[0..]);
     @memcpy(input[repeated.len .. repeated.len + noise.len], &noise);
@@ -686,7 +689,7 @@ test "compressed frame shrinks mixed repeated and noisy data" {
 }
 
 test "pinned compression is repeatable" {
-    const input = ("repeatable zstd output\n" ** 4096);
+    const input = repeatText("repeatable zstd output\n", 4096);
     const first = try writeAndCheck(input, null);
     defer std.testing.allocator.free(first);
     const second = try writeAndCheck(input, null);
@@ -696,7 +699,7 @@ test "pinned compression is repeatable" {
 }
 
 test "compressed frame advertises content size without checksum or dictionary id" {
-    const input = "pinned frame metadata" ** 32;
+    const input = repeatText("pinned frame metadata", 32);
     const encoded = try writeAndCheck(input, null);
     defer std.testing.allocator.free(encoded);
 
@@ -718,7 +721,7 @@ test "empty input emits a valid empty frame" {
 }
 
 test "native raw frame interoperates with linked libzstd decoder" {
-    const input = "hello zstd raw blocks" ** 4096;
+    const input = repeatText("hello zstd raw blocks", 4096);
 
     var out = std.Io.Writer.Allocating.init(std.testing.allocator);
     defer out.deinit();
@@ -809,4 +812,27 @@ test "compression bound includes optional skippable frame" {
         plain + 8 + skippable_payload_len,
         with_payload,
     );
+}
+
+test "no-libc graphs retain raw framing and refuse compression" {
+    if (builtin.link_libc) return error.SkipZigTest;
+    var out = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer out.deinit();
+    const input = repeatText("native raw", 3);
+
+    try writeRawFrameForSlice(&out.writer, input, null);
+    try std.testing.expectEqual(
+        try maxEncodedSize(input.len, false),
+        out.written().len,
+    );
+    try std.testing.expect(std.mem.endsWith(u8, out.written(), input));
+    try std.testing.expectError(
+        error.ZstdUnavailable,
+        decodeAlloc(std.testing.allocator, out.written()),
+    );
+    try std.testing.expectError(
+        error.ZstdUnavailable,
+        writeFrameForSlice(&out.writer, "compressed", null),
+    );
+    try std.testing.expectError(error.ZstdUnavailable, compressionBound(10, false));
 }

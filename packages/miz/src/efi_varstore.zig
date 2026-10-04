@@ -269,7 +269,7 @@ pub const Store = struct {
             .vendor_guid = vendor_guid,
             .attributes = attributes,
             .monotonic_count = 0,
-            .timestamp = [_]u8{0} ** 16,
+            .timestamp = @as([16]u8, @splat(0)),
             .pubkey_index = 0,
             .data = owned,
         });
@@ -897,7 +897,7 @@ fn writeAtomic(io: Io, destination: []const u8, bytes: []const u8) !void {
 }
 
 fn privateFilePermissions() Io.File.Permissions {
-    return switch (@import("builtin").os.tag) {
+    return switch (@import("builtin").target.os.tag) {
         .windows => .default_file,
         else => .fromMode(0o600),
     };
@@ -950,7 +950,7 @@ const TestVariable = struct {
     attributes: u32,
     data: []const u8,
     state: u8 = state_added,
-    timestamp: [16]u8 = [_]u8{0} ** 16,
+    timestamp: [16]u8 = @as([16]u8, @splat(0)),
 };
 
 fn writeFirmwareVolumeHeader(image: []u8, shape: TemplateShape) void {
@@ -2013,8 +2013,8 @@ test "a firmware volume that is not at offset 0 is refused" {
     const qcow2_header =
         "QFI\xfb" ++ // magic
         "\x00\x00\x00\x03" ++ // version 3
-        "\x00" ** 8 ++ // backing file offset
-        "\x00" ** 4 ++ // backing file size
+        &@as([8:0]u8, @splat(0x00)) ++ // backing file offset
+        &@as([4:0]u8, @splat(0x00)) ++ // backing file size
         "\x00\x00\x00\x0c"; // cluster_bits = 12 (4 KiB clusters)
     const qcow2 = try embedVolumeAlloc(allocator, qcow2_header, 0x1000, volume);
     defer allocator.free(qcow2);
@@ -2056,7 +2056,7 @@ test "a firmware volume that is not at offset 0 is refused" {
     // and vars volumes as separate pflash units, so a combined image is not
     // a variable store miz may edit.
     const ffs_prefix =
-        "\x00" ** 16 ++
+        &@as([16:0]u8, @splat(0x00)) ++
         "\x78\xe5\x8c\x8c\x3d\x8a\x1c\x4f\x99\x35\x89\x61\x85\xc3\x2d\xd3";
     const combined = try embedVolumeAlloc(allocator, ffs_prefix, 0x1000, volume);
     defer allocator.free(combined);
@@ -2132,7 +2132,7 @@ test "malformed signature databases are rejected instead of silently counted" {
     );
     try testing.expectEqual(
         @as(usize, 0),
-        try countX509Certificates(valid, [_]u8{0xff} ** 32),
+        try countX509Certificates(valid, @as([32]u8, @splat(0xff))),
     );
     try testing.expectEqual(@as(usize, 0), try countX509Certificates("", digest));
 

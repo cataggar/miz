@@ -12,7 +12,7 @@ const command_output_limit: usize = 1024 * 1024;
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const argv = try init.minimal.args.toSlice(allocator);
-    if (builtin.os.tag != .linux) {
+    if (builtin.target.os.tag != .linux) {
         std.debug.print("skipping device-write integration: Linux is required\n", .{});
         return;
     }
@@ -75,8 +75,7 @@ fn runIntegration(
     var random: [8]u8 = undefined;
     Io.random(io, &random);
     const random_hex = std.fmt.bytesToHex(random, .lower);
-    const work_path = try std.fmt.allocPrint(
-        allocator,
+    const work_path = try allocator.print(
         "/tmp/miz-device-write-integration-{s}",
         .{&random_hex},
     );
@@ -115,8 +114,7 @@ fn runIntegration(
         .{ .name = "same", .target_size = source_size, .relocated = false },
     };
     for (cases) |case| {
-        const backing_path = try std.fmt.allocPrint(
-            allocator,
+        const backing_path = try allocator.print(
             "{s}/destination-{s}.raw",
             .{ work_path, case.name },
         );

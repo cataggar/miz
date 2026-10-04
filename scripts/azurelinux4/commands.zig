@@ -1597,25 +1597,25 @@ test "release notes render the published table and provenance list" {
 
     const assets = [_]StagedAsset{.{
         .entry = contracts.lookup("x86_64-full").?,
-        .sha256 = "9" ** 64,
+        .sha256 = &@as([64:0]u8, @splat('9')),
         .bytes = 360_667_136,
         .virtual_size = 5_368_709_120,
         .build_runner = contracts.str("runner-x86_64"),
-        .provenance_digest = contracts.str("7" ** 64),
-        .certificate_sha256 = "1" ** 64,
-        .signing_certificate_sha256 = "4" ** 64,
-        .fallback_uki_sha256 = "3" ** 64,
+        .provenance_digest = contracts.str(&@as([64:0]u8, @splat('7'))),
+        .certificate_sha256 = &@as([64:0]u8, @splat('1')),
+        .signing_certificate_sha256 = &@as([64:0]u8, @splat('4')),
+        .fallback_uki_sha256 = &@as([64:0]u8, @splat('3')),
         .azure_location = contracts.str("eastus2"),
         .azure_vm_size = contracts.str("Standard_D2ds_v5"),
-        .derived_vhd_sha256 = contracts.str("9" ** 64),
+        .derived_vhd_sha256 = contracts.str(&@as([64:0]u8, @splat('9'))),
         .derived_vhd_bytes = 1_049_088,
         .derived_vhd_current_size = 1_048_576,
         .azure_image_version_id = contracts.str("/subscriptions/test"),
     }};
     const notes = try renderNotes(allocator, .{
-        .source_commit = "a" ** 40,
-        .certificate_sha256 = "1" ** 64,
-        .signing_certificate_sha256 = "4" ** 64,
+        .source_commit = &@as([40:0]u8, @splat('a')),
+        .certificate_sha256 = &@as([64:0]u8, @splat('1')),
+        .signing_certificate_sha256 = &@as([64:0]u8, @splat('4')),
         .assets = &assets,
     });
 
@@ -1626,9 +1626,9 @@ test "release notes render the published table and provenance list" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         notes,
-        "| `AzureLinux-4.0-x86_64.qcow2` | `" ++ "9" ** 64 ++ "` | `" ++ "3" ** 64 ++
+        "| `AzureLinux-4.0-x86_64.qcow2` | `" ++ &@as([64:0]u8, @splat('9')) ++ "` | `" ++ &@as([64:0]u8, @splat('3')) ++
             "` | 344.0 MiB | 5120.0 MiB | `eastus2` / `Standard_D2ds_v5` | `" ++
-            "9" ** 64 ++ "`; current 1048576 bytes; file 1049088 bytes |",
+            &@as([64:0]u8, @splat('9')) ++ "`; current 1048576 bytes; file 1049088 bytes |",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -1638,7 +1638,7 @@ test "release notes render the published table and provenance list" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         notes,
-        "- `AzureLinux-4.0-x86_64.qcow2`: provenance `" ++ "7" ** 64 ++
+        "- `AzureLinux-4.0-x86_64.qcow2`: provenance `" ++ &@as([64:0]u8, @splat('7')) ++
             "`; hosted build on `runner-x86_64`",
     ) != null);
     try std.testing.expect(std.mem.endsWith(u8, notes, "\n"));
@@ -1759,9 +1759,9 @@ const Fixture = struct {
     azure: []const u8,
     diagnostic: Diagnostic = .{},
 
-    const source_commit = "a" ** 40;
+    const source_commit = &@as([40:0]u8, @splat('a'));
     const certificate = "miz test certificate DER";
-    const signing_leaf = "4" ** 64;
+    const signing_leaf = &@as([64:0]u8, @splat('4'));
     const operation_id = "00000000-0000-4000-8000-000000000001";
     const vhd_current_size = azure_vhd.alignment;
 
@@ -1785,8 +1785,8 @@ const Fixture = struct {
             .io = io,
             .tree = tree,
             .base = base,
-            .candidates = try std.fmt.allocPrint(allocator, "{s}/candidates", .{base}),
-            .azure = try std.fmt.allocPrint(allocator, "{s}/azure", .{base}),
+            .candidates = try allocator.print("{s}/candidates", .{base}),
+            .azure = try allocator.print("{s}/azure", .{base}),
         };
     }
 
@@ -1796,8 +1796,8 @@ const Fixture = struct {
     }
 
     fn path(self: *Fixture, comptime fmt: []const u8, args: anytype) ![]const u8 {
-        const relative = try std.fmt.allocPrint(self.allocator, fmt, args);
-        return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.base, relative });
+        const relative = try self.allocator.print(fmt, args);
+        return self.allocator.print("{s}/{s}", .{ self.base, relative });
     }
 
     fn write(self: *Fixture, target: []const u8, data: []const u8) !void {
@@ -1817,7 +1817,7 @@ const Fixture = struct {
             options.certificate,
         );
         const fingerprint = digest_support.hexBytes(options.certificate);
-        return std.fmt.allocPrint(self.allocator,
+        return self.allocator.print(
             \\{{"schema": 1, "type": "miz-uki-signing", "architecture": "{s}",
             \\ "flavor": "{s}", "signer_mode": "external-command",
             \\ "certificate_sha256": "{s}", "certificate_der_base64": "{s}",
@@ -1837,14 +1837,14 @@ const Fixture = struct {
             \\    "signed_bytes": 4096, "signing_operation_id": "{s}",
             \\    "signing_certificate_sha256": "{s}"}}]}}
         , .{
-            entry.architecture,   entry.flavor,
-            &fingerprint,         encoded,
-            options.signing_leaf, entry.key,
-            "2" ** 64,            "3" ** 64,
-            "3" ** 64,            operation_id,
-            options.signing_leaf, entry.fallbackUkiPath(),
-            "2" ** 64,            "3" ** 64,
-            "3" ** 64,            operation_id,
+            entry.architecture,          entry.flavor,
+            &fingerprint,                encoded,
+            options.signing_leaf,        entry.key,
+            &@as([64:0]u8, @splat('2')), &@as([64:0]u8, @splat('3')),
+            &@as([64:0]u8, @splat('3')), operation_id,
+            options.signing_leaf,        entry.fallbackUkiPath(),
+            &@as([64:0]u8, @splat('2')), &@as([64:0]u8, @splat('3')),
+            &@as([64:0]u8, @splat('3')), operation_id,
             options.signing_leaf,
         });
     }
@@ -1854,7 +1854,7 @@ const Fixture = struct {
             self.allocator,
             options.certificate,
         );
-        return std.fmt.allocPrint(self.allocator,
+        return self.allocator.print(
             \\{{"properties": {{"securityProfile": {{"uefiSettings": {{
             \\ "signatureTemplateNames": ["{s}"],
             \\ "additionalSignatures": {{"db": [{{"type": "x509",
@@ -1864,7 +1864,7 @@ const Fixture = struct {
 
     fn makeBundle(self: *Fixture, entry: contracts.Entry, options: Options) !void {
         const asset = try self.path("candidates/{s}/{s}", .{ entry.key, entry.asset_name });
-        const contents = try std.fmt.allocPrint(self.allocator, "{s}\n", .{entry.key});
+        const contents = try self.allocator.print("{s}\n", .{entry.key});
         try self.write(asset, contents);
 
         const provenance = try self.path(
@@ -1872,11 +1872,11 @@ const Fixture = struct {
             .{entry.key},
         );
         try self.write(
-            try std.fmt.allocPrint(self.allocator, "{s}/inputs.txt", .{provenance}),
+            try self.allocator.print("{s}/inputs.txt", .{provenance}),
             contents,
         );
         if (options.build_log) try self.write(
-            try std.fmt.allocPrint(self.allocator, "{s}/build.log", .{provenance}),
+            try self.allocator.print("{s}/build.log", .{provenance}),
             "diagnostic output\n",
         );
         var name_buffer: [contracts.signing_provenance_name_capacity]u8 = undefined;
@@ -1886,8 +1886,7 @@ const Fixture = struct {
             entry.flavor,
         );
         try self.write(
-            try std.fmt.allocPrint(
-                self.allocator,
+            try self.allocator.print(
                 "{s}/{s}",
                 .{ provenance, signing_name },
             ),
@@ -1905,8 +1904,7 @@ const Fixture = struct {
             .virtual_size = options.virtual_size,
             .source_commit = source_commit,
             .provenance_dir = provenance,
-            .runner = try std.fmt.allocPrint(
-                self.allocator,
+            .runner = try self.allocator.print(
                 "runner-{s}",
                 .{entry.architecture},
             ),
@@ -1936,13 +1934,11 @@ const Fixture = struct {
             .source_commit = source_commit,
             .location = "eastus2",
             .vm_size = "Standard_D2ds_v5",
-            .resource_group = try std.fmt.allocPrint(
-                self.allocator,
+            .resource_group = try self.allocator.print(
                 "rg-{s}",
                 .{entry.key},
             ),
-            .image_version_id = try std.fmt.allocPrint(
-                self.allocator,
+            .image_version_id = try self.allocator.print(
                 "/subscriptions/test/gallery/{s}/versions/1.0.0",
                 .{entry.key},
             ),
@@ -2019,8 +2015,7 @@ test "stage requires and copies exactly four bound assets" {
 
     const staged = try fixture.stageAll();
     const manifest_text = try fixture.read(
-        try std.fmt.allocPrint(
-            arena.allocator(),
+        try arena.allocator().print(
             "{s}/publish-manifest.json",
             .{staged.output},
         ),
@@ -2041,7 +2036,7 @@ test "stage requires and copies exactly four bound assets" {
         ));
         try std.testing.expect(contracts.isString(
             asset.object.get("fallback_uki_sha256"),
-            "3" ** 64,
+            &@as([64:0]u8, @splat('3')),
         ));
         try std.testing.expectEqual(
             contracts.integerOrNull(asset.object.get("derived_vhd_bytes")).?,
@@ -2073,8 +2068,7 @@ test "stage requires and copies exactly four bound assets" {
     // The manifest and the notes carry values read out of each candidate
     // document, which the staging loop must therefore keep alive.
     for (assets, contracts.release_order) |asset, entry| {
-        const runner = try std.fmt.allocPrint(
-            arena.allocator(),
+        const runner = try arena.allocator().print(
             "runner-{s}",
             .{entry.architecture},
         );
@@ -2095,8 +2089,7 @@ test "stage requires and copies exactly four bound assets" {
         "No checksum sidecar assets are published",
     ) != null);
     for (assets, contracts.release_order) |asset, entry| {
-        const line = try std.fmt.allocPrint(
-            arena.allocator(),
+        const line = try arena.allocator().print(
             "- `{s}`: provenance `{s}`; hosted build on `runner-{s}`",
             .{
                 entry.asset_name,
@@ -2158,7 +2151,7 @@ test "stage refuses an incomplete or unbound Azure matrix" {
         try fixture.mutate(
             try fixture.path("azure/x86_64-full/azure-result.json", .{}),
             "azure_accepted_sha256",
-            contracts.str("0" ** 64),
+            contracts.str(&@as([64:0]u8, @splat('0'))),
         );
         try expectStageFails(&fixture);
         try std.testing.expectEqualStrings(
@@ -2192,7 +2185,7 @@ test "stage refuses a checksum sidecar anywhere in the inputs" {
     try fixture.makeAll(.{});
     try fixture.write(
         try fixture.path("candidates/forbidden.sha256", .{}),
-        "0" ** 64,
+        &@as([64:0]u8, @splat('0')),
     );
     try expectStageFails(&fixture);
     try std.testing.expectEqualStrings(
@@ -2302,7 +2295,7 @@ test "stage refuses a release that does not share one signing identity" {
         for (contracts.release_order) |entry| {
             try fixture.makeBundle(entry, .{
                 .signing_leaf = if (std.mem.eql(u8, entry.key, "aarch64-core"))
-                    "5" ** 64
+                    &@as([64:0]u8, @splat('5'))
                 else
                     Fixture.signing_leaf,
             });
@@ -2417,7 +2410,7 @@ test "verify-candidate refuses a mutated manifest and a swapped asset" {
         manifest,
         asset,
         entry.key,
-        "b" ** 40,
+        &@as([40:0]u8, @splat('b')),
         &fixture.diagnostic,
     ));
 

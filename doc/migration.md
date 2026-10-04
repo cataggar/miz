@@ -17,6 +17,17 @@ Existing automation and stored identifiers must be migrated before using a
 
 ## Commands, packages, and builds
 
+- Use the pinned Zig 0.17.0 toolchain. Optimization modes are now `.debug`,
+  `.safe`, `.fast`, and `.small`, with `.safe` the source-build default.
+  Update build scripts from `-Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall`
+  to `-Doptimize=debug|safe|fast|small`.
+- Source-built target OS floors, including guest targets, are Linux 5.10+,
+  macOS 15+, Windows 10+, and FreeBSD 14+. Portable native smoke coverage does
+  not make Linux-only package/image builders or privileged tests portable.
+- Keep Zig 0.17's extracted package sources (`zig-pkg/`, configurable with
+  `ZIG_LOCAL_PKG_DIR` or `--pkg-dir`) separate from disposable compilation
+  caches. Global package-cache entries are compressed archives rather than
+  the extracted directories used by earlier compilers.
 - Replace every `vmiz` or `zvmi` CLI invocation with `miz`.
 - Replace executable and helper names with `miz`, `mizinit`,
   `miz-guest-agent-x86_64`, `miz-guest-agent-aarch64`,

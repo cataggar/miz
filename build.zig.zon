@@ -2,28 +2,32 @@
     .name = .miz,
     .version = "0.2.0",
     .fingerprint = 0xbba1c9ad94477967,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
 
     .dependencies = .{
+        .translate_c = .{
+            .url = "git+https://github.com/cataggar/translate-c#62d06a5d3e93c82727544e8113e4762a315ca0ed",
+            .hash = "translate_c-2.0.0-Q_BUWlpOBwBWvgGBM20tJq-GXgPio3v3UD39rXEn70KN",
+        },
         .bzip2z = .{
-            .url = "git+https://github.com/cataggar/bzip2z#05f6d4e34df2da2729490aee2a5bbe43b5ce94f6",
-            .hash = "bzip2z-0.1.0-m5NdlhNXCwC5mTHdg2pgMytHjahuQP6nImdle78Pb9kO",
+            .url = "git+https://github.com/cataggar/bzip2z#b1ee15f320f53a8f9794d4440fd43798c28f276d",
+            .hash = "bzip2z-0.1.0-m5NdlpirCwBFHH_3t0zvBLPeA0rNwqFU21SbRa6CPCDR",
         },
         .tls = .{
-            .url = "git+https://github.com/cataggar/tls.zig#2621e411af81c8b4d8fa5aaae08b9b183a80bb46",
-            .hash = "tls-0.1.0-ER2e0vpTBgCVdP6tvFCii9_PFjATLb23ht2_xbGy5mYU",
+            .url = "git+https://github.com/cataggar/tls.zig#481b2a677244b994d216eb02a73bad89623610a9",
+            .hash = "tls-0.1.0-ER2e0jFWBgCrVPpTRsqUiILFT0yFB4uykyvXg1Xbeqk3",
         },
         .debz = .{
-            .url = "git+https://github.com/cataggar/debz.git#4d3fc47c2ca4eefd46da0f7bbcf3ad675e883c80",
-            .hash = "debz-0.3.0-Mmw8sGZ7JwDje4hah_B6onhCYdBE0jJE5m__HTdo-QoB",
+            .url = "git+https://github.com/cataggar/debz.git#56be0a32fac5293f20bde45d266b708e53321c73",
+            .hash = "debz-0.3.0-Mmw8sP-LJwD82vaSP0iu67LdHdEYEzE5hjbIVEkJJUg_",
         },
         .rpmz = .{
-            .url = "git+https://github.com/cataggar/rpmz#15b5e1291a9fc3eb3980a4088d757b9d0254d468",
-            .hash = "rpmz-0.1.0-5KEwN2CRkQA-qHdelei8dHxBU3le6kPBVZt10YEqN1Ov",
+            .url = "git+https://github.com/cataggar/rpmz#c9b23a2103b9682434ab663841d00cd657647561",
+            .hash = "rpmz-0.1.0-5KEwN846kgBJRYGnEK_CMamIT-5AmavY-bJ07aA5Sg-Z",
         },
         .zstd = .{
-            .url = "git+https://github.com/cataggar/zstd#45b6dfcd9d0ffdba99fb653c66b233179b9f7229",
-            .hash = "zstd-1.6.0-Nyx42k_XOwDtCIdYiccjJJbSdlkUV7Q6gfo1ijJqJWtf",
+            .url = "git+https://github.com/cataggar/zstd#71502da18ccdacac0c2049c033dedbbf25a40b93",
+            .hash = "zstd-1.6.0-Nyx42kDXOwDefxNDxCG5s0p5PgGoAnYCCeDAgwyGxcrW",
         },
     },
 

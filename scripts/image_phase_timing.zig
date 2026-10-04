@@ -128,8 +128,7 @@ pub const Recorder = struct {
         const output_path = self.output_path orelse return;
         const json = try self.serializeAlloc(status);
         defer self.allocator.free(json);
-        const staged_path = try std.fmt.allocPrint(
-            self.allocator,
+        const staged_path = try self.allocator.print(
             "{s}.miz-timing-stage",
             .{output_path},
         );
@@ -292,13 +291,20 @@ test "failure is recorded and timing output errors propagate" {
     var recorder = Recorder.init(std.testing.allocator, io, output_path);
     const FailureHarness = struct {
         fn run(timing: *Recorder) !void {
+            var phase_error: anyerror = undefined;
             var aggregate = timing.begin(.debz_aggregate, null);
             defer aggregate.end();
-            errdefer |err| aggregate.fail(@errorName(err));
+            errdefer aggregate.fail(@errorName(phase_error));
             var transaction = timing.begin(.debz_transaction, "linux-azure");
             defer transaction.end();
-            errdefer |err| transaction.fail(@errorName(err));
-            return error.DebzFailed;
+            errdefer transaction.fail(@errorName(phase_error));
+            const result: anyerror!void = error.DebzFailed;
+            result catch |err| {
+                phase_error = err;
+                return err;
+            };
+            transaction.succeed();
+            aggregate.succeed();
         }
     };
     try std.testing.expectError(error.DebzFailed, FailureHarness.run(&recorder));
@@ -324,6 +330,14 @@ test "failure is recorded and timing output errors propagate" {
         "DebzFailed",
         parsed.value.object.get("error_name").?.string,
     );
+    const phases = parsed.value.object.get("phases").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), phases.len);
+    try std.testing.expectEqualStrings("debz_transaction", phases[0].object.get("name").?.string);
+    try std.testing.expectEqualStrings("debz_aggregate", phases[1].object.get("name").?.string);
+    for (phases) |phase| {
+        try std.testing.expectEqualStrings("failure", phase.object.get("outcome").?.string);
+        try std.testing.expectEqualStrings("DebzFailed", phase.object.get("error_name").?.string);
+    }
 
     const missing_parent = "test-image-phase-timing-missing";
     Dir.cwd().deleteTree(io, missing_parent) catch {};
