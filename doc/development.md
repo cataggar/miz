@@ -386,8 +386,11 @@ The protected branch context remains **build + test**. A separate
 `native-smoke` matrix builds and executes the portable CLI/library smoke gate
 on hosted Ubuntu 24.04, macOS 15, and Windows 2025 runners in each of
 `debug`, `safe`, `fast`, and `small`. It runs `install-miz test-native-smoke`
-and the resulting native CLI's `version` and `--help` commands, not the
-Linux-only aggregate suite on macOS or Windows. These smoke jobs complement,
+including fixed VHD and QCOW2 creation, JSON metadata, and integrity checks.
+The CLI smoke commands execute on every invocation, including warm-cache
+builds; compilation and immutable codec tests remain cacheable. It also runs
+the resulting native CLI's `version` and `--help` commands, not the Linux-only
+aggregate suite on macOS or Windows. These smoke jobs complement,
 rather than replace, the six release targets: Linux-musl, macOS, and Windows,
 each on x64 and arm64.
 The release archive still contains exactly one executable, `miz`.

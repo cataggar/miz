@@ -616,31 +616,34 @@ pub fn build(b: *std.Build) void {
     smoke_help.expectExitCode(0);
     native_smoke_step.dependOn(&smoke_help.step);
 
-    const smoke_create = b.addRunArtifact(cli_exe);
-    smoke_create.has_side_effects = true;
-    smoke_create.addArgs(&.{ "create", "-f", "vhd", "-o", "subformat=fixed" });
-    const smoke_image = smoke_create.addOutputFileArg("native-smoke.vhd");
-    smoke_create.addArg("1M");
-    smoke_create.expectExitCode(0);
+    for ([_][]const u8{ "vhd", "qcow2" }) |format| {
+        const smoke_create = b.addRunArtifact(cli_exe);
+        smoke_create.has_side_effects = true;
+        smoke_create.addArgs(&.{ "create", "-f", format });
+        if (std.mem.eql(u8, format, "vhd")) smoke_create.addArgs(&.{ "-o", "subformat=fixed" });
+        const smoke_image = smoke_create.addOutputFileArg(b.fmt("native-smoke.{s}", .{format}));
+        smoke_create.addArg("1M");
+        smoke_create.expectExitCode(0);
 
-    const smoke_info = b.addRunArtifact(cli_exe);
-    smoke_info.has_side_effects = true;
-    smoke_info.addArgs(&.{ "info", "--output=json" });
-    smoke_info.addFileArg(smoke_image);
-    smoke_info.expectExitCode(0);
-    smoke_info.expectStdOutMatch("\"format\":\"vhd\"");
-    smoke_info.expectStdOutMatch("\"virtual-size\":1048576");
-    smoke_info.expectStdOutMatch("\"subformat\":\"fixed\"");
-    smoke_info.expectStdErrEqual("");
-    native_smoke_step.dependOn(&smoke_info.step);
+        const smoke_info = b.addRunArtifact(cli_exe);
+        smoke_info.has_side_effects = true;
+        smoke_info.addArgs(&.{ "info", "--output=json" });
+        smoke_info.addFileArg(smoke_image);
+        smoke_info.expectExitCode(0);
+        smoke_info.expectStdOutMatch(b.fmt("\"format\":\"{s}\"", .{format}));
+        smoke_info.expectStdOutMatch("\"virtual-size\":1048576");
+        if (std.mem.eql(u8, format, "vhd")) smoke_info.expectStdOutMatch("\"subformat\":\"fixed\"");
+        smoke_info.expectStdErrEqual("");
+        native_smoke_step.dependOn(&smoke_info.step);
 
-    const smoke_check = b.addRunArtifact(cli_exe);
-    smoke_check.has_side_effects = true;
-    smoke_check.addArg("check");
-    smoke_check.addFileArg(smoke_image);
-    smoke_check.expectExitCode(0);
-    smoke_check.expectStdErrMatch("No errors were found on the image.");
-    native_smoke_step.dependOn(&smoke_check.step);
+        const smoke_check = b.addRunArtifact(cli_exe);
+        smoke_check.has_side_effects = true;
+        smoke_check.addArg("check");
+        smoke_check.addFileArg(smoke_image);
+        smoke_check.expectExitCode(0);
+        smoke_check.expectStdErrMatch("No errors were found on the image.");
+        native_smoke_step.dependOn(&smoke_check.step);
+    }
 
     // Host-only image builders used by the exported build helpers. They remain
     // executable even when the dependency is configured for a foreign target.
