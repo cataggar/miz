@@ -570,6 +570,15 @@ volume root there is `UnsupportedRootPartitionInVm`.
 
 ### Preserved-image customization backends
 
+The preserved-image build helper verifies the committed output path against
+the unchanged resolved plan, not the raw argument spelling. Zig 0.17 maker
+paths beginning with `./` remain supported without accepting a different
+output target or a noncanonical returned path. Source-change protection,
+regular-file checks, failure cleanup, reuse keys, diagnostics and provenance
+remain intact. A native tailnet-style rebuild and status check retain the
+complete released ESP byte-for-byte; this does not qualify guest boot or
+native macOS/AArch64 execution.
+
 Customizing an image that already exists selects one of five backends. They are
 ordered by how much they can do, which is the same order as how much they need.
 
