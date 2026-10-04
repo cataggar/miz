@@ -711,7 +711,7 @@ test "CI actions are pinned to audited commits" {
             return error.UnauditedAction;
         }
     }
-    try std.testing.expectEqual(@as(usize, 13), found);
+    try std.testing.expectEqual(@as(usize, 15), found);
 }
 
 test "CI heavy phases are independent jobs" {
@@ -765,6 +765,38 @@ test "CI heavy phases are independent jobs" {
     try expectCount(workflow, "optimize: debug", 2);
     try expectCount(workflow, "optimize: safe", 1);
     try expectContains(workflow, "cancel-in-progress: true");
+}
+
+test "CI native smoke covers all hosts and optimization modes" {
+    const allocator = std.testing.allocator;
+    const workflow = try readTracked(allocator, std.testing.io, ci_workflow_path);
+    defer allocator.free(workflow);
+    const native = try section(workflow, "  native-smoke:", "\n  vm-backend:");
+
+    try expectContains(native, "runs-on: ${{ matrix.os }}");
+    try expectContains(native, "os: [ubuntu-24.04, macos-15, windows-2025]");
+    try expectContains(native, "optimize: [debug, safe, fast, small]");
+    try expectContains(
+        native,
+        "run: zig build install-miz test-native-smoke -Doptimize=${{ matrix.optimize }} -j2 --summary all",
+    );
+    try expectContains(native, "\"$executable\" version");
+    try expectContains(native, "\"$executable\" --help");
+    try expectContains(native, "if [[ \"$RUNNER_OS\" == Windows ]]; then executable+=.exe; fi");
+    try expectAbsent(native, "-Dtarget=");
+    try expectAbsent(native, "MIZ_RUN_PRIVILEGED_TEST");
+    try expectAbsent(native, "MIZ_RUN_VM_BOOT_TEST");
+
+    const protected = try section(workflow, "  zig-tests:", "\n  native-smoke:");
+    try expectContains(protected, "name: build + test");
+    for ([_][]const u8{
+        try section(workflow, "  vm-backend:", "\n  windows:"),
+        try section(workflow, "  unsafe-chroot:", "\n  vm-boot:"),
+        try sectionToEnd(workflow, "  vm-boot:"),
+    }) |linux_job| {
+        try expectContains(linux_job, "runs-on: ubuntu-latest");
+        try expectAbsent(linux_job, "runs-on: ${{ matrix.os }}");
+    }
 }
 
 test "CI no longer runs an Azure Linux Python suite" {
