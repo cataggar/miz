@@ -365,7 +365,7 @@ fn shellStatus(term: std.process.Child.Term) ?u8 {
         .signal => |signal| std.math.add(
             u8,
             128,
-            @intCast(@intFromEnum(signal)),
+            @intCast(@backingInt(signal)),
         ) catch null,
         else => null,
     };
@@ -567,11 +567,11 @@ fn sshFailureDiagnosticAlloc(
         ),
         .signal => |signal| try output.writer.print(
             "FreeBSD acceptance {s} ended by signal {d}\n",
-            .{ result.operation.description(), @intFromEnum(signal) },
+            .{ result.operation.description(), @backingInt(signal) },
         ),
         .stopped => |signal| try output.writer.print(
             "FreeBSD acceptance {s} stopped by signal {d}\n",
-            .{ result.operation.description(), @intFromEnum(signal) },
+            .{ result.operation.description(), @backingInt(signal) },
         ),
         .unknown => |status| try output.writer.print(
             "FreeBSD acceptance {s} ended with unknown status {d}\n",
@@ -1670,7 +1670,7 @@ fn expectProcessGroupGone(io: Io, group_id: std.posix.pid_t) !void {
     // Signal 0 runs the permission and existence check without delivering anything, which is how
     // POSIX asks whether a process group still has members. The signal enum is non-exhaustive
     // because it carries no name for a signal that is never delivered.
-    const existence_probe: std.posix.SIG = @enumFromInt(0);
+    const existence_probe: std.posix.SIG = @fromBackingInt(@intCast(0));
     var attempt: usize = 0;
     while (attempt < 200) : (attempt += 1) {
         std.posix.kill(-group_id, existence_probe) catch |err| switch (err) {

@@ -5112,7 +5112,7 @@ const PolicyFixture = struct {
             .by_declared_key => policy_signing_scalar,
             // Any other valid scalar produces a signature that is perfectly
             // well formed and simply is not this key's.
-            .by_other_key => [_]u8{0x11} ** 32,
+            .by_other_key => @as([32]u8, @splat(0x11)),
             .none => return allocator.dupe(u8, ""),
         };
         const secret = try Ecdsa.SecretKey.fromBytes(scalar);

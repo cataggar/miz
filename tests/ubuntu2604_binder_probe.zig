@@ -44,7 +44,7 @@ fn probeDevice(path: [*:0]const u8) void {
     const open_rc = linux.open(path, .{ .ACCMODE = .RDWR }, 0);
     const open_err = linux.errno(open_rc);
     if (open_err != .SUCCESS) {
-        printLine("device={s} status=open-failed errno={d}\n", .{ std.mem.span(path), @intFromEnum(open_err) });
+        printLine("device={s} status=open-failed errno={d}\n", .{ std.mem.span(path), @backingInt(open_err) });
         return;
     }
     const fd: i32 = @intCast(open_rc);
@@ -54,7 +54,7 @@ fn probeDevice(path: [*:0]const u8) void {
     const ioctl_rc = linux.ioctl(fd, binder_version_request, @intFromPtr(&version));
     const ioctl_err = linux.errno(ioctl_rc);
     if (ioctl_err != .SUCCESS) {
-        printLine("device={s} status=ioctl-failed errno={d}\n", .{ std.mem.span(path), @intFromEnum(ioctl_err) });
+        printLine("device={s} status=ioctl-failed errno={d}\n", .{ std.mem.span(path), @backingInt(ioctl_err) });
         return;
     }
     printLine("device={s} status=ok protocol_version={d}\n", .{ std.mem.span(path), version.protocol_version });

@@ -376,7 +376,7 @@ fn parseStub(allocator: std.mem.Allocator, stub: []const u8) GenerateError!Parse
 
 fn encodeSectionName(name: []const u8) GenerateError![8]u8 {
     if (name.len == 0 or name.len > 8) return error.SectionNameTooLong;
-    var encoded = [_]u8{0} ** 8;
+    var encoded = @as([8]u8, @splat(0));
     std.mem.copyForwards(u8, encoded[0..name.len], name);
     return encoded;
 }

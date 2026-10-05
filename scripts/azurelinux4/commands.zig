@@ -1597,25 +1597,25 @@ test "release notes render the published table and provenance list" {
 
     const assets = [_]StagedAsset{.{
         .entry = contracts.lookup("x86_64-full").?,
-        .sha256 = "9" ** 64,
+        .sha256 = &@as([64:0]u8, @splat("9"[0])),
         .bytes = 360_667_136,
         .virtual_size = 5_368_709_120,
         .build_runner = contracts.str("runner-x86_64"),
-        .provenance_digest = contracts.str("7" ** 64),
-        .certificate_sha256 = "1" ** 64,
-        .signing_certificate_sha256 = "4" ** 64,
-        .fallback_uki_sha256 = "3" ** 64,
+        .provenance_digest = contracts.str(&@as([64:0]u8, @splat("7"[0]))),
+        .certificate_sha256 = &@as([64:0]u8, @splat("1"[0])),
+        .signing_certificate_sha256 = &@as([64:0]u8, @splat("4"[0])),
+        .fallback_uki_sha256 = &@as([64:0]u8, @splat("3"[0])),
         .azure_location = contracts.str("eastus2"),
         .azure_vm_size = contracts.str("Standard_D2ds_v5"),
-        .derived_vhd_sha256 = contracts.str("9" ** 64),
+        .derived_vhd_sha256 = contracts.str(&@as([64:0]u8, @splat("9"[0]))),
         .derived_vhd_bytes = 1_049_088,
         .derived_vhd_current_size = 1_048_576,
         .azure_image_version_id = contracts.str("/subscriptions/test"),
     }};
     const notes = try renderNotes(allocator, .{
-        .source_commit = "a" ** 40,
-        .certificate_sha256 = "1" ** 64,
-        .signing_certificate_sha256 = "4" ** 64,
+        .source_commit = &@as([40:0]u8, @splat("a"[0])),
+        .certificate_sha256 = &@as([64:0]u8, @splat("1"[0])),
+        .signing_certificate_sha256 = &@as([64:0]u8, @splat("4"[0])),
         .assets = &assets,
     });
 
@@ -1626,9 +1626,9 @@ test "release notes render the published table and provenance list" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         notes,
-        "| `AzureLinux-4.0-x86_64.qcow2` | `" ++ "9" ** 64 ++ "` | `" ++ "3" ** 64 ++
+        "| `AzureLinux-4.0-x86_64.qcow2` | `" ++ &@as([64:0]u8, @splat("9"[0])) ++ "` | `" ++ &@as([64:0]u8, @splat("3"[0])) ++
             "` | 344.0 MiB | 5120.0 MiB | `eastus2` / `Standard_D2ds_v5` | `" ++
-            "9" ** 64 ++ "`; current 1048576 bytes; file 1049088 bytes |",
+            &@as([64:0]u8, @splat("9"[0])) ++ "`; current 1048576 bytes; file 1049088 bytes |",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -1638,7 +1638,7 @@ test "release notes render the published table and provenance list" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         notes,
-        "- `AzureLinux-4.0-x86_64.qcow2`: provenance `" ++ "7" ** 64 ++
+        "- `AzureLinux-4.0-x86_64.qcow2`: provenance `" ++ &@as([64:0]u8, @splat("7"[0])) ++
             "`; hosted build on `runner-x86_64`",
     ) != null);
     try std.testing.expect(std.mem.endsWith(u8, notes, "\n"));
@@ -1759,9 +1759,9 @@ const Fixture = struct {
     azure: []const u8,
     diagnostic: Diagnostic = .{},
 
-    const source_commit = "a" ** 40;
+    const source_commit = &@as([40:0]u8, @splat("a"[0]));
     const certificate = "miz test certificate DER";
-    const signing_leaf = "4" ** 64;
+    const signing_leaf = &@as([64:0]u8, @splat("4"[0]));
     const operation_id = "00000000-0000-4000-8000-000000000001";
     const vhd_current_size = azure_vhd.alignment;
 
@@ -1837,14 +1837,14 @@ const Fixture = struct {
             \\    "signed_bytes": 4096, "signing_operation_id": "{s}",
             \\    "signing_certificate_sha256": "{s}"}}]}}
         , .{
-            entry.architecture,   entry.flavor,
-            &fingerprint,         encoded,
-            options.signing_leaf, entry.key,
-            "2" ** 64,            "3" ** 64,
-            "3" ** 64,            operation_id,
-            options.signing_leaf, entry.fallbackUkiPath(),
-            "2" ** 64,            "3" ** 64,
-            "3" ** 64,            operation_id,
+            entry.architecture,             entry.flavor,
+            &fingerprint,                   encoded,
+            options.signing_leaf,           entry.key,
+            &@as([64:0]u8, @splat("2"[0])), &@as([64:0]u8, @splat("3"[0])),
+            &@as([64:0]u8, @splat("3"[0])), operation_id,
+            options.signing_leaf,           entry.fallbackUkiPath(),
+            &@as([64:0]u8, @splat("2"[0])), &@as([64:0]u8, @splat("3"[0])),
+            &@as([64:0]u8, @splat("3"[0])), operation_id,
             options.signing_leaf,
         });
     }
@@ -2041,7 +2041,7 @@ test "stage requires and copies exactly four bound assets" {
         ));
         try std.testing.expect(contracts.isString(
             asset.object.get("fallback_uki_sha256"),
-            "3" ** 64,
+            &@as([64:0]u8, @splat("3"[0])),
         ));
         try std.testing.expectEqual(
             contracts.integerOrNull(asset.object.get("derived_vhd_bytes")).?,
@@ -2158,7 +2158,7 @@ test "stage refuses an incomplete or unbound Azure matrix" {
         try fixture.mutate(
             try fixture.path("azure/x86_64-full/azure-result.json", .{}),
             "azure_accepted_sha256",
-            contracts.str("0" ** 64),
+            contracts.str(&@as([64:0]u8, @splat("0"[0]))),
         );
         try expectStageFails(&fixture);
         try std.testing.expectEqualStrings(
@@ -2192,7 +2192,7 @@ test "stage refuses a checksum sidecar anywhere in the inputs" {
     try fixture.makeAll(.{});
     try fixture.write(
         try fixture.path("candidates/forbidden.sha256", .{}),
-        "0" ** 64,
+        &@as([64:0]u8, @splat("0"[0])),
     );
     try expectStageFails(&fixture);
     try std.testing.expectEqualStrings(
@@ -2302,7 +2302,7 @@ test "stage refuses a release that does not share one signing identity" {
         for (contracts.release_order) |entry| {
             try fixture.makeBundle(entry, .{
                 .signing_leaf = if (std.mem.eql(u8, entry.key, "aarch64-core"))
-                    "5" ** 64
+                    &@as([64:0]u8, @splat("5"[0]))
                 else
                     Fixture.signing_leaf,
             });
@@ -2417,7 +2417,7 @@ test "verify-candidate refuses a mutated manifest and a swapped asset" {
         manifest,
         asset,
         entry.key,
-        "b" ** 40,
+        &@as([40:0]u8, @splat("b"[0])),
         &fixture.diagnostic,
     ));
 

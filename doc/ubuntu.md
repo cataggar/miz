@@ -996,7 +996,7 @@ the same guest bytes.
 
 ## Local build
 
-Use Zig 0.16.0 or later on a matching native Ubuntu host. Install the same
+Use Zig 0.17.0 on a matching native Ubuntu host. Install the same
 builder dependencies as the release workflow:
 
 ```console
@@ -1203,7 +1203,7 @@ Prerequisites:
 
 - a native `aarch64` Ubuntu host running as root, because package scripts run
   in the architecture-matched offline root;
-- Zig 0.16.0, `file`, and the aarch64 `systemd-boot-efi` stub;
+- Zig 0.17.0, `file`, and the aarch64 `systemd-boot-efi` stub;
 - the pinned Canonical image, `SHA256SUMS`, detached signature, and arm64
   manifest with the hashes listed above;
 - the seven exact arm64 lock files emitted by a previously successful
@@ -1246,7 +1246,7 @@ sudo -E zig-out/bin/ubuntu2604-image-benchmark run \
   --signing-certificate-sha256 <canonical-DER-SHA-256> \
   --sign-command /absolute/path/to/miz \
   --sign-command-arg sign \
-  --zig /absolute/path/to/zig-0.16.0 \
+  --zig /absolute/path/to/zig-0.17.0 \
   --zig-global-cache /data/miz-inputs/zig-global-cache
 ```
 

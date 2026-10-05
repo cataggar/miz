@@ -127,7 +127,7 @@ pub fn minimumVolumeLength(request: SpaceRequest, options: VolumeLengthOptions) 
 
     // One entry per power-of-two sectors-per-cluster value `format` may
     // choose, so a total is computed at most once for each.
-    var needed_by_cluster_shift = [_]?u64{null} ** 8;
+    var needed_by_cluster_shift = @as([8]?u64, @splat(null));
     var length: u64 = options.alignment;
     while (length <= options.max_length) : (length += options.alignment) {
         const info = computeLayout(.{
@@ -259,7 +259,7 @@ pub const FileWriter = struct {
             const cluster_size = self.fs.info.clusterSize();
             const tail = self.size % cluster_size;
             if (tail != 0) {
-                var zeros: [max_cluster_size]u8 = [_]u8{0} ** max_cluster_size;
+                var zeros: [max_cluster_size]u8 = @as([max_cluster_size]u8, @splat(0));
                 try self.fs.writeRegion(
                     io,
                     zeros[0 .. cluster_size - tail],
@@ -403,7 +403,7 @@ pub const FileSystem = struct {
 
         const tail_bytes = new_size % cluster_size;
         if (tail_bytes != 0) {
-            var zeros: [max_cluster_size]u8 = [_]u8{0} ** max_cluster_size;
+            var zeros: [max_cluster_size]u8 = @as([max_cluster_size]u8, @splat(0));
             try self.writeRegion(
                 io,
                 zeros[0 .. cluster_size - tail_bytes],
@@ -548,7 +548,7 @@ pub const FileSystem = struct {
         const lfn_count: usize = if (use_lfn) std.math.divCeil(usize, utf16_name.len + 1, 13) catch unreachable else 0;
         const total_slots = lfn_count + 1;
 
-        var slots: [max_directory_slots][directory_entry_size]u8 = [_][directory_entry_size]u8{[_]u8{0} ** directory_entry_size} ** max_directory_slots;
+        var slots: [max_directory_slots][directory_entry_size]u8 = @as([max_directory_slots][directory_entry_size]u8, @splat(@as([directory_entry_size]u8, @splat(0))));
         if (use_lfn) buildLfnEntries(slots[0..lfn_count], utf16_name, short_name);
         slots[lfn_count] = buildShortEntry(short_name, kind, first_cluster, size);
 
@@ -772,7 +772,7 @@ pub const FileSystem = struct {
         const cluster_size = self.info.clusterSize();
         var cluster = first_cluster;
         var offset: usize = 0;
-        var zero_buf: [max_cluster_size]u8 = [_]u8{0} ** max_cluster_size;
+        var zero_buf: [max_cluster_size]u8 = @as([max_cluster_size]u8, @splat(0));
         while (true) {
             const take = @min(data.len - offset, cluster_size);
             const cluster_rel = self.clusterOffset(cluster);
@@ -806,7 +806,7 @@ pub const FileSystem = struct {
     }
 
     fn persistFsInfo(self: *FileSystem, io: Io) MutationError!void {
-        var sector: [default_bytes_per_sector]u8 = [_]u8{0} ** default_bytes_per_sector;
+        var sector: [default_bytes_per_sector]u8 = @as([default_bytes_per_sector]u8, @splat(0));
         std.mem.writeInt(u32, sector[0..4], fsinfo_lead_signature, .little);
         std.mem.writeInt(u32, sector[484..488], fsinfo_struct_signature, .little);
         std.mem.writeInt(u32, sector[488..492], self.free_cluster_count, .little);
@@ -880,7 +880,7 @@ pub const FileSystem = struct {
     }
 
     fn zeroCluster(self: *FileSystem, io: Io, cluster: u32) MutationError!void {
-        var zeros: [max_cluster_size]u8 = [_]u8{0} ** max_cluster_size;
+        var zeros: [max_cluster_size]u8 = @as([max_cluster_size]u8, @splat(0));
         try self.writeRegion(io, zeros[0..self.info.clusterSize()], self.clusterOffset(cluster));
     }
 
@@ -932,7 +932,7 @@ pub fn format(image: *Image, io: Io, options: FormatOptions) FormatError!void {
     const boot_sector = buildBootSector(layout);
     try fs.writeRegion(io, &boot_sector, 0);
 
-    var fsinfo_sector_buf: [default_bytes_per_sector]u8 = [_]u8{0} ** default_bytes_per_sector;
+    var fsinfo_sector_buf: [default_bytes_per_sector]u8 = @as([default_bytes_per_sector]u8, @splat(0));
     std.mem.writeInt(u32, fsinfo_sector_buf[0..4], fsinfo_lead_signature, .little);
     std.mem.writeInt(u32, fsinfo_sector_buf[484..488], fsinfo_struct_signature, .little);
     std.mem.writeInt(u32, fsinfo_sector_buf[488..492], layout.data_cluster_count - 1, .little);
@@ -1374,7 +1374,7 @@ fn layoutFor(total_sectors: u32, bytes_per_sector: u16, reserved_sector_count: u
 }
 
 fn buildBootSector(info: VolumeInfo) [default_bytes_per_sector]u8 {
-    var sector: [default_bytes_per_sector]u8 = [_]u8{0} ** default_bytes_per_sector;
+    var sector: [default_bytes_per_sector]u8 = @as([default_bytes_per_sector]u8, @splat(0));
     sector[0] = 0xEB;
     sector[1] = 0x58;
     sector[2] = 0x90;
@@ -1408,7 +1408,7 @@ fn buildBootSector(info: VolumeInfo) [default_bytes_per_sector]u8 {
 }
 
 fn zeroRange(fs: *const FileSystem, io: Io, start: u64, length: u64) MutationError!void {
-    var zeros: [4096]u8 = [_]u8{0} ** 4096;
+    var zeros: [4096]u8 = @as([4096]u8, @splat(0));
     var written: u64 = 0;
     while (written < length) {
         const take: usize = @intCast(@min(length - written, zeros.len));
@@ -1596,7 +1596,7 @@ fn splitName(name: []const u8) struct { base: []const u8, ext: []const u8 } {
 }
 
 fn buildShortName(base: []const u8, ext: []const u8) [11]u8 {
-    var short_name = [_]u8{' '} ** 11;
+    var short_name = @as([11]u8, @splat(' '));
     @memcpy(short_name[0..base.len], base);
     @memcpy(short_name[8 .. 8 + ext.len], ext);
     return short_name;
@@ -1619,7 +1619,7 @@ fn chooseShortName(fs: *FileSystem, io: Io, dir_cluster: u32, name: []const u8) 
     while (suffix_num < 1_000_000) : (suffix_num += 1) {
         var suffix_buf: [8]u8 = undefined;
         const suffix = try std.fmt.bufPrint(&suffix_buf, "~{d}", .{suffix_num});
-        var stem_with_suffix: [8]u8 = [_]u8{' '} ** 8;
+        var stem_with_suffix: [8]u8 = @as([8]u8, @splat(' '));
         const prefix_len = 8 - suffix.len;
         const copy_len = @min(prefix_len, stem_len);
         @memcpy(stem_with_suffix[0..copy_len], base_buf[0..copy_len]);
@@ -1654,7 +1654,7 @@ fn shortNameChecksum(short_name: [11]u8) u8 {
 }
 
 fn buildShortEntry(short_name: [11]u8, kind: DirEntryKind, first_cluster: u32, size: u32) [directory_entry_size]u8 {
-    var entry: [directory_entry_size]u8 = [_]u8{0} ** directory_entry_size;
+    var entry: [directory_entry_size]u8 = @as([directory_entry_size]u8, @splat(0));
     entry[0..11].* = short_name;
     entry[11] = if (kind == .directory) attr_directory else attr_archive;
     std.mem.writeInt(u16, entry[14..16], 0, .little);
@@ -1669,14 +1669,14 @@ fn buildShortEntry(short_name: [11]u8, kind: DirEntryKind, first_cluster: u32, s
 }
 
 fn buildVolumeLabelEntry(volume_label: [11]u8) [directory_entry_size]u8 {
-    var entry: [directory_entry_size]u8 = [_]u8{0} ** directory_entry_size;
+    var entry: [directory_entry_size]u8 = @as([directory_entry_size]u8, @splat(0));
     entry[0..11].* = volume_label;
     entry[11] = attr_volume_id;
     return entry;
 }
 
 fn buildDotEntry(parent: bool, cluster: u32) [directory_entry_size]u8 {
-    var name = [_]u8{' '} ** 11;
+    var name = @as([11]u8, @splat(' '));
     name[0] = '.';
     if (parent) name[1] = '.';
     return buildShortEntry(name, .directory, cluster, 0);
@@ -1692,7 +1692,7 @@ fn buildLfnEntries(entries: [][directory_entry_size]u8, utf16_name: []const u16,
     var index: usize = 0;
     while (index < count) : (index += 1) {
         const sequence = count - index;
-        var entry: [directory_entry_size]u8 = [_]u8{0} ** directory_entry_size;
+        var entry: [directory_entry_size]u8 = @as([directory_entry_size]u8, @splat(0));
         entry[0] = @intCast(sequence);
         if (index == 0) entry[0] |= 0x40;
         entry[11] = attr_long_name;
@@ -1701,7 +1701,7 @@ fn buildLfnEntries(entries: [][directory_entry_size]u8, utf16_name: []const u16,
         std.mem.writeInt(u16, entry[26..28], 0, .little);
 
         const start = (sequence - 1) * 13;
-        var units: [13]u16 = [_]u16{0xFFFF} ** 13;
+        var units: [13]u16 = @as([13]u16, @splat(0xFFFF));
         var i: usize = 0;
         while (i < 13 and start + i < utf16_name.len) : (i += 1) units[i] = utf16_name[start + i];
         if (start + i == utf16_name.len and i < 13) {
@@ -2339,7 +2339,7 @@ test "open rejects clusters larger than native scanner buffers" {
 
     var image = try Image.create(io, path, .raw, default_bytes_per_sector, .{});
     defer image.close(io);
-    var boot_sector: [default_bytes_per_sector]u8 = [_]u8{0} ** default_bytes_per_sector;
+    var boot_sector: [default_bytes_per_sector]u8 = @as([default_bytes_per_sector]u8, @splat(0));
     boot_sector[11..13].* = std.mem.toBytes(@as(u16, default_bytes_per_sector));
     boot_sector[13] = 128;
     boot_sector[510] = 0x55;
@@ -2539,7 +2539,7 @@ test "directory enumeration rejects cyclic FAT chains" {
         .partition_len = partition_len,
     });
     var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
-    var directory: [max_cluster_size]u8 = [_]u8{0} ** max_cluster_size;
+    var directory: [max_cluster_size]u8 = @as([max_cluster_size]u8, @splat(0));
     const cluster_size = fs.info.clusterSize();
     var slot: usize = 0;
     while (slot < cluster_size) : (slot += directory_entry_size) {
@@ -2921,7 +2921,7 @@ test "truncate shrinks files and frees unused clusters" {
 
     var tail: [64]u8 = undefined;
     try fs.readRegion(io, &tail, fs.clusterOffset(original_chain[1]) + truncated_size % cluster_size);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** tail.len), &tail);
+    try std.testing.expectEqualSlices(u8, &(@as([tail.len]u8, @splat(0))), &tail);
 
     try std.testing.expectError(error.InvalidTruncateSize, fs.truncateFile(io, "payload.bin", truncated_size + 1));
 
@@ -3222,8 +3222,8 @@ test "a name's slot count covers its long-name entries and its short one" {
     try std.testing.expectEqual(@as(u32, 2), try nameSlotCount("abcdefghijkl"));
     // Thirteen does not: the terminator pushes it into a second.
     try std.testing.expectEqual(@as(u32, 3), try nameSlotCount("abcdefghijklm"));
-    try std.testing.expectEqual(@as(u32, 3), try nameSlotCount("a" ** 25));
-    try std.testing.expectEqual(@as(u32, 4), try nameSlotCount("a" ** 26));
+    try std.testing.expectEqual(@as(u32, 3), try nameSlotCount(&@as([25:0]u8, @splat("a"[0]))));
+    try std.testing.expectEqual(@as(u32, 4), try nameSlotCount(&@as([26:0]u8, @splat("a"[0]))));
 }
 
 test "an empty volume is sized by FAT32's own cluster floor, not by its content" {

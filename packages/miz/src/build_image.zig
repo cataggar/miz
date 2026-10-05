@@ -1242,16 +1242,16 @@ fn isRootfsCandidate(path: []const u8) bool {
     const base = baseName(path);
     return std.ascii.endsWithIgnoreCase(base, ".squashfs") or
         std.ascii.endsWithIgnoreCase(base, ".sqsh") or
-        std.ascii.indexOfIgnoreCase(base, "squashfs") != null or
-        std.ascii.indexOfIgnoreCase(base, "rootfs") != null or
+        std.ascii.findIgnoreCase(base, "squashfs") != null or
+        std.ascii.findIgnoreCase(base, "rootfs") != null or
         std.ascii.endsWithIgnoreCase(base, ".img");
 }
 
 fn candidateScore(path: []const u8) u8 {
     const base = baseName(path);
     if (std.ascii.endsWithIgnoreCase(base, ".squashfs") or std.ascii.endsWithIgnoreCase(base, ".sqsh")) return 4;
-    if (std.ascii.indexOfIgnoreCase(base, "squashfs") != null) return 3;
-    if (std.ascii.indexOfIgnoreCase(base, "rootfs") != null) return 2;
+    if (std.ascii.findIgnoreCase(base, "squashfs") != null) return 3;
+    if (std.ascii.findIgnoreCase(base, "rootfs") != null) return 2;
     if (std.ascii.endsWithIgnoreCase(base, ".img")) return 1;
     return 0;
 }
@@ -4291,7 +4291,7 @@ test "build-image reports errors cleanly (no double-free) when squashfs open fai
     // Clear the inode table's metadata-block "uncompressed" bit and relabel
     // the filesystem as XZ-compressed so squashfs.Reader attempts to
     // decompress raw metadata bytes and fails after partition planning.
-    std.mem.writeInt(u16, squashfs_bytes[20..22], @intFromEnum(squashfs.Compression.xz), .little);
+    std.mem.writeInt(u16, squashfs_bytes[20..22], @backingInt(squashfs.Compression.xz), .little);
     const inode_table_start = std.mem.readInt(u64, squashfs_bytes[64..72], .little);
     const header_offset: usize = @intCast(inode_table_start);
     var header = std.mem.readInt(u16, squashfs_bytes[header_offset..][0..2], .little);
@@ -4941,7 +4941,7 @@ fn buildTarArchive(allocator: std.mem.Allocator, specs: []const TarSpec) ![]u8 {
 }
 
 fn appendTarSpec(out: *std.Io.Writer.Allocating, spec: TarSpec) !void {
-    var header: [512]u8 = [_]u8{0} ** 512;
+    var header: [512]u8 = @as([512]u8, @splat(0));
     if (spec.path.len > 100) return error.InvalidHeader;
     @memcpy(header[0..spec.path.len], spec.path);
     try writeOctalField(header[100..108], spec.mode);

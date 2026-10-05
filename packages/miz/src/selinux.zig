@@ -437,7 +437,7 @@ test "rejects policy names that cannot build a path" {
     try std.testing.expect(!validPolicyName(".."));
     try std.testing.expect(!validPolicyName("a/b"));
     try std.testing.expect(!validPolicyName("a b"));
-    try std.testing.expect(!validPolicyName("a" ** (max_policy_name_bytes + 1)));
+    try std.testing.expect(!validPolicyName(&@as([(max_policy_name_bytes + 1):0]u8, @splat("a"[0]))));
 }
 
 test "builds the file contexts path" {

@@ -599,7 +599,7 @@ fn verifyFileStat(entry: snapshot.Entry, stat: Io.File.Stat) !void {
         stat.size != entry.size or
         @as(u64, @intCast(stat.inode)) != entry.inode or
         @as(u64, @intCast(stat.nlink)) != entry.nlink or
-        (@intFromEnum(stat.permissions) & 0o7777) != entry.mode or
+        (@backingInt(stat.permissions) & 0o7777) != entry.mode or
         stat.mtime.nanoseconds != expected_mtime)
     {
         return error.FileChangedDuringRepack;

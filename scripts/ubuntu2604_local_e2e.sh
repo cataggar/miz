@@ -14,7 +14,7 @@
 # protected release build is dispatched, per the release-gate requirement.
 #
 # Usage:
-#   ZIG=/path/to/zig-0.16.0 \
+#   ZIG=/path/to/zig-0.17.0 \
 #   SEED_CACHE=/home/you/.cache/zig \
 #   scripts/ubuntu2604_local_e2e.sh [x86_64|aarch64]
 #
@@ -39,7 +39,7 @@ esac
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-: "${ZIG:?set ZIG to the zig 0.16.0 binary used to build miz}"
+: "${ZIG:?set ZIG to the zig 0.17.0 binary used to build miz}"
 VIRTUAL_SIZE="${VIRTUAL_SIZE:-5368709120}"
 FIXTURE_DIR="$REPO_ROOT/tests/fixtures/ubuntu2604-local-signing"
 CERT="$FIXTURE_DIR/signing-cert.pem"

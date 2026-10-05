@@ -1659,7 +1659,7 @@ fn verifyOpenPgpDetachedSignature(
     @memcpy(&signature, signature_mpi.bytes);
     try std.crypto.Certificate.rsa.PKCS1v1_5Signature.concatVerify(
         512,
-        signature,
+        &signature,
         &.{ content, body[0..hashed_end], &trailer },
         key.rsa,
         std.crypto.hash.sha2.Sha512,
@@ -4184,7 +4184,6 @@ fn buildInitramfsStage(
     const io = context.io;
     var stage_timing = timing.begin(.debz_transaction, "initramfs-build-stage");
     defer stage_timing.end();
-    errdefer |err| stage_timing.fail(@errorName(err));
 
     if (build_roots.len == 0) return error.InitramfsBuildStageEmpty;
 
@@ -4329,7 +4328,6 @@ fn customizeRootWithDebz(
 ) !DebzCustomization {
     var debz_aggregate = timing.begin(.debz_aggregate, null);
     defer debz_aggregate.end();
-    errdefer |err| debz_aggregate.fail(@errorName(err));
 
     const extraction = try std.fs.path.join(allocator, &.{ work_dir, "official-root" });
     defer allocator.free(extraction);
@@ -4469,7 +4467,6 @@ fn customizeRootWithDebz(
     for (debz_packages, 0..) |package, index| {
         var debz_transaction = timing.begin(.debz_transaction, package);
         defer debz_transaction.end();
-        errdefer |err| debz_transaction.fail(@errorName(err));
 
         const installed_baseline: package_family.InstalledBaselinePolicy =
             if (flavor.freshRoot() and index == 0) .none else .require_locked;
@@ -4500,7 +4497,6 @@ fn customizeRootWithDebz(
 
     var initramfs_import = timing.begin(.initramfs_ext4_import, null);
     defer initramfs_import.end();
-    errdefer |err| initramfs_import.fail(@errorName(err));
     var customization = try customizeOfflineRoot(
         allocator,
         io,
@@ -6822,6 +6818,7 @@ pub fn main(init: std.process.Init) !void {
     );
     var total_runtime = timing.begin(.total_runtime, null);
     buildImage(init, args, architecture, &timing) catch |err| {
+        timing.recordFailure(err);
         total_runtime.fail(@errorName(err));
         timing.write(.failure) catch |timing_err| {
             const failed_phase = timing.failedPhase() orelse .total_runtime;
@@ -6848,7 +6845,6 @@ fn buildImage(
     const profile = profileFor(architecture);
     var input_acquisition = timing.begin(.input_acquisition, null);
     defer input_acquisition.end();
-    errdefer |err| input_acquisition.fail(@errorName(err));
     const work_dir = args.work_dir orelse profile.workDirFor(args.flavor);
     const output = args.output orelse profile.outputFor(args.flavor);
     try Dir.cwd().createDirPath(io, work_dir);
@@ -6926,7 +6922,6 @@ fn buildImage(
     defer allocator.free(mutable);
     var source_setup = timing.begin(.source_qcow2_setup, null);
     defer source_setup.end();
-    errdefer |err| source_setup.fail(@errorName(err));
     Dir.cwd().deleteFile(io, mutable) catch {};
     var source_image = try miz.Image.openPathReadOnlyStandalone(io, source_path);
     defer source_image.close(io);
@@ -6987,7 +6982,6 @@ fn buildImage(
 
     var uki_assembly = timing.begin(.uki_assembly, null);
     defer uki_assembly.end();
-    errdefer |err| uki_assembly.fail(@errorName(err));
     const extract_dir = try std.fs.path.join(allocator, &.{ work_dir, "uki-input" });
     defer allocator.free(extract_dir);
     const release_name = try extractNativeBootInputs(
@@ -7054,7 +7048,6 @@ fn buildImage(
 
     var uki_signing_phase = timing.begin(.uki_signing, null);
     defer uki_signing_phase.end();
-    errdefer |err| uki_signing_phase.fail(@errorName(err));
     const signing_scratch = try std.fs.path.join(allocator, &.{ work_dir, "signing" });
     defer allocator.free(signing_scratch);
     try uki_signing.prepareScratchDirectory(io, signing_scratch);
@@ -7080,7 +7073,6 @@ fn buildImage(
 
     var qcow2_finalization = timing.begin(.qcow2_finalization, null);
     defer qcow2_finalization.end();
-    errdefer |err| qcow2_finalization.fail(@errorName(err));
     // #677 step 5: core plans and writes its own disk here; the other flavors
     // keep publishing the substrate they customized in place.
     var core_disk: ?CoreDisk = if (args.flavor.calculatesGeometry())
@@ -7122,7 +7114,6 @@ fn buildImage(
     qcow2_finalization.succeed();
     var final_image_validation = timing.begin(.final_image_validation, null);
     defer final_image_validation.end();
-    errdefer |err| final_image_validation.fail(@errorName(err));
     var final_root = try openNativeRoot(allocator, io, output, work_dir);
     defer final_root.deinit();
     const os_release = try final_root.filesystem.read(allocator, "/etc/os-release", 64 * 1024);
@@ -7151,7 +7142,6 @@ fn buildImage(
     if (args.raw_output) |raw_path| {
         var raw_materialization = timing.begin(.raw_image_materialization, null);
         defer raw_materialization.end();
-        errdefer |err| raw_materialization.fail(@errorName(err));
         try writeRawCopy(allocator, io, output, raw_path);
         raw_materialization.succeed();
     } else {
@@ -7159,7 +7149,6 @@ fn buildImage(
     }
     var provenance_output = timing.begin(.provenance_output, null);
     defer provenance_output.end();
-    errdefer |err| provenance_output.fail(@errorName(err));
 
     // The image and artifact phases are recorded here, where the finished
     // geometry and the published bytes both exist. Recording them earlier
@@ -7330,7 +7319,7 @@ fn arm64VerifiedFixture(
 ) miz.gpt.VerifiedGpt {
     const total_sectors = virtual_size / miz.gpt.sector_size;
     const last_usable_lba = total_sectors - 2 - miz.gpt.partition_array_sectors;
-    const array_crc = std.hash.crc.Crc32.hash(partition_array);
+    const array_crc = std.hash.Crc32.hash(partition_array);
     const primary = miz.gpt.Header{
         .current_lba = 1,
         .backup_lba = total_sectors - 1,

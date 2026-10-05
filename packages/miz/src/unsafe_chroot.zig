@@ -452,7 +452,7 @@ fn reapNamespace() void {
     if (std.os.linux.getpid() != 1) return;
     _ = std.os.linux.kill(-1, .KILL);
     while (true) {
-        var status: u32 = undefined;
+        var status: i32 = undefined;
         const rc = std.os.linux.waitpid(-1, &status, 0);
         switch (std.os.linux.errno(rc)) {
             .SUCCESS => continue,
@@ -2218,7 +2218,7 @@ const Session = struct {
     }
 
     fn createOneDirectory(self: *Session, path: []const u8) !void {
-        Io.Dir.cwd().createDir(self.io, path, @enumFromInt(0o755)) catch |err| switch (err) {
+        Io.Dir.cwd().createDir(self.io, path, @fromBackingInt(@intCast(0o755))) catch |err| switch (err) {
             error.PathAlreadyExists => return,
             else => return err,
         };
@@ -2227,7 +2227,7 @@ const Session = struct {
         // not -- `iterate` is what asks for a real descriptor.
         var opened = try Io.Dir.cwd().openDir(self.io, path, .{ .iterate = true });
         defer opened.close(self.io);
-        try opened.setPermissions(self.io, @enumFromInt(0o755));
+        try opened.setPermissions(self.io, @fromBackingInt(@intCast(0o755)));
     }
 
     fn writeKernelModuleFiles(self: *Session) !void {
@@ -2256,11 +2256,11 @@ const Session = struct {
             // own mode through a truncating open, so it is set afterwards
             // rather than only at creation.
             const target = try Io.Dir.cwd().createFile(self.io, path, .{
-                .permissions = @enumFromInt(0o644),
+                .permissions = @fromBackingInt(@intCast(0o644)),
             });
             defer target.close(self.io);
             try target.writePositionalAll(self.io, file.contents, 0);
-            try target.setPermissions(self.io, @enumFromInt(0o644));
+            try target.setPermissions(self.io, @fromBackingInt(@intCast(0o644)));
         }
     }
 
@@ -3162,7 +3162,7 @@ fn validateManifestPolicy(manifest: Manifest) !void {
             if (std.mem.eql(u8, previous.name, hook.name)) return error.DuplicateHookName;
         }
         if (previous_phase) |phase| {
-            if (@intFromEnum(hook.phase) < @intFromEnum(phase)) {
+            if (@backingInt(hook.phase) < @backingInt(phase)) {
                 return error.HookPhasesOutOfOrder;
             }
         }
@@ -4824,7 +4824,7 @@ test "the privilege boundary re-checks a hook it is handed" {
         .initramfs = .unchanged,
     };
     const runnable = "#!/bin/sh\nexit 0\n";
-    const long_argument = "x" ** (customize.max_hook_argument_bytes + 1);
+    const long_argument = &@as([(customize.max_hook_argument_bytes + 1):0]u8, @splat("x"[0]));
     var many_arguments: [customize.max_hook_arguments + 1][]const u8 = undefined;
     for (&many_arguments) |*slot| slot.* = "x";
 
@@ -5265,7 +5265,7 @@ test "environment credentials use owned pipe storage and are scrubbed when consu
     const value_offset = environment_credential_magic.len + 4 + 4;
     try std.testing.expectEqualSlices(
         u8,
-        &([_]u8{0} ** "s3cr3t-from-a-variable".len),
+        &(@as(["s3cr3t-from-a-variable".len]u8, @splat(0))),
         sealed[value_offset..][0.."s3cr3t-from-a-variable".len],
     );
 
@@ -6466,7 +6466,7 @@ const FakeExecutorContext = struct {
         ) catch return null;
         defer self.allocator.free(path);
         const status = Io.Dir.cwd().statFile(self.io, path, .{}) catch return null;
-        return @intFromEnum(status.permissions) & 0o7777;
+        return @backingInt(status.permissions) & 0o7777;
     }
 
     fn snapshotKernelModuleFiles(self: *FakeExecutorContext) ![]const []const u8 {

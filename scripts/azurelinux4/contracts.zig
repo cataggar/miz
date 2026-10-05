@@ -564,7 +564,7 @@ pub fn validateAzureGalleryUefiSettings(
 pub fn hasExactContracts(value: ?Value) bool {
     const items = arrayOrNull(value) orelse return false;
     if (items.len != azure_contracts.len) return false;
-    var seen = [_]bool{false} ** azure_contracts.len;
+    var seen = @as([azure_contracts.len]bool, @splat(false));
     for (items) |item| {
         const text = stringOrNull(item) orelse return false;
         var matched = false;
@@ -1099,7 +1099,7 @@ test "identity validation names each mismatch the way the Python did" {
         &good.value.object,
         "azurelinux4-candidate",
         "x86_64-full",
-        "a" ** 40,
+        &@as([40:0]u8, @splat("a"[0])),
         &diagnostic,
     );
     try std.testing.expectEqualStrings("x86_64-full", entry.key);
@@ -1120,7 +1120,7 @@ test "identity validation names each mismatch the way the Python did" {
         &good.value.object,
         "azurelinux4-candidate",
         null,
-        "b" ** 40,
+        &@as([40:0]u8, @splat("b"[0])),
         &diagnostic,
     ));
     try std.testing.expectEqualStrings(
@@ -1389,8 +1389,8 @@ test "provider identity shapes are accepted or rejected exactly" {
     try std.testing.expect(!isArtifactSigningEndpoint("https://.codesigning.azure.net"));
 
     try std.testing.expect(isArtifactSigningResource("miz-uki"));
-    try std.testing.expect(isArtifactSigningResource("a" ** 128));
-    try std.testing.expect(!isArtifactSigningResource("a" ** 129));
+    try std.testing.expect(isArtifactSigningResource(&@as([128:0]u8, @splat("a"[0]))));
+    try std.testing.expect(!isArtifactSigningResource(&@as([129:0]u8, @splat("a"[0]))));
     try std.testing.expect(!isArtifactSigningResource(""));
     try std.testing.expect(!isArtifactSigningResource("miz uki"));
 
@@ -1401,7 +1401,7 @@ test "provider identity shapes are accepted or rejected exactly" {
     try std.testing.expect(!isUuid("000000000000400080000000000000001"));
 }
 
-const test_signing_leaf = "4" ** 64;
+const test_signing_leaf = &@as([64:0]u8, @splat("4"[0]));
 const test_operation_id = "00000000-0000-4000-8000-000000000001";
 
 fn signingDocument(allocator: Allocator, options: struct {
@@ -1409,9 +1409,9 @@ fn signingDocument(allocator: Allocator, options: struct {
     flavor: []const u8 = "full",
     signer_mode: []const u8 = "external-command",
     endpoint: []const u8 = "https://wus.codesigning.azure.net",
-    fallback_signed: []const u8 = "3" ** 64,
+    fallback_signed: []const u8 = &@as([64:0]u8, @splat("3"[0])),
     fallback_operation: []const u8 = test_operation_id,
-    named_signed: []const u8 = "3" ** 64,
+    named_signed: []const u8 = &@as([64:0]u8, @splat("3"[0])),
     certificate: []const u8 = test_certificate,
 }) ![]u8 {
     const encoded = try encodeBase64Alloc(allocator, options.certificate);
@@ -1446,13 +1446,13 @@ fn signingDocument(allocator: Allocator, options: struct {
         encoded,
         options.endpoint,
         test_signing_leaf,
-        "2" ** 64,
+        &@as([64:0]u8, @splat("2"[0])),
         options.named_signed,
         options.named_signed,
         test_operation_id,
         test_signing_leaf,
         fallback,
-        "2" ** 64,
+        &@as([64:0]u8, @splat("2"[0])),
         options.fallback_signed,
         options.fallback_signed,
         options.fallback_operation,
@@ -1476,7 +1476,7 @@ test "signing provenance binds the signer, the leaf, and the fallback UKI" {
         "uki-signing-full-x86_64.json",
         &diagnostic,
     );
-    try std.testing.expectEqualStrings("3" ** 64, binding.fallback_uki_sha256);
+    try std.testing.expectEqualStrings(&@as([64:0]u8, @splat("3"[0])), binding.fallback_uki_sha256);
     try std.testing.expectEqualStrings(test_signing_leaf, binding.signing_certificate_sha256);
     try std.testing.expectEqualStrings("cataggar", binding.provider_account);
     try std.testing.expectEqualStrings(
@@ -1499,7 +1499,7 @@ test "signing provenance rejects a fallback that is not a named signed UKI" {
     const allocator = arena.allocator();
     var diagnostic: Diagnostic = .{};
 
-    const detached = try signingDocument(allocator, .{ .fallback_signed = "5" ** 64 });
+    const detached = try signingDocument(allocator, .{ .fallback_signed = &@as([64:0]u8, @splat("5"[0])) });
     var document = try parse(detached);
     defer document.deinit();
     try std.testing.expectError(error.InvalidSigningProvenance, bindSigningProvenance(
@@ -1595,8 +1595,8 @@ test "signing provenance rejects an unsigned or unbound UKI record" {
 
     // The signed digest equals the unsigned digest: nothing was signed.
     const unchanged = try signingDocument(allocator, .{
-        .named_signed = "2" ** 64,
-        .fallback_signed = "2" ** 64,
+        .named_signed = &@as([64:0]u8, @splat("2"[0])),
+        .fallback_signed = &@as([64:0]u8, @splat("2"[0])),
     });
     var document = try parse(unchanged);
     defer document.deinit();
@@ -1639,14 +1639,14 @@ test "the provenance digest is taken over compact sorted JSON" {
     const allocator = arena.allocator();
 
     const records = [_]ProvenanceRecord{
-        .{ .path = "inputs.txt", .bytes = 12, .sha256 = "a" ** 64 },
-        .{ .path = "nested/build.log", .bytes = 3, .sha256 = "b" ** 64 },
+        .{ .path = "inputs.txt", .bytes = 12, .sha256 = &@as([64:0]u8, @splat("a"[0])) },
+        .{ .path = "nested/build.log", .bytes = 3, .sha256 = &@as([64:0]u8, @splat("b"[0])) },
     };
     const value = try provenanceRecordsValue(allocator, &records);
     const encoded = try json_document.canonicalAlloc(allocator, value, .compact);
     try std.testing.expectEqualStrings(
-        "[{\"bytes\":12,\"path\":\"inputs.txt\",\"sha256\":\"" ++ "a" ** 64 ++ "\"}," ++
-            "{\"bytes\":3,\"path\":\"nested/build.log\",\"sha256\":\"" ++ "b" ** 64 ++ "\"}]",
+        "[{\"bytes\":12,\"path\":\"inputs.txt\",\"sha256\":\"" ++ &@as([64:0]u8, @splat("a"[0])) ++ "\"}," ++
+            "{\"bytes\":3,\"path\":\"nested/build.log\",\"sha256\":\"" ++ &@as([64:0]u8, @splat("b"[0])) ++ "\"}]",
         encoded,
     );
     try std.testing.expectEqualStrings(

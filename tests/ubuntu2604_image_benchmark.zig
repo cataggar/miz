@@ -135,7 +135,7 @@ fn expectExcludes(haystack: []const u8, needle: []const u8) !void {
     }
 }
 
-const digest_a = "a" ** 64;
+const digest_a = &@as([64:0]u8, @splat("a"[0]));
 
 fn hexDigest(allocator: Allocator, bytes: []const u8) ![]const u8 {
     var raw: [32]u8 = undefined;
@@ -419,7 +419,7 @@ test "the benchmark command fixes the profile and its offline inputs" {
     );
 
     const required = [_][]const u8{
-        "-Doptimize=ReleaseSafe",
+        "-Doptimize=safe",
         "-Dubuntu2604-arch=aarch64",
         "-Dubuntu2604-flavor=baremetal",
         "--debz-lock-dir",
@@ -647,7 +647,7 @@ test "a cache manifest reports its missing metadata object" {
         fixture.allocator(),
         contents,
         cache.metadata_digest,
-        "f" ** 64,
+        &@as([64:0]u8, @splat("f"[0])),
     );
     try Dir.cwd().writeFile(fixture.io, .{ .sub_path = manifest, .data = replaced });
     try expectFailure(benchmark.verifyWarmCache(
@@ -739,7 +739,7 @@ test "the lock set fails closed on a cache miss" {
         allocator,
         contents,
         cache.package_digest,
-        "f" ** 64,
+        &@as([64:0]u8, @splat("f"[0])),
     );
     try Dir.cwd().writeFile(fixture.io, .{ .sub_path = target, .data = mutated });
     try expectFailure(benchmark.verifyLockSet(
@@ -913,8 +913,8 @@ test "correctness diagnostics report all safe field paths" {
     const message = fixture.message();
     try expectContains(message, "$.acceptance.command");
     try expectContains(message, "$.profile.source_sha256");
-    try expectContains(message, "a" ** 64);
-    try expectContains(message, "b" ** 64);
+    try expectContains(message, &@as([64:0]u8, @splat("a"[0])));
+    try expectContains(message, &@as([64:0]u8, @splat("b"[0])));
     try expectContains(message, "<absolute-path sha256=");
     try expectExcludes(message, "/private/");
 }
@@ -923,8 +923,8 @@ test "transaction correctness uses a semantic identity" {
     var fixture = try Fixture.create();
     defer fixture.deinit();
     const allocator = fixture.allocator();
-    const lock_digest = "b" ** 64;
-    const transaction_digests = [_][]const u8{ "a" ** 64, "c" ** 64 };
+    const lock_digest = &@as([64:0]u8, @splat("b"[0]));
+    const transaction_digests = [_][]const u8{ &@as([64:0]u8, @splat("a"[0])), &@as([64:0]u8, @splat("c"[0])) };
     const run_names = [_][]const u8{ "run-warmup", "run-measured-01" };
     var contracts: [2]Value = undefined;
     var files: [2]Value = undefined;
@@ -1012,14 +1012,14 @@ test "transaction correctness uses a semantic identity" {
             files[0].object.get("file_sha256").?.string,
             transaction_digests[0],
         })),
-        "e" ** 64,
+        &@as([64:0]u8, @splat("e"[0])),
         benchmark.package_roots[0],
         &fixture.context,
     ));
 
     const mutations = [_][2][]const u8{
-        .{ "semantic_digest_sha256", "c" ** 64 },
-        .{ "lock_sha256", "d" ** 64 },
+        .{ "semantic_digest_sha256", &@as([64:0]u8, @splat("c"[0])) },
+        .{ "lock_sha256", &@as([64:0]u8, @splat("d"[0])) },
     };
     for (mutations) |mutation| {
         var mutated = std.json.ObjectMap.empty;
@@ -1097,24 +1097,24 @@ test "correctness rejects each semantic contract change" {
     ;
     const mutations = [_][2][]const u8{
         .{
-            "\"source_sha256\": \"" ++ "a" ** 64 ++ "\"",
-            "\"source_sha256\": \"" ++ "f" ** 64 ++ "\"",
+            "\"source_sha256\": \"" ++ &@as([64:0]u8, @splat("a"[0])) ++ "\"",
+            "\"source_sha256\": \"" ++ &@as([64:0]u8, @splat("f"[0])) ++ "\"",
         },
         .{
-            "\"closure_sha256\": \"" ++ "b" ** 64 ++ "\"",
-            "\"closure_sha256\": \"" ++ "f" ** 64 ++ "\"",
+            "\"closure_sha256\": \"" ++ &@as([64:0]u8, @splat("b"[0])) ++ "\"",
+            "\"closure_sha256\": \"" ++ &@as([64:0]u8, @splat("f"[0])) ++ "\"",
         },
         .{
-            "\"semantic_digest_sha256\": \"" ++ "c" ** 64 ++ "\"",
-            "\"semantic_digest_sha256\": \"" ++ "f" ** 64 ++ "\"",
+            "\"semantic_digest_sha256\": \"" ++ &@as([64:0]u8, @splat("c"[0])) ++ "\"",
+            "\"semantic_digest_sha256\": \"" ++ &@as([64:0]u8, @splat("f"[0])) ++ "\"",
         },
         .{
-            "\"lock_sha256\": \"" ++ "d" ** 64 ++ "\"",
-            "\"lock_sha256\": \"" ++ "f" ** 64 ++ "\"",
+            "\"lock_sha256\": \"" ++ &@as([64:0]u8, @splat("d"[0])) ++ "\"",
+            "\"lock_sha256\": \"" ++ &@as([64:0]u8, @splat("f"[0])) ++ "\"",
         },
         .{
-            "\"certificate_sha256\": \"" ++ "e" ** 64 ++ "\"",
-            "\"certificate_sha256\": \"" ++ "f" ** 64 ++ "\"",
+            "\"certificate_sha256\": \"" ++ &@as([64:0]u8, @splat("e"[0])) ++ "\"",
+            "\"certificate_sha256\": \"" ++ &@as([64:0]u8, @splat("f"[0])) ++ "\"",
         },
         .{ "\"compression_type\": \"zstd\"", "\"compression_type\": \"none\"" },
         .{
@@ -1167,8 +1167,8 @@ fn summaryRun(
             .block_outputs = 5,
             .io_bytes_source = "linux-proc-descendant-sampling",
         },
-        .correctness_sha256 = "a" ** 64,
-        .image_sha256 = "0" ** 64,
+        .correctness_sha256 = &@as([64:0]u8, @splat("a"[0])),
+        .image_sha256 = &@as([64:0]u8, @splat("0"[0])),
         .image_bytes = 1,
         .raw_output = .{
             .bytes = benchmark.virtual_size,
@@ -1192,14 +1192,14 @@ test "summary generation uses three measured medians" {
     const summary = try benchmark.buildSummary(
         allocator,
         &runs,
-        "b" ** 40,
+        &@as([40:0]u8, @splat("b"[0])),
         try fixture.parse(
             \\{"machine": "aarch64"}
         ),
         try fixture.parse(
             \\{"inventory_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}
         ),
-        "d" ** 64,
+        &@as([64:0]u8, @splat("d"[0])),
         try fixture.parse("[]"),
         &fixture.context,
     );
@@ -1240,7 +1240,7 @@ fn hostDocumentFromDeepFrame(allocator: Allocator, depth: usize) !Value {
     setUtsField(&uts.sysname, "Linux");
     setUtsField(&uts.release, "6.14.0-1234-benchmark");
     setUtsField(&uts.machine, "aarch64");
-    return benchmark.hostDocument(allocator, &uts, "0.16.0", 8);
+    return benchmark.hostDocument(allocator, &uts, "0.17.0", 8);
 }
 
 /// Overwrites the stack region the frames above used, so a document that had
@@ -1267,7 +1267,7 @@ test "the recorded host identity outlives the utsname it was read from" {
         .{ "system", "Linux" },
         .{ "kernel", "6.14.0-1234-benchmark" },
         .{ "machine", "aarch64" },
-        .{ "zig", "0.16.0" },
+        .{ "zig", "0.17.0" },
     };
     for (fields) |field| {
         const value = document.object.get(field[0]) orelse return error.TestMissingField;
@@ -1286,10 +1286,10 @@ test "the recorded host identity outlives the utsname it was read from" {
             try summaryRun(allocator, "run-2", "measured", 10, 10),
             try summaryRun(allocator, "run-3", "measured", 20, 20),
         },
-        "b" ** 40,
+        &@as([40:0]u8, @splat("b"[0])),
         document,
         try fixture.parse("{}"),
-        "d" ** 64,
+        &@as([64:0]u8, @splat("d"[0])),
         try fixture.parse("[]"),
         &fixture.context,
     );
@@ -1313,10 +1313,10 @@ test "a summary requires exactly three measured runs" {
     try expectFailure(benchmark.buildSummary(
         allocator,
         &runs,
-        "b" ** 40,
+        &@as([40:0]u8, @splat("b"[0])),
         try fixture.parse("{}"),
         try fixture.parse("{}"),
-        "d" ** 64,
+        &@as([64:0]u8, @splat("d"[0])),
         try fixture.parse("[]"),
         &fixture.context,
     ));
@@ -1446,7 +1446,7 @@ test "the non-regression gate passes, fails, and records missing evidence" {
         \\{{"status": "valid", "source_commit": "{s}",
         \\  "medians": {{"phase_elapsed_ns": {{"total_runtime": 520000000000,
         \\               "raw_image_materialization": 42000000000}}}}}}
-    , .{"b" ** 40}));
+    , .{&@as([40:0]u8, @splat("b"[0]))}));
     try std.testing.expect(try benchmark.runGate(
         allocator,
         fixture.io,
@@ -1466,7 +1466,7 @@ test "the non-regression gate passes, fails, and records missing evidence" {
         \\{{"status": "valid", "source_commit": "{s}",
         \\  "medians": {{"phase_elapsed_ns": {{"total_runtime": 530000000001,
         \\               "raw_image_materialization": 42000000000}}}}}}
-    , .{"b" ** 40}));
+    , .{&@as([40:0]u8, @splat("b"[0]))}));
     try std.testing.expect(!try benchmark.runGate(
         allocator,
         fixture.io,
@@ -1485,11 +1485,11 @@ test "the evidence scan fails closed on a candidate it cannot read" {
     const evidence_root = try fixture.mkdir(&.{"evidence"});
     const benchmark_root = try fixture.mkdir(&.{"benchmark"});
     const unreadable = try fixture.write(&.{ "evidence", "sealed.log" }, "sealed\n");
-    try Dir.cwd().setFilePermissions(fixture.io, unreadable, @enumFromInt(0o000), .{});
+    try Dir.cwd().setFilePermissions(fixture.io, unreadable, @fromBackingInt(@intCast(0o000)), .{});
     defer Dir.cwd().setFilePermissions(
         fixture.io,
         unreadable,
-        @enumFromInt(0o600),
+        @fromBackingInt(@intCast(0o600)),
         .{},
     ) catch {};
 

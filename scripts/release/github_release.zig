@@ -3495,7 +3495,7 @@ test "asset table mutation gates require exact uploaded API digests" {
     try Dir.cwd().writeFile(io, .{ .sub_path = notes_path, .data = "notes" });
     try Dir.cwd().writeFile(io, .{
         .sub_path = expected_path,
-        .data = "result.json\t" ++ "a" ** 64 ++ "\t7\n",
+        .data = "result.json\t" ++ &@as([64:0]u8, @splat("a"[0])) ++ "\t7\n",
     });
     const metadata =
         "\"id\":42,\"tag_name\":\"capture-v1\",\"target_commitish\":" ++
@@ -3533,7 +3533,7 @@ test "asset table mutation gates require exact uploaded API digests" {
 
     const exact_asset =
         "{\"id\":1,\"name\":\"result.json\",\"size\":7,\"state\":\"uploaded\"," ++
-        "\"digest\":\"sha256:" ++ "a" ** 64 ++ "\"}";
+        "\"digest\":\"sha256:" ++ &@as([64:0]u8, @splat("a"[0])) ++ "\"}";
     try Dir.cwd().writeFile(io, .{
         .sub_path = release_path,
         .data = "{" ++ metadata ++ ",\"draft\":true,\"assets\":[" ++
@@ -3563,11 +3563,11 @@ test "asset table mutation gates require exact uploaded API digests" {
             .plan = "2\n",
         },
         .{
-            .json = "{\"id\":3,\"name\":\"result.json\",\"size\":7,\"state\":\"starter\",\"digest\":\"sha256:" ++ "a" ** 64 ++ "\"}",
+            .json = "{\"id\":3,\"name\":\"result.json\",\"size\":7,\"state\":\"starter\",\"digest\":\"sha256:" ++ &@as([64:0]u8, @splat("a"[0])) ++ "\"}",
             .plan = "3\n",
         },
         .{
-            .json = "{\"id\":4,\"name\":\"result.json\",\"size\":7,\"state\":\"uploaded\",\"digest\":\"sha256:" ++ "b" ** 64 ++ "\"}",
+            .json = "{\"id\":4,\"name\":\"result.json\",\"size\":7,\"state\":\"uploaded\",\"digest\":\"sha256:" ++ &@as([64:0]u8, @splat("b"[0])) ++ "\"}",
             .plan = "4\n",
         },
     };

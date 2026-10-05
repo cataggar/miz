@@ -950,7 +950,7 @@ test "a malformed or truncated inventory is refused rather than half-judged" {
     try content.object.put(
         allocator,
         "policy_sha256",
-        .{ .string = "0" ** 64 },
+        .{ .string = &@as([64:0]u8, @splat("0"[0])) },
     );
     try std.testing.expectError(error.Failed, size_budget.evaluate(
         std.testing.allocator,
@@ -1012,7 +1012,7 @@ test "a published verdict is re-derived rather than believed" {
         .{
             .architecture = "x86_64",
             .flavor = "core",
-            .inventory_sha256 = "9" ** 64,
+            .inventory_sha256 = &@as([64:0]u8, @splat("9"[0])),
         },
         &diagnostic,
     ));

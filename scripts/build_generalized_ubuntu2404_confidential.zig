@@ -1269,7 +1269,7 @@ test "signed checksum entry must be unique and exact" {
     try requireSignedEntry(good, archive_name, archive_sha256);
     try std.testing.expectError(
         error.SignedDigestMismatch,
-        requireSignedEntry("0" ** 64 ++ " *" ++ archive_name ++ "\n", archive_name, archive_sha256),
+        requireSignedEntry(&@as([64:0]u8, @splat("0"[0])) ++ " *" ++ archive_name ++ "\n", archive_name, archive_sha256),
     );
     try std.testing.expectError(
         error.SignedEntryMissingOrDuplicate,
