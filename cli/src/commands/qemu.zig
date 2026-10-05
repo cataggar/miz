@@ -318,6 +318,7 @@ const Options = struct {
     ovmf_code_path: ?[]const u8 = null,
     ovmf_vars_path: ?[]const u8 = null,
     secure_boot: bool = false,
+    include_system_firmware: bool = true,
     secure_boot_certificate_path: ?[]const u8 = null,
     secure_boot_certificate_sha256: ?miz.artifact_pipeline.Digest = null,
     admin_username: ?[]const u8 = null,
@@ -2369,6 +2370,7 @@ fn findGhrQemuAtToolsPathAlloc(
         .explicit_vars_path = options.ovmf_vars_path,
         .qemu_path = package_paths.binary_path,
         .data_dirs = &.{package_paths.data_dir},
+        .include_system_candidates = options.include_system_firmware,
     }) catch |err| {
         package_paths.deinit(allocator);
         return err;
@@ -3865,7 +3867,7 @@ test "qemu architecture inference uses only recognized GPT root or usr GUIDs" {
 }
 
 test "qemu architecture inference reads PE machine metadata" {
-    var bytes = [_]u8{0} ** 128;
+    var bytes = @as([128]u8, @splat(0));
     bytes[0..2].* = "MZ".*;
     std.mem.writeInt(u32, bytes[0x3c..][0..4], 64, .little);
     bytes[64..68].* = "PE\x00\x00".*;
@@ -4283,7 +4285,7 @@ fn writeTestVars(
 const test_microsoft_db =
     "\xa1\x59\xc0\xa5\xe4\x94\xa7\x4a\x87\xb5\xab\x15\x5c\x2b\xf0\x72" ++
     "\x38\x00\x00\x00\x00\x00\x00\x00\x1c\x00\x00\x00" ++
-    "\x00" ** 16 ++ "microsoft db";
+    &@as([16:0]u8, @splat("\x00"[0])) ++ "microsoft db";
 
 test "qemu enrolls and validates the exact release leaf in native vars" {
     const allocator = std.testing.allocator;
@@ -5260,7 +5262,7 @@ test "qemu resolves AArch64 from a ghr package containing both emulators" {
         allocator,
         io,
         tools_buf[0..tools_len],
-        .{},
+        .{ .include_system_firmware = false },
         .aarch64,
     )).?;
     defer resolved.deinit(allocator);

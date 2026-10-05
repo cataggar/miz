@@ -2603,7 +2603,7 @@ fn validateHooks(
             try diagnostics.append(validationError(.invalid_policy, "/hooks/name", "hook names must be safe non-empty values", null));
         }
         if (previous_phase) |phase| {
-            if (@intFromEnum(hook.phase) < @intFromEnum(phase)) {
+            if (@backingInt(hook.phase) < @backingInt(phase)) {
                 try diagnostics.append(validationError(
                     .invalid_policy,
                     "/hooks/phase",
@@ -4282,7 +4282,7 @@ pub fn resolve(
         .generated = if (request.execution.backend == .native_fresh) derived else null,
         .operations = operations,
         .required_capabilities = capabilities,
-        .plan_hash = .{ .bytes = [_]u8{0} ** 32 },
+        .plan_hash = .{ .bytes = @as([32]u8, @splat(0)) },
     };
     data.plan_hash = hashPlan(data);
 
@@ -5747,16 +5747,16 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     hashInt(&hash, @intFromBool(plan.container_pull_path != null));
     if (plan.container_pull_path) |path| hashString(&hash, path);
     hashInt(&hash, plan.request_api_version);
-    hashInt(&hash, @intFromEnum(plan.architectures.host));
-    hashInt(&hash, @intFromEnum(plan.architectures.image));
-    hashInt(&hash, @intFromEnum(plan.architectures.firmware));
-    hashInt(&hash, @intFromEnum(plan.architectures.repository));
-    hashInt(&hash, @intFromEnum(plan.architectures.runner));
-    hashInt(&hash, @intFromEnum(std.meta.activeTag(plan.input)));
+    hashInt(&hash, @backingInt(plan.architectures.host));
+    hashInt(&hash, @backingInt(plan.architectures.image));
+    hashInt(&hash, @backingInt(plan.architectures.firmware));
+    hashInt(&hash, @backingInt(plan.architectures.repository));
+    hashInt(&hash, @backingInt(plan.architectures.runner));
+    hashInt(&hash, @backingInt(std.meta.activeTag(plan.input)));
     switch (plan.input) {
         .iso_oci => |input| {
             hashString(&hash, input.iso_path);
-            hashInt(&hash, @intFromEnum(std.meta.activeTag(input.container)));
+            hashInt(&hash, @backingInt(std.meta.activeTag(input.container)));
             switch (input.container) {
                 .host_path => |path| hashString(&hash, path),
                 // The canonical reference covers the authority, the repository
@@ -5770,7 +5770,7 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
                     hashInt(&hash, @intFromBool(image.access.credential != null));
                     if (image.access.credential) |credential| {
                         hashString(&hash, credential.username);
-                        hashInt(&hash, @intFromEnum(std.meta.activeTag(credential.password)));
+                        hashInt(&hash, @backingInt(std.meta.activeTag(credential.password)));
                         switch (credential.password) {
                             .host_path => |path| hashString(&hash, path),
                             .host_environment => |name| hashString(&hash, name),
@@ -5786,7 +5786,7 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
                     // is an oracle for nothing.
                     hashInt(&hash, @intFromBool(image.signature != null));
                     if (image.signature) |signature| {
-                        hashInt(&hash, @intFromEnum(std.meta.activeTag(signature.key)));
+                        hashInt(&hash, @backingInt(std.meta.activeTag(signature.key)));
                         switch (signature.key) {
                             .inline_bytes => |bytes| hashString(&hash, bytes),
                             .host_path => |path| hashString(&hash, path),
@@ -5802,14 +5802,14 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
         },
     }
     hashString(&hash, plan.output.path);
-    hashInt(&hash, @intFromEnum(plan.output.format));
+    hashInt(&hash, @backingInt(plan.output.format));
     hashInt(&hash, plan.output.requested_size);
     hashInt(&hash, plan.output.disk_size);
-    hashInt(&hash, @intFromEnum(plan.output.size_policy));
-    hashInt(&hash, @intFromEnum(std.meta.activeTag(plan.storage)));
+    hashInt(&hash, @backingInt(plan.output.size_policy));
+    hashInt(&hash, @backingInt(std.meta.activeTag(plan.storage)));
     switch (plan.storage) {
         .fresh => |storage| {
-            hashInt(&hash, @intFromEnum(storage.generation));
+            hashInt(&hash, @backingInt(storage.generation));
             hashInt(&hash, storage.esp_size);
             hashString(&hash, storage.ext4_label);
             hashBool(&hash, storage.skip_iso_rootfs);
@@ -5861,7 +5861,7 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     hashInitramfsPolicy(&hash, plan.initramfs);
     hashSelinuxPolicy(&hash, plan.selinux);
     hashCrossArchitecturePolicy(&hash, plan.cross_architecture);
-    hashInt(&hash, @intFromEnum(plan.boot_security.boot_mode));
+    hashInt(&hash, @backingInt(plan.boot_security.boot_mode));
     hashBool(&hash, plan.boot_security.verity);
     hashString(&hash, plan.boot_security.extra_kernel_options);
     hashOptionalString(&hash, plan.boot_security.uki.stub_source_path);
@@ -5873,12 +5873,12 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     // plans, and nothing here is a secret a hash could turn into an oracle.
     hashInt(&hash, @intFromBool(plan.boot_security.signing != null));
     if (plan.boot_security.signing) |signing| {
-        hashInt(&hash, @intFromEnum(std.meta.activeTag(signing.certificate)));
+        hashInt(&hash, @backingInt(std.meta.activeTag(signing.certificate)));
         switch (signing.certificate) {
             .inline_bytes => |bytes| hashString(&hash, bytes),
             .host_path => |path| hashString(&hash, path),
         }
-        hashInt(&hash, @intFromEnum(std.meta.activeTag(signing.provider)));
+        hashInt(&hash, @backingInt(std.meta.activeTag(signing.provider)));
         switch (signing.provider) {
             .external_command => |command| {
                 hashString(&hash, command.executable_path);
@@ -5888,7 +5888,7 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     }
     hashGeneralization(&hash, plan.generalization);
     hashString(&hash, plan.execution.workspace_path);
-    hashInt(&hash, @intFromEnum(plan.execution.backend));
+    hashInt(&hash, @backingInt(plan.execution.backend));
     hashBool(&hash, plan.execution.overwrite);
     hashBool(&hash, plan.execution.acknowledge_unsafe);
     // The absent deadline is hashed as its own value rather than as zero, so
@@ -5898,7 +5898,7 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     if (plan.execution.vm) |vm| {
         hash.update(&.{1});
         hashString(&hash, vm.emulator_command);
-        hashInt(&hash, @intFromEnum(std.meta.activeTag(vm.boot)));
+        hashInt(&hash, @backingInt(std.meta.activeTag(vm.boot)));
         switch (vm.boot) {
             .direct_kernel => {},
             .firmware => |firmware| {
@@ -5909,11 +5909,11 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
                 hashInt(&hash, firmware.boot_timeout_seconds);
             },
         }
-        hashInt(&hash, @intFromEnum(vm.acceleration));
+        hashInt(&hash, @backingInt(vm.acceleration));
         hashBool(&hash, vm.acknowledge_software_emulation);
         hashInt(&hash, vm.memory_mib);
         hashInt(&hash, vm.vcpus);
-        hashInt(&hash, @intFromEnum(vm.network));
+        hashInt(&hash, @backingInt(vm.network));
         hashInt(&hash, vm.boot_timeout_seconds);
         hashOptionalString(&hash, vm.machine);
         hashOptionalString(&hash, vm.cpu);
@@ -5946,14 +5946,14 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
     hashInt(&hash, plan.operations.len);
     for (plan.operations) |operation| {
         hashInt(&hash, operation.id);
-        hashInt(&hash, @intFromEnum(operation.phase));
-        hashInt(&hash, @intFromEnum(operation.action));
+        hashInt(&hash, @backingInt(operation.phase));
+        hashInt(&hash, @backingInt(operation.action));
         hashInt(&hash, operation.depends_on.len);
         for (operation.depends_on) |dependency| hashInt(&hash, dependency);
     }
     hashInt(&hash, plan.required_capabilities.len);
     for (plan.required_capabilities) |capability| {
-        hashInt(&hash, @intFromEnum(capability.kind));
+        hashInt(&hash, @backingInt(capability.kind));
         hashString(&hash, capability.path);
         hashString(&hash, capability.related_path);
         hashString(&hash, capability.reason);
@@ -5966,11 +5966,11 @@ fn hashPlan(plan: ResolvedPlanData) Digest {
 fn hashOsCustomization(hash: *std.crypto.hash.sha2.Sha256, customization: OsCustomization) void {
     hashInt(hash, customization.filesystem.len);
     for (customization.filesystem) |operation| {
-        hashInt(hash, @intFromEnum(std.meta.activeTag(operation)));
+        hashInt(hash, @backingInt(std.meta.activeTag(operation)));
         switch (operation) {
             .put_file => |file| {
                 hashString(hash, file.path);
-                hashInt(hash, @intFromEnum(std.meta.activeTag(file.source)));
+                hashInt(hash, @backingInt(std.meta.activeTag(file.source)));
                 switch (file.source) {
                     .inline_bytes => |bytes| hashString(hash, bytes),
                     .host_path => |path| hashString(hash, path),
@@ -6018,7 +6018,7 @@ fn hashOsCustomization(hash: *std.crypto.hash.sha2.Sha256, customization: OsCust
         hashStrings(hash, user.secondary_groups);
         hashOptionalString(hash, user.home);
         hashString(hash, user.shell);
-        hashInt(hash, @intFromEnum(std.meta.activeTag(user.password)));
+        hashInt(hash, @backingInt(std.meta.activeTag(user.password)));
         switch (user.password) {
             .locked => {},
             .prehashed => |value| hashString(hash, value),
@@ -6029,7 +6029,7 @@ fn hashOsCustomization(hash: *std.crypto.hash.sha2.Sha256, customization: OsCust
     hashInt(hash, customization.services.len);
     for (customization.services) |service| {
         hashString(hash, service.name);
-        hashInt(hash, @intFromEnum(service.state));
+        hashInt(hash, @backingInt(service.state));
     }
     hashInt(hash, customization.kernel_modules.len);
     for (customization.kernel_modules) |module| {
@@ -6046,11 +6046,11 @@ fn hashExistingPathOperations(
 ) void {
     hashInt(hash, operations.len);
     for (operations) |operation| {
-        hashInt(hash, @intFromEnum(std.meta.activeTag(operation)));
+        hashInt(hash, @backingInt(std.meta.activeTag(operation)));
         switch (operation) {
             .overwrite_file => |overwrite| {
                 hashString(hash, overwrite.path);
-                hashInt(hash, @intFromEnum(std.meta.activeTag(overwrite.source)));
+                hashInt(hash, @backingInt(std.meta.activeTag(overwrite.source)));
                 switch (overwrite.source) {
                     .bytes => |bytes| hashString(hash, bytes),
                     .host_path => |path| hashString(hash, path),
@@ -6065,7 +6065,7 @@ fn hashExistingPathOperations(
 fn hashPackagePolicy(hash: *std.crypto.hash.sha2.Sha256, policy: PackagePolicy) void {
     hashInt(hash, policy.actions.len);
     for (policy.actions) |action| {
-        hashInt(hash, @intFromEnum(std.meta.activeTag(action)));
+        hashInt(hash, @backingInt(std.meta.activeTag(action)));
         switch (action) {
             .install => |packages| hashStrings(hash, packages),
             .remove => |packages| hashStrings(hash, packages),
@@ -6077,10 +6077,10 @@ fn hashPackagePolicy(hash: *std.crypto.hash.sha2.Sha256, policy: PackagePolicy) 
     for (policy.repositories) |repository| {
         hashString(hash, repository.id);
         hashStrings(hash, repository.urls);
-        hashInt(hash, @intFromEnum(repository.use));
+        hashInt(hash, @backingInt(repository.use));
         hashInt(hash, repository.trust.len);
         for (repository.trust) |trust| {
-            hashInt(hash, @intFromEnum(std.meta.activeTag(trust)));
+            hashInt(hash, @backingInt(std.meta.activeTag(trust)));
             switch (trust) {
                 .inline_bytes => |bytes| hashString(hash, bytes),
                 .host_path => |path| hashString(hash, path),
@@ -6091,11 +6091,11 @@ fn hashPackagePolicy(hash: *std.crypto.hash.sha2.Sha256, policy: PackagePolicy) 
         // covered a password would verify a guess of it offline.
         hashInt(hash, @intFromBool(repository.credential != null));
         if (repository.credential) |credential| {
-            hashInt(hash, @intFromEnum(std.meta.activeTag(credential)));
+            hashInt(hash, @backingInt(std.meta.activeTag(credential)));
             switch (credential) {
                 .basic => |basic| {
                     hashString(hash, basic.username);
-                    hashInt(hash, @intFromEnum(std.meta.activeTag(basic.password)));
+                    hashInt(hash, @backingInt(std.meta.activeTag(basic.password)));
                     switch (basic.password) {
                         .host_path => |path| hashString(hash, path),
                         .host_environment => |name| hashString(hash, name),
@@ -6104,7 +6104,7 @@ fn hashPackagePolicy(hash: *std.crypto.hash.sha2.Sha256, policy: PackagePolicy) 
             }
         }
     }
-    hashInt(hash, @intFromEnum(std.meta.activeTag(policy.cache)));
+    hashInt(hash, @backingInt(std.meta.activeTag(policy.cache)));
     // The directory, not only the mode. Two runs reading different caches
     // could install different bytes, so they are not one plan -- and hashing
     // it here rather than relying on the `package_cache` capability's path
@@ -6113,7 +6113,7 @@ fn hashPackagePolicy(hash: *std.crypto.hash.sha2.Sha256, policy: PackagePolicy) 
         .online => {},
         .online_populating, .cache_only => |path| hashString(hash, path),
     }
-    hashInt(hash, @intFromEnum(std.meta.activeTag(policy.lock)));
+    hashInt(hash, @backingInt(std.meta.activeTag(policy.lock)));
     switch (policy.lock) {
         .unlocked => {},
         .snapshot => |snapshot| hashString(hash, snapshot),
@@ -6126,7 +6126,7 @@ fn hashPackagePolicy(hash: *std.crypto.hash.sha2.Sha256, policy: PackagePolicy) 
             }
         },
     }
-    hashInt(hash, @intFromEnum(std.meta.activeTag(policy.resolver)));
+    hashInt(hash, @backingInt(std.meta.activeTag(policy.resolver)));
     switch (policy.resolver) {
         .host_resolver => {},
         .nameservers => |nameservers| hashStrings(hash, nameservers),
@@ -6137,8 +6137,8 @@ fn hashHooks(hash: *std.crypto.hash.sha2.Sha256, hooks: []const Hook) void {
     hashInt(hash, hooks.len);
     for (hooks) |hook| {
         hashString(hash, hook.name);
-        hashInt(hash, @intFromEnum(hook.phase));
-        hashInt(hash, @intFromEnum(std.meta.activeTag(hook.source)));
+        hashInt(hash, @backingInt(hook.phase));
+        hashInt(hash, @backingInt(std.meta.activeTag(hook.source)));
         switch (hook.source) {
             .inline_script => |script| hashString(hash, script),
             .host_path => |path| hashString(hash, path),
@@ -6148,13 +6148,13 @@ fn hashHooks(hash: *std.crypto.hash.sha2.Sha256, hooks: []const Hook) void {
 }
 
 fn hashInitramfsPolicy(hash: *std.crypto.hash.sha2.Sha256, policy: InitramfsPolicy) void {
-    hashInt(hash, @intFromEnum(std.meta.activeTag(policy)));
+    hashInt(hash, @backingInt(std.meta.activeTag(policy)));
     switch (policy) {
         .unchanged => {},
         .regenerate => |regenerate| {
             hashOptionalString(hash, regenerate.generator);
             hashStrings(hash, regenerate.kernels);
-            hashInt(hash, @intFromEnum(regenerate.no_installed_kernels));
+            hashInt(hash, @backingInt(regenerate.no_installed_kernels));
         },
         // Resolved away before a plan exists, so this never contributes to a
         // plan hash. Hashed distinctly anyway rather than asserted absent:
@@ -6164,18 +6164,18 @@ fn hashInitramfsPolicy(hash: *std.crypto.hash.sha2.Sha256, policy: InitramfsPoli
 }
 
 fn hashSelinuxPolicy(hash: *std.crypto.hash.sha2.Sha256, policy: SelinuxPolicy) void {
-    hashInt(hash, @intFromEnum(std.meta.activeTag(policy)));
+    hashInt(hash, @backingInt(std.meta.activeTag(policy)));
     switch (policy) {
         .unchanged, .relabel => {},
         .configure => |configure| {
             if (configure.mode) |mode| {
                 hash.update(&.{1});
-                hashInt(hash, @intFromEnum(mode));
+                hashInt(hash, @backingInt(mode));
             } else {
                 hash.update(&.{0});
             }
             hashOptionalString(hash, configure.policy);
-            hashInt(hash, @intFromEnum(configure.relabel));
+            hashInt(hash, @backingInt(configure.relabel));
         },
     }
 }
@@ -6184,12 +6184,12 @@ fn hashCrossArchitecturePolicy(
     hash: *std.crypto.hash.sha2.Sha256,
     policy: CrossArchitecturePolicy,
 ) void {
-    hashInt(hash, @intFromEnum(std.meta.activeTag(policy)));
+    hashInt(hash, @backingInt(std.meta.activeTag(policy)));
     switch (policy) {
         .reject => {},
         .runner => |runner| {
-            hashInt(hash, @intFromEnum(runner.kind));
-            hashInt(hash, @intFromEnum(runner.guest_architecture));
+            hashInt(hash, @backingInt(runner.kind));
+            hashInt(hash, @backingInt(runner.guest_architecture));
             hashOptionalString(hash, runner.command);
         },
     }
@@ -6199,7 +6199,7 @@ fn hashPartitionSelector(
     hash: *std.crypto.hash.sha2.Sha256,
     selector: PartitionSelector,
 ) void {
-    hashInt(hash, @intFromEnum(std.meta.activeTag(selector)));
+    hashInt(hash, @backingInt(std.meta.activeTag(selector)));
     switch (selector) {
         .gpt_index => |index| hashInt(hash, index),
         .mbr_index => |index| hashInt(hash, index),
@@ -6257,7 +6257,7 @@ fn hashStrings(hash: *std.crypto.hash.sha2.Sha256, values: []const []const u8) v
 }
 
 fn hashGeneralization(hash: *std.crypto.hash.sha2.Sha256, policy: GeneralizationPolicy) void {
-    hashInt(hash, @intFromEnum(std.meta.activeTag(policy)));
+    hashInt(hash, @backingInt(std.meta.activeTag(policy)));
     switch (policy) {
         .none => {},
         .azure => |options| {
@@ -10761,7 +10761,7 @@ fn hashDirectory(allocator: Allocator, io: Io, path: []const u8) !Digest {
     hash.update("miz-directory-hash-v1\x00");
     for (entries.items) |entry| {
         hashString(&hash, entry.path);
-        hashInt(&hash, @intFromEnum(entry.kind));
+        hashInt(&hash, @backingInt(entry.kind));
         if (entry.kind == .file) {
             const digest = try hashFile(io, dir, entry.path);
             hash.update(&digest.bytes);
@@ -10804,7 +10804,7 @@ fn validRequest() Request {
         .storage = .{ .fresh = .{} },
         .execution = .{ .workspace_path = "." },
         .reproducibility = .{
-            .seed = .{ .bytes = [_]u8{0x5A} ** 32 },
+            .seed = .{ .bytes = @as([32]u8, @splat(0x5A)) },
             .source_date_epoch = 1_735_689_600,
         },
     };
@@ -10836,7 +10836,7 @@ fn createCustomizeTestDisk(io: Io, path: []const u8, spool_path: []const u8) !vo
         .offset = @as(u64, customize_test_partition_first_lba) * mbr.sector_size,
         .length = @as(u64, customize_test_partition_sectors) * mbr.sector_size,
         .label = "customize-root",
-        .uuid = [_]u8{0x63} ** 16,
+        .uuid = @as([16]u8, @splat(0x63)),
         .timestamp = 1_735_689_600,
     });
 }
@@ -10886,7 +10886,7 @@ fn createCustomizeSelinuxTestDisk(
         .offset = @as(u64, customize_test_partition_first_lba) * mbr.sector_size,
         .length = @as(u64, customize_test_partition_sectors) * mbr.sector_size,
         .label = "customize-root",
-        .uuid = [_]u8{0x65} ** 16,
+        .uuid = @as([16]u8, @splat(0x65)),
         .timestamp = 1_735_689_600,
     });
 }
@@ -10940,7 +10940,7 @@ fn createCustomizeGptTestDisk(io: Io, path: []const u8, spool_path: []const u8) 
         .offset = placements[1].first_lba * gpt.sector_size,
         .length = (placements[1].last_lba - placements[1].first_lba + 1) * gpt.sector_size,
         .label = "customize-root",
-        .uuid = [_]u8{0x64} ** 16,
+        .uuid = @as([16]u8, @splat(0x64)),
         .timestamp = 1_735_689_600,
     });
 }
@@ -11014,7 +11014,7 @@ fn createCustomizeBootTestDisk(io: Io, path: []const u8, spool_path: []const u8)
         .offset = placements[1].first_lba * gpt.sector_size,
         .length = (placements[1].last_lba - placements[1].first_lba + 1) * gpt.sector_size,
         .label = "customize-root",
-        .uuid = [_]u8{0x65} ** 16,
+        .uuid = @as([16]u8, @splat(0x65)),
         .timestamp = 1_735_689_600,
     });
 }
@@ -11060,7 +11060,7 @@ fn validNativeEditRequest(
             .backend = .native_edit,
         },
         .reproducibility = .{
-            .seed = .{ .bytes = [_]u8{0xA7} ** 32 },
+            .seed = .{ .bytes = @as([32]u8, @splat(0xA7)) },
             .source_date_epoch = 1_735_689_600,
         },
     };
@@ -11483,7 +11483,7 @@ test "v2 native-fresh requests require the explicit adapter" {
         .storage = .{ .fresh = .{} },
         .execution = .{ .workspace_path = "." },
         .reproducibility = .{
-            .seed = .{ .bytes = [_]u8{0x19} ** 32 },
+            .seed = .{ .bytes = @as([32]u8, @splat(0x19)) },
             .source_date_epoch = 1_735_689_600,
         },
     };
@@ -12760,8 +12760,8 @@ test "a host-path container keeps the diagnostics, capabilities and plan it alwa
     try std.testing.expectEqual(@as(usize, 2), isolation_paths);
 }
 
-const test_registry_digest = "sha256:" ++ ("ab" ** 32);
-const test_registry_other_digest = "sha256:" ++ ("cd" ** 32);
+const test_registry_digest = "sha256:" ++ (repeatedBytes("ab", 32));
+const test_registry_other_digest = "sha256:" ++ (repeatedBytes("cd", 32));
 const test_registry_reference = "docker://registry.example.invalid/base/image@" ++ test_registry_digest;
 
 fn registryRequest(reference: []const u8) Request {
@@ -15288,7 +15288,7 @@ test "rebuild execution creates paths and emits strict tree provenance" {
     const rebuild_record = outcome.result.?.provenance.execution.preserved.?.rebuild.?;
     try std.testing.expectEqual(ext4.SourceProfile.miz_ext4_v1, rebuild_record.profile);
     try std.testing.expect(rebuild_record.reproducible);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0x63} ** 16), &rebuild_record.ext4_uuid.bytes);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0x63))), &rebuild_record.ext4_uuid.bytes);
     try std.testing.expectEqual(@as(usize, 1), rebuild_record.existing_operation_count);
     try std.testing.expectEqual(@as(usize, 1), rebuild_record.os_customization_count);
     try std.testing.expect(rebuild_record.final_node_count > rebuild_record.imported_node_count);
@@ -16103,10 +16103,10 @@ test "a repository credential is declared by reference and never by value" {
     // this module stringifies whole types by reflection, so an arm holding
     // bytes would be published by a public API by default. Adding one has to
     // fail here rather than in a customer's provenance document.
-    inline for (@typeInfo(CredentialSource).@"union".fields) |field| {
+    inline for (@typeInfo(CredentialSource).@"union".field_names) |field_name| {
         comptime std.debug.assert(
-            std.mem.eql(u8, field.name, "host_path") or
-                std.mem.eql(u8, field.name, "host_environment"),
+            std.mem.eql(u8, field_name, "host_path") or
+                std.mem.eql(u8, field_name, "host_environment"),
         );
     }
 
@@ -16124,11 +16124,11 @@ test "a repository credential is declared by reference and never by value" {
                 for (seen) |already| if (already == T) return false;
                 const next = seen ++ [_]type{T};
                 return switch (@typeInfo(T)) {
-                    .@"struct" => |info| for (info.fields) |field| {
-                        if (reachesCredential(field.type, next)) break true;
+                    .@"struct" => |info| for (info.field_types) |field_type| {
+                        if (reachesCredential(field_type, next)) break true;
                     } else false,
-                    .@"union" => |info| for (info.fields) |field| {
-                        if (reachesCredential(field.type, next)) break true;
+                    .@"union" => |info| for (info.field_types) |field_type| {
+                        if (reachesCredential(field_type, next)) break true;
                     } else false,
                     .optional => |info| reachesCredential(info.child, next),
                     .array => |info| reachesCredential(info.child, next),
@@ -16144,19 +16144,19 @@ test "a repository credential is declared by reference and never by value" {
         // reference. A third field, or a password that stopped being a
         // `CredentialSource`, would be published by `writeProvenanceJson`
         // without anyone having to add it there.
-        const basic = @typeInfo(BasicCredential).@"struct".fields;
-        std.debug.assert(basic.len == 2);
-        std.debug.assert(std.mem.eql(u8, basic[0].name, "username"));
-        std.debug.assert(basic[0].type == []const u8);
-        std.debug.assert(std.mem.eql(u8, basic[1].name, "password"));
-        std.debug.assert(basic[1].type == CredentialSource);
+        const basic = @typeInfo(BasicCredential).@"struct";
+        std.debug.assert(basic.field_names.len == 2);
+        std.debug.assert(std.mem.eql(u8, basic.field_names[0], "username"));
+        std.debug.assert(basic.field_types[0] == []const u8);
+        std.debug.assert(std.mem.eql(u8, basic.field_names[1], "password"));
+        std.debug.assert(basic.field_types[1] == CredentialSource);
         // And a reference is a name: every arm names something on the build
         // machine, so none of them can be holding the material itself.
-        for (@typeInfo(CredentialSource).@"union".fields) |arm| {
-            std.debug.assert(arm.type == []const u8);
+        for (@typeInfo(CredentialSource).@"union".field_types) |arm_type| {
+            std.debug.assert(arm_type == []const u8);
         }
         // `basic` is the only arm, so there is no second shape to check.
-        std.debug.assert(@typeInfo(RepositoryCredential).@"union".fields.len == 1);
+        std.debug.assert(@typeInfo(RepositoryCredential).@"union".field_names.len == 1);
     }
 
     const repositories = [_]PackageRepository{.{
@@ -16360,8 +16360,8 @@ test "a credential is refused where it could not be kept secret" {
 
 test "a hook is refused where it could not be run" {
     const runnable = "#!/bin/sh\nexit 0\n";
-    const oversized = "#!" ++ ("x" ** max_hook_script_bytes);
-    const long_argument = "x" ** (max_hook_argument_bytes + 1);
+    const oversized = "#!" ++ (&@as([max_hook_script_bytes:0]u8, @splat("x"[0])));
+    const long_argument = &@as([(max_hook_argument_bytes + 1):0]u8, @splat("x"[0]));
     var many_arguments: [max_hook_arguments + 1][]const u8 = undefined;
     for (&many_arguments) |*slot| slot.* = "x";
 
@@ -16730,7 +16730,7 @@ test "a digest survives the round trip a worker report makes" {
     // The unsafe backend's report crosses a process boundary as JSON, so a
     // digest that stringifies one way and parses another would arrive as a
     // different value or not at all.
-    const original = Digest{ .bytes = [_]u8{0xa5} ** 32 };
+    const original = Digest{ .bytes = @as([32]u8, @splat(0xa5)) };
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     var stringify: std.json.Stringify = .{ .writer = &output.writer };
@@ -16788,12 +16788,12 @@ test "the vm backend accepts a credential and carries it off the control documen
     // carries a user name and an index, and there is no field a password could
     // occupy. Asserted structurally, because a test that only checked the
     // rendered bytes would pass again the moment someone added one.
-    const fields = @typeInfo(vm_control.ControlCredential).@"union".fields;
+    const fields = @typeInfo(vm_control.ControlCredential).@"union".field_types;
     try std.testing.expectEqual(@as(usize, 1), fields.len);
-    const basic = @typeInfo(fields[0].type).@"struct".fields;
-    try std.testing.expectEqual(@as(usize, 2), basic.len);
-    try std.testing.expect(std.mem.eql(u8, basic[0].name, "username"));
-    try std.testing.expect(std.mem.eql(u8, basic[1].name, "password_index"));
+    const basic = @typeInfo(fields[0]).@"struct";
+    try std.testing.expectEqual(@as(usize, 2), basic.field_names.len);
+    try std.testing.expect(std.mem.eql(u8, basic.field_names[0], "username"));
+    try std.testing.expect(std.mem.eql(u8, basic.field_names[1], "password_index"));
 }
 
 test "no credential material reaches any document a run publishes" {
@@ -16890,7 +16890,7 @@ test "no credential material reaches any document a run publishes" {
                 .installed_packages = &.{},
                 .imported_trust_keys = &.{"gpg-pubkey-3fa2e4b1"},
                 .host_resolver = .{
-                    .sha256 = .{ .bytes = [_]u8{0x11} ** 32 },
+                    .sha256 = .{ .bytes = @as([32]u8, @splat(0x11)) },
                     .size = 42,
                 },
             };
@@ -17512,4 +17512,17 @@ test "UKI signing is refused where there would be nothing to sign" {
         }
         try std.testing.expect(named);
     }
+}
+
+fn repeatedBytes(comptime pattern: []const u8, comptime count: usize) *const [pattern.len * count:0]u8 {
+    return comptime blk: {
+        @setEvalBranchQuota(1000 + count * 2);
+        var bytes: [pattern.len * count:0]u8 = undefined;
+        for (0..count) |i| {
+            @memcpy(bytes[i * pattern.len ..][0..pattern.len], pattern);
+        }
+        bytes[bytes.len] = 0;
+        const result = bytes;
+        break :blk &result;
+    };
 }

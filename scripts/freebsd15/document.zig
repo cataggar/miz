@@ -322,10 +322,10 @@ test "validators carry the Python failure text" {
     defer arena.deinit();
     var context = testContext(arena.allocator());
 
-    try requireSha256(&context, "a" ** 64, "candidate SHA-256");
+    try requireSha256(&context, &@as([64:0]u8, @splat("a"[0])), "candidate SHA-256");
     try std.testing.expectError(
         error.Invalid,
-        requireSha256(&context, "A" ** 64, "candidate SHA-256"),
+        requireSha256(&context, &@as([64:0]u8, @splat("A"[0])), "candidate SHA-256"),
     );
     try std.testing.expectEqualStrings(
         "candidate SHA-256 must be a lowercase SHA-256",

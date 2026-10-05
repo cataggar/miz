@@ -207,7 +207,7 @@ pub const RecustomizeIsoReport = struct {
     boot_entries: []PreservedBootEntry,
     squashfs_compression: squashfs.WriterCompression,
     /// SHA-256 and byte length of the source ISO.
-    source_sha256: [32]u8 = [_]u8{0} ** 32,
+    source_sha256: [32]u8 = @as([32]u8, @splat(0)),
     source_size: u64 = 0,
     /// Volume metadata modeled from the source ISO.
     source_volume: iso9660.VolumeMetadata,
@@ -219,7 +219,7 @@ pub const RecustomizeIsoReport = struct {
     /// Total output ISO size in bytes (0 for a dry run).
     output_size: u64 = 0,
     /// SHA-256 of the published ISO (all zero for a dry run).
-    output_sha256: [32]u8 = [_]u8{0} ** 32,
+    output_sha256: [32]u8 = @as([32]u8, @splat(0)),
     limit_peaks: limits_mod.Peaks = .{},
 
     pub fn deinit(self: *RecustomizeIsoReport, allocator: std.mem.Allocator) void {
@@ -864,7 +864,7 @@ const testing = std.testing;
 
 const deterministic_fixture = Determinism{
     .filesystem_timestamp = 1_700_000_000,
-    .root_filesystem_uuid = [_]u8{0x22} ** 16,
+    .root_filesystem_uuid = @as([16]u8, @splat(0x22)),
 };
 
 const FixtureNode = struct {
@@ -1014,7 +1014,7 @@ fn buildTar(allocator: std.mem.Allocator, entries: []const TarEntry) ![]u8 {
     var out = std.array_list.Managed(u8).init(allocator);
     errdefer out.deinit();
     for (entries) |entry| {
-        var header = [_]u8{0} ** 512;
+        var header = @as([512]u8, @splat(0));
         @memcpy(header[0..entry.path.len], entry.path);
         testWriteOctal(header[100..108], 0o644);
         testWriteOctal(header[108..116], 0);
@@ -1460,9 +1460,9 @@ test "recustomize-iso preserves an exact UEFI-validation + BIOS-section catalog 
     // could never emit: UEFI is the validation/default entry, BIOS is a section,
     // and both the validation entry and the section header carry non-empty id
     // strings.
-    var validation_id = [_]u8{0} ** 24;
+    var validation_id = @as([24]u8, @splat(0));
     @memcpy(validation_id[0.."MIZ-UEFI-VALID".len], "MIZ-UEFI-VALID");
-    var section_id = [_]u8{0} ** 28;
+    var section_id = @as([28]u8, @splat(0));
     @memcpy(section_id[0.."MIZ-BIOS-SECTION".len], "MIZ-BIOS-SECTION");
     try writeSourceIsoWithCatalog(allocator, io, iso_path, squashfs_bytes, .{
         .validation_platform = iso9660.boot_platform_uefi,
@@ -1931,7 +1931,7 @@ test "recustomize-iso verifies output volume metadata on the scratch ISO before 
     {
         const file = try Io.Dir.cwd().openFile(io, scratch_path, .{ .mode = .read_write });
         defer file.close(io);
-        var mutated = [_]u8{' '} ** 32;
+        var mutated = @as([32]u8, @splat(' '));
         @memcpy(mutated[0..10], "MUTATEDVOL");
         try file.writePositionalAll(io, &mutated, 16 * 2048 + 40);
     }

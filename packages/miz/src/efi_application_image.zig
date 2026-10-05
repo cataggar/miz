@@ -810,7 +810,7 @@ fn derivedUuid(seed: [Sha256.digest_length]u8, label: []const u8) [16]u8 {
 }
 
 fn makeTestEfi(machine: u16, subsystem: u16) [512]u8 {
-    var bytes: [512]u8 = [_]u8{0} ** 512;
+    var bytes: [512]u8 = @as([512]u8, @splat(0));
     bytes[0..2].* = "MZ".*;
     std.mem.writeInt(u32, bytes[0x3c..0x40], 0x80, .little);
     bytes[0x80..0x84].* = "PE\x00\x00".*;

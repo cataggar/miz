@@ -27,7 +27,7 @@ const miz = @import("miz");
 pub const Builder = support.Builder;
 pub const Diagnostic = support.Diagnostic;
 
-pub const source_commit = "a" ** 40;
+pub const source_commit = &@as([40:0]u8, @splat("a"[0]));
 pub const certificate_der_base64 =
     "MIIC2jCCAcKgAwIBAgICBKEwDQYJKoZIhvcNAQELBQAwMDEgMB4GA1UEAwwXbWl6IG5hdGl2ZSBsb2NhbCBzaWduZXIxDDAKBgNV" ++
     "BAoMA21pejAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEwMDAwMDBaMDAxIDAeBgNVBAMMF21peiBuYXRpdmUgbG9jYWwgc2lnbmVy" ++
@@ -39,7 +39,7 @@ pub const certificate_der_base64 =
     "+3bbchG+eakZn/w1LA6XsayOIsS9+VGSV4szcKhOsraPPuK2SkVtrzbvqsSr5phZb1P8BUE91YjZDsSlVWUYqUodRxn1gH0AbFrZ" ++
     "w9ZQ9lenhbx4WZaeTUiS/kQNHx/xs11pvWOozhaCoyAV2VXsAqqB92laSzqVLz1nm6Z16PD14VrycusNZdO/sQZwqrjLvRjmg24T" ++
     "YoUWAtRNPDc2F2mb/htcZFimdufWME5ZPEP54OeUJNFmQUvxScSGGEAHuU1kQxca1IqEU0FiJXPCy6o=";
-pub const signing_certificate_sha256 = "4" ** 64;
+pub const signing_certificate_sha256 = &@as([64:0]u8, @splat("4"[0]));
 pub const operation_id = "00000000-0000-4000-8000-000000000001";
 /// Two aligned MiB: large enough to exercise the VHD footer geometry, small
 /// enough that every fixture is written in one go.
@@ -532,8 +532,8 @@ fn writeDebzLockFile(
         \\"digest_sha256": "{s}"}}
     , .{
         source_architecture,
-        "1" ** 64,
-        "2" ** 64,
+        &@as([64:0]u8, @splat("1"[0])),
+        &@as([64:0]u8, @splat("2"[0])),
         package_records,
         digest,
     });
@@ -656,7 +656,7 @@ fn writeProvenance(
         .data = manifest_text,
     });
     const manifest_digest = support.digest.hexBytes(manifest_text);
-    const image_digest = "5" ** 64;
+    const image_digest = &@as([64:0]u8, @splat("5"[0]));
 
     const checksums = try std.fmt.allocPrint(
         allocator,
@@ -814,7 +814,7 @@ fn writeProvenance(
             ),
         );
         try builder.putString(&initramfs, "kernel_release", fixture_kernel_release);
-        try builder.putString(&initramfs, "sha256", "6" ** 64);
+        try builder.putString(&initramfs, "sha256", &@as([64:0]u8, @splat("6"[0])));
         try builder.putInteger(&initramfs, "bytes", 32 * 1024 * 1024);
         var build_stage = builder.object();
         try builder.putString(&build_stage, "purpose", "initramfs-generation");
@@ -847,7 +847,7 @@ fn writeProvenance(
     try builder.putString(&document, "architecture", entry.architecture);
     try builder.putString(&document, "release", "26.04");
     try builder.put(&document, "snapshot", .{ .object = snapshot });
-    try builder.putString(&document, "canonical_key_fingerprint", "c" ** 40);
+    try builder.putString(&document, "canonical_key_fingerprint", &@as([40:0]u8, @splat("c"[0])));
     try builder.put(&document, "sha256sums_signature_verified", .{ .bool = true });
     try builder.put(
         &document,
@@ -1325,9 +1325,9 @@ fn writeSigning(
         encoded,
         options.signing_certificate_sha256,
         fallback,
-        "2" ** 64,
-        "3" ** 64,
-        "3" ** 64,
+        &@as([64:0]u8, @splat("2"[0])),
+        &@as([64:0]u8, @splat("3"[0])),
+        &@as([64:0]u8, @splat("3"[0])),
         operation_id,
         options.signing_certificate_sha256,
     });

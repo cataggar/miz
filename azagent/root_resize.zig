@@ -275,8 +275,8 @@ fn resizeKernelPartition(disk_file: std.Io.File, partition_number: u32, extent: 
         .start = std.math.cast(i64, extent.start_bytes) orelse return error.PartitionExtentTooLarge,
         .length = std.math.cast(i64, extent.length_bytes) orelse return error.PartitionExtentTooLarge,
         .pno = std.math.cast(c_int, partition_number) orelse return error.PartitionNumberTooLarge,
-        .devname = [_]u8{0} ** blkpg_name_len,
-        .volname = [_]u8{0} ** blkpg_name_len,
+        .devname = @as([blkpg_name_len]u8, @splat(0)),
+        .volname = @as([blkpg_name_len]u8, @splat(0)),
     };
     var arg = BlkpgIoctlArg{
         .op = blkpg_resize_partition,
@@ -412,9 +412,9 @@ pub fn setup(options: SetupOptions) !void {
     defer root.deinit(options.allocator);
 
     var disk_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const disk_path = try std.fmt.bufPrintZ(&disk_path_buf, "/dev/{s}", .{root.disk_name});
+    const disk_path = try std.fmt.bufPrintSentinel(&disk_path_buf, "/dev/{s}", .{root.disk_name}, 0);
     var part_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const part_path = try std.fmt.bufPrintZ(&part_path_buf, "/dev/{s}", .{root.partition_name});
+    const part_path = try std.fmt.bufPrintSentinel(&part_path_buf, "/dev/{s}", .{root.partition_name}, 0);
 
     var disk_file = try std.Io.Dir.cwd().openFile(options.io, disk_path, .{ .mode = .read_write });
     defer disk_file.close(options.io);
@@ -475,7 +475,7 @@ test "growMbrRoot preserves BIOS bootstrap code and returns an extent on retry" 
 
     var after_sector0: [mbr.sector_size]u8 = undefined;
     _ = try img.pread(io, &after_sector0, 0);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xA5} ** 0x1B8), after_sector0[0..0x1B8]);
+    try std.testing.expectEqualSlices(u8, &(@as([0x1B8]u8, @splat(0xA5))), after_sector0[0..0x1B8]);
 
     const retry_extent = try growMbrRoot(io, &img, &after_sector0, try mbr.Mbr.decode(&after_sector0), 1);
     try std.testing.expectEqual(first_extent, retry_extent);
@@ -519,7 +519,7 @@ fn remapGptEntriesForTest(
         );
     }
 
-    const array_crc = std.hash.crc.Crc32.hash(remapped);
+    const array_crc = std.hash.Crc32.hash(remapped);
     var primary = parsed.header;
     primary.partition_array_crc32 = array_crc;
 

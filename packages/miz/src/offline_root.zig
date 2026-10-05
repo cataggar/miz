@@ -374,7 +374,7 @@ pub const Executor = struct {
         const clone_flags: u32 = @as(u32, linux.CLONE.NEWNS) |
             @as(u32, linux.CLONE.NEWNET) |
             @as(u32, linux.CLONE.NEWPID) |
-            @as(u32, @intFromEnum(linux.SIG.CHLD));
+            @as(u32, @backingInt(linux.SIG.CHLD));
         const clone_rc = linux.clone(
             namespaceChild,
             stack_top,
@@ -559,7 +559,7 @@ const guest_devices = [_]DeviceNode{
 
 fn dupeArgvZ(arena: Allocator, argv: []const []const u8) ![:null]const ?[*:0]const u8 {
     const list = try arena.allocSentinel(?[*:0]const u8, argv.len, null);
-    for (argv, 0..) |value, index| list[index] = (try arena.dupeZ(u8, value)).ptr;
+    for (argv, 0..) |value, index| list[index] = (try arena.dupeSentinel(u8, value, 0)).ptr;
     return list;
 }
 
@@ -573,7 +573,7 @@ fn buildGuestEnvironment(arena: Allocator) ![:null]const ?[*:0]const u8 {
         "DEBIAN_FRONTEND=noninteractive",
     };
     const list = try arena.allocSentinel(?[*:0]const u8, entries.len, null);
-    inline for (entries, 0..) |value, index| list[index] = (try arena.dupeZ(u8, value)).ptr;
+    inline for (entries, 0..) |value, index| list[index] = (try arena.dupeSentinel(u8, value, 0)).ptr;
     return list;
 }
 
@@ -601,7 +601,7 @@ fn namespaceChild(arg: usize) callconv(.c) u8 {
 
     // If the supervising parent dies, take the whole namespace down with it.
     // This replaces `unshare --kill-child`.
-    _ = linux.prctl(@intFromEnum(linux.PR.SET_PDEATHSIG), @as(usize, @intFromEnum(linux.SIG.KILL)), 0, 0, 0);
+    _ = linux.prctl(@backingInt(linux.PR.SET_PDEATHSIG), @as(usize, @backingInt(linux.SIG.KILL)), 0, 0, 0);
     // Lead a fresh session/process group so the parent can signal the whole
     // tree at once (previously provided by `setsid`).
     _ = linux.setsid();
@@ -721,13 +721,13 @@ fn superviseGuest(guest_pid: i32, timeout_ms: u64, kill_grace_ms: u64) u8 {
     var terminate_at: u64 = 0;
     while (true) {
         while (true) {
-            var status: u32 = undefined;
+            var status: i32 = undefined;
             const rc = linux.waitpid(-1, &status, linux.W.NOHANG);
             switch (linux.errno(rc)) {
                 .SUCCESS => {
                     if (rc == 0) break;
                     if (@as(i32, @intCast(rc)) == guest_pid) {
-                        guest_status = status;
+                        guest_status = @bitCast(status);
                         guest_reaped = true;
                     }
                 },
@@ -759,10 +759,10 @@ fn superviseGuest(guest_pid: i32, timeout_ms: u64, kill_grace_ms: u64) u8 {
 /// clears the ambient set, empties the bounding set, and zeroes the permitted,
 /// effective and inheritable sets so the exec starts with no capabilities.
 fn dropAllCapabilities() void {
-    _ = linux.prctl(@intFromEnum(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+    _ = linux.prctl(@backingInt(linux.PR.CAP_AMBIENT), linux.PR.CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
     var capability: usize = 0;
     while (capability <= linux.CAP.LAST_CAP) : (capability += 1) {
-        _ = linux.prctl(@intFromEnum(linux.PR.CAPBSET_DROP), capability, 0, 0, 0);
+        _ = linux.prctl(@backingInt(linux.PR.CAPBSET_DROP), capability, 0, 0, 0);
     }
     var header = linux.cap_user_header_t{ .version = linux_capability_version_3, .pid = 0 };
     const data = [2]linux.cap_user_data_t{
@@ -834,7 +834,7 @@ fn signalChildTree(pid: i32) void {
 
 fn reapChild(pid: i32) void {
     if (comptime builtin.os.tag != .linux) return;
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     while (true) {
         const rc = linux.waitpid(pid, &status, 0);
         if (linux.errno(rc) == .INTR) continue;
@@ -892,11 +892,11 @@ fn waitpidFallback(io: Io, pid: i32, deadline: Io.Timeout) !std.process.Child.Te
     while (true) {
         const remaining = deadline.toDurationFromNow(io) orelse return reapTerm(pid);
         if (remaining.raw.nanoseconds <= 0) return error.Timeout;
-        var status: u32 = undefined;
+        var status: i32 = undefined;
         const result = linux.waitpid(pid, &status, linux.W.NOHANG);
         switch (linux.errno(result)) {
             .SUCCESS => {
-                if (result != 0) return waitStatusTerm(status);
+                if (result != 0) return waitStatusTerm(@bitCast(status));
             },
             .INTR => continue,
             else => return error.WaitpidFailed,
@@ -910,20 +910,20 @@ fn waitpidFallback(io: Io, pid: i32, deadline: Io.Timeout) !std.process.Child.Te
 }
 
 fn reapTerm(pid: i32) std.process.Child.Term {
-    var status: u32 = undefined;
+    var status: i32 = undefined;
     while (true) {
         const rc = linux.waitpid(pid, &status, 0);
         if (linux.errno(rc) == .INTR) continue;
         break;
     }
-    return waitStatusTerm(status);
+    return waitStatusTerm(@bitCast(status));
 }
 
 fn waitStatusTerm(status: u32) std.process.Child.Term {
     const signal = status & 0x7f;
     if (signal == 0) return .{ .exited = @intCast((status >> 8) & 0xff) };
-    if (signal == 0x7f) return .{ .stopped = @enumFromInt(@as(u8, @intCast((status >> 8) & 0xff))) };
-    return .{ .signal = @enumFromInt(@as(u8, @intCast(signal))) };
+    if (signal == 0x7f) return .{ .stopped = @fromBackingInt(@intCast(@as(u8, @intCast((status >> 8) & 0xff)))) };
+    return .{ .signal = @fromBackingInt(@intCast(@as(u8, @intCast(signal)))) };
 }
 
 pub const Root = struct {
@@ -1635,7 +1635,7 @@ const FakeRunner = struct {
 };
 
 fn fakePidfdErrno(errno: std.os.linux.E) usize {
-    return @bitCast(-@as(isize, @intCast(@intFromEnum(errno))));
+    return @bitCast(-@as(isize, @intCast(@backingInt(errno))));
 }
 
 fn fakePidfdEnosys(_: i32) usize {

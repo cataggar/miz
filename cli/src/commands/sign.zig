@@ -933,7 +933,7 @@ fn tokenHttpStatusError(
     request_kind: TokenHttpRequest,
     status: std.http.Status,
 ) anyerror {
-    const status_code = @intFromEnum(status);
+    const status_code = @backingInt(status);
     return switch (request_kind) {
         .github_oidc => switch (status_code) {
             400 => error.GithubOidcBadRequest,
@@ -1491,7 +1491,7 @@ fn runMockArtifactSigningScenario(
     io: Io,
     scenario: MockArtifactSigningScenario,
 ) !ArtifactSigningResult {
-    const port: u16 = 28910 + @as(u16, @intFromEnum(scenario));
+    const port: u16 = 28910 + @as(u16, @backingInt(scenario));
     var listen_address: std.Io.net.IpAddress = .{
         .ip4 = .{
             .bytes = .{ 127, 0, 0, 1 },
@@ -1517,7 +1517,7 @@ fn runMockArtifactSigningScenario(
         "00000000-0000-4000-8000-000000000000",
     );
     defer allocator.free(poll_url);
-    const signature = [_]u8{0x5a} ** 256;
+    const signature = @as([256]u8, @splat(0x5a));
     const signature_text = try allocator.alloc(
         u8,
         std.base64.standard.Encoder.calcSize(signature.len),
@@ -1556,7 +1556,7 @@ fn runMockArtifactSigningScenario(
         &client,
         config,
         "test-token",
-        [_]u8{0xa5} ** 32,
+        @as([32]u8, @splat(0xa5)),
         .{ .max_attempts = 2, .sleep = false },
     ) catch |err| {
         thread.join();

@@ -171,7 +171,7 @@ pub const Footer = struct {
     /// Serializes to the on-disk, big-endian, 512-byte footer, with the
     /// checksum field computed and filled in.
     pub fn encode(self: Footer) [footer_size]u8 {
-        var buf: [footer_size]u8 = [_]u8{0} ** footer_size;
+        var buf: [footer_size]u8 = @as([footer_size]u8, @splat(0));
 
         var w = ByteWriter{ .buf = &buf };
         w.bytes(&cookie_conectix);
@@ -187,7 +187,7 @@ pub const Footer = struct {
         w.putU16(self.geometry.cylinders);
         w.putU8(self.geometry.heads);
         w.putU8(self.geometry.sectors_per_track);
-        w.putU32(@intFromEnum(self.disk_type));
+        w.putU32(@backingInt(self.disk_type));
         w.putU32(0); // checksum placeholder, filled below
         w.bytes(&self.unique_id);
         w.putU8(self.saved_state);
@@ -225,7 +225,7 @@ pub const Footer = struct {
         const cylinders = r.getU16();
         const heads = r.getU8();
         const sectors_per_track = r.getU8();
-        const disk_type: DiskType = @enumFromInt(r.getU32());
+        const disk_type: DiskType = @fromBackingInt(@intCast(r.getU32()));
         r.skip(4); // checksum
         const unique_id = r.bytes(16).*;
         const saved_state = r.getU8();
@@ -279,12 +279,12 @@ pub const DynamicHeader = struct {
     header_version: u32 = 0x0001_0000,
     max_table_entries: u32,
     block_size: u32 = default_block_size,
-    parent_unique_id: [16]u8 = [_]u8{0} ** 16,
+    parent_unique_id: [16]u8 = @as([16]u8, @splat(0)),
     parent_timestamp: u32 = 0,
-    parent_unicode_name: [512]u8 = [_]u8{0} ** 512,
+    parent_unicode_name: [512]u8 = @as([512]u8, @splat(0)),
 
     pub fn encode(self: DynamicHeader) [dynamic_header_size]u8 {
-        var buf: [dynamic_header_size]u8 = [_]u8{0} ** dynamic_header_size;
+        var buf: [dynamic_header_size]u8 = @as([dynamic_header_size]u8, @splat(0));
 
         var w = ByteWriter{ .buf = &buf };
         w.bytes(&cookie_cxsparse);
@@ -425,7 +425,7 @@ test "calculateGeometry matches known QEMU vectors" {
 
 test "Footer encode/decode round-trip" {
     const size: u64 = 64 * 1024 * 1024; // 64 MiB
-    const footer = Footer.forFixedDisk(size, [_]u8{0xAB} ** 16, timestamp_base + 1000);
+    const footer = Footer.forFixedDisk(size, @as([16]u8, @splat(0xAB)), timestamp_base + 1000);
     const encoded = footer.encode();
 
     try std.testing.expectEqualSlices(u8, &cookie_conectix, encoded[0..8]);
@@ -442,19 +442,19 @@ test "Footer encode/decode round-trip" {
 }
 
 test "Footer.decode rejects bad cookie" {
-    var buf = [_]u8{0} ** footer_size;
+    var buf = @as([footer_size]u8, @splat(0));
     try std.testing.expectError(error.BadCookie, Footer.decode(&buf));
 }
 
 test "Footer.decode rejects corrupted checksum" {
-    const footer = Footer.forFixedDisk(1024 * 1024, [_]u8{1} ** 16, timestamp_base);
+    const footer = Footer.forFixedDisk(1024 * 1024, @as([16]u8, @splat(1)), timestamp_base);
     var encoded = footer.encode();
     encoded[100] ^= 0xFF; // corrupt a reserved byte
     try std.testing.expectError(error.BadChecksum, Footer.decode(&encoded));
 }
 
 test "Footer.virtualSize uses CHS geometry for legacy qemu creator app" {
-    var footer = Footer.forFixedDisk(4 * 1024 * 1024, [_]u8{3} ** 16, timestamp_base);
+    var footer = Footer.forFixedDisk(4 * 1024 * 1024, @as([16]u8, @splat(3)), timestamp_base);
     footer.creator_application = "qemu".*;
     footer.current_size = 8 * 1024 * 1024;
     footer.geometry = .{
@@ -471,7 +471,7 @@ test "Footer.virtualSize uses CHS geometry for legacy qemu creator app" {
 }
 
 test "Footer.virtualSize defaults to current_size for unknown creator app" {
-    var footer = Footer.forFixedDisk(4 * 1024 * 1024, [_]u8{4} ** 16, timestamp_base);
+    var footer = Footer.forFixedDisk(4 * 1024 * 1024, @as([16]u8, @splat(4)), timestamp_base);
     footer.creator_application = .{ 0, 0, 0, 0 };
     footer.current_size = 8 * 1024 * 1024;
     footer.geometry = .{
@@ -511,7 +511,7 @@ test "DynamicHeader encode/decode round-trip" {
 }
 
 test "DynamicHeader.decode rejects bad cookie" {
-    var buf = [_]u8{0} ** dynamic_header_size;
+    var buf = @as([dynamic_header_size]u8, @splat(0));
     try std.testing.expectError(error.BadCookie, DynamicHeader.decode(&buf));
 }
 
@@ -523,7 +523,7 @@ test "DynamicHeader.decode rejects corrupted checksum" {
 }
 
 test "Footer.forDynamicDisk points data_offset at the dynamic header" {
-    const footer = Footer.forDynamicDisk(4 * 1024 * 1024, footer_size, [_]u8{2} ** 16, timestamp_base);
+    const footer = Footer.forDynamicDisk(4 * 1024 * 1024, footer_size, @as([16]u8, @splat(2)), timestamp_base);
     try std.testing.expectEqual(DiskType.dynamic, footer.disk_type);
     try std.testing.expectEqual(@as(u64, footer_size), footer.data_offset);
 }

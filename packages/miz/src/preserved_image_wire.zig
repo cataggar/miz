@@ -224,9 +224,9 @@ pub const PackageCachePolicy = union(enum) {
                 inline .string, .allocated_string => |field| field,
                 else => return error.UnexpectedToken,
             };
-            inline for (@typeInfo(PackageCachePolicy).@"union".fields) |field| {
-                if (std.mem.eql(u8, name, field.name)) {
-                    break :blk @field(std.meta.Tag(PackageCachePolicy), field.name);
+            inline for (@typeInfo(PackageCachePolicy).@"union".field_names) |field_name| {
+                if (std.mem.eql(u8, name, field_name)) {
+                    break :blk @field(std.meta.Tag(PackageCachePolicy), field_name);
                 }
             }
             return error.UnknownField;
@@ -820,7 +820,7 @@ test "a logical volume selector needs a volume name and only exists from v3" {
     }, 0));
     try std.testing.expectError(error.InvalidPartitionSelector, validate(.{
         .root_partition = .{ .logical_volume = .{
-            .logical_volume = "x" ** (lvm.max_name_len + 1),
+            .logical_volume = &@as([(lvm.max_name_len + 1):0]u8, @splat("x"[0])),
         } },
     }, 0));
     // v2 predates logical volumes, so a v2 configuration is held to exactly

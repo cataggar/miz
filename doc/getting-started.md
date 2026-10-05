@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Zig **0.16.0** or later.
+- Zig **0.17.0** or later.
 - `zig build` compiles the pinned static libzstd dependency from
   `build.zig.zon`; no system libzstd development package is needed for miz's
   zstd wrapper.

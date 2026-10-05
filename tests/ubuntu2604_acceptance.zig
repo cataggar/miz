@@ -2873,7 +2873,7 @@ fn serialContains(
         else => return err,
     };
     defer allocator.free(serial);
-    return std.ascii.indexOfIgnoreCase(serial, marker) != null;
+    return std.ascii.findIgnoreCase(serial, marker) != null;
 }
 
 fn waitForSerialMarker(
@@ -4158,7 +4158,7 @@ test "Ubuntu 26.04 acceptance flavor policy preserves full and isolates core" {
     try std.testing.expect(!hasContract(full.contracts(), "dma-heap-device"));
     try std.testing.expect(!hasContract(full.contracts(), "runtime-contract"));
     for (core.contracts()) |contract| {
-        try std.testing.expect(std.ascii.indexOfIgnoreCase(contract, "android") == null);
+        try std.testing.expect(std.ascii.findIgnoreCase(contract, "android") == null);
     }
 }
 
@@ -4231,7 +4231,7 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
     // preserved-geometry flavor it has to be the declared one.
     const fixture_virtual_size: u64 = 5 * gib;
     var identity: AcceptanceResultIdentity = .{
-        .source_commit = try allocator.dupe(u8, "a" ** 40),
+        .source_commit = try allocator.dupe(u8, &@as([40:0]u8, @splat("a"[0]))),
         .candidate_run_id = try allocator.dupe(u8, "90"),
         .candidate_run_attempt = try allocator.dupe(u8, "1"),
         .run_id = try allocator.dupe(u8, "100"),
@@ -4301,7 +4301,7 @@ test "Ubuntu 26.04 full acceptance result binds candidate and workflow identity"
         "Ubuntu-26.04-aarch64.qcow2",
         result.get("asset_name").?.string,
     );
-    try std.testing.expectEqualStrings("a" ** 40, result.get("source_commit").?.string);
+    try std.testing.expectEqualStrings(&@as([40:0]u8, @splat("a"[0])), result.get("source_commit").?.string);
     try std.testing.expectEqualStrings("success", result.get("status").?.string);
     const candidate_workflow = result.get("candidate_workflow").?.object;
     try std.testing.expectEqualStrings(
@@ -4348,7 +4348,7 @@ test "a core acceptance result publishes the calculated size it booted" {
     try std.testing.expect(candidate.calculatesGeometry());
 
     var identity: AcceptanceResultIdentity = .{
-        .source_commit = try allocator.dupe(u8, "b" ** 40),
+        .source_commit = try allocator.dupe(u8, &@as([40:0]u8, @splat("b"[0]))),
         .candidate_run_id = try allocator.dupe(u8, "91"),
         .candidate_run_attempt = try allocator.dupe(u8, "1"),
         .run_id = try allocator.dupe(u8, "101"),
@@ -4544,7 +4544,7 @@ test "EFI db parser finds the exact enrolled DER certificate" {
         0x87, 0xb5, 0xab, 0x15, 0x5c, 0x2b, 0xf0, 0x72,
     };
     const certificate = "DER certificate";
-    var variable = [_]u8{0} ** (28 + 16 + certificate.len);
+    var variable = @as([(28 + 16 + certificate.len)]u8, @splat(0));
     const list_offset = 0;
     @memcpy(variable[list_offset..][0..efi_cert_x509_guid.len], &efi_cert_x509_guid);
     std.mem.writeInt(
@@ -4565,7 +4565,7 @@ test "EFI db parser finds the exact enrolled DER certificate" {
     try std.testing.expect(efiDbContainsCertificate(&variable, digest));
     try std.testing.expect(!efiDbContainsCertificate(
         &variable,
-        [_]u8{0xff} ** 32,
+        @as([32]u8, @splat(0xff)),
     ));
     try std.testing.expect(!efiDbContainsCertificate(variable[0 .. variable.len - 1], digest));
     variable[list_offset] = 0;
@@ -4790,7 +4790,7 @@ test "a probe report carries the enrolled signing certificate through to the db 
 
     const digest = miz.artifact_pipeline.sha256Bytes(certificate);
     try std.testing.expect(efiDbContainsCertificate(decoded, digest));
-    try std.testing.expect(!efiDbContainsCertificate(decoded, [_]u8{0xff} ** 32));
+    try std.testing.expect(!efiDbContainsCertificate(decoded, @as([32]u8, @splat(0xff))));
 }
 
 test "signed Binder module script pins the module tree and requires evidence" {
@@ -4916,7 +4916,7 @@ test "guest cloud-init verification runs no interpreter in the guest" {
     // may appear in either script, and the shell variable that used to carry
     // the guest-side verdict is gone.
     for ([_][]const u8{ full_checks, cloud_init_status_command }) |script| {
-        try std.testing.expect(std.ascii.indexOfIgnoreCase(script, interpreter) == null);
+        try std.testing.expect(std.ascii.findIgnoreCase(script, interpreter) == null);
         try std.testing.expect(std.mem.indexOf(u8, script, "import ") == null);
     }
     try std.testing.expect(std.mem.indexOf(u8, full_checks, "cloud_init_status") == null);
@@ -5058,9 +5058,7 @@ test "rejected cloud-init status documents are reported trimmed and bounded" {
 }
 
 test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    errdefer |err| {
+    finalizedQcow2Acceptance() catch |err| {
         std.debug.print(
             "Ubuntu 26.04 same-architecture QEMU acceptance failed: {s}\n",
             .{@errorName(err)},
@@ -5068,7 +5066,13 @@ test "Ubuntu 26.04 finalized QCOW2 boots, provisions, restarts, and powers off" 
         if (@errorReturnTrace()) |trace| {
             std.debug.dumpErrorReturnTrace(trace);
         }
-    }
+        return err;
+    };
+}
+
+fn finalizedQcow2Acceptance() !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
     const candidate = try selectedCandidate();
 
     const image_path = try requireImageAlloc(allocator, io, candidate);

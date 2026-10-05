@@ -222,7 +222,7 @@ pub fn execute(
             .backend_failed,
             "embedded debz package-family transaction failed",
             disposition,
-            @intFromEnum(backend_result.exit_status),
+            @backingInt(backend_result.exit_status),
         );
     }
 

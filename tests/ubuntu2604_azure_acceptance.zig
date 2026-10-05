@@ -1183,7 +1183,7 @@ test "azure-uefi-db accepts a probe report carrying the enrolled certificate" {
         "--report",
         path,
         "--certificate-sha256",
-        "0" ** 64,
+        &@as([64:0]u8, @splat("0"[0])),
     });
     defer rejected.deinit(allocator);
     try std.testing.expect(!rejected.succeeded());

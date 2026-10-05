@@ -266,11 +266,11 @@ test "azure acceptance uses the current harness with the accepted-source tool" {
     try expectContains(
         manifest,
         "git+https://github.com/cataggar/bzip2z" ++
-            "#05f6d4e34df2da2729490aee2a5bbe43b5ce94f6",
+            "#0f68f7ae3a42b1ef9e4ab00291f139700932f233",
     );
     try expectContains(
         manifest,
-        "bzip2z-0.1.0-m5NdlhNXCwC5mTHdg2pgMytHjahuQP6nImdle78Pb9kO",
+        "bzip2z-0.1.0-m5Ndli7cCwDhpSA7JvF7_pBHYju1ZMAnW-Y-39NKdzEH",
     );
     try expectAbsent(manifest, "mirrors.kernel.org/sourceware/bzip2");
 
@@ -289,7 +289,7 @@ test "build manifest dependencies are git-pinned to a full commit" {
     const manifest = try readTracked(allocator, std.testing.io, "build.zig.zon");
     defer allocator.free(manifest);
 
-    const names = [_][]const u8{ "bzip2z", "tls", "debz", "rpmz", "zstd" };
+    const names = [_][]const u8{ "bzip2z", "tls", "debz", "rpmz", "zstd", "translate_c" };
     try expectCount(manifest, ".url = \"git+https://", names.len);
     for (names) |name| {
         const declaration = try std.fmt.allocPrint(allocator, ".{s} = .{{", .{name});
@@ -313,7 +313,7 @@ test "build manifest dependencies are git-pinned to a full commit" {
     try expectContains(
         manifest,
         "git+https://github.com/cataggar/zstd" ++
-            "#45b6dfcd9d0ffdba99fb653c66b233179b9f7229",
+            "#71502da18ccdacac0c2049c033dedbbf25a40b93",
     );
 
     const build = try readTracked(allocator, std.testing.io, "build.zig");
@@ -741,29 +741,29 @@ test "CI heavy phases are independent jobs" {
     try expectContains(
         workflow,
         "zig build check-ci-production-entrypoints test-package-family test-ci \\\n" ++
-            "            -Doptimize=Debug --summary all",
+            "            -Doptimize=debug --summary all",
     );
-    try expectAbsent(workflow, "run: zig build -Doptimize=Debug");
+    try expectAbsent(workflow, "run: zig build -Doptimize=debug");
     try expectCount(workflow, "zig build test-ci", 0);
     try expectCount(
         workflow,
-        "run: zig build test-vm-backend -Doptimize=Debug --summary all",
+        "run: zig build test-vm-backend -Doptimize=debug --summary all",
         1,
     );
     try expectCount(
         workflow,
-        "run: zig build test-device-write-integration -Doptimize=Debug --summary all",
+        "run: zig build test-device-write-integration -Doptimize=debug --summary all",
         1,
     );
     try expectCount(
         workflow,
-        "run: zig build test-unsafe-chroot-integration -Doptimize=Debug --summary all",
+        "run: zig build test-unsafe-chroot-integration -Doptimize=debug --summary all",
         1,
     );
     try expectCount(workflow, "zig build test-vm-real-boot", 3);
     try expectCount(workflow, "-Doptimize=${{ matrix.optimize }} --summary all", 3);
-    try expectCount(workflow, "optimize: Debug", 2);
-    try expectCount(workflow, "optimize: ReleaseSafe", 1);
+    try expectCount(workflow, "optimize: debug", 2);
+    try expectCount(workflow, "optimize: safe", 1);
     try expectContains(workflow, "cancel-in-progress: true");
 }
 

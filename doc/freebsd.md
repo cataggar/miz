@@ -303,7 +303,7 @@ zig build generalized-freebsd15 -- \
 `--architecture`, select exactly one profile, whose defaults for `--output` and
 `--work-dir` are used when those options are omitted.
 
-The builder is Linux-only and requires Zig 0.16, `curl`, XZ Utils, `qemu-img`,
+The builder is Linux-only and requires Zig 0.17.0, `curl`, XZ Utils, `qemu-img`,
 the architecture-matched `qemu-system` executable, matching
 EDK2/AAVMF or OVMF firmware, and outbound guest networking for signed FreeBSD
 package installation. Use `--source` for a local official compressed image;

@@ -1021,7 +1021,7 @@ fn dispatchMetadata(
             arguments[0],
             arguments[1],
         );
-        return @intFromEnum(result);
+        return @backingInt(result);
     }
     unreachable;
 }
