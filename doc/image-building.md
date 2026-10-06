@@ -568,6 +568,14 @@ untouched. The `vm` backend is the exception -- the guest reaches its root
 through `/dev/vdaN` and this initramfs carries no volume manager, so a logical
 volume root there is `UnsupportedRootPartitionInVm`.
 
+### Repeating output publication
+
+The image status checker publishes a successful bundle's image without
+overwriting an existing output. Repetition succeeds only when both paths
+are regular files with identical bytes. Conflicting files, symlinks,
+directories, missing sources and detected changes during verification
+remain errors.
+
 ### Preserved-image customization backends
 
 The preserved-image build helper verifies the committed output path against
