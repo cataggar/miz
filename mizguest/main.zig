@@ -1038,11 +1038,7 @@ const Session = struct {
     fn runChroot(self: *Session, argv: []const []const u8) !void {
         const version = self.probeVersion(argv[0]);
         const captured = try runInChroot(self.allocator, argv);
-        try self.tools.append(.{
-            .name = std.fs.path.basename(argv[0]),
-            .version = version,
-            .command = argv,
-        });
+        try self.recordTool(argv, version);
         if (captured.exit_code != 0) {
             self.last_exit_code = captured.exit_code;
             log("[miz-guest] command failed: ");
@@ -1051,6 +1047,20 @@ const Session = struct {
             log(captured.output);
             return error.GuestCommandFailed;
         }
+    }
+
+    /// Records a command for provenance, owning its argv.
+    ///
+    /// Copied rather than borrowed: callers such as `regenerateInitramfs`
+    /// pass a by-value array from their own stack frame, and the record is
+    /// not serialized until `publish`, long after that frame is gone. The
+    /// strings themselves are constants or session-arena allocations.
+    fn recordTool(self: *Session, argv: []const []const u8, version: ?[]const u8) !void {
+        try self.tools.append(.{
+            .name = std.fs.path.basename(argv[0]),
+            .version = version,
+            .command = try self.allocator.dupe([]const u8, argv),
+        });
     }
 
     /// Best-effort tool version for provenance. A probe that fails is not a run
@@ -1983,6 +1993,33 @@ test "tool versions are reported as their first line only" {
     try std.testing.expectEqualStrings("tdnf 3.5.8", firstLine("tdnf 3.5.8\nlibsolv 0.7\n"));
     try std.testing.expectEqualStrings("dracut 059", firstLine("dracut 059"));
     try std.testing.expectEqualStrings("", firstLine(""));
+}
+
+test "a recorded tool owns its command rather than the caller's argv" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var session = Session{
+        .allocator = arena.allocator(),
+        .tools = .init(arena.allocator()),
+        .installed_packages = .init(arena.allocator()),
+        .baseline_packages = .init(arena.allocator()),
+        .emitted_lock = .init(arena.allocator()),
+        .hook_outcomes = .init(arena.allocator()),
+        .imported_trust_keys = .init(arena.allocator()),
+        .initramfs_images = .init(arena.allocator()),
+        .skipped_kernels = .init(arena.allocator()),
+    };
+
+    // `regenerateInitramfs` hands over a by-value array from its own frame,
+    // which is dead by the time `publish` serializes the record.
+    var argv = initramfs_mod.regenerateArgv("6.12.0-1.azl3");
+    try session.recordTool(&argv, null);
+    argv[0] = "/reused/stack";
+
+    const recorded = session.tools.items[0];
+    try std.testing.expectEqualStrings("dracut", recorded.name);
+    try std.testing.expectEqualStrings(initramfs_mod.tool_path, recorded.command[0]);
+    try std.testing.expectEqualStrings("6.12.0-1.azl3", recorded.command[6]);
 }
 
 test "a module member the agent will not open is refused before any syscall" {
