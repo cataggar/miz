@@ -360,7 +360,7 @@ jobs:
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           zig build --fetch=all
-          zig build -Doptimize=safe
+          zig build install-miz -Doptimize=safe
           test -x zig-out/bin/miz
 
       - name: Refresh Azure OIDC credential before acceptance

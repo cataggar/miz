@@ -254,6 +254,8 @@ test "azure acceptance uses the current harness with the accepted-source tool" {
     try expectContains(acceptance, "ref: ${{ github.sha }}");
     try expectContains(acceptance, "path: release-source");
     try expectContains(acceptance, "working-directory: release-source");
+    try expectContains(acceptance, "zig build install-miz -Doptimize=safe");
+    try expectAbsent(acceptance, "zig build -Doptimize=safe");
     try expectAbsent(acceptance, "vendor/zig-bzip2");
     try expectAbsent(acceptance, "--build-file");
     try expectContains(
@@ -393,6 +395,9 @@ test "fixed VHD validation is structural and bound to the derived size" {
         "expanded_size_gib=$(((vhd_current_size + 1073741823) / 1073741824 + 2))",
     );
     try expectContains(script, "--vhd-current-size \"$vhd_current_size\"");
+    try expectAbsent(script, "source_before=$(sha256sum \"$asset\"");
+    try expectAbsent(script, "vhd_sha256=$(sha256sum \"$vhd\"");
+    try expectContains(script, "vhd_sha256=${derive_output##*SHA-256 }");
 }
 
 test "the publisher verifies drafts by release id" {
@@ -443,7 +448,8 @@ test "the release workflow uses hosted architecture runners" {
     try expectAbsent(workflow, "self-hosted");
     try expectCount(workflow, "runner: ubuntu-24.04\n", 2);
     try expectCount(workflow, "runner: ubuntu-24.04-arm\n", 2);
-    try expectContains(workflow, "max-parallel: 2");
+    try expectContains(workflow, "max-parallel: 4");
+    try expectAbsent(workflow, "max-parallel: 2");
     try expectAbsent(workflow, "test-azurelinux4-acceptance");
     try expectContains(workflow, "scripts/azurelinux4_azure_acceptance.sh run");
 }

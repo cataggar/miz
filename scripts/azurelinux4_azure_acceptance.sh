@@ -348,13 +348,17 @@ has_resource_disk=$(
 )
 [[ "$has_resource_disk" == true || "$has_resource_disk" == false ]]
 
-source_before=$(sha256sum "$asset" | awk '{print $1}')
-test "$source_before" = "$qcow_sha256"
-"$MIZ" azure derive \
-  --input-sha256 "$qcow_sha256" \
-  --expected-virtual-size "$virtual_size" \
-  "$asset" \
-  "$vhd"
+derive_output=$(
+  "$MIZ" azure derive \
+    --input-sha256 "$qcow_sha256" \
+    --expected-virtual-size "$virtual_size" \
+    "$asset" \
+    "$vhd" 2>&1
+) || {
+  printf '%s\n' "$derive_output" >&2
+  exit 1
+}
+printf '%s\n' "$derive_output"
 test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
 qemu-img info -f vpc --output=json "$vhd" >"$RESULT_DIR/vhd-info.json"
 readarray -t vhd_geometry < <(
@@ -368,7 +372,7 @@ vhd_bytes=${vhd_geometry[1]}
 expected_vhd_current_size=$(((virtual_size + 1048575) / 1048576 * 1048576))
 test "$vhd_current_size" -eq "$expected_vhd_current_size"
 test "$vhd_bytes" -eq "$((vhd_current_size + 512))"
-vhd_sha256=$(sha256sum "$vhd" | awk '{print $1}')
+vhd_sha256=${derive_output##*SHA-256 }
 [[ "$vhd_sha256" =~ ^[0-9a-f]{64}$ ]]
 
 azure_trusted_launch_disk_create_args \
