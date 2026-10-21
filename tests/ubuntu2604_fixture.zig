@@ -516,8 +516,8 @@ fn writeDebzLockFile(
         );
     defer allocator.free(package_records);
     const lock_text = try allocator.print(
-        \\{{"schema": "https://debz.dev/schema/exact-closure-lock-v1",
-        \\"version": 1, "target_architecture": "{s}",
+        \\{{"schema": "https://debz.dev/schema/exact-closure-lock-v3",
+        \\"version": 3, "target_architecture": "{s}",
         \\"request_sha256": "{s}", "policy_sha256": "{s}",
         \\"repositories": [{{"fixture": true}}],
         \\"packages": [
@@ -557,12 +557,12 @@ fn writeDebzTransactionRecord(
         .{ package, source_architecture },
     );
     const transaction_text = try allocator.print(
-        \\{{"schema": "https://debz.dev/schema/transaction-result-v1",
-        \\"version": 1, "target_architecture": "{s}", "lock_sha256": "{s}",
+        \\{{"schema": "https://debz.dev/schema/native-transaction-provenance-v2",
+        \\"version": 2, "backend": "native", "exact_lock_sha256": "{s}",
         \\"outcome": "succeeded",
-        \\"final_verification": {{"status": "exact_match"}},
+        \\"final_state_kind": "package_database_closure_v1",
         \\"digest_sha256": "{s}"}}
-    , .{ source_architecture, lock.digest, transaction_digest });
+    , .{ lock.digest, transaction_digest });
     defer allocator.free(transaction_text);
     const transaction_path = try std.fs.path.join(
         allocator,

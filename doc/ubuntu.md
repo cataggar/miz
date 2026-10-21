@@ -238,7 +238,8 @@ publication failures remove the unpublished QCOW2 stage.
 Each package root is a separate debz transaction with its own dpkg admin
 state, discarded after it publishes so no stage inherits another's installed
 baseline. The downloaded objects are not: every stage reads and writes one
-`debz-cache` directory in the work dir, kept between stages and between runs.
+`debz-cache` directory in the work dir (`metadata-v1` and `packages-v2`), kept
+between stages and between runs.
 Objects there are named by their own SHA-256 and the sources document pins an
 immutable snapshot, so a cache hit cannot change what a stage resolves to or
 installs, and repository signatures are verified and recorded in provenance
@@ -277,7 +278,7 @@ The following inputs are compiled into the builder:
 - arm64 manifest SHA-256:
   `2889120db0432e8029f8f01622efb40ce964e434ba2c81e98937ad1e2616e4f5`
 - embedded debz API commit:
-  `56be0a32fac5293f20bde45d266b708e53321c73`
+  `7dd6e8e30b33a7898b12c80b7aa0fe89dc4cbc6f`
 
 The builder first verifies the pinned checksum files with its bounded native
 OpenPGP verifier. It embeds Canonical's ASCII-armored public key, pins the
@@ -294,11 +295,13 @@ packages.
 Every requested package is a separate debz transaction. Full resolves
 `linux-azure` and `walinuxagent` from the Canonical image's installed dpkg
 baseline. Core resolves its four package roots from the empty root. Both apply
-the same exact lock with strict repository priority and no recommends or
-downgrades, and retain the exact lock and `transaction-result.json`. Missing
-baseline packages, versions, architectures, or closure members fail the
-build. The transaction provenance's `lock_sha256` must equal the lock's
-semantic digest. The final sorted dpkg inventory at
+the same exact lock (`exact-closure-lock-v3`) with strict repository priority
+and no recommends or downgrades, and retain the exact lock and staged native
+transaction provenance (`native-transaction-provenance-v2` in
+`transaction-result.json`). Missing baseline packages, versions, architectures,
+or closure members fail the build. The transaction provenance's
+`exact_lock_sha256` must equal the lock's semantic digest. The final sorted dpkg
+inventory at
 `/var/lib/miz/ubuntu2604-package-lock.tsv` must match the selected flavor and
 architecture with no foreign amd64/arm64 packages. Native inspection records
 the selected kernel, initramfs, modules directory, and exact lock digest in

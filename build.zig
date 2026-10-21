@@ -310,6 +310,7 @@ pub fn build(b: *std.Build) void {
     const debz_dependency = b.dependency("debz", .{
         .target = b.graph.host,
         .optimize = optimize,
+        .@"native-helper-debug-info" = true,
     });
     const debz_mod = debz_dependency.module("debz");
     const rpmz_dependency = b.dependency("rpmz", .{

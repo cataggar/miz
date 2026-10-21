@@ -1401,18 +1401,23 @@ fn validateDebzTransaction(
     defer transaction_document.deinit();
 
     const document = transaction_document.object();
-    const final_verification = support.objectOf(document.get("final_verification"));
+    const valid_final_state = support.stringIs(
+        document.get("final_state_kind"),
+        "package_database_closure_v1",
+    ) or support.stringIs(
+        document.get("final_state_kind"),
+        "package_database_closure_with_baseline_noop_v1",
+    );
     if (!support.stringIs(
         document.get("schema"),
-        "https://debz.dev/schema/transaction-result-v1",
+        "https://debz.dev/schema/native-transaction-provenance-v2",
     ) or
-        support.integerOf(document.get("version")) != 1 or
-        !support.stringIs(document.get("target_architecture"), source_architecture) or
-        !support.stringIs(document.get("lock_sha256"), lock_digest) or
+        support.integerOf(document.get("version")) != 2 or
+        !support.stringIs(document.get("backend"), "native") or
+        !support.stringIs(document.get("exact_lock_sha256"), lock_digest) or
         !support.stringIs(document.get("digest_sha256"), transaction_digest) or
         !support.stringIs(document.get("outcome"), "succeeded") or
-        final_verification == null or
-        !support.stringIs(final_verification.?.get("status"), "exact_match"))
+        !valid_final_state)
     {
         return fail(
             diagnostic,
@@ -1456,9 +1461,9 @@ fn validateDebzLock(
     };
     if (!support.stringIs(
         document.get("schema"),
-        "https://debz.dev/schema/exact-closure-lock-v1",
+        "https://debz.dev/schema/exact-closure-lock-v3",
     ) or
-        support.integerOf(document.get("version")) != 1 or
+        support.integerOf(document.get("version")) != 3 or
         !support.stringIs(document.get("target_architecture"), source_architecture) or
         !support.stringIs(document.get("digest_sha256"), lock_digest) or
         repositories == null or repositories.?.len == 0 or
@@ -1789,7 +1794,7 @@ pub fn validateSigning(
 
 test "debz lock retention matches the declared installed baseline" {
     const empty_lock =
-        \\{"schema":"https://debz.dev/schema/exact-closure-lock-v1","version":1,
+        \\{"schema":"https://debz.dev/schema/exact-closure-lock-v3","version":3,
         \\"target_architecture":"amd64","repositories":[{"fixture":true}],
         \\"packages":[{"name":"linux-azure","version":"1","architecture":"amd64",
         \\"retention":"requested"}],
@@ -1822,7 +1827,7 @@ test "debz lock retention matches the declared installed baseline" {
     ));
 
     const retained_lock =
-        \\{"schema":"https://debz.dev/schema/exact-closure-lock-v1","version":1,
+        \\{"schema":"https://debz.dev/schema/exact-closure-lock-v3","version":3,
         \\"target_architecture":"amd64","repositories":[{"fixture":true}],
         \\"packages":[{"name":"base-files","version":"1","architecture":"amd64",
         \\"retention":"retained"},{"name":"linux-azure","version":"1","architecture":"amd64",
