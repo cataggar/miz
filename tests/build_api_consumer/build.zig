@@ -2,15 +2,25 @@ const std = @import("std");
 const miz = @import("miz");
 
 pub fn build(b: *std.Build) void {
+    const default_optimize: std.lang.Optimize = switch (b.graph.release_mode) {
+        .off, .any, .safe => .safe,
+        .fast => .fast,
+        .small => .small,
+    };
+    const optimize = b.option(
+        std.lang.Optimize,
+        "optimize",
+        "Prioritize performance, safety, or binary size",
+    ) orelse default_optimize;
     const dependency = b.dependencyFromBuildZig(miz, .{
         .target = b.graph.host,
-        .optimize = .safe,
+        .optimize = optimize,
     });
     const package_family_consumer = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("package_family_consumer.zig"),
             .target = b.graph.host,
-            .optimize = .safe,
+            .optimize = optimize,
             .imports = &.{.{ .name = "miz", .module = dependency.module("miz_host") }},
         }),
     });
@@ -222,7 +232,7 @@ pub fn build(b: *std.Build) void {
             .cpu_arch = .aarch64,
             .os_tag = .linux,
         }),
-        .optimize = .safe,
+        .optimize = optimize,
     });
     const preserved_image = miz.addPreservedImage(b, foreign_dependency, .{
         .name = "preserved-fixture",
