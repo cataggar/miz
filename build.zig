@@ -299,14 +299,20 @@ pub fn build(b: *std.Build) void {
         "ubuntu2604-flavor",
         "Ubuntu 26.04 guest flavor: full (default, cloud-init/systemd), core (mizinit/azagent), or baremetal (core on a physical machine)",
     ) orelse .full;
-    const bzip2z = b.dependency("bzip2z", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const target_is_host = target.result.cpu.arch == b.graph.host.result.cpu.arch and
+        target.result.os.tag == b.graph.host.result.os.tag and
+        target.result.abi == b.graph.host.result.abi;
     const host_bzip2z = b.dependency("bzip2z", .{
         .target = b.graph.host,
         .optimize = optimize,
     });
+    const bzip2z = if (target_is_host)
+        host_bzip2z
+    else
+        b.dependency("bzip2z", .{
+            .target = target,
+            .optimize = optimize,
+        });
     // Windows hosts run only the portable CLI/library smoke gate; keep debz
     // lazy so Windows never unpacks debz's multi-arch `pkg:arch` dpkg fixtures
     // onto NTFS (where `:` is parsed as an alternate data stream).
@@ -322,8 +328,11 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
-    const zstd_dependency = zstdDependency(b, target, optimize);
     const host_zstd_dependency = zstdDependency(b, b.graph.host, optimize);
+    const zstd_dependency = if (target_is_host)
+        host_zstd_dependency
+    else
+        zstdDependency(b, target, optimize);
 
     // ---- packages/miz: the core disk-image library ----
     const miz_mod = b.addModule("miz", .{
@@ -2120,6 +2129,11 @@ pub fn build(b: *std.Build) void {
     build_api_consumer_check.addArgs(&.{
         "build",
         "package-family",
+        "diagnostics",
+        "execution-diagnostics",
+        "preserved-diagnostics",
+        "preserved-vm-diagnostics",
+        b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
         "-j2",
     });
     build_api_consumer_check.setName("check external build.zig consumer");
@@ -2129,6 +2143,7 @@ pub fn build(b: *std.Build) void {
     package_family_consumer_check.addArgs(&.{
         "build",
         "check",
+        b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
         "-j2",
     });
     package_family_consumer_check.setName(
@@ -2137,46 +2152,6 @@ pub fn build(b: *std.Build) void {
     package_family_consumer_check.setCwd(
         b.path("tests/package_family_consumer"),
     );
-
-    const build_api_diagnostics_check = b.addRunFile(.zig_exe);
-    build_api_diagnostics_check.addArgs(&.{
-        "build",
-        "diagnostics",
-        "-j2",
-    });
-    build_api_diagnostics_check.setName("check external build.zig diagnostics");
-    build_api_diagnostics_check.setCwd(b.path("tests/build_api_consumer"));
-
-    const build_api_execution_diagnostics_check = b.addRunFile(.zig_exe);
-    build_api_execution_diagnostics_check.addArgs(&.{
-        "build",
-        "execution-diagnostics",
-        "-j2",
-    });
-    build_api_execution_diagnostics_check.setName("check external build.zig execution diagnostics");
-    build_api_execution_diagnostics_check.setCwd(b.path("tests/build_api_consumer"));
-
-    const build_api_preserved_diagnostics_check = b.addRunFile(.zig_exe);
-    build_api_preserved_diagnostics_check.addArgs(&.{
-        "build",
-        "preserved-diagnostics",
-        "-j2",
-    });
-    build_api_preserved_diagnostics_check.setName(
-        "check external preserved-image build.zig diagnostics",
-    );
-    build_api_preserved_diagnostics_check.setCwd(b.path("tests/build_api_consumer"));
-
-    const build_api_preserved_vm_diagnostics_check = b.addRunFile(.zig_exe);
-    build_api_preserved_vm_diagnostics_check.addArgs(&.{
-        "build",
-        "preserved-vm-diagnostics",
-        "-j2",
-    });
-    build_api_preserved_vm_diagnostics_check.setName(
-        "check external preserved-image vm backend diagnostics",
-    );
-    build_api_preserved_vm_diagnostics_check.setCwd(b.path("tests/build_api_consumer"));
 
     // ---- scripts/build_generalized_azurelinux4.zig: generalized Azure Linux 4
     // QCOW2 builder, replacing scripts/build-generalized-azurelinux4.py.
@@ -2850,16 +2825,6 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_build_api_tests.step);
         aggregate_test_step.dependOn(&build_api_consumer_check.step);
         aggregate_test_step.dependOn(&package_family_consumer_check.step);
-        aggregate_test_step.dependOn(&build_api_diagnostics_check.step);
-        aggregate_test_step.dependOn(
-            &build_api_execution_diagnostics_check.step,
-        );
-        aggregate_test_step.dependOn(
-            &build_api_preserved_diagnostics_check.step,
-        );
-        aggregate_test_step.dependOn(
-            &build_api_preserved_vm_diagnostics_check.step,
-        );
     }
     test_step.dependOn(&run_device_write_integration.step);
     test_step.dependOn(&run_unsafe_chroot_integration.step);
