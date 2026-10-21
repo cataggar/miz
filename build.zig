@@ -307,12 +307,17 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = optimize,
     });
-    const debz_dependency = b.dependency("debz", .{
-        .target = b.graph.host,
-        .optimize = optimize,
-        .@"native-helper-debug-info" = true,
-    });
-    const debz_mod = debz_dependency.module("debz");
+    // Windows hosts run only the portable CLI/library smoke gate; keep debz
+    // lazy so Windows never unpacks debz's multi-arch `pkg:arch` dpkg fixtures
+    // onto NTFS (where `:` is parsed as an alternate data stream).
+    const debz_mod: ?*std.Build.Module = if (b.graph.host.result.os.tag != .windows) blk: {
+        const debz_dependency = b.dependency("debz", .{
+            .target = b.graph.host,
+            .optimize = optimize,
+            .@"native-helper-debug-info" = true,
+        });
+        break :blk debz_dependency.module("debz");
+    } else null;
     const rpmz_dependency = b.dependency("rpmz", .{
         .target = b.graph.host,
         .optimize = optimize,
@@ -333,7 +338,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     addZstdLibrary(host_miz_mod, host_zstd_dependency);
-    host_miz_mod.addImport("debz", debz_mod);
+    if (debz_mod) |mod| host_miz_mod.addImport("debz", mod);
     const static_host_miz_mod = b.createModule(.{
         .root_source_file = b.path("packages/miz/src/root.zig"),
         .target = b.graph.host,
@@ -365,32 +370,49 @@ pub fn build(b: *std.Build) void {
     );
     zstd_test_step.dependOn(&b.addRunArtifact(zstd_tests).step);
     zstd_test_step.dependOn(&run_no_libc_zstd_tests.step);
-    const package_family_mod = b.createModule(.{
-        .root_source_file = b.path("packages/miz/src/package_family.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "debz", .module = debz_mod }},
-    });
-    const host_package_family_mod = b.addModule("miz-package-family-host", .{
-        .root_source_file = b.path("packages/miz/src/rpm_package_family.zig"),
-        .target = b.graph.host,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "package_family", .module = package_family_mod },
-            .{ .name = "rpmz", .module = rpmz_dependency.module("rpmz") },
-        },
-    });
-    const host_package_family_tests = b.addTest(.{
-        .root_module = host_package_family_mod,
-    });
-    const run_host_package_family_tests = b.addRunArtifact(
-        host_package_family_tests,
-    );
     const package_family_test_step = b.step(
         "test-package-family-host",
         "Run host-only rpmz package-family tests",
     );
-    package_family_test_step.dependOn(&run_host_package_family_tests.step);
+    const package_family_step = b.step(
+        "test-package-family",
+        "Run embedded debz package-family acceptance tests",
+    );
+    if (debz_mod) |mod| {
+        const package_family_mod = b.createModule(.{
+            .root_source_file = b.path("packages/miz/src/package_family.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "debz", .module = mod }},
+        });
+        const host_package_family_mod = b.addModule("miz-package-family-host", .{
+            .root_source_file = b.path("packages/miz/src/rpm_package_family.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "package_family", .module = package_family_mod },
+                .{ .name = "rpmz", .module = rpmz_dependency.module("rpmz") },
+            },
+        });
+        const host_package_family_tests = b.addTest(.{
+            .root_module = host_package_family_mod,
+        });
+        const run_host_package_family_tests = b.addRunArtifact(
+            host_package_family_tests,
+        );
+        package_family_test_step.dependOn(&run_host_package_family_tests.step);
+
+        const package_family_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("packages/miz/src/package_family.zig"),
+                .target = b.graph.host,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "debz", .module = mod }},
+            }),
+        });
+        const run_package_family_tests = b.addRunArtifact(package_family_tests);
+        package_family_step.dependOn(&run_package_family_tests.step);
+    }
     // Declared this early because the preserved-image builder resolves EDK2
     // firmware through the same module `miz qemu` does, and that builder is
     // constructed well before the qemu-facing part of the graph.
@@ -443,17 +465,6 @@ pub fn build(b: *std.Build) void {
         "Run native EDK2 Secure Boot variable-store tests",
     );
     efi_varstore_test_step.dependOn(&run_efi_varstore_tests.step);
-    const package_family_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("packages/miz/src/package_family.zig"),
-            .target = b.graph.host,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "debz", .module = debz_mod }},
-        }),
-    });
-    const run_package_family_tests = b.addRunArtifact(package_family_tests);
-    b.step("test-package-family", "Run embedded debz package-family acceptance tests")
-        .dependOn(&run_package_family_tests.step);
     const tls_fixture = b.dependency("tls", .{
         .target = b.graph.host,
         .optimize = optimize,
@@ -2777,7 +2788,7 @@ pub fn build(b: *std.Build) void {
     for (aggregate_test_steps) |aggregate_test_step| {
         aggregate_test_step.dependOn(&run_miz_tests.step);
         aggregate_test_step.dependOn(&run_no_libc_zstd_tests.step);
-        aggregate_test_step.dependOn(&run_host_package_family_tests.step);
+        aggregate_test_step.dependOn(package_family_test_step);
         aggregate_test_step.dependOn(&run_oci_registry_tests.step);
         aggregate_test_step.dependOn(&run_wireserver_tests.step);
         aggregate_test_step.dependOn(&run_qemu_host_tests.step);
