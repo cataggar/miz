@@ -780,6 +780,19 @@ test "Azure error bodies are never accepted as retrieved boot logs" {
     try script.expectContains("if [[ ! -s \"$output\" ]]; then");
 }
 
+test "VHD derivation reuses verified candidate and derived digests without redundant sha256sum passes" {
+    var script = try open();
+    defer script.deinit();
+
+    try script.expectContains("derive_output=$(\n  \"$MIZ\" azure derive \\");
+    try script.expectContains("--input-sha256 \"$qcow_sha256\"");
+    try script.expectContains("[[ \"$derive_output\" =~ SHA-256\\ ([0-9a-f]{64})$ ]]");
+    try script.expectContains("vhd_sha256=${BASH_REMATCH[1]}");
+    try script.expectOmits("source_before=");
+    try script.expectOmits("sha256sum \"$asset\"");
+    try script.expectOmits("sha256sum \"$vhd\"");
+}
+
 // ---- process and fixture support ----
 
 const Result = struct {

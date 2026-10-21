@@ -106,7 +106,7 @@ jobs:
       id-token: write
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 4
       matrix:
         include:
           - key: x86_64-full
@@ -616,7 +616,7 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 4
       matrix:
         include:
           - key: x86_64-full
@@ -1006,7 +1006,7 @@ jobs:
       id-token: write
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 4
       matrix:
         include:
           - key: x86_64-full
@@ -1104,8 +1104,9 @@ jobs:
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           bash scripts/zig_fetch_retry.sh
-          zig build -Doptimize=safe
+          zig build install-miz install-ubuntu2604-release -Doptimize=safe
           test -x zig-out/bin/miz
+          test -x "$RELEASE_TOOL"
 
       - name: Build Binder device usability probe
         if: matrix.flavor == 'core'
@@ -1132,7 +1133,7 @@ jobs:
           # runtime contract is evaluated.
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build install-ubuntu2604-runtime-contract-probes
+          zig build install-ubuntu2604-runtime-contract-probes -Doptimize=safe
           test -x "$RUNTIME_CONTRACT_PROBE"
 
       - name: Log in to Azure with protected-environment OIDC

@@ -574,6 +574,17 @@ test "core build and acceptance contracts are explicit" {
 
     const azure = try job(&workflow, "azure_acceptance", "validate");
     try source.expectContainsIn(azure, "FLAVOR: core", workflow_path);
+    try source.expectContainsIn(
+        azure,
+        "zig build install-miz install-ubuntu2604-release -Doptimize=safe",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        azure,
+        "zig build install-ubuntu2604-runtime-contract-probes -Doptimize=safe",
+        workflow_path,
+    );
+    try source.expectOmitsIn(azure, "zig build -Doptimize=safe\n", workflow_path);
     try source.expectContainsIn(azure, "ubuntu2604_azure_acceptance.sh run", workflow_path);
     try source.expectOrder(
         azure,
