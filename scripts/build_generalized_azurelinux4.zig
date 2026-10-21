@@ -2141,7 +2141,78 @@ const LayerResult = struct {
     compressed_size: u64,
 };
 
-fn gzipFile(io: Io, source_path: []const u8, output_path: []const u8) !u64 {
+const GzipFileDigests = struct {
+    uncompressed_size: u64,
+    uncompressed_sha256: [64]u8,
+    compressed_size: u64,
+    compressed_sha256: [64]u8,
+};
+
+const HashingFileWriter = struct {
+    io: Io,
+    file: Io.File,
+    hash: std.crypto.hash.sha2.Sha256,
+    size: u64,
+    interface: Io.Writer,
+
+    fn init(io: Io, file: Io.File, buffer: []u8) HashingFileWriter {
+        return .{
+            .io = io,
+            .file = file,
+            .hash = std.crypto.hash.sha2.Sha256.init(.{}),
+            .size = 0,
+            .interface = .{
+                .buffer = buffer,
+                .vtable = &.{
+                    .drain = drain,
+                    .flush = flush,
+                },
+            },
+        };
+    }
+
+    fn commit(self: *HashingFileWriter, bytes: []const u8) Io.Writer.Error!void {
+        if (bytes.len == 0) return;
+        const next_size = std.math.add(u64, self.size, bytes.len) catch return error.WriteFailed;
+        self.file.writePositionalAll(self.io, bytes, self.size) catch return error.WriteFailed;
+        self.hash.update(bytes);
+        self.size = next_size;
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *HashingFileWriter = @alignCast(@fieldParentPtr("interface", w));
+        const buffered = w.buffered();
+        if (buffered.len > 0) try self.commit(buffered);
+        w.end = 0;
+
+        var total: usize = 0;
+        for (data[0 .. data.len - 1]) |slice| {
+            try self.commit(slice);
+            total += slice.len;
+        }
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| {
+            try self.commit(pattern);
+            total += pattern.len;
+        }
+        return total;
+    }
+
+    fn flush(w: *Io.Writer) Io.Writer.Error!void {
+        const self: *HashingFileWriter = @alignCast(@fieldParentPtr("interface", w));
+        const buffered = w.buffered();
+        if (buffered.len > 0) try self.commit(buffered);
+        w.end = 0;
+    }
+
+    fn finalHex(self: *HashingFileWriter) [64]u8 {
+        var digest: [32]u8 = undefined;
+        self.hash.final(&digest);
+        return artifact_pipeline.formatSha256(digest);
+    }
+};
+
+fn gzipFileWithDigests(io: Io, source_path: []const u8, output_path: []const u8) !GzipFileDigests {
     var source_file = try Dir.cwd().openFile(io, source_path, .{});
     defer source_file.close(io);
 
@@ -2153,16 +2224,36 @@ fn gzipFile(io: Io, source_path: []const u8, output_path: []const u8) !u64 {
     defer output_file.close(io);
 
     var write_buf: [65536]u8 = undefined;
-    var output_writer = output_file.writer(io, &write_buf);
+    var output_writer = HashingFileWriter.init(io, output_file, &write_buf);
     var history: [std.compress.flate.max_window_len]u8 = undefined;
-    var compressor = try std.compress.flate.Compress.init(&output_writer.interface, &history, .gzip, .level_9);
+    var compressor = try std.compress.flate.Compress.init(&output_writer.interface, &history, .gzip, .level_1);
 
+    var uncompressed_hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var uncompressed_size: u64 = 0;
     var read_buf: [65536]u8 = undefined;
-    var source_reader = source_file.reader(io, &read_buf);
-    const streamed = try source_reader.interface.streamRemaining(&compressor.writer);
+    while (true) {
+        const count = try source_file.readPositionalAll(io, &read_buf, uncompressed_size);
+        if (count == 0) break;
+        const slice = read_buf[0..count];
+        uncompressed_hash.update(slice);
+        try compressor.writer.writeAll(slice);
+        uncompressed_size = try std.math.add(u64, uncompressed_size, count);
+    }
     try compressor.finish();
     try output_writer.interface.flush();
-    return @intCast(streamed);
+
+    var uncompressed_digest: [32]u8 = undefined;
+    uncompressed_hash.final(&uncompressed_digest);
+    return .{
+        .uncompressed_size = uncompressed_size,
+        .uncompressed_sha256 = artifact_pipeline.formatSha256(uncompressed_digest),
+        .compressed_size = output_writer.size,
+        .compressed_sha256 = output_writer.finalHex(),
+    };
+}
+
+fn gzipFile(io: Io, source_path: []const u8, output_path: []const u8) !u64 {
+    return (try gzipFileWithDigests(io, source_path, output_path)).uncompressed_size;
 }
 
 fn createOciLayer(
@@ -2221,30 +2312,30 @@ fn createOciLayer(
         return error.LayerTooLarge;
     }
 
-    // diff_id = sha256 of uncompressed tar.
-    const diff_hex = try sha256File(io, layer_tar);
-    const diff_id = try gpa.print("sha256:{s}", .{&diff_hex});
+    // Compress the tar at fast level while computing both uncompressed and
+    // compressed SHA-256 digests in a single streaming pass.
+    const digests = try gzipFileWithDigests(io, layer_tar, layer_gz);
+    errdefer Dir.cwd().deleteFile(io, layer_gz) catch {};
+    if (digests.uncompressed_size != tar_stat.size) return error.IncompleteOciLayer;
+    Dir.cwd().deleteFile(io, layer_tar) catch {};
+
+    const diff_id = try gpa.print("sha256:{s}", .{&digests.uncompressed_sha256});
     errdefer gpa.free(diff_id);
-
-    // Zig's Reader.stream() copies only one chunk. Use streamRemaining() so
-    // the OCI layer contains the complete tar rather than its first 64 KiB.
-    const streamed = try gzipFile(io, layer_tar, layer_gz);
-    if (streamed != tar_stat.size) return error.IncompleteOciLayer;
-
-    const gz_hex = try sha256File(io, layer_gz);
-    const compressed_digest = try gpa.print("sha256:{s}", .{&gz_hex});
+    const compressed_digest = try gpa.print("sha256:{s}", .{&digests.compressed_sha256});
     errdefer gpa.free(compressed_digest);
-    const gz_stat = try Dir.cwd().statFile(io, layer_gz, .{});
 
-    // Copy blob to blobs_dir.
-    const blob_dest = try gpa.print("{s}/{s}", .{ blobs_dir, &gz_hex });
+    // Move blob into blobs_dir (fallback to copy+delete across filesystems).
+    const blob_dest = try gpa.print("{s}/{s}", .{ blobs_dir, &digests.compressed_sha256 });
     defer gpa.free(blob_dest);
-    try Dir.copyFile(Dir.cwd(), layer_gz, Dir.cwd(), blob_dest, io, .{});
+    Dir.cwd().rename(layer_gz, Dir.cwd(), blob_dest, io) catch {
+        try Dir.copyFile(Dir.cwd(), layer_gz, Dir.cwd(), blob_dest, io, .{});
+        Dir.cwd().deleteFile(io, layer_gz) catch {};
+    };
 
     return .{
         .diff_id = diff_id,
         .compressed_digest = compressed_digest,
-        .compressed_size = gz_stat.size,
+        .compressed_size = digests.compressed_size,
     };
 }
 
@@ -4749,7 +4840,7 @@ test "kernel asset compatibility requires matching ISO and installed releases" {
     ));
 }
 
-test "gzipFile streams the complete source" {
+test "gzipFile streams the complete source and computes exact digests" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const source_path = "test-generalized-azurelinux4-gzip-source";
@@ -4762,10 +4853,17 @@ test "gzipFile streams the complete source" {
     for (payload, 0..) |*byte, index| byte.* = @intCast(index % 251);
     try Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = payload });
 
-    try std.testing.expectEqual(@as(u64, payload.len), try gzipFile(io, source_path, output_path));
+    const digests = try gzipFileWithDigests(io, source_path, output_path);
+    try std.testing.expectEqual(@as(u64, payload.len), digests.uncompressed_size);
+    try std.testing.expectEqualSlices(u8, &sha256Bytes(payload), &digests.uncompressed_sha256);
 
     const compressed = try Dir.cwd().readFileAlloc(io, output_path, gpa, .limited(payload.len + 1024));
     defer gpa.free(compressed);
+    try std.testing.expectEqual(@as(u64, compressed.len), digests.compressed_size);
+    try std.testing.expectEqualSlices(u8, &sha256Bytes(compressed), &digests.compressed_sha256);
+
+    try std.testing.expectEqual(@as(u64, payload.len), try gzipFile(io, source_path, output_path));
+
     var compressed_reader = Io.Reader.fixed(compressed);
     var window: [std.compress.flate.max_window_len]u8 = undefined;
     var decompressor: std.compress.flate.Decompress = .init(&compressed_reader, .gzip, &window);

@@ -953,57 +953,153 @@ pub fn resize(file: Io.File, io: Io, info: *Info, new_size: u64) ResizeError!voi
     ok = true;
 }
 
+const RefcountChecker = struct {
+    file: Io.File,
+    io: Io,
+    info: Info,
+    cached_table_index: ?u64 = null,
+    cached_block_offset: u64 = 0,
+    cached_page_base: ?u64 = null,
+    page: [4096]u8 = undefined,
+
+    fn expectNonZero(self: *RefcountChecker, cluster_index: u64) CheckError!void {
+        const entries_per_block = refcountBlockEntries(self.info);
+        const table_index = cluster_index / entries_per_block;
+        if (table_index >= self.info.refcount_block_count) {
+            return error.ReferencedClusterHasZeroRefcount;
+        }
+        const block_offset = if (self.cached_table_index == table_index)
+            self.cached_block_offset
+        else blk: {
+            const offset = try readU64(self.file, self.io, self.info.refcount_table_offset + table_index * 8);
+            if (offset == 0) return error.ReferencedClusterHasZeroRefcount;
+            if (!isAligned(offset, self.info.cluster_size)) return error.MissingRefcountBlock;
+            self.cached_table_index = table_index;
+            self.cached_block_offset = offset;
+            self.cached_page_base = null;
+            break :blk offset;
+        };
+
+        const byte_offset = block_offset + (cluster_index % entries_per_block) * 2;
+        const page_base = byte_offset & ~@as(u64, self.page.len - 1);
+        if (self.cached_page_base != page_base) {
+            const got = try self.file.readPositionalAll(self.io, &self.page, page_base);
+            if (got != self.page.len) {
+                if (try readRefcountByClusterIndex(self.file, self.io, self.info, cluster_index) == 0) {
+                    return error.ReferencedClusterHasZeroRefcount;
+                }
+                return;
+            }
+            self.cached_page_base = page_base;
+        }
+        const in_page: usize = @intCast(byte_offset - page_base);
+        if (std.mem.readInt(u16, self.page[in_page..][0..2], .big) == 0) {
+            return error.ReferencedClusterHasZeroRefcount;
+        }
+    }
+
+    fn expectRangeNonZero(self: *RefcountChecker, start_cluster_index: u64, cluster_count: u32) CheckError!void {
+        var i: u32 = 0;
+        while (i < cluster_count) : (i += 1) {
+            try self.expectNonZero(start_cluster_index + i);
+        }
+    }
+};
+
 pub fn check(file: Io.File, io: Io, info: Info) CheckError!void {
     if (info.incompatible_features & incompatible_dirty != 0) return error.ImageMarkedDirty;
     if (info.incompatible_features & incompatible_corrupt != 0) return error.ImageMarkedCorrupt;
 
-    try expectClusterRefcountNonZero(file, io, info, 0);
-    try setClusterRangeRefcountExpected(file, io, info, info.refcount_table_offset / info.cluster_size, info.refcount_table_clusters);
-    try setClusterRangeRefcountExpected(file, io, info, info.l1_table_offset / info.cluster_size, tableClusterCount(@as(u64, info.l1_size) * 8, info.cluster_size));
+    var refcounts = RefcountChecker{ .file = file, .io = io, .info = info };
+    try refcounts.expectNonZero(0);
+    try refcounts.expectRangeNonZero(info.refcount_table_offset / info.cluster_size, info.refcount_table_clusters);
+    try refcounts.expectRangeNonZero(info.l1_table_offset / info.cluster_size, tableClusterCount(@as(u64, info.l1_size) * 8, info.cluster_size));
 
     const table_entries = info.refcount_table_capacity_blocks;
+    var table_buf: [4096]u8 = undefined;
     var table_index: u64 = 0;
-    while (table_index < table_entries) : (table_index += 1) {
-        const block_offset = try readU64(file, io, info.refcount_table_offset + table_index * 8);
-        if (block_offset == 0) continue;
-        try expectClusterRefcountNonZero(file, io, info, block_offset / info.cluster_size);
+    while (table_index < table_entries) {
+        const chunk_entries: usize = @intCast(@min(table_entries - table_index, table_buf.len / 8));
+        const chunk_bytes = chunk_entries * 8;
+        const got = try file.readPositionalAll(io, table_buf[0..chunk_bytes], info.refcount_table_offset + table_index * 8);
+        if (got == chunk_bytes) {
+            var i: usize = 0;
+            while (i < chunk_entries) : (i += 1) {
+                const block_offset = std.mem.readInt(u64, table_buf[i * 8 ..][0..8], .big);
+                if (block_offset == 0) continue;
+                try refcounts.expectNonZero(block_offset / info.cluster_size);
+            }
+        } else {
+            var i: usize = 0;
+            while (i < chunk_entries) : (i += 1) {
+                const block_offset = try readU64(file, io, info.refcount_table_offset + (table_index + i) * 8);
+                if (block_offset == 0) continue;
+                try refcounts.expectNonZero(block_offset / info.cluster_size);
+            }
+        }
+        table_index += chunk_entries;
     }
 
     const guest_clusters = divCeil(info.virtual_size, info.cluster_size);
-    var guest_cluster_index: u64 = 0;
-    while (guest_cluster_index < guest_clusters) : (guest_cluster_index += 1) {
-        const l1_index = guest_cluster_index / info.l2_entries;
+    const needed_l1 = divCeil(guest_clusters, info.l2_entries);
+    const entry_size = l2EntrySizeBytes(info.incompatible_features);
+    var l2_buf: [4096]u8 = undefined;
+    var l1_index: u64 = 0;
+    while (l1_index < needed_l1) : (l1_index += 1) {
         if (l1_index >= info.l1_size) return error.L1TableTooSmall;
 
         const l1_entry = try readU64(file, io, info.l1_table_offset + l1_index * 8);
         const l2_table_offset = l1_entry & host_offset_mask;
         if (l2_table_offset == 0) continue;
-        try expectClusterRefcountNonZero(file, io, info, l2_table_offset / info.cluster_size);
+        try refcounts.expectNonZero(l2_table_offset / info.cluster_size);
 
         if (usesExternalDataFile(info)) continue;
 
-        const l2_index = guest_cluster_index % info.l2_entries;
-        const l2_entry_offset = l2_table_offset + l2_index * l2EntrySizeBytes(info.incompatible_features);
-        const l2_entry = try readU64(file, io, l2_entry_offset);
-        if (l2_entry & compressed_mask != 0) {
-            const mapping = try compressedClusterMapping(info, l2_entry);
-            const host_offset = mapping.host_offset.?;
-            try expectClusterRefcountNonZero(file, io, info, hostOffsetClusterIndex(host_offset, info.cluster_size));
-            const end_cluster_index = hostOffsetClusterIndex(host_offset + mapping.compressed_byte_len - 1, info.cluster_size);
-            if (end_cluster_index != hostOffsetClusterIndex(host_offset, info.cluster_size)) {
-                try expectClusterRefcountNonZero(file, io, info, end_cluster_index);
+        const base_guest_cluster = l1_index * info.l2_entries;
+        const l2_count = @min(info.l2_entries, guest_clusters - base_guest_cluster);
+        const entries_per_chunk: u64 = l2_buf.len / entry_size;
+        var l2_index: u64 = 0;
+        while (l2_index < l2_count) {
+            const batch_count: usize = @intCast(@min(l2_count - l2_index, entries_per_chunk));
+            const batch_bytes: usize = batch_count * @as(usize, @intCast(entry_size));
+            const batch_offset = l2_table_offset + l2_index * entry_size;
+            const got = try file.readPositionalAll(io, l2_buf[0..batch_bytes], batch_offset);
+            const use_buf = (got == batch_bytes);
+
+            var i: usize = 0;
+            while (i < batch_count) : (i += 1) {
+                const guest_cluster_index = base_guest_cluster + l2_index + i;
+                const l2_entry_offset = batch_offset + @as(u64, i) * entry_size;
+                const l2_entry = if (use_buf)
+                    std.mem.readInt(u64, l2_buf[i * @as(usize, @intCast(entry_size)) ..][0..8], .big)
+                else
+                    try readU64(file, io, l2_entry_offset);
+
+                if (l2_entry & compressed_mask != 0) {
+                    const mapping = try compressedClusterMapping(info, l2_entry);
+                    const host_offset = mapping.host_offset.?;
+                    try refcounts.expectNonZero(hostOffsetClusterIndex(host_offset, info.cluster_size));
+                    const end_cluster_index = hostOffsetClusterIndex(host_offset + mapping.compressed_byte_len - 1, info.cluster_size);
+                    if (end_cluster_index != hostOffsetClusterIndex(host_offset, info.cluster_size)) {
+                        try refcounts.expectNonZero(end_cluster_index);
+                    }
+                    continue;
+                }
+
+                if (isExtendedL2(info)) {
+                    const bitmap = if (use_buf)
+                        std.mem.readInt(u64, l2_buf[i * 16 + 8 ..][0..8], .big)
+                    else
+                        try readU64(file, io, l2_entry_offset + 8);
+                    if ((bitmap & 0xFFFF_FFFF) == 0) continue;
+                } else if (!hasDataHostCluster(info, guest_cluster_index, l2_entry)) {
+                    continue;
+                }
+
+                try refcounts.expectNonZero(hostOffsetClusterIndex(l2_entry & host_offset_mask, info.cluster_size));
             }
-            continue;
+            l2_index += batch_count;
         }
-
-        if (isExtendedL2(info)) {
-            const bitmap = try readU64(file, io, l2_entry_offset + 8);
-            if ((bitmap & 0xFFFF_FFFF) == 0) continue;
-        } else if (!hasDataHostCluster(info, guest_cluster_index, l2_entry)) {
-            continue;
-        }
-
-        try expectClusterRefcountNonZero(file, io, info, hostOffsetClusterIndex(l2_entry & host_offset_mask, info.cluster_size));
     }
 }
 
@@ -2159,14 +2255,34 @@ fn scanRefcountBlockCount(file: Io.File, io: Io, refcount_table_offset: u64, ref
     const entry_count = @as(u64, refcount_table_clusters) * cluster_size / 8;
     var last_nonzero: u64 = 0;
     var saw_nonzero = false;
+    var buf: [4096]u8 = undefined;
     var index: u64 = 0;
-    while (index < entry_count) : (index += 1) {
-        const entry = try readU64(file, io, refcount_table_offset + index * 8);
-        if (entry != 0) {
-            if (!tableFits(file_size, entry, cluster_size, cluster_size, cluster_size)) return error.InvalidRefcountBlock;
-            saw_nonzero = true;
-            last_nonzero = index + 1;
+    while (index < entry_count) {
+        const chunk_entries: usize = @intCast(@min(entry_count - index, buf.len / 8));
+        const chunk_bytes = chunk_entries * 8;
+        const got = try file.readPositionalAll(io, buf[0..chunk_bytes], refcount_table_offset + index * 8);
+        if (got == chunk_bytes) {
+            var i: usize = 0;
+            while (i < chunk_entries) : (i += 1) {
+                const entry = std.mem.readInt(u64, buf[i * 8 ..][0..8], .big);
+                if (entry != 0) {
+                    if (!tableFits(file_size, entry, cluster_size, cluster_size, cluster_size)) return error.InvalidRefcountBlock;
+                    saw_nonzero = true;
+                    last_nonzero = index + i + 1;
+                }
+            }
+        } else {
+            var i: usize = 0;
+            while (i < chunk_entries) : (i += 1) {
+                const entry = try readU64(file, io, refcount_table_offset + (index + i) * 8);
+                if (entry != 0) {
+                    if (!tableFits(file_size, entry, cluster_size, cluster_size, cluster_size)) return error.InvalidRefcountBlock;
+                    saw_nonzero = true;
+                    last_nonzero = index + i + 1;
+                }
+            }
         }
+        index += chunk_entries;
     }
     if (!saw_nonzero) return 0;
     return std.math.cast(u32, last_nonzero) orelse std.math.maxInt(u32);
@@ -2266,7 +2382,7 @@ fn writeRefcountTableEntry(file: Io.File, io: Io, refcount_table_offset: u64, in
 }
 
 fn copyRange(file: Io.File, io: Io, src_offset: u64, dst_offset: u64, byte_length: u64) (Io.File.ReadPositionalError || Io.File.WritePositionalError)!void {
-    var buf: [4096]u8 = undefined;
+    var buf: [64 * 1024]u8 = undefined;
     var copied: u64 = 0;
     while (copied < byte_length) {
         const n: usize = @intCast(@min(byte_length - copied, buf.len));
@@ -2277,7 +2393,7 @@ fn copyRange(file: Io.File, io: Io, src_offset: u64, dst_offset: u64, byte_lengt
 }
 
 fn zeroRange(file: Io.File, io: Io, offset: u64, byte_length: u64) Io.File.WritePositionalError!void {
-    const zeroes: [4096]u8 = @as([4096]u8, @splat(0));
+    const zeroes: [64 * 1024]u8 = @as([64 * 1024]u8, @splat(0));
     var written: u64 = 0;
     while (written < byte_length) {
         const n: usize = @intCast(@min(byte_length - written, zeroes.len));
@@ -2364,6 +2480,7 @@ fn requiredL1Entries(virtual_size: u64, cluster_size: u64, l2_entries: u64) ?u64
 pub const SourceReader = struct {
     context: *const anyopaque,
     readFn: *const fn (context: *const anyopaque, io: Io, offset: u64, buffer: []u8) anyerror!void,
+    qcow2_source: ?*const Qcow2SourceContext = null,
 
     fn readGuest(self: SourceReader, io: Io, offset: u64, buffer: []u8) anyerror!void {
         return self.readFn(self.context, io, offset, buffer);
@@ -2401,7 +2518,7 @@ pub const Qcow2SourceContext = struct {
     info: *const Info,
 
     pub fn reader(self: *const Qcow2SourceContext) SourceReader {
-        return .{ .context = self, .readFn = read };
+        return .{ .context = self, .readFn = read, .qcow2_source = self };
     }
 
     fn read(context: *const anyopaque, io: Io, offset: u64, buffer: []u8) anyerror!void {
@@ -2462,8 +2579,7 @@ const CompressedGeometry = struct {
 };
 
 fn isAllZeroBytes(bytes: []const u8) bool {
-    for (bytes) |b| if (b != 0) return false;
-    return true;
+    return std.mem.allEqual(u8, bytes, 0);
 }
 
 /// Writes a standalone zstd-compressed qcow2 image to `out_file`, drawing
@@ -2527,12 +2643,93 @@ pub fn writeStandaloneCompressed(
     const comp_buf = try allocator.alloc(u8, comp_buf_len);
     defer allocator.free(comp_buf);
 
+    const fast_qcow2_src: ?*const Qcow2SourceContext = if (source.qcow2_source) |qcow2_src| blk: {
+        const src_info = qcow2_src.info.*;
+        if (src_info.cluster_size == cs and
+            src_info.backing_file_len == 0 and
+            !usesExternalDataFile(src_info) and
+            !isExtendedL2(src_info))
+        {
+            break :blk qcow2_src;
+        }
+        break :blk null;
+    } else null;
+    const src_l2_buf: []u8 = if (fast_qcow2_src != null) try allocator.alloc(u8, cs_usize) else &.{};
+    defer if (fast_qcow2_src != null) allocator.free(src_l2_buf);
+    var cached_src_l1_index: ?u64 = null;
+    var cached_src_l2_valid = false;
+
     // Pass 1: stream each non-zero cluster's compressed payload to disk,
     // packed at sector granularity starting at cluster 1.
     var data_offset: u64 = cs;
     var guest_index: u64 = 0;
     while (guest_index < guest_clusters) : (guest_index += 1) {
-        source.readGuest(io, guest_index * cs, cluster_buf) catch return error.SourceReadFailed;
+        if (fast_qcow2_src) |qcow2_src| {
+            const src_info = qcow2_src.info.*;
+            const guest_byte_offset = guest_index * cs;
+            if (guest_byte_offset >= src_info.virtual_size) break;
+            if (guest_byte_offset + cs <= src_info.virtual_size) {
+                const src_l1_index = guest_index / src_info.l2_entries;
+                if (src_l1_index < src_info.l1_size) {
+                    if (cached_src_l1_index != src_l1_index) {
+                        cached_src_l1_index = src_l1_index;
+                        cached_src_l2_valid = false;
+                        const src_l1_entry = readU64(
+                            qcow2_src.file,
+                            io,
+                            src_info.l1_table_offset + src_l1_index * 8,
+                        ) catch return error.SourceReadFailed;
+                        const src_l2_offset = src_l1_entry & host_offset_mask;
+                        if (src_l2_offset == 0) {
+                            const skip_to = @min(guest_clusters, (src_l1_index + 1) * src_info.l2_entries);
+                            guest_index = skip_to - 1;
+                            continue;
+                        }
+                        if (isAligned(src_l2_offset, src_info.cluster_size) and
+                            src_l2_offset >= src_info.cluster_size and
+                            src_l2_offset + src_info.cluster_size <= src_info.file_size)
+                        {
+                            const got = qcow2_src.file.readPositionalAll(io, src_l2_buf, src_l2_offset) catch return error.SourceReadFailed;
+                            if (got == src_l2_buf.len) {
+                                cached_src_l2_valid = true;
+                            }
+                        }
+                    }
+                    if (cached_src_l2_valid) {
+                        const src_l2_index: usize = @intCast(guest_index % src_info.l2_entries);
+                        const src_l2_entry = std.mem.readInt(u64, src_l2_buf[src_l2_index * 8 ..][0..8], .big);
+                        if (src_l2_entry & compressed_mask == 0) {
+                            if (standardClusterMapping(src_info, guest_index, src_l2_entry)) |mapping| {
+                                switch (mapping.kind) {
+                                    .backing, .zero => continue,
+                                    .standard => {
+                                        const got = qcow2_src.file.readPositionalAll(
+                                            io,
+                                            cluster_buf,
+                                            mapping.host_offset.?,
+                                        ) catch return error.SourceReadFailed;
+                                        if (got < cluster_buf.len) @memset(cluster_buf[got..], 0);
+                                    },
+                                    .compressed => unreachable,
+                                }
+                            } else |_| {
+                                return error.SourceReadFailed;
+                            }
+                        } else {
+                            source.readGuest(io, guest_byte_offset, cluster_buf) catch return error.SourceReadFailed;
+                        }
+                    } else {
+                        source.readGuest(io, guest_byte_offset, cluster_buf) catch return error.SourceReadFailed;
+                    }
+                } else {
+                    return error.SourceReadFailed;
+                }
+            } else {
+                source.readGuest(io, guest_byte_offset, cluster_buf) catch return error.SourceReadFailed;
+            }
+        } else {
+            source.readGuest(io, guest_index * cs, cluster_buf) catch return error.SourceReadFailed;
+        }
         if (isAllZeroBytes(cluster_buf)) continue;
 
         var frame_writer = Io.Writer.fixed(comp_buf);
