@@ -153,6 +153,7 @@ const digest_d = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
 const digest_e = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const digest_f = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 const digest_zero = "0000000000000000000000000000000000000000000000000000000000000000";
+const sha512_a = digest_a ++ digest_a;
 const commit_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
 fn hexDigest(allocator: Allocator, bytes: []const u8) ![]const u8 {
@@ -217,7 +218,7 @@ fn makeCache(fixture: *Fixture, input_dir: ?[]const u8) !CacheFixture {
     const cache = try fixture.path(&.{"cache-fixture"});
     const metadata = try fixture.mkdir(&.{ "cache-fixture", "metadata-v1", "objects" });
     const manifests = try fixture.mkdir(&.{ "cache-fixture", "metadata-v1", "manifests" });
-    const packages = try fixture.mkdir(&.{ "cache-fixture", "packages-v1", "objects" });
+    const packages = try fixture.mkdir(&.{ "cache-fixture", "packages-v2", "objects" });
     const metadata_bytes = "metadata";
     const metadata_digest = try hexDigest(allocator, metadata_bytes);
     try Dir.cwd().writeFile(fixture.io, .{
@@ -226,8 +227,13 @@ fn makeCache(fixture: *Fixture, input_dir: ?[]const u8) !CacheFixture {
     });
     const package_bytes = "package";
     const package_digest = try hexDigest(allocator, package_bytes);
+    const package_object = try std.fmt.allocPrint(
+        allocator,
+        "sha256-{s}",
+        .{package_digest},
+    );
     try Dir.cwd().writeFile(fixture.io, .{
-        .sub_path = try std.fs.path.join(allocator, &.{ packages, package_digest }),
+        .sub_path = try std.fs.path.join(allocator, &.{ packages, package_object }),
         .data = package_bytes,
     });
 
@@ -292,13 +298,17 @@ fn makeLocks(fixture: *Fixture, package_digest: []const u8) ![]const u8 {
         const digest = try allocator.alloc(u8, 64);
         @memset(digest, std.fmt.digitToChar(@intCast(index + 1), .lower));
         const document = try std.fmt.allocPrint(allocator,
-            \\{{"schema": "https://debz.dev/schema/exact-closure-lock-v1",
-            \\ "version": 1,
+            \\{{"schema": "https://debz.dev/schema/exact-closure-lock-v3",
+            \\ "version": 3,
             \\ "target_architecture": "arm64",
             \\ "digest_sha256": "{s}",
             \\ "packages": [{{"name": "{s}", "version": "1",
-            \\               "architecture": "arm64", "sha256": "{s}"}}]}}
-        , .{ digest, package, package_digest });
+            \\               "architecture": "arm64",
+            \\               "archive_identity": {{"digests": [
+            \\                 {{"algorithm": "sha256", "digest": "{s}"}},
+            \\                 {{"algorithm": "sha512", "digest": "{s}"}}
+            \\               ], "sha512_origin": "derived_after_signed_sha256_verify"}}}}]}}
+        , .{ digest, package, package_digest, sha512_a });
         const filename = try benchmark.lockFilename(allocator, package);
         try Dir.cwd().writeFile(fixture.io, .{
             .sub_path = try std.fs.path.join(allocator, &.{ locks, filename }),
@@ -594,8 +604,13 @@ test "the warm cache verifies its content-addressed objects" {
     try std.testing.expectEqual(@as(usize, 1), inventory.package_objects);
     try std.testing.expect(inventory.hasPackageObject(cache.package_digest));
 
+    const package_object = try std.fmt.allocPrint(
+        fixture.allocator(),
+        "sha256-{s}",
+        .{cache.package_digest},
+    );
     _ = try fixture.write(
-        &.{ "cache-fixture", "packages-v1", "objects", cache.package_digest },
+        &.{ "cache-fixture", "packages-v2", "objects", package_object },
         "corrupt",
     );
     try expectFailure(benchmark.verifyWarmCache(
@@ -943,22 +958,38 @@ test "transaction correctness uses a semantic identity" {
     const allocator = fixture.allocator();
     const lock_digest = digest_b;
     const transaction_digests = [_][]const u8{ digest_a, digest_c };
+    const attempt_ids = [_][]const u8{ digest_d, digest_e };
+    const root_inodes = [_]u64{ 101, 202 };
     const run_names = [_][]const u8{ "run-warmup", "run-measured-01" };
     var contracts: [2]Value = undefined;
     var files: [2]Value = undefined;
     var paths: [2][]const u8 = undefined;
 
-    for (run_names, transaction_digests, 0..) |run_name, transaction_digest, index| {
+    for (
+        run_names,
+        transaction_digests,
+        attempt_ids,
+        root_inodes,
+        0..,
+    ) |run_name, transaction_digest, attempt_id, root_inode, index| {
         const run_root = try fixture.path(&.{ run_name, "work", "root-stage-0" });
         const document = try std.fmt.allocPrint(allocator,
-            \\{{"schema": "https://debz.dev/schema/transaction-result-v1",
-            \\  "version": 1, "target_architecture": "arm64",
-            \\  "lock_sha256": "{s}", "digest_sha256": "{s}",
-            \\  "outcome": "succeeded",
-            \\  "commands": [{{"argv": ["dpkg", "--root={s}"],
-            \\                "command_sha256": "{s}"}}],
-            \\  "final_verification": {{"status": "exact_match"}}}}
-        , .{ lock_digest, transaction_digest, run_root, transaction_digest });
+            \\{{"schema": "https://debz.dev/schema/native-transaction-provenance-v2",
+            \\  "version": 2, "backend": "native",
+            \\  "install_root": "{s}", "attempt_id": "{s}",
+            \\  "root_inode": {d}, "program_sha256": "{s}",
+            \\  "exact_lock_sha256": "{s}", "final_state_sha256": "{s}",
+            \\  "final_state_kind": "package_database_closure_v1",
+            \\  "outcome": "succeeded", "digest_sha256": "{s}"}}
+        , .{
+            run_root,
+            attempt_id,
+            root_inode,
+            digest_a,
+            lock_digest,
+            digest_f,
+            transaction_digest,
+        });
         const name = try std.fmt.allocPrint(allocator, "{s}.json", .{run_name});
         paths[index] = try fixture.write(&.{name}, document);
         const binding = try fixture.parse(try std.fmt.allocPrint(allocator,
@@ -1056,17 +1087,17 @@ test "transaction correctness uses a semantic identity" {
         ));
     }
 
-    // A changed command is a changed meaning even when the recorded digests
-    // are untouched.
+    // A changed semantic field is a changed meaning even when the recorded
+    // digests are untouched.
     const changed_source = try fixture.read(paths[1]);
     const changed = try std.mem.replaceOwned(
         u8,
         allocator,
         changed_source,
-        "\"dpkg\",",
-        "\"dpkg\", \"--force-confnew\",",
+        "\"final_state_sha256\": \"" ++ digest_f ++ "\"",
+        "\"final_state_sha256\": \"" ++ digest_zero ++ "\"",
     );
-    const changed_path = try fixture.write(&.{"changed-command.json"}, changed);
+    const changed_path = try fixture.write(&.{"changed-transaction.json"}, changed);
     const changed_evidence = try benchmark.validateTransaction(
         allocator,
         fixture.io,
@@ -1086,6 +1117,18 @@ test "transaction correctness uses a semantic identity" {
         try wrapProvenance(allocator, .{ .array = changed_list }),
         &fixture.context,
     ));
+
+    try std.testing.expectError(
+        error.InvalidDebzTransaction,
+        benchmark.semanticTransactionDigest(
+            allocator,
+            try fixture.parse(
+                \\{"schema": "https://debz.dev/schema/native-transaction-provenance-v2",
+                \\ "version": 2, "backend": "native"}
+            ),
+            &fixture.context,
+        ),
+    );
 }
 
 fn wrapProvenance(allocator: Allocator, contracts: Value) !Value {

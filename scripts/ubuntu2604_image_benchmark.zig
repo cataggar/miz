@@ -63,7 +63,7 @@ pub const sums_sha256 =
     "d562d59dac70f68d67d00e994db5cd89e49e9d93f7f80b4cb868a5eeb057ec36";
 pub const sums_signature_sha256 =
     "2bf5fae8be0c79cc30c5c10223f1d4790b6ef541240896bfe48c7ac57c3404ed";
-pub const debz_api_commit = "56be0a32fac5293f20bde45d266b708e53321c73";
+pub const debz_api_commit = "7dd6e8e30b33a7898b12c80b7aa0fe89dc4cbc6f";
 pub const canonical_fingerprint = "d2eb44626fddc30b513d5bb71a5d6c4c7db87c81";
 pub const asset_name = "Ubuntu-26.04-aarch64.baremetal.qcow2";
 pub const raw_asset_name = "Ubuntu-26.04-aarch64.baremetal.raw";
@@ -213,6 +213,15 @@ fn lessThanString(_: void, left: []const u8, right: []const u8) bool {
 
 fn isSha256Name(text: []const u8) bool {
     return contract.isSha256Hex(text);
+}
+
+fn isSha512Name(text: []const u8) bool {
+    if (text.len != 128) return false;
+    for (text) |byte| switch (byte) {
+        '0'...'9', 'a'...'f' => {},
+        else => return false,
+    };
+    return true;
 }
 
 /// `sha256(path)`: streaming digest of a file of any size.
@@ -370,6 +379,25 @@ fn requireSha256(
     };
     if (!isSha256Name(text)) {
         return context.fail("{s} is not a lowercase SHA-256", .{label});
+    }
+    return text;
+}
+
+fn requireSha512(
+    value: ?Value,
+    label: []const u8,
+    context: *Context,
+) ![]const u8 {
+    const present = value orelse return context.fail(
+        "{s} is not a lowercase SHA-512",
+        .{label},
+    );
+    const text = switch (present) {
+        .string => |candidate| candidate,
+        else => return context.fail("{s} is not a lowercase SHA-512", .{label}),
+    };
+    if (!isSha512Name(text)) {
+        return context.fail("{s} is not a lowercase SHA-512", .{label});
     }
     return text;
 }
@@ -714,6 +742,8 @@ pub fn debzRepositoryId(
     hashInt(&hash, debz_unbounded_deadline_ms);
     hashInt(&hash, debz_unbounded_deadline_ms);
     hashInt(&hash, debz_unbounded_deadline_ms);
+    hashPart(&hash, "archive-binding");
+    hashPart(&hash, "signed_sha256_derived_sha512");
     var raw: [Sha256.digest_length]u8 = undefined;
     hash.final(&raw);
     return digest_support.hex(raw);
@@ -892,11 +922,16 @@ fn verifyCacheObjects(
     for (names) |name| {
         const path = try joinPath(allocator, &.{ directory, name });
         const stat = try statNoFollow(io, path);
-        if (stat.kind != .file or !isSha256Name(name)) {
+        const hex_digest_part = if (std.mem.eql(u8, label, "package") and
+            std.mem.startsWith(u8, name, "sha256-"))
+            name["sha256-".len..]
+        else
+            name;
+        if (stat.kind != .file or !isSha256Name(hex_digest_part)) {
             return context.fail("{s} contains a non-CAS entry: {s}", .{ label, path });
         }
         const hex = try hashFileHex(io, path);
-        if (!std.mem.eql(u8, &hex, name)) {
+        if (!std.mem.eql(u8, &hex, hex_digest_part)) {
             return context.fail(
                 "{s} object digest does not match its name: {s}",
                 .{ label, path },
@@ -996,7 +1031,7 @@ pub fn verifyWarmCache(
         try metadata_by_digest.put(allocator, item.path, item);
     }
 
-    const packages_dir = try joinPath(allocator, &.{ cache, "packages-v1", "objects" });
+    const packages_dir = try joinPath(allocator, &.{ cache, "packages-v2", "objects" });
     const package_objects = try verifyCacheObjects(
         allocator,
         io,
@@ -1163,7 +1198,10 @@ pub fn verifyWarmCache(
     }));
 
     var package_object_names: std.StringArrayHashMapUnmanaged(void) = .empty;
-    for (package_objects) |item| try package_object_names.put(allocator, item.path, {});
+    for (package_objects) |item| {
+        try package_object_names.put(allocator, item.sha256, {});
+        try package_object_names.put(allocator, item.path, {});
+    }
     var manifests: std.StringArrayHashMapUnmanaged(ManifestRecord) = .empty;
     for (manifest_records.items) |item| try manifests.put(allocator, item.path, item);
 
@@ -1307,7 +1345,38 @@ fn validatePackage(
         .{label},
     );
     defer context.allocator.free(hash_label);
-    result.sha256 = try requireSha256(getField(entry, "sha256"), hash_label, context);
+    if (getField(entry, "archive_identity")) |archive_identity| {
+        if (archive_identity != .object) {
+            return context.fail("{s} package archive_identity is invalid", .{label});
+        }
+        const digests = getField(archive_identity, "digests") orelse Value.null;
+        if (digests != .array) {
+            return context.fail("{s} package archive_identity digests are invalid", .{label});
+        }
+        var sha256_value: ?Value = null;
+        var sha512_value: ?Value = null;
+        for (digests.array.items) |digest_entry| {
+            if (digest_entry != .object) {
+                return context.fail("{s} package digest entry is invalid", .{label});
+            }
+            if (stringEquals(digest_entry, "algorithm", "sha256")) {
+                sha256_value = getField(digest_entry, "digest");
+            } else if (stringEquals(digest_entry, "algorithm", "sha512")) {
+                sha512_value = getField(digest_entry, "digest");
+            }
+        }
+        if (sha512_value == null) {
+            if (getField(entry, "derived_archive_identity")) |derived| {
+                if (derived == .object and stringEquals(derived, "algorithm", "sha512")) {
+                    sha512_value = getField(derived, "digest");
+                }
+            }
+        }
+        result.sha256 = try requireSha256(sha256_value, hash_label, context);
+        _ = try requireSha512(sha512_value, hash_label, context);
+    } else {
+        result.sha256 = try requireSha256(getField(entry, "sha256"), hash_label, context);
+    }
     if (!std.mem.eql(u8, result.architecture, ubuntu_architecture) and
         !std.mem.eql(u8, result.architecture, "all"))
     {
@@ -1373,9 +1442,9 @@ pub fn verifyLockSet(
         if (!stringEquals(
             document,
             "schema",
-            "https://debz.dev/schema/exact-closure-lock-v1",
+            "https://debz.dev/schema/exact-closure-lock-v3",
         ) or
-            integerField(document, "version") != @as(i64, 1) or
+            integerField(document, "version") != @as(i64, 3) or
             !stringEquals(document, "target_architecture", ubuntu_architecture))
         {
             return context.fail(
@@ -1764,55 +1833,54 @@ pub fn normalizeTransactionArgument(
     });
 }
 
-/// `semantic_transaction_digest`: the transaction's meaning, with the two
-/// fields that are inherently per-run -- its own digest and the argv hashes
-/// over run-specific paths -- removed.
+const non_semantic_transaction_fields = [_][]const u8{
+    "digest_sha256",
+    "attempt_id",
+    "root_identity_sha256",
+    "root_inode",
+    "authorization_sha256",
+    "execution_intent_sha256",
+    "progress_head_sha256",
+    "script_outcomes_sha256",
+    "trigger_evidence_sha256",
+    "evidence_root",
+    "evidence_files",
+    "evidence_files_sha256",
+};
+
+/// `semantic_transaction_digest`: the transaction's meaning, with the
+/// fields that are inherently per-run or per-attempt removed and `install_root`
+/// normalized.
 pub fn semanticTransactionDigest(
     allocator: Allocator,
     document: Value,
     context: *Context,
 ) ![]const u8 {
-    const commands = getField(document, "commands") orelse Value.null;
-    if (commands != .array) {
-        return context.fail("transaction provenance commands are invalid", .{});
+    if (document != .object) {
+        context.set("transaction provenance document is invalid", .{});
+        return error.InvalidDebzTransaction;
     }
-    var normalized_commands = JsonArray.init(allocator);
-    for (commands.array.items) |command| {
-        if (command != .object) {
-            return context.fail("transaction provenance command is invalid", .{});
-        }
-        const argv = getField(command, "argv") orelse Value.null;
-        if (argv != .array) {
-            return context.fail("transaction provenance command argv is invalid", .{});
-        }
-        var normalized_argv = JsonArray.init(allocator);
-        for (argv.array.items) |item| {
-            if (item != .string) return context.fail(
-                "transaction provenance command argv is invalid",
-                .{},
-            );
-            try normalized_argv.append(
-                str(try normalizeTransactionArgument(allocator, item.string)),
-            );
-        }
-        var map = ObjectMap.empty;
-        var entries = command.object.iterator();
-        while (entries.next()) |entry| {
-            if (std.mem.eql(u8, entry.key_ptr.*, "command_sha256")) continue;
-            if (std.mem.eql(u8, entry.key_ptr.*, "argv")) continue;
-            try map.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
-        }
-        try map.put(allocator, "argv", .{ .array = normalized_argv });
-        try normalized_commands.append(.{ .object = map });
+    const install_root = stringField(document, "install_root") orelse {
+        context.set("transaction provenance install_root is invalid", .{});
+        return error.InvalidDebzTransaction;
+    };
+    if (install_root.len == 0) {
+        context.set("transaction provenance install_root is invalid", .{});
+        return error.InvalidDebzTransaction;
     }
     var normalized = ObjectMap.empty;
     var entries = document.object.iterator();
     while (entries.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "digest_sha256")) continue;
-        if (std.mem.eql(u8, entry.key_ptr.*, "commands")) continue;
-        try normalized.put(allocator, entry.key_ptr.*, entry.value_ptr.*);
+        const key = entry.key_ptr.*;
+        if (isMember(key, &non_semantic_transaction_fields)) continue;
+        if (std.mem.eql(u8, key, "install_root")) continue;
+        try normalized.put(allocator, key, entry.value_ptr.*);
     }
-    try normalized.put(allocator, "commands", .{ .array = normalized_commands });
+    try normalized.put(
+        allocator,
+        "install_root",
+        str(try normalizeTransactionArgument(allocator, install_root)),
+    );
     return canonicalDigestAlloc(allocator, .{ .object = normalized });
 }
 
@@ -1841,7 +1909,6 @@ pub fn validateTransaction(
         );
     }
     const document = try readJson(allocator, io, path, context);
-    const final = getField(document, "final_verification") orelse Value.null;
     const digest_label = try std.fmt.allocPrint(
         allocator,
         "{s} transaction digest",
@@ -1852,18 +1919,24 @@ pub fn validateTransaction(
         digest_label,
         context,
     );
+    const final_state_ok =
+        stringEquals(document, "final_state_kind", "package_database_closure_v1") or
+        stringEquals(
+            document,
+            "final_state_kind",
+            "package_database_closure_with_baseline_noop_v1",
+        );
     if (!stringEquals(
         document,
         "schema",
-        "https://debz.dev/schema/transaction-result-v1",
+        "https://debz.dev/schema/native-transaction-provenance-v2",
     ) or
-        integerField(document, "version") != @as(i64, 1) or
-        !stringEquals(document, "target_architecture", ubuntu_architecture) or
-        !stringEquals(document, "lock_sha256", lock_digest) or
+        integerField(document, "version") != @as(i64, 2) or
+        !stringEquals(document, "backend", "native") or
+        !stringEquals(document, "exact_lock_sha256", lock_digest) or
         !stringEquals(document, "digest_sha256", provenance_digest) or
         !stringEquals(document, "outcome", "succeeded") or
-        final != .object or
-        !stringEquals(final, "status", "exact_match"))
+        !final_state_ok)
     {
         return context.fail(
             "{s} transaction provenance does not prove exact success",

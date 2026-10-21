@@ -885,7 +885,7 @@ fn cleanupSharedDebzCacheStaging(io: Io, cache_path: []const u8) !void {
     var cache = try Dir.cwd().openDir(io, cache_path, .{ .follow_symlinks = false });
     defer cache.close(io);
 
-    for (&[_][]const u8{ "metadata-v1", "packages-v1" }) |namespace_name| {
+    for (&[_][]const u8{ "metadata-v1", "packages-v1", "packages-v2" }) |namespace_name| {
         var namespace = cache.openDir(io, namespace_name, .{ .follow_symlinks = false }) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
@@ -3906,7 +3906,7 @@ fn publishDebzEvidence(
         .provenance_path = stable_provenance,
         .provenance_sha256 = artifact_pipeline.formatSha256(provenance_metadata.sha256),
         .provenance_digest_sha256 = try requireJsonSha256Field(allocator, io, stable_provenance, "digest_sha256"),
-        .provenance_lock_sha256 = try requireJsonSha256Field(allocator, io, stable_provenance, "lock_sha256"),
+        .provenance_lock_sha256 = try requireJsonSha256Field(allocator, io, stable_provenance, "exact_lock_sha256"),
     };
     if (!std.mem.eql(u8, &evidence.lock_digest_sha256, &evidence.provenance_lock_sha256))
         return error.DebzProvenanceLockMismatch;
@@ -4388,6 +4388,7 @@ fn customizeRootWithDebz(
     const source_config = std.json.Stringify.valueAlloc(allocator, .{
         .source_path = absolute_source,
         .immutable = true,
+        .archive_binding = "signed_sha256_derived_sha512",
     }, .{}) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(source_config);
     Dir.cwd().writeFile(io, .{ .sub_path = source_config_path, .data = source_config }) catch |err| return phaseError(&phase_error, err);
@@ -8046,7 +8047,7 @@ test "shared debz cache startup removes only abandoned staging files" {
     defer temporary.cleanup();
     const io = std.testing.io;
 
-    for (&[_][]const u8{ "metadata-v1", "packages-v1" }) |namespace| {
+    for (&[_][]const u8{ "metadata-v1", "packages-v1", "packages-v2" }) |namespace| {
         var path_buffer: [128]u8 = undefined;
         const staging = try std.fmt.bufPrint(&path_buffer, "cache/{s}/staging", .{namespace});
         try temporary.dir.createDirPath(io, staging);
@@ -8085,7 +8086,7 @@ test "shared debz cache startup removes only abandoned staging files" {
 
     try cleanupSharedDebzCacheStaging(io, cache_path);
 
-    for (&[_][]const u8{ "metadata-v1", "packages-v1" }) |namespace| {
+    for (&[_][]const u8{ "metadata-v1", "packages-v1", "packages-v2" }) |namespace| {
         var abandoned_buffer: [160]u8 = undefined;
         const abandoned = try std.fmt.bufPrint(&abandoned_buffer, "cache/{s}/staging/abandoned.tmp", .{namespace});
         try std.testing.expectError(error.FileNotFound, temporary.dir.statFile(io, abandoned, .{}));

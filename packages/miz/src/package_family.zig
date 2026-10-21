@@ -1,5 +1,7 @@
 //! Versioned package-family boundary used by host-side image builders.
-//! Debian-family roots use debz in-process; RPM behavior remains injectable.
+//! Debian-family roots use debz's native v2 package-family backend in-process
+//! with exact-closure-lock-v3 and native-transaction-provenance-v2 without
+//! invoking apt or dpkg; RPM behavior remains injectable.
 
 const std = @import("std");
 const debz = @import("debz");
@@ -11,7 +13,14 @@ const Dir = Io.Dir;
 pub const api_version: u32 = 4;
 pub const request_schema = "io.github.cataggar.miz.package-family.request.v4";
 pub const result_schema = "io.github.cataggar.miz.package-family.result.v4";
-pub const debz_api_commit = "56be0a32fac5293f20bde45d266b708e53321c73";
+pub const debz_commit = "7dd6e8e30b33a7898b12c80b7aa0fe89dc4cbc6f";
+pub const debz_api_commit = debz_commit;
+pub const debz_capability_schema = "io.github.cataggar.debz.package-family.capabilities.v2";
+pub const debz_request_schema = "io.github.cataggar.debz.package-family.request.v2";
+pub const debz_result_schema = "io.github.cataggar.debz.package-family.result.v2";
+pub const debz_schema_version: u32 = 2;
+pub const debz_exact_lock_schema = "https://debz.dev/schema/exact-closure-lock-v3";
+pub const debz_provenance_schema = "https://debz.dev/schema/native-transaction-provenance-v2";
 pub const rpmz_api_commit = "c9b23a2103b9682434ab663841d00cd657647561";
 pub const rpm_lock_schema = "io.github.cataggar.miz.rpm-lock.v1";
 pub const rpm_provenance_schema = "io.github.cataggar.miz.rpm-provenance.v1";
@@ -143,12 +152,17 @@ pub const ExistingBackend = struct {
     executeFn: *const fn (?*anyopaque, Allocator, Io, Request) anyerror!Result,
 };
 
-/// Tests and specialized hosts can inject a typed debz product executor.
-/// The default constructs debz.ProductionBackend with the caller's Io.
+/// Tests and specialized hosts can inject a typed debz product executor or
+/// capability descriptor. The default runs debz.NativePackageFamilyBackend
+/// with the caller's Io.
 pub const DebianBackend = struct {
+    capabilities: ?debz.NativePackageFamilyCapabilities = null,
     product_executor: ?debz.ProductBackend = null,
-    capabilities: debz.PackageFamilyCapabilities = debz.packageFamilyCapabilities(),
 };
+
+pub fn defaultDebianCapabilities() debz.NativePackageFamilyCapabilities {
+    return debz.nativePackageFamilyCapabilities();
+}
 
 pub const BackendSet = struct {
     debian: DebianBackend = .{},
@@ -184,17 +198,11 @@ pub fn execute(
             .disposable,
             null,
         );
-    if (!compatible(backends.debian.capabilities))
+    const capabilities = backends.debian.capabilities orelse debz.nativePackageFamilyCapabilities();
+    if (!compatible(capabilities))
         return failed(.incompatible_backend, "incompatible debz package-family capability schema", .disposable, null);
 
-    // Own every debz-side allocation in a scoped arena so the returned result
-    // (diagnostic message, provenance path, product items) is released on all
-    // exits without the embedder guessing whether each field is heap or literal.
-    // The one field that must outlive the arena, `provenance_path`, is duplicated
-    // into `allocator` at the success return below.
-    var debz_arena = std.heap.ArenaAllocator.init(allocator);
-    defer debz_arena.deinit();
-    const backend_result = executeDebz(debz_arena.allocator(), io, backends.debian, request) catch {
+    var owned_result = executeDebz(allocator, io, backends.debian, request) catch {
         return failed(
             .backend_unavailable,
             "embedded debz backend could not execute",
@@ -202,8 +210,10 @@ pub fn execute(
             null,
         );
     };
-    if (!std.mem.eql(u8, backend_result.schema, debz.package_family_backend.result_schema) or
-        backend_result.version != debz.package_family_backend.schema_version or
+    defer owned_result.deinit();
+    const backend_result = owned_result.result;
+    if (!std.mem.eql(u8, backend_result.schema, debz_result_schema) or
+        backend_result.version != debz_schema_version or
         backend_result.operation != debzOperation(request.operation))
     {
         cleanup(io, request);
@@ -226,13 +236,12 @@ pub fn execute(
         );
     }
 
-    const lock_path = backend_result.lock_path;
-    if (request.operation != .inspect and lock_path == null) {
+    if (request.operation != .inspect and backend_result.lock_path == null) {
         cleanup(io, request);
         return failed(.lock_missing, "debz did not return an exact lock path", .disposable, 0);
     }
     var lock_digest: ?[32]u8 = null;
-    if (lock_path) |path| {
+    const lock_path = if (backend_result.lock_path) |path| blk: {
         const expected = request.inputs.lock_output_path orelse request.inputs.lock_input_path;
         if (expected == null or !std.mem.eql(u8, path, expected.?)) {
             cleanup(io, request);
@@ -248,24 +257,42 @@ pub fn execute(
             cleanup(io, request);
             return failed(.lock_missing, "debz did not emit or preserve a valid exact lock", .disposable, 0);
         };
-    }
+        break :blk expected.?;
+    } else null;
 
-    const provenance_path = backend_result.provenance_path;
+    var published_provenance_path: ?[]u8 = null;
+    errdefer if (published_provenance_path) |path| allocator.free(path);
     if (requiresProvenance(request.operation)) {
-        const path = provenance_path orelse
+        const path = backend_result.provenance_path orelse
             return failed(.provenance_missing, "debz did not return transaction provenance", .recoverable, 0);
         const expected = try allocator.print("{s}/{s}", .{
-            request.inputs.state_path,
-            debz.package_family_backend.provenance_basename,
+            request.inputs.root_stage,
+            debz.native_provenance.document_path,
         });
         defer allocator.free(expected);
         if (!std.mem.eql(u8, path, expected))
             return failed(.provenance_missing, "debz returned an unexpected provenance path", .recoverable, 0);
-        verifyProvenance(allocator, io, path, lock_digest.?) catch
+        const provenance_bytes = verifyProvenance(allocator, io, path, lock_digest.?) catch
             return failed(.provenance_missing, "debz did not emit valid transaction provenance", .recoverable, 0);
+        defer allocator.free(provenance_bytes);
+        const state_provenance = try allocator.print("{s}/{s}", .{
+            request.inputs.state_path,
+            debz.package_family_backend.provenance_basename,
+        });
+        writeRegularFile(io, state_provenance, provenance_bytes) catch {
+            allocator.free(state_provenance);
+            return failed(.provenance_missing, "debz transaction provenance could not be recorded", .recoverable, 0);
+        };
+        published_provenance_path = state_provenance;
     }
 
     if (publishes(request.operation)) {
+        const stage_debz_dir = try allocator.print("{s}/var/lib/debz", .{request.inputs.root_stage});
+        defer allocator.free(stage_debz_dir);
+        Dir.cwd().deleteTree(io, stage_debz_dir) catch {
+            if (published_provenance_path) |path| allocator.free(path);
+            return failed(.publication_failed, "validated root stage could not be scrubbed before publication", .recoverable, 0);
+        };
         Dir.renamePreserve(
             Dir.cwd(),
             request.inputs.root_stage,
@@ -273,6 +300,7 @@ pub fn execute(
             request.inputs.published_root,
             io,
         ) catch {
+            if (published_provenance_path) |path| allocator.free(path);
             return failed(.publication_failed, "validated root could not be published atomically", .recoverable, 0);
         };
     }
@@ -280,7 +308,7 @@ pub fn execute(
         .succeeded = true,
         .published = publishes(request.operation),
         .lock_path = lock_path,
-        .provenance_path = if (provenance_path) |path| try allocator.dupe(u8, path) else null,
+        .provenance_path = published_provenance_path,
     };
 }
 
@@ -326,13 +354,12 @@ fn executeDebz(
     io: Io,
     backend: DebianBackend,
     request: Request,
-) !debz.PackageFamilyResult {
-    var production: debz.ProductionBackend = .{ .io = io };
-    const product = backend.product_executor orelse production.interface();
-    const package_family: debz.PackageFamilyBackend = .{ .product_backend = product };
+) !debz.PackageFamilyOwnedResult {
     const foreign_architectures = try debzArchitectures(allocator, request.inputs.foreign_architectures);
     defer allocator.free(foreign_architectures);
-    return package_family.execute(allocator, .{
+    const debz_request: debz.PackageFamilyRequest = .{
+        .schema = debz_request_schema,
+        .version = debz_schema_version,
         .operation = debzOperation(request.operation),
         .root = request.inputs.root_stage,
         .architecture = switch (request.inputs.architecture) {
@@ -367,7 +394,32 @@ fn executeDebz(
         .proxy = request.inputs.proxy,
         .deadline_ms = request.inputs.deadline_ms,
         .lock_wait_ms = request.inputs.lock_wait_ms,
-    });
+    };
+    if (backend.product_executor) |product| {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        var legacy_request = debz_request;
+        legacy_request.schema = debz.package_family_backend.request_schema;
+        legacy_request.version = debz.package_family_backend.schema_version;
+        const package_family: debz.PackageFamilyBackend = .{
+            .product_backend = product,
+            .legacy_execution_capable = true,
+        };
+        var result = try package_family.execute(owned, legacy_request);
+        result.schema = debz_result_schema;
+        result.version = debz_schema_version;
+        if (result.provenance_path != null) {
+            result.provenance_path = try std.fmt.allocPrint(
+                owned,
+                "{s}/{s}",
+                .{ request.inputs.root_stage, debz.native_provenance.document_path },
+            );
+        }
+        return .{ .result = result, .arena = arena };
+    }
+    const native_backend: debz.NativePackageFamilyBackend = .{ .io = io };
+    return native_backend.execute(allocator, debz_request);
 }
 
 fn debzArchitectures(
@@ -394,15 +446,19 @@ fn debzOperation(operation: Operation) debz.package_family_backend.Operation {
     };
 }
 
-fn compatible(capabilities: debz.PackageFamilyCapabilities) bool {
-    return std.mem.eql(u8, capabilities.schema, debz.package_family_backend.capability_schema) and
-        capabilities.version == debz.package_family_backend.schema_version and
-        std.mem.eql(u8, capabilities.request_schema, debz.package_family_backend.request_schema) and
-        std.mem.eql(u8, capabilities.result_schema, debz.package_family_backend.result_schema) and
-        std.mem.eql(u8, capabilities.exact_lock_schema, debz.exact_lock.schema_id) and
-        std.mem.eql(u8, capabilities.provenance_schema, debz.transaction_provenance.schema_id) and
+fn compatible(capabilities: debz.NativePackageFamilyCapabilities) bool {
+    return std.mem.eql(u8, capabilities.schema, debz_capability_schema) and
+        capabilities.version == debz_schema_version and
+        std.mem.eql(u8, capabilities.request_schema, debz_request_schema) and
+        std.mem.eql(u8, capabilities.result_schema, debz_result_schema) and
+        std.mem.eql(u8, capabilities.exact_lock_schema, debz_exact_lock_schema) and
+        capabilities.provenance_schema != null and
+        std.mem.eql(u8, capabilities.provenance_schema.?, debz_provenance_schema) and
         std.mem.eql(u8, capabilities.family, "debian") and
+        capabilities.transaction_backend == .native and
         !capabilities.invokes_apt and
+        !capabilities.invokes_dpkg and
+        capabilities.recovery == .disposable_or_recoverable and
         contains(capabilities.operations, "resolve-lock") and
         contains(capabilities.operations, "create") and
         contains(capabilities.operations, "customize") and
@@ -558,6 +614,12 @@ fn readRegularFile(
     return reader.interface.allocRemaining(allocator, .limited(maximum_bytes));
 }
 
+fn writeRegularFile(io: Io, path: []const u8, bytes: []const u8) !void {
+    var file = try Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    try file.writeStreamingAll(io, bytes);
+}
+
 fn verifyLock(
     allocator: Allocator,
     io: Io,
@@ -565,12 +627,12 @@ fn verifyLock(
     architecture: Architecture,
     installed_baseline: InstalledBaselinePolicy,
 ) ![32]u8 {
-    const bytes = try readRegularFile(allocator, io, path, debz.exact_lock.maximum_document_bytes);
+    const bytes = try readRegularFile(allocator, io, path, debz.exact_lock_v3.maximum_document_bytes);
     defer allocator.free(bytes);
-    var lock = try debz.decodeExactClosureLock(
+    var lock = try debz.decodeExactClosureLockV3(
         allocator,
         bytes,
-        debz.exact_lock.maximum_document_bytes,
+        debz.exact_lock_v3.maximum_document_bytes,
     );
     defer lock.deinit();
     const expected = switch (architecture) {
@@ -597,30 +659,21 @@ fn verifyProvenance(
     io: Io,
     path: []const u8,
     lock_digest: [32]u8,
-) !void {
+) ![]u8 {
     const bytes = try readRegularFile(
         allocator,
         io,
         path,
-        debz.transaction_provenance.maximum_document_bytes,
+        debz.native_provenance.maximum_document_bytes,
     );
-    defer allocator.free(bytes);
-    var provenance = try debz.validateTransactionProvenance(
-        allocator,
-        bytes,
-        debz.transaction_provenance.maximum_document_bytes,
-    );
+    errdefer allocator.free(bytes);
+    var provenance = try debz.native_provenance.decode(allocator, bytes);
     defer provenance.deinit();
-    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, provenance.bytes, .{});
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |value| value,
-        else => return error.InvalidProvenance,
-    };
-    const encoded = object.get("lock_sha256") orelse return error.InvalidProvenance;
-    if (encoded != .string or encoded.string.len != 64) return error.InvalidProvenance;
+    if (provenance.document.outcome != .succeeded) return error.InvalidProvenance;
     const expected = std.fmt.bytesToHex(lock_digest, .lower);
-    if (!std.mem.eql(u8, encoded.string, &expected)) return error.InvalidProvenance;
+    if (!std.mem.eql(u8, &provenance.document.exact_lock_sha256, &expected))
+        return error.InvalidProvenance;
+    return bytes;
 }
 
 fn failed(
@@ -681,7 +734,13 @@ const FakeProduct = struct {
                 try writeTestLock(self.io, path, request.options.architecture);
         }
         if (request.operation.mutates() and request.operation != .recover and request.options.lock_input_path != null) {
-            const provenance = try std.testing.allocator.print("{s}/transaction-result.json", .{self.state_path});
+            const debz_dir = try std.testing.allocator.print("{s}/var/lib/debz", .{request.options.install_root});
+            defer std.testing.allocator.free(debz_dir);
+            try Dir.cwd().createDirPath(self.io, debz_dir);
+            const provenance = try std.testing.allocator.print(
+                "{s}/{s}",
+                .{ request.options.install_root, debz.native_provenance.document_path },
+            );
             defer std.testing.allocator.free(provenance);
             try writeTestProvenance(self.io, request.options.lock_input_path.?, provenance);
         }
@@ -697,31 +756,42 @@ const FakeProduct = struct {
 fn writeTestLock(io: Io, path: []const u8, architecture: []const u8) !void {
     const repository_id: [64]u8 = @splat('a');
     const snapshot: [32]u8 = @splat(1);
-    const repositories = [_]debz.exact_lock.Repository{.{
+    const repositories = [_]debz.exact_lock_v3.Repository{.{
         .id = repository_id,
         .snapshot_sha256 = snapshot,
         .release_sha256 = @splat(2),
-        .index_sha256 = @splat(3),
+        .index_identity = .{
+            .digests = .{ .sha256 = @splat(3) },
+            .primary = .sha256,
+        },
         .signer_fingerprints = &.{@splat(4)},
     }};
-    const packages = [_]debz.exact_lock.Package{.{
+    const packages = [_]debz.exact_lock_v3.Package{.{
         .name = "fixture",
         .version = "1",
         .architecture = architecture,
-        .repository_id = repository_id,
-        .repository_snapshot_sha256 = snapshot,
-        .sha256 = @splat(5),
+        .origin = .{
+            .authenticated_repository = .{
+                .repository_id = repository_id,
+                .repository_snapshot_sha256 = snapshot,
+            },
+        },
+        .archive_identity = .{
+            .digests = .{ .sha256 = @splat(5), .sha512 = @splat(6) },
+            .primary = .sha512,
+        },
         .declared_size = 1,
         .retention = .requested,
         .dpkg_selection_hold = false,
     }};
-    var lock = try debz.createExactClosureLock(std.testing.allocator, .{
+    var lock = try debz.createExactClosureLockV3(std.testing.allocator, .{
         .target_architecture = architecture,
-        .request_sha256 = @splat(6),
-        .policy_sha256 = @splat(7),
+        .request_sha256 = @splat(7),
+        .policy_sha256 = @splat(8),
         .repositories = &repositories,
+        .local_artifacts = &.{},
         .packages = &packages,
-        .authenticated_metadata = true,
+        .verified_origins = true,
     });
     defer lock.deinit();
     const bytes = try lock.lock.canonicalJson(std.testing.allocator);
@@ -736,36 +806,108 @@ fn writeTestProvenance(io: Io, lock_path: []const u8, path: []const u8) !void {
         std.testing.allocator,
         io,
         lock_path,
-        debz.exact_lock.maximum_document_bytes,
+        debz.exact_lock_v3.maximum_document_bytes,
     );
     defer std.testing.allocator.free(lock_bytes);
-    var lock = try debz.decodeExactClosureLock(
+    var lock = try debz.decodeExactClosureLockV3(
         std.testing.allocator,
         lock_bytes,
-        debz.exact_lock.maximum_document_bytes,
+        debz.exact_lock_v3.maximum_document_bytes,
     );
     defer lock.deinit();
-    var provenance = try debz.createTransactionProvenance(std.testing.allocator, .{
-        .target_architecture = lock.lock.target_architecture,
-        .request_sha256 = @splat(6),
-        .solver_policy_sha256 = @splat(7),
-        .executor_policy_sha256 = @splat(8),
-        .plan_sha256 = @splat(9),
-        .lock_sha256 = lock.lock.digest_sha256,
-        .repositories = &.{},
-        .packages = &.{},
-        .commands = &.{},
-        .journal_steps = &.{},
-        .final_verification = .{
-            .status = .exact_match,
-            .installed_state_sha256 = @splat(10),
-            .package_origins_sha256 = @splat(11),
-            .detail = "fixture verified",
+    const evidence_root =
+        "var/lib/debz/native-receipts-v1/1111111111111111111111111111111111111111111111111111111111111111";
+    const evidence_files = [_]debz.native_provenance.EvidenceFile{
+        .{
+            .kind = .authorization,
+            .path = evidence_root ++ "/authorization.json",
+            .sha256 = @splat('1'),
+            .document_sha256 = @splat('2'),
+            .size = 1,
         },
+        .{
+            .kind = .program,
+            .path = evidence_root ++ "/program.json",
+            .sha256 = @splat('2'),
+            .document_sha256 = @splat('3'),
+            .size = 1,
+        },
+        .{
+            .kind = .intent,
+            .path = evidence_root ++ "/intent.json",
+            .sha256 = @splat('3'),
+            .document_sha256 = @splat('4'),
+            .size = 1,
+        },
+        .{
+            .kind = .progress,
+            .path = evidence_root ++ "/progress.json",
+            .sha256 = @splat('4'),
+            .document_sha256 = @splat('5'),
+            .size = 1,
+        },
+        .{
+            .kind = .managed_state,
+            .path = evidence_root ++ "/managed-state.json",
+            .sha256 = @splat('5'),
+            .document_sha256 = @splat('6'),
+            .size = 1,
+        },
+        .{
+            .kind = .trigger_events,
+            .path = evidence_root ++ "/trigger-events.json",
+            .sha256 = @splat('6'),
+            .document_sha256 = @splat('7'),
+            .size = 1,
+        },
+    };
+    var document: debz.native_provenance.Document = .{
+        .authority = .{
+            .execution_request_schema = "https://debz.dev/schema/native-execution-request-v4",
+            .execution_request_version = 4,
+            .authorization_schema = "https://debz.dev/schema/native-transaction-authorization-v2",
+            .authorization_version = 2,
+            .program_schema = "https://debz.dev/schema/native-transaction-program-v2",
+            .program_version = 2,
+            .exact_lock_schema = "https://debz.dev/schema/exact-closure-lock-v3",
+            .exact_lock_version = 3,
+            .execution_intent_schema = "https://debz.dev/schema/native-execution-intent-v2",
+            .execution_intent_version = 2,
+            .progress_schema = "https://debz.dev/schema/native-execution-progress-v3",
+            .progress_version = 3,
+        },
+        .attempt_id = @splat('1'),
+        .install_root = "/srv/root",
+        .root_identity_sha256 = debz.native_provenance.hexDigest(
+            debz.transaction_recovery.rootIdentity("/srv/root"),
+        ),
+        .root_inode = 42,
+        .operation = .{ .package_transaction = .install },
+        .request_sha256 = @splat('3'),
+        .policy_sha256 = @splat('4'),
+        .authorization_sha256 = @splat('5'),
+        .program_sha256 = @splat('6'),
+        .exact_lock_sha256 = debz.native_provenance.hexDigest(lock.lock.digest_sha256),
+        .artifact_evidence_sha256 = @splat('8'),
+        .initial_database_generation_sha256 = @splat('9'),
+        .execution_intent_sha256 = @splat('a'),
+        .progress_head_sha256 = @splat('b'),
+        .progress_record_count = 12,
+        .script_outcomes_sha256 = @splat('c'),
+        .trigger_evidence_sha256 = @splat('d'),
+        .final_database_generation_sha256 = @splat('e'),
+        .final_state_sha256 = @splat('f'),
+        .recovered_phase_count = 1,
+        .evidence_root = evidence_root,
+        .evidence_files = &evidence_files,
+        .evidence_files_sha256 = debz.native_provenance.evidenceDigest(&evidence_files),
+        .final_state_kind = .package_database_closure_v1,
         .outcome = .succeeded,
-    });
-    defer provenance.deinit();
-    const bytes = try provenance.result.canonicalJson(std.testing.allocator);
+        .detail = "recovered",
+        .digest_sha256 = @splat('0'),
+    };
+    debz.native_provenance.seal(&document);
+    const bytes = try document.canonicalJson(std.testing.allocator);
     defer std.testing.allocator.free(bytes);
     var file = try Dir.cwd().createFile(io, path, .{});
     defer file.close(io);
@@ -870,6 +1012,13 @@ test "embedded debz product executor resolves reviewed lock then publishes Ubunt
     try std.testing.expect(created.published);
     try std.testing.expectEqual(@as(usize, 1), fake.seen_packages);
     _ = try Dir.cwd().statFile(io, paths.output, .{});
+    const published_debz_dir = try allocator.print("{s}/var/lib/debz", .{paths.output});
+    defer allocator.free(published_debz_dir);
+    try std.testing.expectError(error.FileNotFound, Dir.cwd().statFile(io, published_debz_dir, .{}));
+    const state_provenance = try allocator.print("{s}/transaction-result.json", .{paths.state});
+    defer allocator.free(state_provenance);
+    _ = try Dir.cwd().statFile(io, state_provenance, .{});
+    try std.testing.expectEqualStrings(state_provenance, created.provenance_path.?);
 }
 
 test "multiple package names are rejected without invoking debz" {
@@ -940,7 +1089,7 @@ test "immutable repository configs can supply all source documents" {
 }
 
 test "capability mismatch is a typed boundary failure" {
-    var capabilities = debz.packageFamilyCapabilities();
+    var capabilities = debz.nativePackageFamilyCapabilities();
     capabilities.version += 1;
     const result = try execute(std.testing.allocator, std.testing.io, .{
         .debian = .{ .capabilities = capabilities },
