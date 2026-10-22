@@ -288,6 +288,7 @@ pub const FileSystem = struct {
     free_cluster_count: u32,
     next_free_cluster: u32,
     fat_cache_sector: ?u32 = null,
+    fat_cache_dirty: bool = false,
     fat_cache: [max_bytes_per_sector]u8 = undefined,
 
     pub fn volumeMetadata(self: *const FileSystem) VolumeMetadata {
@@ -726,13 +727,20 @@ pub const FileSystem = struct {
         std.debug.assert(count > 0);
         var first: u32 = 0;
         var prev: u32 = 0;
-        errdefer if (first != 0) self.releaseChain(io, first) catch {};
+        errdefer if (first != 0) {
+            if (prev != 0) self.setFatEntryCached(io, prev, fat_entry_eoc) catch {};
+            self.flushFatCache(io) catch {};
+            self.releaseChain(io, first) catch {};
+        };
         var remaining = count;
         while (remaining > 0) : (remaining -= 1) {
-            const cluster = try self.allocateCluster(io);
-            if (first == 0) first = cluster else try self.writeFatEntry(io, prev, cluster);
+            const cluster = try self.allocateClusterUnflushed(io, false);
+            if (first == 0) first = cluster else try self.setFatEntryCached(io, prev, cluster);
             prev = cluster;
         }
+        try self.setFatEntryCached(io, prev, fat_entry_eoc);
+        try self.flushFatCache(io);
+        try self.persistFsInfo(io);
         return first;
     }
 
@@ -741,26 +749,33 @@ pub const FileSystem = struct {
         var cluster = first_cluster;
         while (true) {
             const next = try self.nextCluster(io, cluster);
-            try self.writeFatEntry(io, cluster, 0);
+            try self.setFatEntryCached(io, cluster, 0);
             self.free_cluster_count += 1;
             if (cluster < self.next_free_cluster) self.next_free_cluster = cluster;
             if (next == null) break;
             cluster = next.?;
         }
+        try self.flushFatCache(io);
         try self.persistFsInfo(io);
     }
 
     fn allocateCluster(self: *FileSystem, io: Io) MutationError!u32 {
+        const cluster = try self.allocateClusterUnflushed(io, true);
+        try self.flushFatCache(io);
+        try self.persistFsInfo(io);
+        return cluster;
+    }
+
+    fn allocateClusterUnflushed(self: *FileSystem, io: Io, mark_eoc: bool) MutationError!u32 {
         if (self.free_cluster_count == 0) return error.FilesystemFull;
         const max_cluster = self.info.maxClusterNumber();
         var probe = if (self.next_free_cluster < 2 or self.next_free_cluster > max_cluster) @as(u32, 2) else self.next_free_cluster;
         const start = probe;
         while (true) {
             if (try self.readFatEntry(io, probe) == 0) {
-                try self.writeFatEntry(io, probe, fat_entry_eoc);
+                if (mark_eoc) try self.setFatEntryCached(io, probe, fat_entry_eoc);
                 self.free_cluster_count -= 1;
                 self.next_free_cluster = if (probe == max_cluster) 2 else probe + 1;
-                try self.persistFsInfo(io);
                 return probe;
             }
             probe = if (probe == max_cluster) 2 else probe + 1;
@@ -769,20 +784,38 @@ pub const FileSystem = struct {
     }
 
     fn writeChainData(self: *FileSystem, io: Io, first_cluster: u32, data: []const u8) MutationError!void {
+        if (data.len == 0) return;
         const cluster_size = self.info.clusterSize();
         var cluster = first_cluster;
         var offset: usize = 0;
         var zero_buf: [max_cluster_size]u8 = @as([max_cluster_size]u8, @splat(0));
-        while (true) {
-            const take = @min(data.len - offset, cluster_size);
-            const cluster_rel = self.clusterOffset(cluster);
-            try self.writeRegion(io, data[offset .. offset + take], cluster_rel);
-            if (take < cluster_size) {
-                try self.writeRegion(io, zero_buf[0 .. cluster_size - take], cluster_rel + take);
+        while (offset < data.len) {
+            const run_start_cluster = cluster;
+            var run_end_cluster = cluster;
+            var run_clusters: usize = 1;
+            const remaining = data.len - offset;
+            var next_cluster_after_run: ?u32 = null;
+            while (remaining > run_clusters * cluster_size) {
+                const next = (try self.nextCluster(io, run_end_cluster)) orelse return error.BadClusterChain;
+                if (next == run_end_cluster + 1) {
+                    run_end_cluster = next;
+                    run_clusters += 1;
+                } else {
+                    next_cluster_after_run = next;
+                    break;
+                }
+            }
+            const run_bytes = run_clusters * cluster_size;
+            const take = @min(remaining, run_bytes);
+            const run_rel = self.clusterOffset(run_start_cluster);
+            try self.writeRegion(io, data[offset .. offset + take], run_rel);
+            if (take < run_bytes) {
+                const pad = run_bytes - take;
+                try self.writeRegion(io, zero_buf[0..pad], run_rel + take);
             }
             offset += take;
             if (offset == data.len) break;
-            cluster = (try self.nextCluster(io, cluster)) orelse return error.BadClusterChain;
+            cluster = next_cluster_after_run.?;
         }
     }
 
@@ -794,14 +827,28 @@ pub const FileSystem = struct {
         const cluster_size = self.info.clusterSize();
         var offset: usize = 0;
         while (offset < buffer.len) {
-            const take = @min(buffer.len - offset, cluster_size);
-            try self.readRegion(io, buffer[offset .. offset + take], self.clusterOffset(cluster));
+            const run_start_cluster = cluster;
+            var run_end_cluster = cluster;
+            var run_clusters: usize = 1;
+            const remaining = buffer.len - offset;
+            var next_cluster_after_run: ?u32 = null;
+            while (remaining > run_clusters * cluster_size) {
+                const next = (try self.nextCluster(io, run_end_cluster)) orelse
+                    return error.BadClusterChain;
+                try tracker.advance(next, self.info.data_cluster_count);
+                if (next == run_end_cluster + 1) {
+                    run_end_cluster = next;
+                    run_clusters += 1;
+                } else {
+                    next_cluster_after_run = next;
+                    break;
+                }
+            }
+            const take = @min(remaining, run_clusters * cluster_size);
+            try self.readRegion(io, buffer[offset .. offset + take], self.clusterOffset(run_start_cluster));
             offset += take;
             if (offset == buffer.len) break;
-            const next = (try self.nextCluster(io, cluster)) orelse
-                return error.BadClusterChain;
-            try tracker.advance(next, self.info.data_cluster_count);
-            cluster = next;
+            cluster = next_cluster_after_run.?;
         }
     }
 
@@ -845,17 +892,37 @@ pub const FileSystem = struct {
         return entry;
     }
 
+    fn loadFatSector(self: *FileSystem, io: Io, sector: u32) MutationError!void {
+        if (self.fat_cache_sector == sector) return;
+        if (self.fat_cache_dirty) try self.flushFatCache(io);
+        const sector_size: usize = self.info.bytes_per_sector;
+        const rel = (@as(u64, self.info.reserved_sector_count) + sector) *
+            self.info.bytes_per_sector;
+        try self.readRegion(io, self.fat_cache[0..sector_size], rel);
+        self.fat_cache_sector = sector;
+        self.fat_cache_dirty = false;
+    }
+
+    fn flushFatCache(self: *FileSystem, io: Io) MutationError!void {
+        if (!self.fat_cache_dirty) return;
+        const sector = self.fat_cache_sector orelse return;
+        const sector_size: usize = self.info.bytes_per_sector;
+        var fat_index: u8 = 0;
+        while (fat_index < self.info.fat_count) : (fat_index += 1) {
+            const rel = (@as(u64, self.info.reserved_sector_count) +
+                @as(u64, fat_index) * self.info.fat_size_sectors +
+                sector) * self.info.bytes_per_sector;
+            try self.writeRegion(io, self.fat_cache[0..sector_size], rel);
+        }
+        self.fat_cache_dirty = false;
+    }
+
     fn readFatEntry(self: *FileSystem, io: Io, cluster: u32) MutationError!u32 {
         const sector_size: usize = self.info.bytes_per_sector;
         const fat_offset = @as(u64, cluster) * 4;
         const sector: u32 = @intCast(fat_offset / @as(u64, sector_size));
         const entry_offset: usize = @intCast(fat_offset % @as(u64, sector_size));
-        if (self.fat_cache_sector != sector) {
-            const rel = (@as(u64, self.info.reserved_sector_count) + sector) *
-                self.info.bytes_per_sector;
-            try self.readRegion(io, self.fat_cache[0..sector_size], rel);
-            self.fat_cache_sector = sector;
-        }
+        try self.loadFatSector(io, sector);
         return std.mem.readInt(
             u32,
             self.fat_cache[entry_offset..][0..4],
@@ -863,15 +930,30 @@ pub const FileSystem = struct {
         ) & fat_entry_mask;
     }
 
+    fn setFatEntryCached(self: *FileSystem, io: Io, cluster: u32, value: u32) MutationError!void {
+        const sector_size: usize = self.info.bytes_per_sector;
+        const fat_offset = @as(u64, cluster) * 4;
+        const sector: u32 = @intCast(fat_offset / @as(u64, sector_size));
+        const entry_offset: usize = @intCast(fat_offset % @as(u64, sector_size));
+        try self.loadFatSector(io, sector);
+        const existing = std.mem.readInt(
+            u32,
+            self.fat_cache[entry_offset..][0..4],
+            .little,
+        );
+        const combined = (existing & ~fat_entry_mask) | (value & fat_entry_mask);
+        std.mem.writeInt(
+            u32,
+            self.fat_cache[entry_offset..][0..4],
+            combined,
+            .little,
+        );
+        self.fat_cache_dirty = true;
+    }
+
     fn writeFatEntry(self: *FileSystem, io: Io, cluster: u32, value: u32) MutationError!void {
-        var buf: [4]u8 = undefined;
-        std.mem.writeInt(u32, &buf, value, .little);
-        self.fat_cache_sector = null;
-        var fat_index: u8 = 0;
-        while (fat_index < self.info.fat_count) : (fat_index += 1) {
-            const rel = (@as(u64, self.info.reserved_sector_count) + @as(u64, fat_index) * self.info.fat_size_sectors) * self.info.bytes_per_sector + @as(u64, cluster) * 4;
-            try self.writeRegion(io, &buf, rel);
-        }
+        try self.setFatEntryCached(io, cluster, value);
+        try self.flushFatCache(io);
     }
 
     fn readCluster(self: *FileSystem, io: Io, cluster: u32, buffer: []u8) MutationError!void {
@@ -947,9 +1029,10 @@ pub fn format(image: *Image, io: Io, options: FormatOptions) FormatError!void {
         try fs.writeRegion(io, &fsinfo_sector_buf, @as(u64, layout.backup_boot_sector + 1) * layout.bytes_per_sector);
     }
 
-    try fs.writeFatEntry(io, 0, (@as(u32, 0x0FFF_FF00) | options.media_descriptor));
-    try fs.writeFatEntry(io, 1, fat_entry_mask);
-    try fs.writeFatEntry(io, layout.root_cluster, fat_entry_eoc);
+    try fs.setFatEntryCached(io, 0, (@as(u32, 0x0FFF_FF00) | options.media_descriptor));
+    try fs.setFatEntryCached(io, 1, fat_entry_mask);
+    try fs.setFatEntryCached(io, layout.root_cluster, fat_entry_eoc);
+    try fs.flushFatCache(io);
 }
 
 /// Opens an existing FAT32 volume that lives inside `region` of `image`.
@@ -3303,4 +3386,102 @@ test "the length a volume is sized to is one format accepts and can be filled to
     const read_back = try fs.readFileAlloc(io, std.testing.allocator, "sub/two.bin");
     defer std.testing.allocator.free(read_back);
     try std.testing.expectEqualSlices(u8, payload, read_back);
+}
+
+test "multi-sector FAT chain allocation, coalesced I/O, overwrite, and deletion keep FAT copies and FSInfo exact" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporaryTestPath(allocator, io, &temporary, "test-fat32-multi-sector-hot-paths.img");
+    defer allocator.free(path);
+
+    const partition_len: u64 = 64 * 1024 * 1024;
+    var img = try Image.create(io, path, .raw, partition_len, .{});
+    defer img.close(io);
+
+    try format(&img, io, .{ .partition_offset = 0, .partition_len = partition_len });
+    var fs = try open(&img, io, .{ .offset = 0, .length = partition_len });
+    const cluster_size = fs.info.clusterSize();
+    const initial_free = fs.free_cluster_count;
+
+    // 1101 clusters (> 512 KiB and > 128 entries per 512-byte FAT sector),
+    // crossing 9 FAT sector boundaries.
+    const initial_clusters: u32 = 1101;
+    const initial_len: usize = @as(usize, initial_clusters - 1) * cluster_size + 73;
+    const initial_data = try allocPattern(allocator, initial_len, 0xA3);
+    defer allocator.free(initial_data);
+
+    try fs.createDir(io, "EFI/BOOT");
+    const free_after_dirs = fs.free_cluster_count;
+    try std.testing.expectEqual(initial_free - 2, free_after_dirs);
+
+    try fs.writeFile(io, "EFI/BOOT/uki.efi", initial_data);
+    try std.testing.expectEqual(free_after_dirs - initial_clusters, fs.free_cluster_count);
+
+    // Verify FAT #1 and FAT #2 match across all FAT sectors.
+    const fat_bytes: usize = @as(usize, fs.info.fat_size_sectors) * fs.info.bytes_per_sector;
+    const fat1 = try allocator.alloc(u8, fat_bytes);
+    defer allocator.free(fat1);
+    const fat2 = try allocator.alloc(u8, fat_bytes);
+    defer allocator.free(fat2);
+    const fat1_offset = @as(u64, fs.info.reserved_sector_count) * fs.info.bytes_per_sector;
+    const fat2_offset = fat1_offset + fat_bytes;
+    try fs.readRegion(io, fat1, fat1_offset);
+    try fs.readRegion(io, fat2, fat2_offset);
+    try std.testing.expectEqualSlices(u8, fat1, fat2);
+
+    // Verify persisted FSInfo and actual FAT free count match.
+    var reopened = try open(&img, io, .{ .offset = 0, .length = partition_len });
+    try std.testing.expectEqual(fs.free_cluster_count, reopened.free_cluster_count);
+    try reopened.recountFreeClusters(io);
+    try std.testing.expectEqual(fs.free_cluster_count, reopened.free_cluster_count);
+
+    // Verify read-back of contiguous multi-FAT-sector file.
+    const read_initial = try fs.readFileAlloc(io, allocator, "EFI/BOOT/uki.efi");
+    defer allocator.free(read_initial);
+    try std.testing.expectEqualSlices(u8, initial_data, read_initial);
+
+    // Place a barrier file right after uki.efi, then delete uki.efi and write a
+    // larger replacement so the replacement spans two non-contiguous cluster runs
+    // across multiple FAT sectors.
+    const barrier_data = try allocPattern(allocator, cluster_size * 3 + 11, 0x5C);
+    defer allocator.free(barrier_data);
+    try fs.writeFile(io, "EFI/BOOT/barrier.bin", barrier_data);
+
+    try fs.deletePath(io, "EFI/BOOT/uki.efi");
+    try std.testing.expectEqual(free_after_dirs - 4, fs.free_cluster_count);
+
+    const overwrite_clusters: u32 = 1350;
+    const overwrite_len: usize = @as(usize, overwrite_clusters - 1) * cluster_size + 199;
+    const overwrite_data = try allocPattern(allocator, overwrite_len, 0xE7);
+    defer allocator.free(overwrite_data);
+    try fs.writeFile(io, "EFI/BOOT/uki.efi", overwrite_data);
+    try std.testing.expectEqual(free_after_dirs - 4 - overwrite_clusters, fs.free_cluster_count);
+
+    try fs.readRegion(io, fat1, fat1_offset);
+    try fs.readRegion(io, fat2, fat2_offset);
+    try std.testing.expectEqualSlices(u8, fat1, fat2);
+
+    const read_overwritten = try fs.readFileAlloc(io, allocator, "EFI/BOOT/uki.efi");
+    defer allocator.free(read_overwritten);
+    try std.testing.expectEqualSlices(u8, overwrite_data, read_overwritten);
+
+    const read_barrier = try fs.readFileAlloc(io, allocator, "EFI/BOOT/barrier.bin");
+    defer allocator.free(read_barrier);
+    try std.testing.expectEqualSlices(u8, barrier_data, read_barrier);
+
+    // Delete both files and verify all file clusters are returned and FAT #1 == FAT #2.
+    try fs.deletePath(io, "EFI/BOOT/uki.efi");
+    try fs.deletePath(io, "EFI/BOOT/barrier.bin");
+    try std.testing.expectEqual(free_after_dirs, fs.free_cluster_count);
+
+    try fs.readRegion(io, fat1, fat1_offset);
+    try fs.readRegion(io, fat2, fat2_offset);
+    try std.testing.expectEqualSlices(u8, fat1, fat2);
+
+    reopened = try open(&img, io, .{ .offset = 0, .length = partition_len });
+    try std.testing.expectEqual(free_after_dirs, reopened.free_cluster_count);
+    try reopened.recountFreeClusters(io);
+    try std.testing.expectEqual(free_after_dirs, reopened.free_cluster_count);
 }
