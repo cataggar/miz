@@ -414,6 +414,7 @@ const Instance = struct {
     swtpm_child: ?std.process.Child = null,
     spawned: ?qmp.Spawned = null,
     child_waited: bool = false,
+    runtime_contract_probe_uploaded: bool = false,
 
     fn init(
         self: *Instance,
@@ -465,6 +466,7 @@ const Instance = struct {
             .swtpm_state_path = swtpm_state_path,
             .swtpm_socket_path = swtpm_socket_path,
             .swtpm_log_path = swtpm_log_path,
+            .runtime_contract_probe_uploaded = false,
         };
     }
 
@@ -701,6 +703,48 @@ fn initialGuestLaunchOrder(
             .first_ready,
             .start_second,
             .second_ready,
+        },
+    };
+}
+
+const GuestLifecycleStep = enum {
+    start_first,
+    first_ready,
+    complete_first_and_poweroff,
+    start_second,
+    second_ready,
+    complete_second_and_poweroff,
+    verify_first_pre_reboot,
+    verify_second_pre_reboot,
+    reboot_and_verify_first,
+    reboot_and_verify_second,
+    poweroff_first,
+    poweroff_second,
+};
+
+fn guestLifecycleOrder(
+    policy: execution.InitialGuestLaunchPolicy,
+) []const GuestLifecycleStep {
+    return switch (policy) {
+        .serial_until_ready => &.{
+            .start_first,
+            .first_ready,
+            .complete_first_and_poweroff,
+            .start_second,
+            .second_ready,
+            .complete_second_and_poweroff,
+        },
+        .concurrent => &.{
+            .start_first,
+            .start_second,
+            .first_ready,
+            .second_ready,
+            .verify_first_pre_reboot,
+            .verify_second_pre_reboot,
+            .reboot_and_verify_first,
+            .reboot_and_verify_second,
+            .poweroff_first,
+            .poweroff_second,
         },
     };
 }
@@ -1940,6 +1984,7 @@ fn startInstance(
         .stdout = .ignore,
         .stderr = .inherit,
     });
+    instance.runtime_contract_probe_uploaded = false;
 }
 
 fn commandSucceeded(
@@ -2293,16 +2338,14 @@ fn verifyGuestSecureBoot(
     allocator: Allocator,
     io: Io,
     ssh_path: []const u8,
-    instance: *const Instance,
+    instance: *Instance,
     certificate_sha256: miz.artifact_pipeline.Digest,
 ) !void {
-    try pushProbeBinary(
+    try ensureRuntimeContractProbe(
         allocator,
         io,
         ssh_path,
         instance,
-        runtimeContractProbeHostPath(),
-        runtime_contract_probe_remote_path,
     );
 
     const evidence_command = try uefiEvidenceCommandAlloc(allocator);
@@ -2753,14 +2796,13 @@ const RuntimeContractReport = struct {
     }
 };
 
-/// Uploads the probe, runs the whole contract, and refuses a report that does
-/// not satisfy every guest requirement.
-fn readGuestRuntimeContractAlloc(
+fn ensureRuntimeContractProbe(
     allocator: Allocator,
     io: Io,
     ssh_path: []const u8,
-    instance: *const Instance,
-) !RuntimeContractReport {
+    instance: *Instance,
+) !void {
+    if (instance.runtime_contract_probe_uploaded) return;
     try pushProbeBinary(
         allocator,
         io,
@@ -2768,6 +2810,23 @@ fn readGuestRuntimeContractAlloc(
         instance,
         runtimeContractProbeHostPath(),
         runtime_contract_probe_remote_path,
+    );
+    instance.runtime_contract_probe_uploaded = true;
+}
+
+/// Uploads the probe (if not already present for this boot), runs the whole
+/// contract, and refuses a report that does not satisfy every guest requirement.
+fn readGuestRuntimeContractAlloc(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    instance: *Instance,
+) !RuntimeContractReport {
+    try ensureRuntimeContractProbe(
+        allocator,
+        io,
+        ssh_path,
+        instance,
     );
     const output = try sshOutputAlloc(
         allocator,
@@ -2968,6 +3027,11 @@ fn verifyAdminLogin(
         return error.UnexpectedAdminUsername;
 }
 
+const key_only_sshd_config_command =
+    "out=$(sudo -n sshd -T) && " ++
+    "printf '%s\\n' \"$out\" | grep -Fxq 'passwordauthentication no' && " ++
+    "printf '%s\\n' \"$out\" | grep -Fxq 'kbdinteractiveauthentication no'";
+
 fn verifyKeyOnlySsh(
     allocator: Allocator,
     io: Io,
@@ -3010,7 +3074,7 @@ fn verifyKeyOnlySsh(
         io,
         ssh_path,
         instance,
-        "sudo -n sshd -T | grep -Fxq 'passwordauthentication no' && sudo -n sshd -T | grep -Fxq 'kbdinteractiveauthentication no'",
+        key_only_sshd_config_command,
     )) return error.SshPasswordAuthenticationEnabled;
 }
 
@@ -3484,7 +3548,7 @@ fn rebootAndReadIdentity(
     allocator: Allocator,
     io: Io,
     ssh_path: []const u8,
-    instance: *const Instance,
+    instance: *Instance,
     before: *const GuestIdentity,
 ) !GuestIdentity {
     _ = sshSucceeded(
@@ -3494,6 +3558,7 @@ fn rebootAndReadIdentity(
         instance,
         "sudo -n /sbin/reboot",
     ) catch false;
+    instance.runtime_contract_probe_uploaded = false;
 
     const deadline = Io.Clock.awake.now(io).addDuration(.fromSeconds(
         instance.execution_profile.timeouts.guest_ready_seconds,
@@ -3552,6 +3617,275 @@ fn poweroff(
         else => {},
     }
     return error.QemuDidNotExitCleanly;
+}
+
+const PreRebootGuestState = struct {
+    before: GuestIdentity,
+    core_before: ?CoreProvisionedState = null,
+
+    fn deinit(self: *PreRebootGuestState, allocator: Allocator) void {
+        self.before.deinit(allocator);
+        if (self.core_before) |*state| state.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+const CompletedGuestLifecycle = struct {
+    before: GuestIdentity,
+    after: GuestIdentity,
+    core_before: ?CoreProvisionedState = null,
+
+    fn deinit(self: *CompletedGuestLifecycle, allocator: Allocator) void {
+        self.before.deinit(allocator);
+        self.after.deinit(allocator);
+        if (self.core_before) |*state| state.deinit(allocator);
+        self.* = undefined;
+    }
+};
+
+fn verifyPreRebootGuestAlloc(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    ssh_keygen_path: []const u8,
+    candidate: Candidate,
+    published_geometry: PublishedGeometry,
+    certificate_sha256: miz.artifact_pipeline.Digest,
+    is_first_guest: bool,
+    instance: *Instance,
+) !PreRebootGuestState {
+    try verifyRootGrowth(allocator, io, ssh_path, instance, candidate, published_geometry);
+    try verifyGuestSecureBoot(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        certificate_sha256,
+    );
+
+    if (candidate.flavor == .core) {
+        try verifyGuestSignedBinderModule(allocator, io, ssh_path, instance);
+
+        // One probe run per guest answers the whole runtime contract, and the
+        // BinderFS and DMA-heap contracts are then read out of it rather than
+        // re-asked with shell utilities the final image should not have to keep.
+        var contract = try readGuestRuntimeContractAlloc(
+            allocator,
+            io,
+            ssh_path,
+            instance,
+        );
+        defer contract.deinit(allocator);
+        try verifyGuestBinderfsDevices(&contract);
+        try verifyGuestBinderDeviceUsability(allocator, io, ssh_path, instance);
+        try verifyGuestDmaHeap(&contract);
+
+        // The measured first-boot phase issue #677 step 1 left open. The root
+        // has booted and grown by now, so this is the first moment the numbers
+        // exist at all; they are read from the guest's own `statfs` and
+        // appended to a copy of the candidate's inventory, never to the bound
+        // document, whose digest provenance already depends on.
+        if (is_first_guest) {
+            try recordFirstBootInventory(allocator, io, ssh_path, instance, candidate);
+        }
+    }
+
+    var before = try readGuestIdentityAlloc(allocator, io, ssh_path, instance);
+    errdefer before.deinit(allocator);
+
+    var core_before: ?CoreProvisionedState = null;
+    errdefer if (core_before) |*state| state.deinit(allocator);
+    if (candidate.flavor == .core) {
+        try waitForSerialMarker(
+            allocator,
+            io,
+            instance,
+            "explicit local provisioning media detected; WireServer Ready will be skipped",
+            5,
+        );
+        const public_key_fingerprint = try publicKeyFingerprintAlloc(
+            allocator,
+            io,
+            ssh_keygen_path,
+            instance.public_key_path,
+        );
+        defer allocator.free(public_key_fingerprint);
+
+        core_before = try readCoreProvisionedStateAlloc(
+            allocator,
+            io,
+            ssh_path,
+            instance,
+        );
+        try std.testing.expectEqualStrings(
+            public_key_fingerprint,
+            core_before.?.authorized_key_fingerprint,
+        );
+        try verifyCoreSshdRestart(allocator, io, ssh_path, instance);
+    }
+
+    return .{
+        .before = before,
+        .core_before = core_before,
+    };
+}
+
+fn rebootAndVerifyPostRebootGuestAlloc(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    candidate: Candidate,
+    certificate_sha256: miz.artifact_pipeline.Digest,
+    is_first_guest: bool,
+    pre_reboot: *const PreRebootGuestState,
+    instance: *Instance,
+) !GuestIdentity {
+    var after = try rebootAndReadIdentity(
+        allocator,
+        io,
+        ssh_path,
+        instance,
+        &pre_reboot.before,
+    );
+    errdefer after.deinit(allocator);
+
+    try std.testing.expectEqualStrings(
+        pre_reboot.before.machine_id,
+        after.machine_id,
+    );
+    try std.testing.expectEqualStrings(
+        pre_reboot.before.ssh_fingerprint,
+        after.ssh_fingerprint,
+    );
+    try verifyAdminLogin(allocator, io, ssh_path, instance);
+    try verifyKeyOnlySsh(allocator, io, ssh_path, instance);
+    try verifyFlavorRuntime(allocator, io, ssh_path, candidate, instance);
+    if (candidate.flavor == .core) {
+        var core_after = try readCoreProvisionedStateAlloc(
+            allocator,
+            io,
+            ssh_path,
+            instance,
+        );
+        defer core_after.deinit(allocator);
+        try expectCoreProvisionedStateEqual(&pre_reboot.core_before.?, &core_after);
+    }
+    if (is_first_guest) {
+        try verifyGuestSecureBoot(
+            allocator,
+            io,
+            ssh_path,
+            instance,
+            certificate_sha256,
+        );
+    }
+    return after;
+}
+
+fn completeReadyGuestLifecycleAlloc(
+    allocator: Allocator,
+    io: Io,
+    ssh_path: []const u8,
+    ssh_keygen_path: []const u8,
+    candidate: Candidate,
+    published_geometry: PublishedGeometry,
+    certificate_sha256: miz.artifact_pipeline.Digest,
+    is_first_guest: bool,
+    instance: *Instance,
+) !CompletedGuestLifecycle {
+    var pre_reboot = try verifyPreRebootGuestAlloc(
+        allocator,
+        io,
+        ssh_path,
+        ssh_keygen_path,
+        candidate,
+        published_geometry,
+        certificate_sha256,
+        is_first_guest,
+        instance,
+    );
+    errdefer pre_reboot.deinit(allocator);
+
+    var after = try rebootAndVerifyPostRebootGuestAlloc(
+        allocator,
+        io,
+        ssh_path,
+        candidate,
+        certificate_sha256,
+        is_first_guest,
+        &pre_reboot,
+        instance,
+    );
+    errdefer after.deinit(allocator);
+
+    try poweroff(allocator, io, ssh_path, instance);
+
+    return .{
+        .before = pre_reboot.before,
+        .after = after,
+        .core_before = pre_reboot.core_before,
+    };
+}
+
+fn verifyCrossGuestUniqueness(
+    flavor: Flavor,
+    first_before: *const GuestIdentity,
+    second_before: *const GuestIdentity,
+    first_after: *const GuestIdentity,
+    second_after: *const GuestIdentity,
+    first_core_before: ?CoreProvisionedState,
+    second_core_before: ?CoreProvisionedState,
+) !void {
+    try std.testing.expectEqualStrings(
+        first_before.machine_id,
+        first_after.machine_id,
+    );
+    try std.testing.expectEqualStrings(
+        first_before.ssh_fingerprint,
+        first_after.ssh_fingerprint,
+    );
+    try std.testing.expectEqualStrings(
+        second_before.machine_id,
+        second_after.machine_id,
+    );
+    try std.testing.expectEqualStrings(
+        second_before.ssh_fingerprint,
+        second_after.ssh_fingerprint,
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first_before.machine_id,
+        second_before.machine_id,
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first_before.ssh_fingerprint,
+        second_before.ssh_fingerprint,
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first_after.machine_id,
+        second_after.machine_id,
+    ));
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first_after.ssh_fingerprint,
+        second_after.ssh_fingerprint,
+    ));
+    if (flavor == .core) {
+        const first_core = first_core_before orelse return error.InvalidCoreProvisionedState;
+        const second_core = second_core_before orelse return error.InvalidCoreProvisionedState;
+        try std.testing.expect(!std.mem.eql(
+            u8,
+            first_core.authorized_key_fingerprint,
+            second_core.authorized_key_fingerprint,
+        ));
+        try std.testing.expect(!std.mem.eql(
+            u8,
+            first_core.sentinel,
+            second_core.sentinel,
+        ));
+    }
 }
 
 fn writeAcceptanceResultValue(
@@ -4477,6 +4811,116 @@ test "initial guest launch policy serializes Arm TCG but keeps KVM concurrent" {
         },
         &tcg_order,
     );
+
+    const kvm_lifecycle = guestLifecycleOrder(
+        execution.x86_64_kvm.initial_guest_launch,
+    );
+    const tcg_lifecycle = guestLifecycleOrder(
+        execution.aarch64_tcg.initial_guest_launch,
+    );
+    try std.testing.expectEqualSlices(
+        GuestLifecycleStep,
+        &.{
+            .start_first,
+            .start_second,
+            .first_ready,
+            .second_ready,
+            .verify_first_pre_reboot,
+            .verify_second_pre_reboot,
+            .reboot_and_verify_first,
+            .reboot_and_verify_second,
+            .poweroff_first,
+            .poweroff_second,
+        },
+        kvm_lifecycle,
+    );
+    try std.testing.expectEqualSlices(
+        GuestLifecycleStep,
+        &.{
+            .start_first,
+            .first_ready,
+            .complete_first_and_poweroff,
+            .start_second,
+            .second_ready,
+            .complete_second_and_poweroff,
+        },
+        tcg_lifecycle,
+    );
+}
+
+test "cross-guest uniqueness and key-only sshd check preserve acceptance invariants" {
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, key_only_sshd_config_command, "sshd -T"),
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, key_only_sshd_config_command, "passwordauthentication no") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, key_only_sshd_config_command, "kbdinteractiveauthentication no") != null,
+    );
+
+    const first_before: GuestIdentity = .{
+        .machine_id = @constCast("11111111111111111111111111111111"),
+        .ssh_fingerprint = @constCast("SHA256:first-host-key"),
+        .boot_id = @constCast("boot-1a"),
+    };
+    const first_after: GuestIdentity = .{
+        .machine_id = @constCast("11111111111111111111111111111111"),
+        .ssh_fingerprint = @constCast("SHA256:first-host-key"),
+        .boot_id = @constCast("boot-1b"),
+    };
+    const second_before: GuestIdentity = .{
+        .machine_id = @constCast("22222222222222222222222222222222"),
+        .ssh_fingerprint = @constCast("SHA256:second-host-key"),
+        .boot_id = @constCast("boot-2a"),
+    };
+    const second_after: GuestIdentity = .{
+        .machine_id = @constCast("22222222222222222222222222222222"),
+        .ssh_fingerprint = @constCast("SHA256:second-host-key"),
+        .boot_id = @constCast("boot-2b"),
+    };
+    const first_core: CoreProvisionedState = .{
+        .account = @constCast("miztest:1000:1000:/home/miztest:/bin/sh"),
+        .authorized_key_fingerprint = @constCast("SHA256:first-admin-key"),
+        .sentinel = @constCast("sentinel-first"),
+    };
+    const second_core: CoreProvisionedState = .{
+        .account = @constCast("miztest:1000:1000:/home/miztest:/bin/sh"),
+        .authorized_key_fingerprint = @constCast("SHA256:second-admin-key"),
+        .sentinel = @constCast("sentinel-second"),
+    };
+
+    try verifyCrossGuestUniqueness(
+        .full,
+        &first_before,
+        &second_before,
+        &first_after,
+        &second_after,
+        null,
+        null,
+    );
+    try verifyCrossGuestUniqueness(
+        .core,
+        &first_before,
+        &second_before,
+        &first_after,
+        &second_after,
+        first_core,
+        second_core,
+    );
+    try std.testing.expectError(
+        error.InvalidCoreProvisionedState,
+        verifyCrossGuestUniqueness(
+            .core,
+            &first_before,
+            &second_before,
+            &first_after,
+            &second_after,
+            first_core,
+            null,
+        ),
+    );
 }
 
 test "full service checks keep dispatcher strict and udisks D-Bus-only" {
@@ -5221,9 +5665,20 @@ fn verifyFinalizedQcow2Acceptance() !void {
     defer second.deinit(allocator);
     errdefer second.dumpSerial(allocator, io);
 
-    // KVM still exercises two concurrent first boots. Arm TCG waits for the
-    // first independently provisioned guest to pass the same strict runtime
-    // checks before launching the second, avoiding two 2-vCPU startup bursts.
+    const published_geometry = try readPublishedGeometry(
+        allocator,
+        io,
+        absolute_image,
+        candidate,
+    );
+    var first_completed: ?CompletedGuestLifecycle = null;
+    defer if (first_completed) |*state| state.deinit(allocator);
+    var second_completed: ?CompletedGuestLifecycle = null;
+    defer if (second_completed) |*state| state.deinit(allocator);
+
+    // KVM still exercises two concurrent live guests. Arm TCG runs the first
+    // independently provisioned guest through its full lifecycle and poweroff
+    // before launching the second, avoiding two-VM TCG CPU contention.
     for (initialGuestLaunchOrder(
         configured_execution.profile.initial_guest_launch,
     )) |step| switch (step) {
@@ -5241,13 +5696,28 @@ fn verifyFinalizedQcow2Acceptance() !void {
             true,
             &first,
         ),
-        .first_ready => try verifyInitialGuestReady(
-            allocator,
-            io,
-            ssh_path,
-            candidate,
-            &first,
-        ),
+        .first_ready => {
+            try verifyInitialGuestReady(
+                allocator,
+                io,
+                ssh_path,
+                candidate,
+                &first,
+            );
+            if (configured_execution.profile.initial_guest_launch == .serial_until_ready) {
+                first_completed = try completeReadyGuestLifecycleAlloc(
+                    allocator,
+                    io,
+                    ssh_path,
+                    ssh_keygen_path,
+                    candidate,
+                    published_geometry,
+                    certificate_sha256,
+                    true,
+                    &first,
+                );
+            }
+        },
         .start_second => try startInstance(
             allocator,
             io,
@@ -5262,233 +5732,103 @@ fn verifyFinalizedQcow2Acceptance() !void {
             true,
             &second,
         ),
-        .second_ready => try verifyInitialGuestReady(
-            allocator,
-            io,
-            ssh_path,
-            candidate,
-            &second,
-        ),
+        .second_ready => {
+            try verifyInitialGuestReady(
+                allocator,
+                io,
+                ssh_path,
+                candidate,
+                &second,
+            );
+            if (configured_execution.profile.initial_guest_launch == .serial_until_ready) {
+                second_completed = try completeReadyGuestLifecycleAlloc(
+                    allocator,
+                    io,
+                    ssh_path,
+                    ssh_keygen_path,
+                    candidate,
+                    published_geometry,
+                    certificate_sha256,
+                    false,
+                    &second,
+                );
+            }
+        },
     };
-    const published_geometry = try readPublishedGeometry(
-        allocator,
-        io,
-        absolute_image,
-        candidate,
-    );
-    try verifyRootGrowth(allocator, io, ssh_path, &first, candidate, published_geometry);
-    try verifyRootGrowth(allocator, io, ssh_path, &second, candidate, published_geometry);
-    try verifyGuestSecureBoot(
-        allocator,
-        io,
-        ssh_path,
-        &first,
-        certificate_sha256,
-    );
-    try verifyGuestSecureBoot(
-        allocator,
-        io,
-        ssh_path,
-        &second,
-        certificate_sha256,
-    );
 
-    if (candidate.flavor == .core) {
-        try verifyGuestSignedBinderModule(allocator, io, ssh_path, &first);
-        try verifyGuestSignedBinderModule(allocator, io, ssh_path, &second);
+    switch (configured_execution.profile.initial_guest_launch) {
+        .serial_until_ready => try verifyCrossGuestUniqueness(
+            candidate.flavor,
+            &first_completed.?.before,
+            &second_completed.?.before,
+            &first_completed.?.after,
+            &second_completed.?.after,
+            first_completed.?.core_before,
+            second_completed.?.core_before,
+        ),
+        .concurrent => {
+            var first_pre = try verifyPreRebootGuestAlloc(
+                allocator,
+                io,
+                ssh_path,
+                ssh_keygen_path,
+                candidate,
+                published_geometry,
+                certificate_sha256,
+                true,
+                &first,
+            );
+            defer first_pre.deinit(allocator);
+            var second_pre = try verifyPreRebootGuestAlloc(
+                allocator,
+                io,
+                ssh_path,
+                ssh_keygen_path,
+                candidate,
+                published_geometry,
+                certificate_sha256,
+                false,
+                &second,
+            );
+            defer second_pre.deinit(allocator);
 
-        // One probe run per guest answers the whole runtime contract, and the
-        // BinderFS and DMA-heap contracts are then read out of it rather than
-        // re-asked with shell utilities the final image should not have to keep.
-        var first_contract = try readGuestRuntimeContractAlloc(
-            allocator,
-            io,
-            ssh_path,
-            &first,
-        );
-        defer first_contract.deinit(allocator);
-        var second_contract = try readGuestRuntimeContractAlloc(
-            allocator,
-            io,
-            ssh_path,
-            &second,
-        );
-        defer second_contract.deinit(allocator);
-        try verifyGuestBinderfsDevices(&first_contract);
-        try verifyGuestBinderfsDevices(&second_contract);
-        try verifyGuestBinderDeviceUsability(allocator, io, ssh_path, &first);
-        try verifyGuestBinderDeviceUsability(allocator, io, ssh_path, &second);
-        try verifyGuestDmaHeap(&first_contract);
-        try verifyGuestDmaHeap(&second_contract);
+            var first_after = try rebootAndVerifyPostRebootGuestAlloc(
+                allocator,
+                io,
+                ssh_path,
+                candidate,
+                certificate_sha256,
+                true,
+                &first_pre,
+                &first,
+            );
+            defer first_after.deinit(allocator);
+            var second_after = try rebootAndVerifyPostRebootGuestAlloc(
+                allocator,
+                io,
+                ssh_path,
+                candidate,
+                certificate_sha256,
+                false,
+                &second_pre,
+                &second,
+            );
+            defer second_after.deinit(allocator);
 
-        // The measured first-boot phase issue #677 step 1 left open. The root
-        // has booted and grown by now, so this is the first moment the numbers
-        // exist at all; they are read from the guest's own `statfs` and
-        // appended to a copy of the candidate's inventory, never to the bound
-        // document, whose digest provenance already depends on.
-        try recordFirstBootInventory(allocator, io, ssh_path, &first, candidate);
+            try verifyCrossGuestUniqueness(
+                candidate.flavor,
+                &first_pre.before,
+                &second_pre.before,
+                &first_after,
+                &second_after,
+                first_pre.core_before,
+                second_pre.core_before,
+            );
+
+            try poweroff(allocator, io, ssh_path, &first);
+            try poweroff(allocator, io, ssh_path, &second);
+        },
     }
-
-    var first_before = try readGuestIdentityAlloc(allocator, io, ssh_path, &first);
-    defer first_before.deinit(allocator);
-    var second_before = try readGuestIdentityAlloc(allocator, io, ssh_path, &second);
-    defer second_before.deinit(allocator);
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        first_before.machine_id,
-        second_before.machine_id,
-    ));
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        first_before.ssh_fingerprint,
-        second_before.ssh_fingerprint,
-    ));
-
-    var first_core_before: ?CoreProvisionedState = null;
-    defer if (first_core_before) |*state| state.deinit(allocator);
-    var second_core_before: ?CoreProvisionedState = null;
-    defer if (second_core_before) |*state| state.deinit(allocator);
-    if (candidate.flavor == .core) {
-        try waitForSerialMarker(
-            allocator,
-            io,
-            &first,
-            "explicit local provisioning media detected; WireServer Ready will be skipped",
-            5,
-        );
-        try waitForSerialMarker(
-            allocator,
-            io,
-            &second,
-            "explicit local provisioning media detected; WireServer Ready will be skipped",
-            5,
-        );
-        const first_public_key_fingerprint = try publicKeyFingerprintAlloc(
-            allocator,
-            io,
-            ssh_keygen_path,
-            first.public_key_path,
-        );
-        defer allocator.free(first_public_key_fingerprint);
-        const second_public_key_fingerprint = try publicKeyFingerprintAlloc(
-            allocator,
-            io,
-            ssh_keygen_path,
-            second.public_key_path,
-        );
-        defer allocator.free(second_public_key_fingerprint);
-
-        first_core_before = try readCoreProvisionedStateAlloc(
-            allocator,
-            io,
-            ssh_path,
-            &first,
-        );
-        second_core_before = try readCoreProvisionedStateAlloc(
-            allocator,
-            io,
-            ssh_path,
-            &second,
-        );
-        try std.testing.expectEqualStrings(
-            first_public_key_fingerprint,
-            first_core_before.?.authorized_key_fingerprint,
-        );
-        try std.testing.expectEqualStrings(
-            second_public_key_fingerprint,
-            second_core_before.?.authorized_key_fingerprint,
-        );
-        try std.testing.expect(!std.mem.eql(
-            u8,
-            first_core_before.?.authorized_key_fingerprint,
-            second_core_before.?.authorized_key_fingerprint,
-        ));
-        try std.testing.expect(!std.mem.eql(
-            u8,
-            first_core_before.?.sentinel,
-            second_core_before.?.sentinel,
-        ));
-        try verifyCoreSshdRestart(allocator, io, ssh_path, &first);
-        try verifyCoreSshdRestart(allocator, io, ssh_path, &second);
-    }
-
-    var first_after = try rebootAndReadIdentity(
-        allocator,
-        io,
-        ssh_path,
-        &first,
-        &first_before,
-    );
-    defer first_after.deinit(allocator);
-    var second_after = try rebootAndReadIdentity(
-        allocator,
-        io,
-        ssh_path,
-        &second,
-        &second_before,
-    );
-    defer second_after.deinit(allocator);
-
-    try std.testing.expectEqualStrings(
-        first_before.machine_id,
-        first_after.machine_id,
-    );
-    try std.testing.expectEqualStrings(
-        first_before.ssh_fingerprint,
-        first_after.ssh_fingerprint,
-    );
-    try std.testing.expectEqualStrings(
-        second_before.machine_id,
-        second_after.machine_id,
-    );
-    try std.testing.expectEqualStrings(
-        second_before.ssh_fingerprint,
-        second_after.ssh_fingerprint,
-    );
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        first_after.machine_id,
-        second_after.machine_id,
-    ));
-    try std.testing.expect(!std.mem.eql(
-        u8,
-        first_after.ssh_fingerprint,
-        second_after.ssh_fingerprint,
-    ));
-    try verifyAdminLogin(allocator, io, ssh_path, &first);
-    try verifyAdminLogin(allocator, io, ssh_path, &second);
-    try verifyKeyOnlySsh(allocator, io, ssh_path, &first);
-    try verifyKeyOnlySsh(allocator, io, ssh_path, &second);
-    try verifyFlavorRuntime(allocator, io, ssh_path, candidate, &first);
-    try verifyFlavorRuntime(allocator, io, ssh_path, candidate, &second);
-    if (candidate.flavor == .core) {
-        var first_core_after = try readCoreProvisionedStateAlloc(
-            allocator,
-            io,
-            ssh_path,
-            &first,
-        );
-        defer first_core_after.deinit(allocator);
-        var second_core_after = try readCoreProvisionedStateAlloc(
-            allocator,
-            io,
-            ssh_path,
-            &second,
-        );
-        defer second_core_after.deinit(allocator);
-        try expectCoreProvisionedStateEqual(&first_core_before.?, &first_core_after);
-        try expectCoreProvisionedStateEqual(&second_core_before.?, &second_core_after);
-    }
-    try verifyGuestSecureBoot(
-        allocator,
-        io,
-        ssh_path,
-        &first,
-        certificate_sha256,
-    );
-
-    try poweroff(allocator, io, ssh_path, &first);
-    try poweroff(allocator, io, ssh_path, &second);
 
     const tampered_image = try std.fs.path.join(
         allocator,
