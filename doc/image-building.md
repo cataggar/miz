@@ -1577,6 +1577,59 @@ built ext4 have never held anything, so they are already zero, and both the
 extent map and the all-zero chunk detection reduce them to compressed zero
 runs. Skipping that pass saves writing the full virtual size twice.
 
+### Converting a `qcow2` image to `.img.gz` (with ISP size limits)
+
+Some ISPs accept only a raw disk image (`.img`) compressed with gzip
+(`.img.gz`), enforcing both an uncompressed size ceiling (for example, 6 GB)
+and a compressed size ceiling (for example, 5 GB). An existing `qcow2` image
+can be converted either in a single streaming pass with `miz` or in two steps
+with `qemu-img` and `gzip`.
+
+#### Option 1: `miz` (native, single pass)
+
+```sh
+miz info disk.qcow2
+miz convert -O raw.gz --compress-level 9 disk.qcow2 disk.img.gz
+stat -c '%s bytes' disk.img.gz
+```
+
+`-O raw.gz` emits gzip-compressed raw disk bytes directly without storing a
+full intermediate `.img` on disk. `--compress-level 9` prioritizes smaller
+output over the faster default level `1`, and the `.img.gz` filename works
+because `-O raw.gz` explicitly selects the output format.
+
+#### Option 2: `qemu-img` + `gzip` (two steps)
+
+```sh
+qemu-img info disk.qcow2
+qemu-img convert -p -O raw disk.qcow2 disk.img
+gzip -9 disk.img  # produces disk.img.gz; removes disk.img by default
+stat -c '%s bytes' disk.img.gz
+```
+
+Unlike the `miz` path, this requires scratch disk space for the full
+uncompressed raw intermediate `disk.img` and runs compression as a separate
+pass over that file.
+
+#### Preflight and postflight size checks
+
+- **Check the `qcow2` virtual size before converting** (not its on-disk file
+  size): the virtual size is the uncompressed raw disk length and must fit
+  within the ISP's uncompressed limit (for example, 6 GB). Both
+  `miz info disk.qcow2` and `qemu-img info disk.qcow2` report it
+  (`miz info --output=json disk.qcow2` also reports `virtual-size` in bytes).
+- **Check the final `.img.gz` byte count after converting**
+  (`stat -c '%s bytes' disk.img.gz`) against the ISP's compressed limit (for
+  example, 5 GB). `gzip` cannot guarantee a target size; if the image contents
+  do not compress enough, the artifact still will not qualify.
+- **Confirm decimal GB vs. binary GiB**: check whether the ISP defines its
+  limits in decimal GB (`6,000,000,000` / `5,000,000,000` bytes) or binary GiB
+  (`6,442,450,944` / `5,368,709,120` bytes). Neither command enforces
+  ISP-specific limits automatically, and a `qcow2` whose virtual size exceeds
+  the uncompressed limit must have its disk layout and virtual size reduced
+  before converting (`gzip` only reduces the compressed file size, not the
+  uncompressed virtual size).
+
 ## Formats and filesystem APIs
 
 `convert` skips all-zero chunks (aligned to the destination's block size for
