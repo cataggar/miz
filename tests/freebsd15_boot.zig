@@ -1894,23 +1894,27 @@ test "generalized FreeBSD image boots, provisions SSH, and survives reboot" {
             \\    permissions: "0700"
             \\    content: |
             \\      #!/bin/sh
-            \\      sleep 30
-            \\      if [ -s /etc/ssh/ssh_host_ed25519_key ] &&
-            \\          [ -s /home/miztest/.ssh/authorized_keys ] &&
-            \\          /usr/bin/id miztest >/dev/null 2>&1 &&
-            \\          /usr/sbin/service sshd onestatus >/dev/null 2>&1 &&
-            \\          /sbin/ifconfig vtnet0 | /usr/bin/grep -q 'inet '; then
-            \\          printf 'MIZ_FREEBSD_ACCEPTANCE_READY {s}\n' >/dev/console
-            \\      else
-            \\          printf 'MIZ_FREEBSD_ACCEPTANCE_FAILED {s}\n' >/dev/console
-            \\          /sbin/ifconfig -a >/dev/console 2>&1 || true
-            \\          /usr/sbin/service sshd onestatus >/dev/console 2>&1 || true
-            \\          /usr/bin/id miztest >/dev/console 2>&1 || true
-            \\          /usr/bin/stat -f '%Sp %Su:%Sg %z %N' \
-            \\              /home/miztest /home/miztest/.ssh \
-            \\              /home/miztest/.ssh/authorized_keys \
-            \\              >/dev/console 2>&1 || true
-            \\      fi
+            \\      attempt=0
+            \\      while [ "$attempt" -lt 30 ]; do
+            \\          if [ -s /etc/ssh/ssh_host_ed25519_key ] &&
+            \\              [ -s /home/miztest/.ssh/authorized_keys ] &&
+            \\              /usr/bin/id miztest >/dev/null 2>&1 &&
+            \\              /usr/sbin/service sshd onestatus >/dev/null 2>&1 &&
+            \\              /sbin/ifconfig vtnet0 | /usr/bin/grep -q 'inet '; then
+            \\              printf 'MIZ_FREEBSD_ACCEPTANCE_READY {s}\n' >/dev/console
+            \\              exit 0
+            \\          fi
+            \\          attempt=$((attempt + 1))
+            \\          sleep 1
+            \\      done
+            \\      printf 'MIZ_FREEBSD_ACCEPTANCE_FAILED {s}\n' >/dev/console
+            \\      /sbin/ifconfig -a >/dev/console 2>&1 || true
+            \\      /usr/sbin/service sshd onestatus >/dev/console 2>&1 || true
+            \\      /usr/bin/id miztest >/dev/console 2>&1 || true
+            \\      /usr/bin/stat -f '%Sp %Su:%Sg %z %N' \
+            \\          /home/miztest /home/miztest/.ssh \
+            \\          /home/miztest/.ssh/authorized_keys \
+            \\          >/dev/console 2>&1 || true
             \\runcmd:
             \\  - /usr/sbin/daemon -cf /root/miz-acceptance-ready.sh
             \\
