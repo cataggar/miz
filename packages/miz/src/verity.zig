@@ -307,17 +307,26 @@ fn buildLeafLevelFromBytes(
 
     const block_len: usize = @intCast(options.data_block_size);
     const per_block = hashesPerBlock(options.hash_block_size);
+    var zero_digest: [digest_size]u8 = undefined;
+    if (data_blocks >= 4) {
+        hashZeroBlock(block_len, options.salt, &zero_digest);
+    }
 
     var block_index: u64 = 0;
     while (block_index < data_blocks) : (block_index += 1) {
         const data_offset: usize = @intCast(block_index * options.data_block_size);
-        var digest: [digest_size]u8 = undefined;
-        hashBlock(data[data_offset .. data_offset + block_len], options.salt, &digest);
+        const block_slice = data[data_offset .. data_offset + block_len];
 
         const hash_block_index = block_index / per_block;
         const digest_index = block_index % per_block;
         const dst_offset: usize = @intCast(hash_block_index * options.hash_block_size + digest_index * digest_size);
-        std.mem.copyForwards(u8, out[dst_offset .. dst_offset + digest_size], &digest);
+        const dst_digest: *[digest_size]u8 = out[dst_offset..][0..digest_size];
+
+        if (data_blocks >= 4 and std.mem.allEqual(u8, block_slice, 0)) {
+            dst_digest.* = zero_digest;
+        } else {
+            hashBlock(block_slice, options.salt, dst_digest);
+        }
     }
 
     return out;
@@ -338,21 +347,45 @@ fn buildLeafLevelFromFile(
 
     const block_len: usize = @intCast(options.data_block_size);
     const per_block = hashesPerBlock(options.hash_block_size);
-    const block = try allocator.alloc(u8, block_len);
-    defer allocator.free(block);
+    const target_window_bytes: u64 = 1024 * 1024;
+    const window_blocks: u64 = @min(
+        data_blocks,
+        @max(@as(u64, 1), target_window_bytes / options.data_block_size),
+    );
+    const window_len: usize = @intCast(window_blocks * options.data_block_size);
+    const window = try allocator.alloc(u8, window_len);
+    defer allocator.free(window);
+
+    var zero_digest: [digest_size]u8 = undefined;
+    hashZeroBlock(block_len, options.salt, &zero_digest);
 
     var block_index: u64 = 0;
-    while (block_index < data_blocks) : (block_index += 1) {
-        const got = try file.readPositionalAll(io, block, options.device_offset + block_index * options.data_block_size);
-        if (got != block.len) return error.ShortRead;
+    while (block_index < data_blocks) {
+        const batch_blocks: usize = @intCast(@min(data_blocks - block_index, window_blocks));
+        const chunk_len: usize = batch_blocks * block_len;
+        const got = try file.readPositionalAll(
+            io,
+            window[0..chunk_len],
+            options.device_offset + block_index * options.data_block_size,
+        );
+        if (got != chunk_len) return error.ShortRead;
 
-        var digest: [digest_size]u8 = undefined;
-        hashBlock(block, options.salt, &digest);
+        var i: usize = 0;
+        while (i < batch_blocks) : (i += 1) {
+            const block_slice = window[i * block_len ..][0..block_len];
+            const cur_block = block_index + i;
+            const hash_block_index = cur_block / per_block;
+            const digest_index = cur_block % per_block;
+            const dst_offset: usize = @intCast(hash_block_index * options.hash_block_size + digest_index * digest_size);
+            const dst_digest: *[digest_size]u8 = out[dst_offset..][0..digest_size];
 
-        const hash_block_index = block_index / per_block;
-        const digest_index = block_index % per_block;
-        const dst_offset: usize = @intCast(hash_block_index * options.hash_block_size + digest_index * digest_size);
-        std.mem.copyForwards(u8, out[dst_offset .. dst_offset + digest_size], &digest);
+            if (std.mem.allEqual(u8, block_slice, 0)) {
+                dst_digest.* = zero_digest;
+            } else {
+                hashBlock(block_slice, options.salt, dst_digest);
+            }
+        }
+        block_index += batch_blocks;
     }
 
     return out;
@@ -397,6 +430,19 @@ fn hashBlock(block: []const u8, salt: [salt_size]u8, out: *[digest_size]u8) void
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(&salt);
     hasher.update(block);
+    hasher.final(out);
+}
+
+fn hashZeroBlock(block_len: usize, salt: [salt_size]u8, out: *[digest_size]u8) void {
+    const zero_chunk: [256]u8 = @splat(0);
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(&salt);
+    var remaining = block_len;
+    while (remaining > 0) {
+        const chunk = @min(remaining, zero_chunk.len);
+        hasher.update(zero_chunk[0..chunk]);
+        remaining -= chunk;
+    }
     hasher.final(out);
 }
 
@@ -509,4 +555,49 @@ test "generateFromBytes stores a multi-level tree root-first, leaf-last on disk"
     var expected_root_hash: [digest_size]u8 = undefined;
     hashBlock(&root_level, salt, &expected_root_hash);
     try std.testing.expectEqualSlices(u8, &expected_root_hash, &generated.info.rootHash);
+}
+
+test "generateAndWrite matches generateFromBytes across zero and non-zero blocks" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const data_blocks = 8;
+    const data_size = data_blocks * default_data_block_size;
+    const data = try allocator.alloc(u8, data_size);
+    defer allocator.free(data);
+    @memset(data, 0);
+    @memset(data[default_data_block_size .. 2 * default_data_block_size], 0xA5);
+    @memset(data[5 * default_data_block_size .. 6 * default_data_block_size], 0x5A);
+
+    var salt: [salt_size]u8 = undefined;
+    for (&salt, 0..) |*byte, index| byte.* = @intCast(index + 17);
+
+    var expected = try generateFromBytes(allocator, data, .{
+        .data_size = data_size,
+        .salt = salt,
+    });
+    defer expected.deinit(allocator);
+
+    const file = try tmp.dir.createFile(io, "verity-test.img", .{ .truncate = true, .read = true });
+    defer file.close(io);
+    const device_offset: u64 = 4096;
+    try file.writePositionalAll(io, data, device_offset);
+
+    const info = try generateAndWrite(io, file, allocator, .{
+        .device_offset = device_offset,
+        .data_size = data_size,
+        .hash_offset = data_size,
+        .salt = salt,
+    });
+
+    try std.testing.expectEqualSlices(u8, &expected.info.rootHash, &info.rootHash);
+    try std.testing.expectEqual(expected.info.hashTreeSize, info.hashTreeSize);
+
+    const disk_tree = try allocator.alloc(u8, expected.tree_bytes.len);
+    defer allocator.free(disk_tree);
+    const got = try file.readPositionalAll(io, disk_tree, device_offset + data_size);
+    try std.testing.expectEqual(disk_tree.len, got);
+    try std.testing.expectEqualSlices(u8, expected.tree_bytes, disk_tree);
 }
