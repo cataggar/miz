@@ -611,15 +611,28 @@ pub fn build(b: *std.Build) void {
         "test-native-smoke",
         "Run portable image codecs and native CLI smoke checks",
     );
+    const native_smoke_files = b.addWriteFiles();
+    _ = native_smoke_files.addCopyFile(b.path("packages/miz/src/vhd.zig"), "vhd.zig");
+    _ = native_smoke_files.addCopyFile(b.path("packages/miz/src/zstd.zig"), "zstd.zig");
+    const native_smoke_root = native_smoke_files.add("native_smoke.zig",
+        \\const std = @import("std");
+        \\test {
+        \\    std.testing.refAllDecls(@import("vhd.zig"));
+        \\    std.testing.refAllDecls(@import("zstd.zig"));
+        \\}
+        \\
+    );
+    const native_smoke_mod = b.createModule(.{
+        .root_source_file = native_smoke_root,
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    addZstdLibrary(native_smoke_mod, host_zstd_dependency);
     const native_vhd_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("packages/miz/src/vhd.zig"),
-            .target = b.graph.host,
-            .optimize = optimize,
-        }),
+        .root_module = native_smoke_mod,
     });
     native_smoke_step.dependOn(&b.addRunArtifact(native_vhd_tests).step);
-    native_smoke_step.dependOn(zstd_test_step);
+    native_smoke_step.dependOn(&run_no_libc_zstd_tests.step);
 
     // Exercise native execution and filesystem behavior even with a warm cache.
     const smoke_version = b.addRunArtifact(cli_exe);
