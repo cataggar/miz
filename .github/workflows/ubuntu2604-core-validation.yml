@@ -948,8 +948,9 @@ jobs:
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           zig build --fetch=all
-          zig build -Doptimize=safe
+          zig build install-miz install-ubuntu2604-release -Doptimize=safe
           test -x zig-out/bin/miz
+          test -x "$RELEASE_TOOL"
 
       - name: Build Binder device usability probe
         run: |
@@ -972,7 +973,7 @@ jobs:
           # that could compile a different table than the one being enforced.
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build install-ubuntu2604-runtime-contract-probes
+          zig build install-ubuntu2604-runtime-contract-probes -Doptimize=safe
           test -x "$RUNTIME_CONTRACT_PROBE"
 
       - name: Log in to Azure with protected-environment OIDC

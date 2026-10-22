@@ -152,6 +152,8 @@ test "each matrix carries the exact four published candidates" {
         const start = try std.fmt.bufPrint(&start_buffer, "\n  {s}:\n", .{boundary[0]});
         const end = try std.fmt.bufPrint(&end_buffer, "\n  {s}:\n", .{boundary[1]});
         const section = try workflow.section(start, end);
+        try source.expectContainsIn(section, "max-parallel: 4", boundary[0]);
+        try source.expectOmitsIn(section, "max-parallel: 2", boundary[0]);
 
         const rows = [_]struct {
             key: []const u8,
@@ -868,9 +870,15 @@ test "the release workflow publishes and re-checks the core runtime contract" {
     try source.expectContainsIn(azure, "RUNTIME_CONTRACT_PROBE:", workflow_path);
     try source.expectContainsIn(
         azure,
-        "zig build install-ubuntu2604-runtime-contract-probes",
+        "zig build install-miz install-ubuntu2604-release -Doptimize=safe",
         workflow_path,
     );
+    try source.expectContainsIn(
+        azure,
+        "zig build install-ubuntu2604-runtime-contract-probes -Doptimize=safe",
+        workflow_path,
+    );
+    try source.expectOmitsIn(azure, "zig build -Doptimize=safe\n", workflow_path);
 }
 
 test "every first-boot step is gated on the flavor that has a first-boot phase" {

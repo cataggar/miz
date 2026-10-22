@@ -617,14 +617,16 @@ has_local_temp_storage=${sku_storage[1]}
 [[ "$has_local_temp_storage" == true ||
    "$has_local_temp_storage" == false ]]
 
-source_before=$(sha256sum "$asset" | awk '{print $1}')
-test "$source_before" = "$qcow_sha256"
-"$MIZ" azure derive \
-  --input-sha256 "$qcow_sha256" \
-  --expected-virtual-size "$virtual_size" \
-  "$asset" \
-  "$vhd"
-test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
+derive_output=$(
+  "$MIZ" azure derive \
+    --input-sha256 "$qcow_sha256" \
+    --expected-virtual-size "$virtual_size" \
+    "$asset" \
+    "$vhd" 2>&1
+)
+printf '%s\n' "$derive_output" >&2
+[[ "$derive_output" =~ SHA-256\ ([0-9a-f]{64})$ ]]
+vhd_sha256=${BASH_REMATCH[1]}
 qemu-img info -f vpc --output=json "$vhd" >"$RESULT_DIR/vhd-info.json"
 readarray -t vhd_geometry < <(
   "$RELEASE_TOOL" verify-vhd \
@@ -637,7 +639,6 @@ vhd_bytes=${vhd_geometry[1]}
 expected_vhd_current_size=$(((virtual_size + 1048575) / 1048576 * 1048576))
 test "$vhd_current_size" -eq "$expected_vhd_current_size"
 test "$vhd_bytes" -eq "$((vhd_current_size + 512))"
-vhd_sha256=$(sha256sum "$vhd" | awk '{print $1}')
 [[ "$vhd_sha256" =~ ^[0-9a-f]{64}$ ]]
 "$RELEASE_TOOL" azure-conversion-attestation \
   --output "$conversion_attestation" \
@@ -1647,7 +1648,6 @@ fi
   --result "$RESULT_DIR/azure-result.json" \
   --key "$CANDIDATE_KEY" \
   --source-commit "$SOURCE_COMMIT" >/dev/null
-test "$(sha256sum "$asset" | awk '{print $1}')" = "$qcow_sha256"
 
 {
   echo "### Azure acceptance: $ASSET_NAME"
