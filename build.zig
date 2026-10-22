@@ -817,6 +817,9 @@ pub fn build(b: *std.Build) void {
     const run_image_status_check_tests = b.addRunArtifact(image_status_check_tests);
     if (b.graph.host.result.os.tag == .windows) {
         for ([_]*std.Build.Step.Compile{
+            miz_tests,
+            artifact_pipeline_tests,
+            oci_registry_tests,
             image_builder_exe,
             image_builder_tests,
             iso_builder_exe,
