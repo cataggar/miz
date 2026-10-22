@@ -1698,17 +1698,22 @@ const CopyLayout = struct {
 
 fn copyLayout(src: *const Image, dst: *const Image) CopyLayout {
     const default_chunk_size = 4 * 1024 * 1024;
-    const buffer_size: usize = if (dst.dynamic) |*d|
+    const dst_unit: ?usize = if (dst.dynamic) |*d|
         d.block_size
     else if (dst.vhdx) |*v|
         v.block_size
     else if (dst.qcow2) |*q|
         @intCast(q.cluster_size)
     else
+        null;
+
+    const buffer_size: usize = if (dst_unit) |u|
+        @max(default_chunk_size, u)
+    else
         default_chunk_size;
 
-    var zero_chunk_size = buffer_size;
-    if (dst.format == .raw and dst.device == null) {
+    var zero_chunk_size: usize = dst_unit orelse buffer_size;
+    if ((dst.format == .raw and dst.device == null) or (dst.format == .vhd and dst.dynamic == null)) {
         const source_allocation_unit: ?u64 = if (src.dynamic) |*d|
             d.block_size
         else if (src.vhdx) |*v|
@@ -1721,7 +1726,10 @@ fn copyLayout(src: *const Image, dst: *const Image) CopyLayout {
         else
             null;
         if (source_allocation_unit) |unit| {
-            zero_chunk_size = @intCast(@min(unit, buffer_size));
+            const source_unit: usize = @intCast(@min(unit, buffer_size));
+            if (source_unit <= buffer_size and buffer_size % source_unit == 0) {
+                zero_chunk_size = source_unit;
+            }
         }
     }
     return .{ .buffer_size = buffer_size, .zero_chunk_size = zero_chunk_size };
@@ -2075,6 +2083,24 @@ test "convert qcow2 to raw preserves zero clusters and a partial final cluster" 
     defer allocator.free(actual);
     try std.testing.expectEqual(actual.len, try dst.pread(io, actual, 0));
     try std.testing.expectEqualSlices(u8, expected, actual);
+
+    const vhd_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "destination.vhd" });
+    defer allocator.free(vhd_path);
+    var fixed_vhd: Image = undefined;
+    try Image.createInto(io, vhd_path, .vhd, size, .{ .vhd_subformat = .fixed }, &fixed_vhd);
+    defer fixed_vhd.close(io);
+
+    const qcow2_to_vhd = copyLayout(&src, &fixed_vhd);
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), qcow2_to_vhd.buffer_size);
+    try std.testing.expectEqual(cluster_size, qcow2_to_vhd.zero_chunk_size);
+
+    const vhd_to_qcow2 = copyLayout(&fixed_vhd, &src);
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), vhd_to_qcow2.buffer_size);
+    try std.testing.expectEqual(cluster_size, vhd_to_qcow2.zero_chunk_size);
+
+    const raw_to_qcow2 = copyLayout(&dst, &src);
+    try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), raw_to_qcow2.buffer_size);
+    try std.testing.expectEqual(cluster_size, raw_to_qcow2.zero_chunk_size);
 }
 
 test "create dynamic vhd, write across blocks, reopen and read back" {

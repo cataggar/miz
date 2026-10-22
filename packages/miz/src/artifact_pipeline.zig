@@ -1058,18 +1058,6 @@ pub fn finalizeQcow2(
     if (!sameFileSnapshot(source_stat, try source_handle.stat(io))) {
         return error.InputChanged;
     }
-    const source_after = try hashOpenFileLength(
-        io,
-        source_handle,
-        options.input_path,
-        source_stat.size,
-    );
-    if (!sameFileSnapshot(source_stat, try source_handle.stat(io))) {
-        return error.InputChanged;
-    }
-    if (!std.mem.eql(u8, &source_after.sha256, &options.expected_input_sha256)) {
-        return error.InputChanged;
-    }
 
     if (options.compression != .zstd) {
         try runQemuImg(io, .{
@@ -1295,21 +1283,6 @@ pub fn deriveFixedVhd(
     try validateStageBounded(io, stage.file, options.max_output_size);
 
     if (!sameFileSnapshot(source_stat, try source_image.file.stat(io))) {
-        return error.InputChanged;
-    }
-    const source_after = try hashOpenFileLength(
-        io,
-        source_image.file,
-        options.input_path,
-        source_stat.size,
-    );
-    if (!sameFileSnapshot(source_stat, try source_image.file.stat(io)) or
-        !std.mem.eql(
-            u8,
-            &source_after.sha256,
-            &options.expected_input_sha256,
-        ))
-    {
         return error.InputChanged;
     }
 
