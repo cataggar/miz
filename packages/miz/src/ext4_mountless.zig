@@ -532,14 +532,22 @@ fn copySparseContent(
         var chunk_offset: usize = 0;
         while (chunk_offset < got) {
             const end = @min(chunk_offset + 4096, got);
-            if (!std.mem.allEqual(u8, copy_buffer[chunk_offset..end], 0)) {
-                try destination.writePositionalAll(
-                    io,
-                    copy_buffer[chunk_offset..end],
-                    copied + chunk_offset,
-                );
+            if (std.mem.allEqual(u8, copy_buffer[chunk_offset..end], 0)) {
+                chunk_offset = end;
+                continue;
             }
+            const run_start = chunk_offset;
             chunk_offset = end;
+            while (chunk_offset < got) {
+                const next_end = @min(chunk_offset + 4096, got);
+                if (std.mem.allEqual(u8, copy_buffer[chunk_offset..next_end], 0)) break;
+                chunk_offset = next_end;
+            }
+            try destination.writePositionalAll(
+                io,
+                copy_buffer[run_start..chunk_offset],
+                copied + run_start,
+            );
         }
         copied += got;
     }
@@ -1027,6 +1035,7 @@ pub const FileSystem = struct {
         manifest: ?*HostTreeManifest,
     ) Error!void {
         try Io.Dir.cwd().createDirPath(self.io, destination);
+        var last_guest_parent: ?[]const u8 = "";
         for (0..self.tree.nodeCount()) |index| {
             const entry = self.tree.nodeView(index);
             if (excludedTopLevel(entry.path, options.excluded_top_level)) {
@@ -1035,10 +1044,17 @@ pub const FileSystem = struct {
             }
             const host_path = try std.fs.path.join(self.allocator, &.{ destination, entry.path });
             defer self.allocator.free(host_path);
-            const parent = std.fs.path.dirname(host_path) orelse destination;
-            try Io.Dir.cwd().createDirPath(self.io, parent);
+            const guest_parent = std.fs.path.dirname(entry.path) orelse "";
+            if (last_guest_parent == null or !std.mem.eql(u8, last_guest_parent.?, guest_parent)) {
+                const parent = std.fs.path.dirname(host_path) orelse destination;
+                try Io.Dir.cwd().createDirPath(self.io, parent);
+                last_guest_parent = guest_parent;
+            }
             switch (entry.kind) {
-                .directory => try Io.Dir.cwd().createDirPath(self.io, host_path),
+                .directory => {
+                    try Io.Dir.cwd().createDirPath(self.io, host_path);
+                    last_guest_parent = entry.path;
+                },
                 .file => {
                     const bytes = try self.tree.readFileAllocAt(
                         self.allocator,
@@ -1302,15 +1318,18 @@ pub const FileSystem = struct {
         max_bytes: u64,
     ) !bool {
         if (size > max_bytes) return error.FileLimitExceeded;
+        const guest_node = self.tree.findNode(guest_path) orelse return false;
+        if (guest_node.size() != size) return false;
+        if (size == 0) return true;
         const host = try Io.Dir.cwd().openFile(self.io, host_path, .{});
         defer host.close(self.io);
         var buffer: [64 * 1024]u8 = undefined;
+        var guest_buffer: [64 * 1024]u8 = undefined;
         var offset: u64 = 0;
         while (offset < size) {
             const wanted: usize = @intCast(@min(@as(u64, buffer.len), size - offset));
             const got = try host.readPositionalAll(self.io, buffer[0..wanted], offset);
             if (got != wanted) return false;
-            var guest_buffer: [64 * 1024]u8 = undefined;
             const guest_got = try self.tree.readNodeContent(guest_path, guest_buffer[0..wanted], offset);
             if (guest_got != wanted or !std.mem.eql(u8, buffer[0..wanted], guest_buffer[0..wanted])) {
                 return false;
