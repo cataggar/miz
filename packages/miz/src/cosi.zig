@@ -996,7 +996,7 @@ test "detectOsRelease reads /etc/os-release from an XFS root partition" {
     const arena = arena_state.allocator();
 
     const partitions = [_]PartitionArtifact{dummyPartitionArtifact(partition_offset, volume.len, "xfs")};
-    const detected = try detectOsRelease(arena, img, io, &partitions, null);
+    const detected = try detectOsRelease(arena, &img, io, &partitions, null);
     try std.testing.expectEqualStrings(os_release, detected);
 }
 
@@ -1023,6 +1023,6 @@ test "detectOsRelease treats an XFS partition it cannot open as having no os-rel
     const arena = arena_state.allocator();
 
     const partitions = [_]PartitionArtifact{dummyPartitionArtifact(0, disk_size, "xfs")};
-    const detected = try detectOsRelease(arena, img, io, &partitions, null);
+    const detected = try detectOsRelease(arena, &img, io, &partitions, null);
     try std.testing.expectEqualStrings("", detected);
 }
