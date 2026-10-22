@@ -2091,6 +2091,10 @@ test "the acceptance harness invokes azure-result with exactly the parser's opti
         "\n\n",
     );
     try expectSameOptions(try invokedOptions(tree.allocator(), block), "azure-result");
+    try support.expectAbsent(source, "source_before=$(sha256sum \"$asset\"");
+    try support.expectAbsent(source, "vhd_sha256=$(sha256sum \"$vhd\"");
+    try support.expectAbsent(source, "azure_accepted_sha256=$(sha256sum \"$asset\"");
+    try support.expectContains(source, "vhd_sha256=${derive_output##*SHA-256 }");
 }
 
 test "the workflow invokes candidate with exactly the parser's options" {
@@ -2273,6 +2277,8 @@ test "the release workflow runs no Python and builds the ported tooling" {
     );
     try support.expectAbsent(source, support.interpreter_name);
     try support.expectContains(source, "zig build freebsd15-release-tools");
+    try support.expectContains(source, "zig build install-miz -Doptimize=safe");
+    try support.expectAbsent(source, "zig build -Doptimize=safe");
     try support.expectContains(source, "\"$release_tool\" matrix \\");
     try support.expectContains(source, "\"$release_tool\" azure-matrix \\");
     try support.expectContains(source, "\"$release_tool\" include-count --matrix \"$matrix\"");
