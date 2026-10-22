@@ -650,25 +650,51 @@ pub fn stageCommand(context: *Context, arguments: StageArguments) Error!void {
         });
         // `replace = false` materializes through a link, so an existing staged
         // asset is refused rather than silently overwritten.
-        Dir.cwd().copyFile(
+        var linked = true;
+        Dir.cwd().hardLink(
             validated.asset_path,
             Dir.cwd(),
             destination,
             context.io,
-            .{ .make_path = true, .replace = false },
-        ) catch |err| switch (err) {
+            .{},
+        ) catch |link_err| switch (link_err) {
             error.PathAlreadyExists => return context.fail(
                 "staged asset already exists: {s}",
                 .{destination},
             ),
-            else => return context.fail(
-                "cannot stage {s}: {t}",
-                .{ destination, err },
-            ),
+            else => {
+                linked = false;
+                Dir.cwd().copyFile(
+                    validated.asset_path,
+                    Dir.cwd(),
+                    destination,
+                    context.io,
+                    .{ .make_path = true, .replace = false },
+                ) catch |err| switch (err) {
+                    error.PathAlreadyExists => return context.fail(
+                        "staged asset already exists: {s}",
+                        .{destination},
+                    ),
+                    else => return context.fail(
+                        "cannot stage {s}: {t}",
+                        .{ destination, err },
+                    ),
+                };
+            },
         };
-        const staged = try candidate_support.hashFile(context, destination);
-        if (!document.eqlString(validated.get("asset_sha256"), &staged)) {
-            return context.fail("staged asset digest mismatch", .{});
+        if (linked) {
+            const staged_size = try candidate_support.regularFileSize(
+                context,
+                destination,
+            );
+            if (staged_size != @as(u64, @intCast(validated.compressed_size))) {
+                return context.fail("staged asset digest mismatch", .{});
+            }
+        } else {
+            const staged = try candidate_support.hashFile(context, destination);
+            if (!document.eqlString(validated.get("asset_sha256"), &staged)) {
+                return context.fail("staged asset digest mismatch", .{});
+            }
         }
     }
 

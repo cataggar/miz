@@ -303,12 +303,6 @@ jobs:
             --virtual-size "$VIRTUAL_SIZE"
           digest=$(sha256sum "$asset" | awk '{print $1}')
           [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
-
-      - name: Bind structurally validated candidate digest
-        run: |
-          set -euo pipefail
-          digest=$(sha256sum "$BUNDLE_DIR/$ASSET_NAME" | awk '{print $1}')
-          [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
           printf '%s\n' "$digest" > "$BUNDLE_DIR/internal-provenance/build-validated-digest"
 
       - name: Bind candidate metadata
@@ -354,7 +348,7 @@ jobs:
           RUNNER_NAME_VALUE: ${{ runner.name }}
         run: |
           set -euo pipefail
-          digest=$(sha256sum "$BUNDLE_DIR/$ASSET_NAME" | awk '{print $1}')
+          digest=$(<"$BUNDLE_DIR/internal-provenance/build-validated-digest")
           {
             echo "### Hosted candidate: $ASSET_NAME"
             echo

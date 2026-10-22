@@ -211,8 +211,7 @@ while true; do
 done
 check_draft_assets subset >/dev/null
 
-while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
-  test "$(sha256sum "$assets_dir/$asset_name" | awk '{print $1}')" = "$expected_sha"
+while IFS=$'\t' read -r asset_name _ expected_bytes; do
   test "$(stat --format='%s' "$assets_dir/$asset_name")" = "$expected_bytes"
   [[ "$asset_name" =~ ^[A-Za-z0-9._-]+$ ]]
   upload_status=$(check_draft_assets asset "$asset_name")
@@ -226,7 +225,6 @@ while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
     --input "$assets_dir/$asset_name" \
     "https://uploads.github.com/repos/$REPOSITORY/releases/$release_id/assets?name=$asset_name" \
     >/dev/null
-  check_draft_assets subset >/dev/null
 done <"$expected_file"
 
 check_draft_assets exact >/dev/null

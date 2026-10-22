@@ -116,7 +116,6 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      max-parallel: 2
       matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     env:
       VARIANT: ${{ matrix.variant }}

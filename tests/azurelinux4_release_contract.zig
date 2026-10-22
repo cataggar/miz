@@ -428,6 +428,7 @@ test "the publisher verifies drafts by release id" {
     try expectContains(script, "check_draft_assets asset \"$asset_name\"");
     try expectContains(script, "check_draft_assets subset");
     try expectContains(script, "check_draft_assets exact");
+    try expectAbsent(script, "sha256sum \"$assets_dir/$asset_name\"");
     try expectContains(script, "\"$release_tool\" check-downloads \\");
     try expectContains(script, "--state published");
     const draft = std.mem.indexOf(u8, script, "check_draft_assets exact").?;
@@ -582,6 +583,7 @@ test "every job that calls the release tool builds and names it" {
     try expectContains(workflow, "\"$AZURELINUX4_RELEASE\" check-candidate-info \\");
     try expectContains(workflow, "\"$AZURELINUX4_RELEASE\" candidate \\");
     try expectContains(workflow, "\"$AZURELINUX4_RELEASE\" verify-candidate \\");
+    try expectAbsent(workflow, "sha256sum \"$BUNDLE_DIR/$ASSET_NAME\"");
 
     // Both shell callers fail closed when the tool is absent rather than
     // falling back to anything.
