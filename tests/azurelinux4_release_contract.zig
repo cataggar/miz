@@ -765,18 +765,13 @@ test "CI heavy phases are independent jobs" {
         "run: zig build test-vm-backend -Doptimize=debug --summary all",
         1,
     );
-    try expectCount(
+    try expectContains(
         workflow,
-        "run: zig build test-device-write-integration -Doptimize=debug --summary all",
-        1,
-    );
-    try expectCount(
-        workflow,
-        "run: zig build test-unsafe-chroot-integration -Doptimize=debug --summary all",
-        1,
+        "zig build test-device-write-integration test-unsafe-chroot-integration \\\n" ++
+            "            -Doptimize=debug --summary all",
     );
     try expectCount(workflow, "zig build test-vm-real-boot", 3);
-    try expectCount(workflow, "-Doptimize=${{ matrix.optimize }} --summary all", 3);
+    try expectCount(workflow, "-Doptimize=${{ matrix.optimize }} --summary all", 4);
     try expectCount(workflow, "optimize: debug", 2);
     try expectCount(workflow, "optimize: safe", 1);
     try expectContains(workflow, "cancel-in-progress: true");
@@ -793,7 +788,7 @@ test "CI native smoke covers all hosts and optimization modes" {
     try expectContains(native, "optimize: [debug, safe, fast, small]");
     try expectContains(
         native,
-        "run: zig build install-miz test-native-smoke -Doptimize=${{ matrix.optimize }} -j2 --summary all",
+        "run: zig build install-miz test-native-smoke -Doptimize=${{ matrix.optimize }} --summary all",
     );
     try expectContains(native, "\"$executable\" version");
     try expectContains(native, "\"$executable\" --help");

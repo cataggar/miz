@@ -33,8 +33,13 @@ jobs:
       - name: zig fmt --check
         run: zig fmt --check .
 
-      - name: Stale brand guard
-        run: zig build test-stale-brand --summary all
+      - name: Run stale brand and workflow guards
+        run: |
+          zig build test-stale-brand test-python-inventory \
+            test-ubuntu2604-workflow \
+            test-ubuntu2404-confidential-workflow test-ubuntu2404-confidential-capture-workflow \
+            test-ubuntu2604-image-benchmark-workflow test-freebsd15-release-contract \
+            test-immutable-releases -Doptimize=debug --summary all
 
   zig-tests:
     # Keep the protected-branch context stable while changing the job graph.
@@ -85,8 +90,8 @@ jobs:
 
       # The portable gate does not run Linux-only package, mount or VM tests
       # on macOS/Windows. Each binary is executed on the host that built it.
-      - name: Build and run portable CLI/library smoke tests
-        run: zig build install-miz test-native-smoke -Doptimize=${{ matrix.optimize }} -j2 --summary all
+      - name: Build native CLI and run library smoke tests
+        run: zig build install-miz test-native-smoke -Doptimize=${{ matrix.optimize }} --summary all
 
       - name: Run the native CLI
         shell: bash
@@ -139,7 +144,7 @@ jobs:
             cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Build ${{ matrix.target }}
-        run: zig build install-miz -Doptimize=safe -Dtarget=${{ matrix.target }}
+        run: zig build install-miz -Doptimize=safe -Dtarget=${{ matrix.target }} --summary all
 
   unsafe-chroot:
     name: privileged integrations
@@ -157,15 +162,12 @@ jobs:
           tools: |
             cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
-      - name: privileged device-write integration
+      - name: Run privileged device-write and unsafe-chroot integrations
         env:
           MIZ_RUN_PRIVILEGED_TEST: "1"
-        run: zig build test-device-write-integration -Doptimize=debug --summary all
-
-      - name: privileged unsafe-chroot integration
-        env:
-          MIZ_RUN_PRIVILEGED_TEST: "1"
-        run: zig build test-unsafe-chroot-integration -Doptimize=debug --summary all
+        run: |
+          zig build test-device-write-integration test-unsafe-chroot-integration \
+            -Doptimize=debug --summary all
 
   vm-boot:
     name: VM boot (${{ matrix.name }})
