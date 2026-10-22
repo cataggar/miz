@@ -1823,23 +1823,33 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        const run_guard = run_build.addArtifactWithEnvironmentPaths(
-            b,
-            guard_tests,
-            &.{.{
-                .name = "MIZ_UBUNTU2604_RELEASE_TOOL",
-                .path = b.graph.path(.install_bin, "ubuntu2604_release"),
-            }},
+        const needs_release_tool = std.mem.eql(
+            u8,
+            guard_source,
+            "tests/ubuntu2604_azure_acceptance.zig",
         );
+        const run_guard = if (needs_release_tool)
+            run_build.addArtifactWithEnvironmentPaths(
+                b,
+                guard_tests,
+                &.{.{
+                    .name = "MIZ_UBUNTU2604_RELEASE_TOOL",
+                    .path = b.graph.path(.install_bin, "ubuntu2604_release"),
+                }},
+            )
+        else
+            b.addRunArtifact(guard_tests);
         run_guard.has_side_effects = true;
         run_guard.setEnvironmentVariable(
             "MIZ_UBUNTU2604_SOURCE_ROOT",
             b.root.toString(b.allocator) catch @panic("OOM"),
         );
-        // The harness guards run the real release tool the shell calls, so
-        // the installed artifact is a declared dependency rather than
-        // something a previous `zig build` is assumed to have left behind.
-        run_guard.step.dependOn(&install_ubuntu2604_release.step);
+        if (needs_release_tool) {
+            // The harness guard runs the real release tool the shell calls, so
+            // the installed artifact is a declared dependency rather than
+            // something a previous `zig build` is assumed to have left behind.
+            run_guard.step.dependOn(&install_ubuntu2604_release.step);
+        }
         run_ubuntu2604_guards[guard_index] = run_guard;
         ubuntu2604_guard_step.dependOn(&run_guard.step);
     }
@@ -2127,6 +2137,13 @@ pub fn build(b: *std.Build) void {
         "Check the tracked tree for legacy branding",
     );
     stale_brand_test_step.dependOn(&run_stale_brand_tests.step);
+    stale_brand_test_step.dependOn(&run_python_inventory_tests.step);
+    stale_brand_test_step.dependOn(ubuntu2604_guard_step);
+    stale_brand_test_step.dependOn(
+        &run_ubuntu2604_image_benchmark_workflow_tests.step,
+    );
+    stale_brand_test_step.dependOn(&run_freebsd15_contract_tests.step);
+    stale_brand_test_step.dependOn(&run_immutable_release_guard_tests.step);
 
     const build_api_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -2151,7 +2168,6 @@ pub fn build(b: *std.Build) void {
         "preserved-diagnostics",
         "preserved-vm-diagnostics",
         b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
-        "-j2",
     });
     build_api_consumer_check.setName("check external build.zig consumer");
     build_api_consumer_check.setCwd(b.path("tests/build_api_consumer"));
@@ -2161,7 +2177,6 @@ pub fn build(b: *std.Build) void {
         "build",
         "check",
         b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
-        "-j2",
     });
     package_family_consumer_check.setName(
         "check external host package-family consumer",
@@ -2497,6 +2512,12 @@ pub fn build(b: *std.Build) void {
         ubuntu2404_confidential_release_test_step.dependOn(
             &run_ubuntu2404_confidential_capture_workflow_tests.step,
         );
+        stale_brand_test_step.dependOn(
+            &run_ubuntu2404_confidential_workflow_tests.step,
+        );
+        stale_brand_test_step.dependOn(
+            &run_ubuntu2404_confidential_capture_workflow_tests.step,
+        );
         for (aggregate_test_steps) |aggregate_test_step| {
             aggregate_test_step.dependOn(
                 &run_ubuntu2404_confidential_release_tests.step,
@@ -2506,12 +2527,6 @@ pub fn build(b: *std.Build) void {
             );
             aggregate_test_step.dependOn(
                 &run_ubuntu2404_confidential_capture_harness_tests.step,
-            );
-            aggregate_test_step.dependOn(
-                &run_ubuntu2404_confidential_workflow_tests.step,
-            );
-            aggregate_test_step.dependOn(
-                &run_ubuntu2404_confidential_capture_workflow_tests.step,
             );
         }
 
@@ -2804,7 +2819,6 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(
             &run_immutable_release_transaction_tests.step,
         );
-        aggregate_test_step.dependOn(&run_immutable_release_guard_tests.step);
         aggregate_test_step.dependOn(
             &run_azure_trusted_launch_contract_tests.step,
         );
@@ -2815,21 +2829,13 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_azurelinux4_release_tests.step);
         aggregate_test_step.dependOn(&run_azurelinux4_contract_tests.step);
         aggregate_test_step.dependOn(&run_ubuntu2604_image_benchmark_tests.step);
-        aggregate_test_step.dependOn(
-            &run_ubuntu2604_image_benchmark_workflow_tests.step,
-        );
         aggregate_test_step.dependOn(&run_freebsd15_release_tests.step);
-        aggregate_test_step.dependOn(&run_freebsd15_contract_tests.step);
         aggregate_test_step.dependOn(&run_freebsd15_acceptance_tests.step);
         aggregate_test_step.dependOn(&run_ubuntu2604_release_tests.step);
         aggregate_test_step.dependOn(&run_ubuntu2604_release_behavior.step);
         aggregate_test_step.dependOn(&run_ubuntu2604_size_inventory.step);
         aggregate_test_step.dependOn(&run_ubuntu2604_size_budget.step);
         aggregate_test_step.dependOn(&run_ubuntu2604_disk_geometry.step);
-        for (run_ubuntu2604_guards) |run_guard| {
-            aggregate_test_step.dependOn(&run_guard.step);
-        }
-        aggregate_test_step.dependOn(&run_python_inventory_tests.step);
         aggregate_test_step.dependOn(&run_nbd_mod_tests.step);
         aggregate_test_step.dependOn(&run_nbd_exe_tests.step);
         aggregate_test_step.dependOn(&run_nbd_server_tests.step);
@@ -2838,11 +2844,11 @@ pub fn build(b: *std.Build) void {
         aggregate_test_step.dependOn(&run_mizinit_tests.step);
         aggregate_test_step.dependOn(&run_mizguest_tests.step);
         aggregate_test_step.dependOn(mizguest_step);
-        aggregate_test_step.dependOn(&run_stale_brand_tests.step);
         aggregate_test_step.dependOn(&run_build_api_tests.step);
         aggregate_test_step.dependOn(&build_api_consumer_check.step);
         aggregate_test_step.dependOn(&package_family_consumer_check.step);
     }
+    test_step.dependOn(stale_brand_test_step);
     test_step.dependOn(&run_device_write_integration.step);
     test_step.dependOn(&run_unsafe_chroot_integration.step);
     test_step.dependOn(&run_vm_backend_integration.step);
