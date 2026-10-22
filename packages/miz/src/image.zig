@@ -577,7 +577,7 @@ pub const Image = struct {
             .format = .qcow2,
             .data_offset = 0,
             .virtual_size = 0,
-            .qcow2 = undefined,
+            .qcow2 = .{},
         };
         try qcow2.openStandaloneInto(io, file, &image.qcow2.?);
         image.virtual_size = image.qcow2.?.virtual_size;
@@ -597,7 +597,7 @@ pub const Image = struct {
             .format = .qcow2,
             .data_offset = 0,
             .virtual_size = 0,
-            .qcow2 = undefined,
+            .qcow2 = .{},
         };
         try qcow2.openStandaloneWithLimitsInto(io, file, limits, &image.qcow2.?);
         image.virtual_size = image.qcow2.?.virtual_size;
@@ -727,7 +727,7 @@ pub const Image = struct {
                     .format = .qcow2,
                     .data_offset = 0,
                     .virtual_size = 0,
-                    .qcow2 = undefined,
+                    .qcow2 = .{},
                 };
                 if (standalone_qcow2)
                     try qcow2.openStandaloneInto(io, file, &out.qcow2.?)
@@ -919,7 +919,7 @@ pub const Image = struct {
                 .dynamic => try createDynamicInto(io, file, size, options, out),
             },
             .qcow2 => {
-                out.* = .{ .file = file, .format = .qcow2, .data_offset = 0, .virtual_size = size, .qcow2 = undefined };
+                out.* = .{ .file = file, .format = .qcow2, .data_offset = 0, .virtual_size = size, .qcow2 = .{} };
                 try qcow2.createInto(io, file, size, &out.qcow2.?);
             },
             .vhdx => {
