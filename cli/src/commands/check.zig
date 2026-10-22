@@ -10,7 +10,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     }
     const path = args[0];
 
-    var img = miz.Image.openPath(io, path) catch |err|
+    var img: miz.Image = undefined;
+    miz.Image.openPathReadOnlyInto(io, path, &img) catch |err|
         return fail("check: failed to open '{s}': {s}", .{ path, @errorName(err) });
     defer img.close(io);
 

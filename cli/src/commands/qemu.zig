@@ -1530,7 +1530,8 @@ fn prepareSecureBootCertificateAlloc(
     }
 
     var initial_image_sha256: ?miz.artifact_pipeline.Digest = null;
-    var disk = blk: {
+    var disk: miz.Image = undefined;
+    {
         const image_file = try std.Io.Dir.cwd().openFile(io, image.disk_path, .{
             .mode = .read_only,
             .allow_directory = false,
@@ -1546,8 +1547,8 @@ fn prepareSecureBootCertificateAlloc(
                 return error.CatalogImageDigestMismatch;
             initial_image_sha256 = actual_image_sha256;
         }
-        break :blk try miz.Image.openFile(io, image_file);
-    };
+        try miz.Image.openFileInto(io, image_file, &disk);
+    }
     defer disk.close(io);
     var extracted = try miz.uki_certificate.extractAlloc(
         allocator,
@@ -1601,11 +1602,12 @@ fn resolveArchitecture(
 }
 
 fn detectImageArchitecture(io: std.Io, image_path: []const u8) !qemu_host.GuestArchitecture {
-    var image = try miz.Image.openPathReadOnly(io, image_path);
+    var image: miz.Image = undefined;
+    try miz.Image.openPathReadOnlyInto(io, image_path, &image);
     defer image.close(io);
 
     var gpt_architecture: ?qemu_host.GuestArchitecture = null;
-    if (miz.gpt.readGpt(image, io, std.heap.page_allocator)) |parsed| {
+    if (miz.gpt.readGptPtr(&image, io, std.heap.page_allocator)) |parsed| {
         defer std.heap.page_allocator.free(parsed.partitions);
         gpt_architecture = inferArchitectureFromGpt(parsed.partitions) catch |err| switch (err) {
             error.AmbiguousArchitecture => return err,

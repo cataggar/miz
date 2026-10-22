@@ -176,7 +176,8 @@ fn buildWithHooks(
     defer if (raw_stage) |*stage| stage.deinit(io);
 
     const raw_atomic = if (raw_stage) |*stage| stage else &output_stage;
-    var raw = try createImageInAtomic(raw_atomic, io, .raw, disk_size, .{});
+    var raw: Image = undefined;
+    try createImageInAtomicInto(raw_atomic, io, .raw, disk_size, .{}, &raw);
 
     const esp_first_lba = esp_offset / gpt.sector_size;
     const esp_sectors = options.esp_size / gpt.sector_size;
@@ -212,12 +213,13 @@ fn buildWithHooks(
     try raw.file.sync(io);
 
     if (options.output_format == .vhd) {
-        var destination = try createImageInAtomic(&output_stage, io, .vhd, disk_size, .{
+        var destination: Image = undefined;
+        try createImageInAtomicInto(&output_stage, io, .vhd, disk_size, .{
             .vhd_subformat = .fixed,
             .unique_id = identity.vhd_unique_id,
             .timestamp_unix = vhd.timestamp_base,
-        });
-        _ = try image_mod.copyAll(io, raw, &destination, allocator);
+        }, &destination);
+        _ = try image_mod.copyAllPtr(io, &raw, &destination, allocator);
         try destination.file.sync(io);
         if (hooks.before_verify) |hook| {
             try hook(hooks.before_verify_ctx orelse return error.InvalidTestHook, destination.file, io);
@@ -276,19 +278,19 @@ fn buildWithHooks(
     };
 }
 
-fn createImageInAtomic(
+fn createImageInAtomicInto(
     stage: *Io.File.Atomic,
     io: Io,
     format: Format,
     size: u64,
     options: image_mod.CreateOptions,
-) !Image {
+    out: *Image,
+) !void {
     const file = stage.file;
     stage.file_open = false;
-    const image = try Image.createFile(io, file, format, size, options);
-    stage.file = image.file;
+    try Image.createFileInto(io, file, format, size, options, out);
+    stage.file = out.file;
     stage.file_open = true;
-    return image;
 }
 
 pub fn validateFixedVhd(
@@ -300,7 +302,8 @@ pub fn validateFixedVhd(
         return error.InvalidEfiSizeLimit;
     }
 
-    var image = try Image.openPathReadOnly(io, options.path);
+    var image: Image = undefined;
+    try Image.openPathReadOnlyInto(io, options.path, &image);
     defer image.close(io);
     const info = try image.info(io);
     if (info.format != .vhd or info.subformat != .fixed) return error.ExpectedFixedVhd;
@@ -319,9 +322,9 @@ pub fn validateFixedVhd(
     }
     const footer = try vhd.Footer.decode(&footer_bytes);
 
-    const partition_style = try azure.checkPartitionStyle(image, io, allocator, .gen2);
+    const partition_style = try azure.checkPartitionStylePtr(&image, io, allocator, .gen2);
     if (!partition_style.ok) return error.PartitionStyleCheckFailed;
-    var table = try gpt.readVerifiedGpt(image, io, allocator, gpt.default_max_partition_array_bytes);
+    var table = try gpt.readVerifiedGptPtr(&image, io, allocator, gpt.default_max_partition_array_bytes);
     defer table.deinit(allocator);
     if (table.partitions.len != 1) return error.ExpectedSingleEsp;
     const partition = table.partitions[0];
@@ -642,9 +645,9 @@ fn verifyOutput(
     const image_check = try image.check(io);
     if (!image_check.ok) return error.OutputImageCheckFailed;
 
-    const partition_style = try azure.checkPartitionStyle(image.*, io, allocator, .gen2);
+    const partition_style = try azure.checkPartitionStylePtr(image, io, allocator, .gen2);
     if (!partition_style.ok) return false;
-    var table = try gpt.readVerifiedGpt(image.*, io, allocator, gpt.default_max_partition_array_bytes);
+    var table = try gpt.readVerifiedGptPtr(image, io, allocator, gpt.default_max_partition_array_bytes);
     defer table.deinit(allocator);
     if (table.partitions.len != 1 or
         !std.mem.eql(u8, &table.primary_header.disk_guid, &identity.disk_guid))

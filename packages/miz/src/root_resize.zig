@@ -255,15 +255,16 @@ pub fn growExistingQcow2(
         return error.InvalidTargetSize;
     }
 
-    var source = try Image.openPathReadOnlyStandalone(io, path);
+    var source: Image = undefined;
+    try Image.openPathReadOnlyStandaloneInto(io, path, &source);
     var source_open = true;
     defer if (source_open) source.close(io);
     if (source.format != .qcow2) return error.UnsupportedFormat;
     if (options.target_size <= source.virtual_size) return error.ImageDidNotGrow;
     const old_virtual_size = source.virtual_size;
 
-    var source_gpt = try gpt.readVerifiedGpt(
-        source,
+    var source_gpt = try gpt.readVerifiedGptPtr(
+        &source,
         io,
         allocator,
         max_partition_array_bytes,
@@ -287,17 +288,22 @@ pub fn growExistingQcow2(
     const raw_path = try temporarySiblingPath(allocator, io, path, "raw");
     defer allocator.free(raw_path);
     defer Io.Dir.cwd().deleteFile(io, raw_path) catch {};
-    var raw = try Image.createExclusive(
+    var raw: Image = undefined;
+    try Image.createExclusiveInto(
         io,
         raw_path,
         .raw,
         options.target_size,
         .{},
+        &raw,
     );
     var raw_open = true;
     defer if (raw_open) raw.close(io);
 
-    _ = try image_mod.copyAll(io, source, &raw, allocator);
+    _ = try image_mod.copyAllPtr(io, &source, &raw, allocator);
+    source.close(io);
+    source_open = false;
+
     const grow_result = try gpt.growPartitionToEnd(
         &raw,
         io,
@@ -320,8 +326,8 @@ pub fn growExistingQcow2(
         .length = new_filesystem_length,
     });
 
-    var raw_gpt = try gpt.readVerifiedGpt(
-        raw,
+    var raw_gpt = try gpt.readVerifiedGptPtr(
+        &raw,
         io,
         allocator,
         max_partition_array_bytes,
@@ -349,27 +355,29 @@ pub fn growExistingQcow2(
 
     raw.close(io);
     raw_open = false;
-    var raw_source = try Image.openPathReadOnly(io, raw_path);
-    defer raw_source.close(io);
+    try Image.openPathReadOnlyInto(io, raw_path, &raw);
+    raw_open = true;
 
     const output_path = try temporarySiblingPath(allocator, io, path, "output");
     defer allocator.free(output_path);
     defer Io.Dir.cwd().deleteFile(io, output_path) catch {};
-    var output = try Image.createExclusive(
+    try Image.createExclusiveInto(
         io,
         output_path,
         .qcow2,
         options.target_size,
         .{},
+        &source,
     );
-    var output_open = true;
-    defer if (output_open) output.close(io);
-    _ = try image_mod.copyAll(io, raw_source, &output, allocator);
+    source_open = true;
+    _ = try image_mod.copyAllPtr(io, &raw, &source, allocator);
+    raw.close(io);
+    raw_open = false;
 
-    const check = try output.check(io);
+    const check = try source.check(io);
     if (!check.ok) return error.FinalImageInvalid;
-    var output_gpt = try gpt.readVerifiedGpt(
-        output,
+    var output_gpt = try gpt.readVerifiedGptPtr(
+        &source,
         io,
         allocator,
         max_partition_array_bytes,
@@ -378,15 +386,14 @@ pub fn growExistingQcow2(
     try expectFilesystemIdentity(
         allocator,
         io,
-        &output,
+        &source,
         root_offset,
         root,
         new_filesystem_length,
     );
-    try output.file.sync(io);
-    output.close(io);
-    output_open = false;
+    try source.file.sync(io);
     source.close(io);
+    source_open = false;
     source_open = false;
     try Io.Dir.cwd().rename(output_path, Io.Dir.cwd(), path, io);
 

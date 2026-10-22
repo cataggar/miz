@@ -44,7 +44,11 @@ pub const metadata_version = "1.2";
 const file_mode = 0o400;
 
 pub fn write(img: Image, io: Io, allocator: std.mem.Allocator, output_path: []const u8) WriteError!void {
-    _ = try writeWithOptions(img, io, allocator, output_path, .{});
+    _ = try writeWithOptionsPtr(&img, io, allocator, output_path, .{});
+}
+
+pub fn writePtr(img: *const Image, io: Io, allocator: std.mem.Allocator, output_path: []const u8) WriteError!void {
+    _ = try writeWithOptionsPtr(img, io, allocator, output_path, .{});
 }
 
 pub const SystemdBootEntry = struct {
@@ -102,11 +106,21 @@ pub fn writeWithOptions(
     output_path: []const u8,
     options: WriteOptions,
 ) WriteError!Report {
+    return writeWithOptionsPtr(&img, io, allocator, output_path, options);
+}
+
+pub fn writeWithOptionsPtr(
+    img: *const Image,
+    io: Io,
+    allocator: std.mem.Allocator,
+    output_path: []const u8,
+    options: WriteOptions,
+) WriteError!Report {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const parsed = try gpt.readGpt(img, io, arena);
+    const parsed = try gpt.readGptPtr(img, io, arena);
     const image_id = parsed.header.disk_guid;
 
     const disk_guid_storage = try arena.create([36]u8);
@@ -182,7 +196,7 @@ const PartitionArtifact = struct {
     part_type_guid: guid.Guid,
 };
 
-fn buildGptRegion(arena: std.mem.Allocator, img: Image, io: Io, header: gpt.Header, image_id: [16]u8) WriteError!GptArtifact {
+fn buildGptRegion(arena: std.mem.Allocator, img: *const Image, io: Io, header: gpt.Header, image_id: [16]u8) WriteError!GptArtifact {
     const gpt_size = primaryGptSize(header);
     const meta = try hashCompressedRegion(arena, img, io, 0, gpt_size, image_id);
     return .{
@@ -198,7 +212,7 @@ fn buildGptRegion(arena: std.mem.Allocator, img: Image, io: Io, header: gpt.Head
 
 fn buildPartitionArtifact(
     arena: std.mem.Allocator,
-    img: Image,
+    img: *const Image,
     io: Io,
     entry: gpt.PartitionEntry,
     number: u32,
@@ -238,7 +252,7 @@ const HashedArtifact = struct {
 
 fn hashCompressedRegion(
     arena: std.mem.Allocator,
-    img: Image,
+    img: *const Image,
     io: Io,
     offset_bytes: u64,
     length: u64,
@@ -267,7 +281,7 @@ fn primaryGptSize(header: gpt.Header) u64 {
         @as(u64, header.num_partition_entries) * header.partition_entry_size;
 }
 
-fn streamCompressedRegionWriter(writer: *std.Io.Writer, img: Image, io: Io, offset_bytes: u64, length: u64, image_id: [16]u8) WriteError!void {
+fn streamCompressedRegionWriter(writer: *std.Io.Writer, img: *const Image, io: Io, offset_bytes: u64, length: u64, image_id: [16]u8) WriteError!void {
     var read_buffer: [64 * 1024]u8 = undefined;
     var block_buffer: [zstd.max_block_size]u8 = undefined;
     var encoder = try zstd.FrameEncoder.init(writer, &block_buffer, .{
@@ -292,7 +306,7 @@ const FsProbe = struct {
     fs_uuid: []const u8,
 };
 
-fn probeFilesystem(arena: std.mem.Allocator, img: Image, io: Io, offset_bytes: u64, length: u64) WriteError!FsProbe {
+fn probeFilesystem(arena: std.mem.Allocator, img: *const Image, io: Io, offset_bytes: u64, length: u64) WriteError!FsProbe {
     var boot_sector: [512]u8 = @as([512]u8, @splat(0));
     if (length >= boot_sector.len) {
         const got = try img.pread(io, &boot_sector, offset_bytes);
@@ -396,7 +410,7 @@ fn dupeGuidText(arena: std.mem.Allocator, value: guid.Guid) std.mem.Allocator.Er
 
 fn detectOsRelease(
     arena: std.mem.Allocator,
-    img: Image,
+    img: *const Image,
     io: Io,
     partitions: []const PartitionArtifact,
     os_release_override: ?[]const u8,

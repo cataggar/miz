@@ -144,7 +144,8 @@ fn runFixup(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
 
     const input_path = path orelse return fail(fixup_usage, .{});
 
-    var src = miz.Image.openPath(io, input_path) catch |err|
+    var src: miz.Image = undefined;
+    miz.Image.openPathInto(io, input_path, &src) catch |err|
         return fail("azure fixup: failed to open '{s}': {s}", .{ input_path, @errorName(err) });
     defer src.close(io);
 
@@ -164,9 +165,10 @@ fn runFixup(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
         miz.azure.alignSizeToMibChecked(src_virtual_size) catch |err|
             return fail("azure fixup: failed to align source size: {s}", .{@errorName(err)});
 
-    var dst = miz.Image.createExclusive(io, output_path, .vhd, initial_vhd_size, .{
+    var dst: miz.Image = undefined;
+    miz.Image.createExclusiveInto(io, output_path, .vhd, initial_vhd_size, .{
         .vhd_subformat = .fixed,
-    }) catch |err| {
+    }, &dst) catch |err| {
         if (err == error.PathAlreadyExists) {
             return fail(
                 "azure fixup: output '{s}' already exists; refusing to overwrite it",
@@ -188,7 +190,7 @@ fn runFixup(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) u8 {
         }
     }
 
-    _ = miz.copyAll(io, src, &dst, gpa) catch |err|
+    _ = miz.Image.copyAllPtr(io, &src, &dst, gpa) catch |err|
         return fail("azure fixup: conversion failed: {s}", .{@errorName(err)});
 
     const outcome = finishFixup(&dst, io, gpa, generation, output_path);
@@ -220,7 +222,7 @@ fn finishFixup(
     generation: miz.azure.Generation,
     file_path: []const u8,
 ) FixupOutcome {
-    const report = miz.azure.checkPartitionStyle(img.*, io, allocator, generation) catch |err| return .{
+    const report = miz.azure.checkPartitionStylePtr(img, io, allocator, generation) catch |err| return .{
         .exit_code = fail("azure fixup: failed to check partition style: {s}", .{@errorName(err)}),
         .fixup_succeeded = false,
     };
@@ -297,16 +299,17 @@ fn runDeprovision(gpa: std.mem.Allocator, io: std.Io, rest: []const []const u8) 
     // that legitimately writes to a live disk, so it is where the
     // block-device write opt-in is offered. Without it a `/dev/...` target
     // opens read-only and the first write fails.
-    var img = miz.Image.openPathWithOptions(io, file_path, .{
+    var img: miz.Image = undefined;
+    miz.Image.openPathWithOptionsInto(io, file_path, .{
         .allow_device_write = allow_device_write,
-    }) catch |err|
+    }, &img) catch |err|
         return fail("azure deprovision: failed to open '{s}': {s}", .{ file_path, @errorName(err) });
     defer img.close(io);
 
-    const offset = miz.deprovision.findRootExt4Offset(gpa, img, io) catch |err|
+    const offset = miz.deprovision.findRootExt4OffsetPtr(gpa, &img, io) catch |err|
         return fail("azure deprovision: failed to locate the root ext4 filesystem: {s}", .{@errorName(err)});
 
-    miz.deprovision.deprovision(gpa, img, io, offset, .{ .username = username }) catch |err|
+    miz.deprovision.deprovisionPtr(gpa, &img, io, offset, .{ .username = username }) catch |err|
         return fail("azure deprovision: failed: {s}", .{@errorName(err)});
 
     if (username) |u| {

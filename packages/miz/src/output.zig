@@ -212,6 +212,16 @@ pub fn writeImage(
     out: *Io.Writer,
     options: WriteOptions,
 ) WriteError!void {
+    return writeImagePtr(allocator, io, &src, out, options);
+}
+
+pub fn writeImagePtr(
+    allocator: std.mem.Allocator,
+    io: Io,
+    src: *const Image,
+    out: *Io.Writer,
+    options: WriteOptions,
+) WriteError!void {
     var sink = try Sink.init(allocator, out, src.virtual_size, options);
     defer sink.deinit(allocator);
 
@@ -259,17 +269,27 @@ pub fn writeImageTo(
     destination: Destination,
     options: WriteOptions,
 ) (WriteError || Io.File.OpenError)!void {
+    return writeImageToPtr(allocator, io, &src, destination, options);
+}
+
+pub fn writeImageToPtr(
+    allocator: std.mem.Allocator,
+    io: Io,
+    src: *const Image,
+    destination: Destination,
+    options: WriteOptions,
+) (WriteError || Io.File.OpenError)!void {
     var buffer: [64 * 1024]u8 = undefined;
     switch (destination) {
         .path => |path| {
             const file = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
             defer file.close(io);
             var file_writer = file.writer(io, &buffer);
-            try writeImage(allocator, io, src, &file_writer.interface, options);
+            try writeImagePtr(allocator, io, src, &file_writer.interface, options);
         },
         .stdout => {
             var stdout_writer = Io.File.stdout().writerStreaming(io, &buffer);
-            try writeImage(allocator, io, src, &stdout_writer.interface, options);
+            try writeImagePtr(allocator, io, src, &stdout_writer.interface, options);
         },
     }
 }

@@ -583,9 +583,10 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    // Windows QCOW2 path buffers make allocation-free Image temporaries
-    // larger than the default PE stack reserve.
-    const windows_image_stack_reserve = 128 * 1024 * 1024;
+    // Windows QCOW2 path buffers keep full std.fs.max_path_bytes capacity
+    // (~1.78 MiB per Image), larger than the 1 MiB default PE stack reserve;
+    // in-place *Into and *Ptr image APIs keep peak frames under 4 MiB.
+    const windows_image_stack_reserve = 16 * 1024 * 1024;
     if (target.result.os.tag == .windows) cli_exe.stack_size = windows_image_stack_reserve;
     ci_production_entrypoint_check.dependOn(&cli_exe.step);
     const install_cli = b.addInstallArtifact(cli_exe, .{});

@@ -240,19 +240,14 @@ pub const Label = struct {
     }
 };
 
-fn readRegion(image: Image, io: Io, region: Region, buffer: []u8, offset: u64) ReadError!void {
+fn readRegion(image: *const Image, io: Io, region: Region, buffer: []u8, offset: u64) ReadError!void {
     const end = std.math.add(u64, offset, buffer.len) catch return error.LvmReadOutOfBounds;
     if (end > region.length) return error.LvmReadOutOfBounds;
     const absolute = std.math.add(u64, region.offset, offset) catch return error.LvmReadOutOfBounds;
     if (try image.pread(io, buffer, absolute) != buffer.len) return error.UnexpectedEndOfFile;
 }
 
-/// Reads the LVM2 label from the first four sectors of `region`, or null when
-/// the region holds no physical volume. A sector whose first eight bytes are
-/// not `LABELONE` is simply not a label; one that says `LABELONE` but fails
-/// its own checksum, names a different sector, or declares an unknown type is
-/// corruption and is reported rather than skipped.
-pub fn readLabel(image: Image, io: Io, region: Region) (ReadError || FormatError)!?Label {
+pub fn readLabelPtr(image: *const Image, io: Io, region: Region) (ReadError || FormatError)!?Label {
     var sector: [label_size]u8 = undefined;
     var index: u64 = 0;
     while (index < label_scan_sectors) : (index += 1) {
@@ -263,6 +258,15 @@ pub fn readLabel(image: Image, io: Io, region: Region) (ReadError || FormatError
         return try parseLabelSector(&sector, index);
     }
     return null;
+}
+
+/// Reads the LVM2 label from the first four sectors of `region`, or null when
+/// the region holds no physical volume. A sector whose first eight bytes are
+/// not `LABELONE` is simply not a label; one that says `LABELONE` but fails
+/// its own checksum, names a different sector, or declares an unknown type is
+/// corruption and is reported rather than skipped.
+pub fn readLabel(image: Image, io: Io, region: Region) (ReadError || FormatError)!?Label {
+    return readLabelPtr(&image, io, region);
 }
 
 /// Decodes one 512-byte label sector known to start with `LABELONE`.
@@ -354,6 +358,17 @@ pub const MetadataAreaHeader = struct {
     committed: RawLocn,
 };
 
+pub fn readMetadataAreaHeaderPtr(
+    image: *const Image,
+    io: Io,
+    region: Region,
+    area: DiskLocn,
+) (ReadError || FormatError)!MetadataAreaHeader {
+    var header: [metadata_area_header_size]u8 = undefined;
+    try readRegion(image, io, region, &header, area.offset);
+    return parseMetadataAreaHeader(&header, area);
+}
+
 /// Reads and validates the 512-byte metadata area header at `area.offset`
 /// within `region`.
 pub fn readMetadataAreaHeader(
@@ -362,9 +377,7 @@ pub fn readMetadataAreaHeader(
     region: Region,
     area: DiskLocn,
 ) (ReadError || FormatError)!MetadataAreaHeader {
-    var header: [metadata_area_header_size]u8 = undefined;
-    try readRegion(image, io, region, &header, area.offset);
-    return parseMetadataAreaHeader(&header, area);
+    return readMetadataAreaHeaderPtr(&image, io, region, area);
 }
 
 pub fn parseMetadataAreaHeader(
@@ -398,16 +411,9 @@ pub fn parseMetadataAreaHeader(
     };
 }
 
-/// Reads the committed metadata text out of one metadata area, or null when
-/// the area holds none (a freshly formatted area) or is flagged ignored (its
-/// contents are stale by design and must not be compared for freshness).
-///
-/// The area is a circular buffer whose first 512 bytes are the header, so a
-/// text that runs off the end resumes immediately after it. The stored
-/// checksum covers the text in logical order, across the wrap.
-pub fn readMetadataText(
+pub fn readMetadataTextPtr(
     allocator: Allocator,
-    image: Image,
+    image: *const Image,
     io: Io,
     region: Region,
     area: DiskLocn,
@@ -447,6 +453,24 @@ pub fn readMetadataText(
 
     if (crc(crc_initial, text) != locn.checksum) return error.BadLvmMetadataChecksum;
     return text;
+}
+
+/// Reads the committed metadata text out of one metadata area, or null when
+/// the area holds none (a freshly formatted area) or is flagged ignored (its
+/// contents are stale by design and must not be compared for freshness).
+///
+/// The area is a circular buffer whose first 512 bytes are the header, so a
+/// text that runs off the end resumes immediately after it. The stored
+/// checksum covers the text in logical order, across the wrap.
+pub fn readMetadataText(
+    allocator: Allocator,
+    image: Image,
+    io: Io,
+    region: Region,
+    area: DiskLocn,
+    header: MetadataAreaHeader,
+) (ReadError || FormatError || Allocator.Error)!?[]u8 {
+    return readMetadataTextPtr(allocator, &image, io, region, area, header);
 }
 
 // ---------------------------------------------------------------------------
@@ -1209,17 +1233,9 @@ fn parseLinear(
 // Scanning a disk
 // ---------------------------------------------------------------------------
 
-/// Every place on `image` that could hold a physical volume: the disk
-/// itself, plus each partition of whatever table it carries. `pvcreate` is
-/// routinely pointed at either, and a disk with a partition table may still
-/// have been given to `pvcreate` whole, so both are tried.
-///
-/// A disk with no readable partition table yields only the whole-disk
-/// candidate: an unreadable table is not an error here, because a physical
-/// volume occupying the whole disk has no table to read in the first place.
-pub fn candidateRegions(
+pub fn candidateRegionsPtr(
     allocator: Allocator,
-    image: Image,
+    image: *const Image,
     io: Io,
 ) (Image.PreadError || gpt.ReadError || Allocator.Error)![]Region {
     var regions = std.array_list.Managed(Region).init(allocator);
@@ -1236,7 +1252,7 @@ pub fn candidateRegions(
     const table = mbr.Mbr.decode(&sector) catch return regions.toOwnedSlice();
 
     if (table.entries[0].partition_type == .gpt_protective) {
-        const parsed = gpt.readGpt(image, io, allocator) catch |err| switch (err) {
+        const parsed = gpt.readGptPtr(image, io, allocator) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             // A protective MBR over an unreadable GPT is a broken disk, but
             // not one this module is entitled to diagnose: the whole-disk
@@ -1278,6 +1294,22 @@ pub fn candidateRegions(
         });
     }
     return regions.toOwnedSlice();
+}
+
+/// Every place on `image` that could hold a physical volume: the disk
+/// itself, plus each partition of whatever table it carries. `pvcreate` is
+/// routinely pointed at either, and a disk with a partition table may still
+/// have been given to `pvcreate` whole, so both are tried.
+///
+/// A disk with no readable partition table yields only the whole-disk
+/// candidate: an unreadable table is not an error here, because a physical
+/// volume occupying the whole disk has no table to read in the first place.
+pub fn candidateRegions(
+    allocator: Allocator,
+    image: Image,
+    io: Io,
+) (Image.PreadError || gpt.ReadError || Allocator.Error)![]Region {
+    return candidateRegionsPtr(allocator, &image, io);
 }
 
 /// A physical volume found on the disk, before its metadata has been read.
@@ -1353,16 +1385,16 @@ pub const Selected = struct {
 /// what LVM2 increments on each committed change. Ties, which mean the
 /// copies agree, are settled by scan order so the same disk always reads the
 /// same way.
-pub fn scan(allocator: Allocator, image: Image, io: Io) ScanError!Scan {
+pub fn scanPtr(allocator: Allocator, image: *const Image, io: Io) ScanError!Scan {
     var arena = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     const scratch = arena.allocator();
 
-    const regions = try candidateRegions(scratch, image, io);
+    const regions = try candidateRegionsPtr(scratch, image, io);
 
     var found = std.array_list.Managed(FoundPv).init(scratch);
     for (regions) |region| {
-        const label = try readLabel(image, io, region) orelse continue;
+        const label = try readLabelPtr(image, io, region) orelse continue;
         // The same physical volume can sit inside a candidate region and
         // inside the whole-disk candidate that contains it; the first sight
         // of it is the more specific one and is kept.
@@ -1376,8 +1408,8 @@ pub fn scan(allocator: Allocator, image: Image, io: Io) ScanError!Scan {
     var candidates = std.array_list.Managed(Candidate).init(scratch);
     for (found.items, 0..) |pv, pv_index| {
         for (pv.label.metadataAreas(), 0..) |area, mda_index| {
-            const header = try readMetadataAreaHeader(image, io, pv.region, area);
-            const text = try readMetadataText(scratch, image, io, pv.region, area, header) orelse
+            const header = try readMetadataAreaHeaderPtr(image, io, pv.region, area);
+            const text = try readMetadataTextPtr(scratch, image, io, pv.region, area, header) orelse
                 continue;
             try candidates.append(.{
                 .group = try parseVolumeGroup(scratch, text),
@@ -1416,6 +1448,10 @@ pub fn scan(allocator: Allocator, image: Image, io: Io) ScanError!Scan {
     // whose group list is still being filled.
     const owned = try groups.toOwnedSlice();
     return .{ .arena = arena, .groups = owned };
+}
+
+pub fn scan(allocator: Allocator, image: Image, io: Io) ScanError!Scan {
+    return scanPtr(allocator, &image, io);
 }
 
 /// Matches a physical volume identity from the metadata text, which is

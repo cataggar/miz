@@ -23,7 +23,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
 
     const file_path = path orelse return fail("usage: miz map [--output=human|json] <file>", .{});
 
-    var img = miz.Image.openPath(io, file_path) catch |err|
+    var img: miz.Image = undefined;
+    miz.Image.openPathReadOnlyInto(io, file_path, &img) catch |err|
         return fail("map: failed to open '{s}': {s}", .{ file_path, @errorName(err) });
     defer img.close(io);
 
@@ -35,7 +36,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     // opaque partition in the extent list, so the volume groups are read as
     // well. Scanning is read-only and happens after the extents so a broken
     // volume group still leaves the allocation map visible.
-    var lvm_scan = miz.lvm.scan(gpa, img, io) catch |err|
+    var lvm_scan = miz.lvm.scanPtr(gpa, &img, io) catch |err|
         return fail("map: failed to read LVM metadata: {s}", .{@errorName(err)});
     defer lvm_scan.deinit();
 

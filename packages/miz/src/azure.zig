@@ -81,6 +81,10 @@ pub const PartitionStyleReport = struct {
 /// matches what the given Hyper-V `generation` expects: Gen1 VMs boot BIOS
 /// + a plain MBR; Gen2 VMs boot UEFI + a protective MBR followed by a GPT.
 pub fn checkPartitionStyle(img: Image, io: Io, allocator: std.mem.Allocator, generation: Generation) FixupError!PartitionStyleReport {
+    return checkPartitionStylePtr(&img, io, allocator, generation);
+}
+
+pub fn checkPartitionStylePtr(img: *const Image, io: Io, allocator: std.mem.Allocator, generation: Generation) FixupError!PartitionStyleReport {
     var mbr_buf: [mbr.sector_size]u8 = undefined;
     _ = try img.pread(io, &mbr_buf, 0);
     const boot_record = mbr.Mbr.decode(&mbr_buf) catch |err| return .{
@@ -100,7 +104,7 @@ pub fn checkPartitionStyle(img: Image, io: Io, allocator: std.mem.Allocator, gen
             if (!has_protective_entry) {
                 return .{ .generation = generation, .ok = false, .message = "Gen2 requires a GPT protective MBR (0xEE partition), but none was found" };
             }
-            var parsed = gpt.readVerifiedGpt(
+            var parsed = gpt.readVerifiedGptPtr(
                 img,
                 io,
                 allocator,

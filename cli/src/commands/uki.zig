@@ -70,9 +70,11 @@ fn runCertificate(allocator: Allocator, io: Io, args: []const []const u8) u8 {
         return 1;
     };
 
-    var image = miz.Image.openPathReadOnlyStandalone(
+    var image: miz.Image = undefined;
+    miz.Image.openPathReadOnlyStandaloneInto(
         io,
         parsed.image_path,
+        &image,
     ) catch |err|
         return fail(
             "failed to open '{s}': {s}",

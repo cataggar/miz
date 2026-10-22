@@ -37,6 +37,10 @@ pub const FindRootError = mbr.Mbr.DecodeError || gpt.ReadError || Image.PreadErr
 /// partition index or type GUID, since a `build-image` output's exact
 /// partition layout varies (Gen1 vs Gen2, `--boot-mode uki`, `--verity`).
 pub fn findRootExt4Offset(allocator: std.mem.Allocator, img: Image, io: Io) FindRootError!u64 {
+    return findRootExt4OffsetPtr(allocator, &img, io);
+}
+
+pub fn findRootExt4OffsetPtr(allocator: std.mem.Allocator, img: *const Image, io: Io) FindRootError!u64 {
     var mbr_buf: [mbr.sector_size]u8 = undefined;
     _ = try img.pread(io, &mbr_buf, 0);
     const boot_record = try mbr.Mbr.decode(&mbr_buf);
@@ -46,7 +50,7 @@ pub fn findRootExt4Offset(allocator: std.mem.Allocator, img: Image, io: Io) Find
     } else false;
 
     if (has_protective_entry) {
-        const parsed = try gpt.readGpt(img, io, allocator);
+        const parsed = try gpt.readGptPtr(img, io, allocator);
         defer allocator.free(parsed.partitions);
         for (parsed.partitions) |p| {
             const offset = p.first_lba * mbr.sector_size;
@@ -62,7 +66,7 @@ pub fn findRootExt4Offset(allocator: std.mem.Allocator, img: Image, io: Io) Find
     return error.NoExt4PartitionFound;
 }
 
-fn tryOpenExt4(allocator: std.mem.Allocator, img: Image, io: Io, offset: u64) bool {
+fn tryOpenExt4(allocator: std.mem.Allocator, img: *const Image, io: Io, offset: u64) bool {
     var editor = ext4.Editor.open(io, img.file, allocator, .{ .offset = offset }) catch return false;
     editor.deinit();
     return true;
@@ -84,6 +88,10 @@ pub const DeprovisionError = ext4.EditError || std.mem.Allocator.Error || std.Io
 /// within `img`. See the module doc comment for the full list and the
 /// tolerant-of-absence policy.
 pub fn deprovision(allocator: std.mem.Allocator, img: Image, io: Io, offset: u64, options: Options) DeprovisionError!void {
+    return deprovisionPtr(allocator, &img, io, offset, options);
+}
+
+pub fn deprovisionPtr(allocator: std.mem.Allocator, img: *const Image, io: Io, offset: u64, options: Options) DeprovisionError!void {
     var editor = try ext4.Editor.open(io, img.file, allocator, .{ .offset = offset });
     defer editor.deinit();
 

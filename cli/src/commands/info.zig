@@ -23,7 +23,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
 
     const file_path = path orelse return fail("usage: miz info [--output=human|json] <file>", .{});
 
-    var img = miz.Image.openPath(io, file_path) catch |err|
+    var img: miz.Image = undefined;
+    miz.Image.openPathInto(io, file_path, &img) catch |err|
         return fail("info: failed to open '{s}': {s}", .{ file_path, @errorName(err) });
     defer img.close(io);
 
@@ -39,7 +40,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             if (stat.subformat) |sf| {
                 std.debug.print("subformat: {s}\n", .{if (sf == .fixed) "fixed" else "dynamic"});
             }
-            if (img.qcow2) |q| {
+            if (img.qcow2) |*q| {
                 std.debug.print("compression type: {s}\n", .{qcow2CompressionName(q.compression_type)});
                 if (q.backing_file_len > 0) {
                     std.debug.print("backing file: {s}\n", .{q.backing_file_path[0..q.backing_file_len]});
@@ -50,11 +51,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
             // Mirror the subset of qemu-img's `info --output=json` schema that
             // downstream release tooling consumes, so native metadata can
             // replace `qemu-img info` as the publication input.
-            const backing_filename: ?[]const u8 = if (img.qcow2) |q|
+            const backing_filename: ?[]const u8 = if (img.qcow2) |*q|
                 (if (q.backing_file_len > 0) q.backing_file_path[0..q.backing_file_len] else null)
             else
                 null;
-            const format_specific: ?FormatSpecific = if (img.qcow2) |q| .{
+            const format_specific: ?FormatSpecific = if (img.qcow2) |*q| .{
                 .type = "qcow2",
                 .data = .{
                     .@"compression-type" = qcow2CompressionName(q.compression_type),
@@ -133,21 +134,24 @@ test "info emits native zstd metadata compatible with the release validator" {
 
     const file = try std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = true });
     var src = TestSliceSource{ .data = data };
-    _ = try miz.qcow2.writeStandaloneCompressed(
+    var written: miz.qcow2.Info = undefined;
+    try miz.qcow2.writeStandaloneCompressedInto(
         std.testing.allocator,
         io,
         file,
         virtual_size,
         src.reader(),
         .{},
+        &written,
     );
     file.close(io);
 
-    var img = try miz.Image.openPathReadOnlyStandalone(io, path);
+    var img: miz.Image = undefined;
+    try miz.Image.openPathReadOnlyStandaloneInto(io, path, &img);
     defer img.close(io);
     try std.testing.expectEqual(miz.Format.qcow2, img.format);
     try std.testing.expectEqual(virtual_size, img.virtual_size);
-    const q = img.qcow2.?;
+    const q = &img.qcow2.?;
     try std.testing.expectEqualStrings("zstd", qcow2CompressionName(q.compression_type));
     try std.testing.expectEqual(@as(u16, 0), q.backing_file_len);
 }

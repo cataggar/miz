@@ -112,8 +112,11 @@ pub const CopyFinalization = image_mod.CopyFinalization;
 pub const CopyResult = image_mod.CopyResult;
 pub const VhdSubformat = image_mod.VhdSubformat;
 pub const copyAll = image_mod.copyAll;
+pub const copyAllPtr = image_mod.copyAllPtr;
 pub const copyAllBytes = image_mod.copyAllBytes;
+pub const copyAllBytesPtr = image_mod.copyAllBytesPtr;
 pub const copyAllWithFinalization = image_mod.copyAllWithFinalization;
+pub const copyAllWithFinalizationPtr = image_mod.copyAllWithFinalizationPtr;
 
 pub const OutputSpec = output.Spec;
 pub const Compression = output.Compression;
