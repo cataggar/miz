@@ -39,7 +39,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         return fail("create: invalid size '{s}': {s}", .{ positional[1], @errorName(err) });
 
     _ = gpa;
-    var img = miz.Image.create(io, path, fmt, size, options) catch |err|
+    var img: miz.Image = undefined;
+    miz.Image.createInto(io, path, fmt, size, options, &img) catch |err|
         return fail("create: failed to create '{s}': {s}", .{ path, @errorName(err) });
     img.close(io);
 

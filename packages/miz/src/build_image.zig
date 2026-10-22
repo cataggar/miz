@@ -537,7 +537,8 @@ pub fn build(
     defer if (!builds_output_in_place) Io.Dir.cwd().deleteFile(io, raw_build_path) catch {};
 
     logStep(options, "create build image");
-    var raw_img = try Image.create(io, raw_build_path, .raw, disk_size, .{});
+    var raw_img: Image = undefined;
+    try Image.createInto(io, raw_build_path, .raw, disk_size, .{}, &raw_img);
     var raw_img_open = true;
     defer if (raw_img_open) raw_img.close(io);
 
@@ -769,6 +770,7 @@ pub fn build(
         try convertRawToOutput(
             allocator,
             io,
+            &raw_img,
             raw_build_path,
             destination.path,
             output_format,
@@ -783,14 +785,15 @@ pub fn build(
     // and validating before publishing means a rejected image is never
     // emitted at all.
     const validate_in_place = builds_output_in_place or (spec.compression == .none and destination == .path);
-    var final_img = if (validate_in_place)
-        try Image.openPath(io, destination.path)
-    else
-        try Image.openPathReadOnly(io, raw_build_path);
-    defer final_img.close(io);
+    if (validate_in_place) {
+        try Image.openPathInto(io, destination.path, &raw_img);
+    } else {
+        try Image.openPathReadOnlyInto(io, raw_build_path, &raw_img);
+    }
+    raw_img_open = true;
 
     if (output_format == .vhdx) {
-        const metadata = try vhdx.open(io, final_img.file);
+        const metadata = try vhdx.open(io, raw_img.file);
         report.vhdx_metadata = .{
             .header_sequence_number = metadata.header_sequence_number,
             .file_write_guid = metadata.file_write_guid,
@@ -801,19 +804,19 @@ pub fn build(
 
     if (output_format == .vhd) {
         logStep(options, "validate Azure VHD alignment");
-        report.vhd_alignment = try azure.alignFixedVhd(&final_img, io);
+        report.vhd_alignment = try azure.alignFixedVhd(&raw_img, io);
     }
 
     if (output_format != .qcow2) {
         logStep(options, "validate partition style");
-        const partition_style = try azure.checkPartitionStyle(final_img, io, allocator, options.generation);
+        const partition_style = try azure.checkPartitionStylePtr(&raw_img, io, allocator, options.generation);
         report.partition_style = partition_style;
         if (!partition_style.ok) return error.PartitionStyleCheckFailed;
     }
 
     if (!validate_in_place) {
         logStep(options, "stream build image to compressed output");
-        try output.writeImageTo(allocator, io, final_img, destination, .{
+        try output.writeImageToPtr(allocator, io, &raw_img, destination, .{
             .compression = spec.compression,
             .level = options.compression_level orelse output.default_level,
         });
@@ -1123,13 +1126,14 @@ fn writeMbrLayout(
 fn convertRawToOutput(
     allocator: std.mem.Allocator,
     io: Io,
+    src: *Image,
     raw_path: []const u8,
     output_path: []const u8,
     output_format: Format,
     disk_size: u64,
     create_options: image_mod.CreateOptions,
 ) !void {
-    var src = try Image.openPath(io, raw_path);
+    try Image.openPathInto(io, raw_path, src);
     defer src.close(io);
 
     var effective_create_options = create_options;
@@ -1137,10 +1141,11 @@ fn convertRawToOutput(
         effective_create_options.vhd_subformat = .fixed;
     }
 
-    var dst = try Image.create(io, output_path, output_format, disk_size, effective_create_options);
+    var dst: Image = undefined;
+    try Image.createInto(io, output_path, output_format, disk_size, effective_create_options, &dst);
     defer dst.close(io);
 
-    _ = try image_mod.copyAll(io, src, &dst, allocator);
+    _ = try image_mod.copyAllPtr(io, src, &dst, allocator);
 }
 
 fn logStep(options: BuildImageOptions, message: []const u8) void {

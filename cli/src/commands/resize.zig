@@ -11,7 +11,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     const path = args[0];
     const size_arg = args[1];
 
-    var img = miz.Image.openPath(io, path) catch |err|
+    var img: miz.Image = undefined;
+    miz.Image.openPathInto(io, path, &img) catch |err|
         return fail("resize: failed to open '{s}': {s}", .{ path, @errorName(err) });
     defer img.close(io);
 

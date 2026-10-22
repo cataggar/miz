@@ -2,16 +2,21 @@
 
 ## Windows stack reservation
 
-`miz.Image` keeps bounded QCOW2 path records inline to remain allocation-free.
-Windows permits substantially larger path buffers than Unix, so image
-operations need more stack than the default PE executable reserve. The
-Windows CLI and host image tools reserve 128 MiB; unoptimized image-open
-call chains use about 98 MiB of stack with Windows-sized path records.
-Windows library consumers using `miz.Image` should likewise set
-`exe.stack_size = 128 * 1024 * 1024` in their Zig build
-and provide the same reservation for worker threads that perform image
-operations. This is virtual address-space reservation, not an eager 128 MiB
-allocation, and does not reduce supported path lengths.
+`miz.Image` keeps bounded QCOW2 path records inline at full
+`std.fs.max_path_bytes` capacity (`98,302` bytes per path on Windows, or
+`~1.78 MiB` per `Image` / `qcow2.Info`) to remain allocation-free without
+narrowing supported Windows paths. Because a single `miz.Image` exceeds the
+1 MiB default PE executable stack reserve, the Windows CLI and host image tools
+reserve 16 MiB (`16 * 1024 * 1024`); in-place `*Into` constructors
+(`Image.openPathInto`, `Image.openPathReadOnlyInto`, `Image.createInto`,
+`qcow2.openInto`, `qcow2.createInto`, etc.) and pointer-borrowing `*Ptr` /
+`*const Image` methods keep peak image stack frames under 4 MiB across Debug
+and Release modes. Windows library consumers using `miz.Image` should set
+`exe.stack_size = 16 * 1024 * 1024` in their Zig build and provide at least an
+8–16 MiB stack reservation for worker threads that hold `miz.Image` values on
+the stack (or heap-allocate `miz.Image` / `qcow2.Info` and initialize it in
+place via the `*Into` APIs). This is virtual address-space reservation, not an
+eager allocation, and preserves full `std.fs.max_path_bytes` path capacity.
 
 ## Package a standalone UEFI application
 

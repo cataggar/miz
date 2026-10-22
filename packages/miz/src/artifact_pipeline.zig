@@ -908,14 +908,16 @@ pub fn finalizeQcow2(
         return error.InputChecksumMismatch;
     }
 
-    var source_image: ?image.Image = null;
-    defer if (source_image) |*opened| opened.close(io);
+    var source_image_storage: image.Image = undefined;
+    var source_image: ?*image.Image = null;
+    defer if (source_image) |opened| opened.close(io);
     const virtual_size = switch (options.source_format) {
         .raw => source_stat.size,
         .qcow2 => size: {
-            source_image = image.Image.openStandaloneQcow2File(
+            image.Image.openStandaloneQcow2FileInto(
                 io,
                 source_file,
+                &source_image_storage,
             ) catch |err| switch (err) {
                 error.BackingFileNotSupported,
                 error.ExternalDataFileNotSupported,
@@ -923,8 +925,8 @@ pub fn finalizeQcow2(
                 else => return err,
             };
             source_file_open = false;
-            const opened = &source_image.?;
-            break :size opened.virtual_size;
+            source_image = &source_image_storage;
+            break :size source_image_storage.virtual_size;
         },
     };
     if (virtual_size == 0 or virtual_size > options.max_virtual_size) {
@@ -954,33 +956,36 @@ pub fn finalizeQcow2(
 
     if (options.compression == .zstd) {
         const cluster_bits: u32 = std.math.log2_int(u32, options.cluster_size);
+        var written_info: qcow2.Info = undefined;
         switch (options.source_format) {
             .raw => {
                 var source_ctx = qcow2.RawSourceContext{
                     .file = source_handle,
                     .readable_len = source_stat.size,
                 };
-                _ = try qcow2.writeStandaloneCompressed(
+                try qcow2.writeStandaloneCompressedInto(
                     allocator,
                     io,
                     stage.file,
                     virtual_size,
                     source_ctx.reader(),
                     .{ .cluster_bits = cluster_bits },
+                    &written_info,
                 );
             },
             .qcow2 => {
                 var source_ctx = qcow2.Qcow2SourceContext{
                     .file = source_handle,
-                    .info = &source_image.?.qcow2.?,
+                    .info = &source_image.?.*.qcow2.?,
                 };
-                _ = try qcow2.writeStandaloneCompressed(
+                try qcow2.writeStandaloneCompressedInto(
                     allocator,
                     io,
                     stage.file,
                     virtual_size,
                     source_ctx.reader(),
                     .{ .cluster_bits = cluster_bits },
+                    &written_info,
                 );
             },
         }
@@ -1084,7 +1089,8 @@ pub fn finalizeQcow2(
     }
 
     const stage_reader = try reopenAtomicFile(io, &stage, .read_only);
-    var finalized = image.Image.openFile(io, stage_reader) catch |err| {
+    var finalized: image.Image = undefined;
+    image.Image.openFileInto(io, stage_reader, &finalized) catch |err| {
         stage_reader.close(io);
         return err;
     };
@@ -1094,7 +1100,7 @@ pub fn finalizeQcow2(
     if (finalized.virtual_size != virtual_size) {
         return error.VirtualSizeMismatch;
     }
-    const finalized_info = finalized.qcow2.?;
+    const finalized_info = &finalized.qcow2.?;
     if (finalized_info.backing_file_len != 0 or
         finalized_info.data_file_len != 0)
     {
@@ -1164,9 +1170,11 @@ pub fn deriveFixedVhd(
         return error.InputChecksumMismatch;
     }
 
-    var source_image = image.Image.openStandaloneQcow2File(
+    var source_image: image.Image = undefined;
+    image.Image.openStandaloneQcow2FileInto(
         io,
         source_file,
+        &source_image,
     ) catch |err| switch (err) {
         error.BackingFileNotSupported,
         error.ExternalDataFileNotSupported,
@@ -1188,8 +1196,8 @@ pub fn deriveFixedVhd(
     const source_check = try source_image.check(io);
     if (!source_check.ok) return error.SourceImageInvalid;
 
-    var source_gpt = try gpt.readVerifiedGpt(
-        source_image,
+    var source_gpt = try gpt.readVerifiedGptPtr(
+        &source_image,
         io,
         allocator,
         options.max_partition_array_bytes,
@@ -1226,7 +1234,8 @@ pub fn deriveFixedVhd(
     try validateStageBounded(io, stage.file, options.max_output_size);
 
     const stage_image_file = try reopenAtomicFile(io, &stage, .read_write);
-    var finalized = try image.Image.createFile(
+    var finalized: image.Image = undefined;
+    try image.Image.createFileInto(
         io,
         stage_image_file,
         .vhd,
@@ -1236,12 +1245,13 @@ pub fn deriveFixedVhd(
             .unique_id = options.unique_id,
             .timestamp_unix = options.timestamp_unix,
         },
+        &finalized,
     );
     var finalized_open = true;
     defer if (finalized_open) finalized.close(io);
     try validateStageBounded(io, stage.file, options.max_output_size);
 
-    _ = try image.copyAll(io, source_image, &finalized, allocator);
+    _ = try image.copyAllPtr(io, &source_image, &finalized, allocator);
     const relocation = try gpt.relocateBackup(
         &finalized,
         io,
@@ -1249,8 +1259,8 @@ pub fn deriveFixedVhd(
         source_gpt,
     );
 
-    var final_gpt = try gpt.readVerifiedGpt(
-        finalized,
+    var final_gpt = try gpt.readVerifiedGptPtr(
+        &finalized,
         io,
         allocator,
         options.max_partition_array_bytes,

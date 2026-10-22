@@ -413,13 +413,15 @@ fn ext4JournalSetting(request: CaptureRequest) miz.ext4.JournalOptions {
 }
 
 fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
-    var disk = miz.Image.openPathReadOnly(io, request.source_path) catch |err|
+    var disk: miz.Image = undefined;
+    miz.Image.openPathReadOnlyInto(io, request.source_path, &disk) catch |err|
         return failOpen(request.source_path, err);
-    defer disk.close(io);
+    var disk_open = true;
+    defer if (disk_open) disk.close(io);
 
     // The partition table is read once and shared: every `gpt:<n>` spec, the
     // ESP search and the PARTUUID of the source root all come out of it.
-    const table: ?miz.gpt.ParsedGpt = miz.gpt.readGpt(disk, io, gpa) catch null;
+    const table: ?miz.gpt.ParsedGpt = miz.gpt.readGptPtr(&disk, io, gpa) catch null;
     defer if (table) |parsed| gpa.free(parsed.partitions);
 
     var scratch = std.array_list.Managed(*miz.Image).init(gpa);
@@ -438,7 +440,8 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
 
     var root_reader = openSourceFilesystem(gpa, io, root_source) catch |err|
         return failWithHint("capture: the root source is not a supported filesystem (ext4 or xfs)", err);
-    defer root_reader.deinit(io);
+    var root_reader_open = true;
+    defer if (root_reader_open) root_reader.deinit(io);
 
     // A root named by path rather than as a partition of --source carries no
     // PARTUUID this can retire, so a `PARTUUID=`-rooted fstab would come
@@ -502,6 +505,8 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
             break :blk .{ .uuid = uuid, .label = label };
         },
     };
+    root_reader.deinit(io);
+    root_reader_open = false;
 
     var root_before = miz.identity_rewrite.Identifiers{ .filesystem_uuid = root_identity.uuid, .filesystem_label = root_identity.label };
     ownedPartition(gpa, &identifier_storage, root_source.partition, &root_before) catch
@@ -620,6 +625,8 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
             }) catch return fail("capture: out of memory", .{});
         }
     }
+    disk.close(io);
+    disk_open = false;
 
     // `assemble` creates its output exclusively and writes raw. When raw to a
     // real path is what was asked for, that is the output; otherwise it is a
@@ -679,17 +686,17 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
     if (request.dry_run) return 0;
     if (writes_raw_directly) return 0;
 
-    var staged = miz.Image.openPathReadOnly(io, raw_path) catch |err|
+    miz.Image.openPathReadOnlyInto(io, raw_path, &disk) catch |err|
         return fail("capture: cannot re-open the staged image: {s}", .{@errorName(err)});
-    defer staged.close(io);
+    disk_open = true;
 
     if (converts_container) {
-        convertStaged(gpa, io, staged, request, report.virtual_size) catch |err|
+        convertStaged(gpa, io, &disk, request, report.virtual_size) catch |err|
             return fail("capture: writing {s} output failed: {s}", .{ request.spec.displayName(), @errorName(err) });
         return 0;
     }
 
-    miz.output.writeImageTo(gpa, io, staged, request.destination, .{
+    miz.output.writeImageToPtr(gpa, io, &disk, request.destination, .{
         .compression = request.spec.compression,
         .level = request.level orelse miz.output.default_level,
     }) catch |err|
@@ -705,7 +712,7 @@ fn capture(gpa: std.mem.Allocator, io: std.Io, request: CaptureRequest) u8 {
 fn convertStaged(
     gpa: std.mem.Allocator,
     io: std.Io,
-    staged: miz.Image,
+    staged: *const miz.Image,
     request: CaptureRequest,
     virtual_size: u64,
 ) !void {
@@ -720,12 +727,13 @@ fn convertStaged(
     // cleanup below safe: what fails to be created is never deleted, so a
     // pre-existing destination -- or a device node `Image.create` refused --
     // survives the failure that named it.
-    var destination = try miz.Image.createExclusive(io, request.destination.path, request.spec.format, virtual_size, options);
+    var destination: miz.Image = undefined;
+    try miz.Image.createExclusiveInto(io, request.destination.path, request.spec.format, virtual_size, options, &destination);
     // A half-written container is worse than none: it opens, reports a
     // plausible size, and fails somewhere the operator will not look.
     errdefer std.Io.Dir.cwd().deleteFile(io, request.destination.path) catch {};
     defer destination.close(io);
-    _ = try miz.copyAll(io, staged, &destination, gpa);
+    _ = try miz.Image.copyAllPtr(io, staged, &destination, gpa);
 }
 
 /// Reads through the image's guest-visible address space rather than the host
@@ -973,7 +981,7 @@ fn resolveSpec(
         .path => |path| {
             const owned = try gpa.create(miz.Image);
             errdefer gpa.destroy(owned);
-            owned.* = try miz.Image.openPathReadOnly(io, path);
+            try miz.Image.openPathReadOnlyInto(io, path, owned);
             errdefer owned.close(io);
             try scratch.append(owned);
             return .{ .image = owned, .offset = 0, .length = owned.virtual_size };
@@ -989,7 +997,7 @@ fn resolveSpec(
             };
         },
         .logical_volume => |selector| {
-            var scan = try miz.lvm.scan(gpa, disk.*, io);
+            var scan = try miz.lvm.scanPtr(gpa, disk, io);
             defer scan.deinit();
             const selected = try scan.findLogicalVolume(selector.group, selector.name);
             const extent = try miz.lvm.contiguousRange(selected.group, selected.volume);

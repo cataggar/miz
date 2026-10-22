@@ -356,6 +356,10 @@ pub const ReadError = error{
 /// (see `check` in `image.zig` for basic consistency checks; a full
 /// primary/backup reconciliation is a possible future enhancement).
 pub fn readGpt(img: Image, io: Io, allocator: std.mem.Allocator) ReadError!ParsedGpt {
+    return readGptPtr(&img, io, allocator);
+}
+
+pub fn readGptPtr(img: *const Image, io: Io, allocator: std.mem.Allocator) ReadError!ParsedGpt {
     var header_buf: [sector_size]u8 = undefined;
     if (try img.pread(io, &header_buf, sector_size * 1) != header_buf.len) {
         return error.UnexpectedEndOfFile;
@@ -460,6 +464,15 @@ pub fn detectVerifiedGpt(
     allocator: std.mem.Allocator,
     max_partition_array_bytes: u64,
 ) VerifyError!DetectedGpt {
+    return detectVerifiedGptPtr(&img, io, allocator, max_partition_array_bytes);
+}
+
+pub fn detectVerifiedGptPtr(
+    img: *const Image,
+    io: Io,
+    allocator: std.mem.Allocator,
+    max_partition_array_bytes: u64,
+) VerifyError!DetectedGpt {
     var first_blocks: [2 * sector_size]u8 = @as([(2 * sector_size)]u8, @splat(0));
     const available = @min(img.virtual_size, first_blocks.len);
     if (available != 0) {
@@ -483,7 +496,7 @@ pub fn detectVerifiedGpt(
         std.mem.eql(u8, first_blocks[sector_size .. sector_size + signature.len], &signature);
     if (!has_protective_entry and !has_primary_signature) return .not_gpt;
 
-    return .{ .verified = try readVerifiedGpt(
+    return .{ .verified = try readVerifiedGptPtr(
         img,
         io,
         allocator,
@@ -530,7 +543,7 @@ pub fn invalidateDestinationPartitionStructures(
     var primary_sector: [sector_size]u8 = undefined;
     var has_primary_sector = false;
     if (total_sectors > 1) {
-        try preadExact(img.*, io, &primary_sector, sector_size);
+        try preadExact(img, io, &primary_sector, sector_size);
         has_primary_sector = true;
     }
 
@@ -582,6 +595,15 @@ pub fn invalidateDestinationPartitionStructures(
 /// every slot exactly, including empty and vendor-extended entry bytes.
 pub fn readVerifiedGpt(
     img: Image,
+    io: Io,
+    allocator: std.mem.Allocator,
+    max_partition_array_bytes: u64,
+) VerifyError!VerifiedGpt {
+    return readVerifiedGptPtr(&img, io, allocator, max_partition_array_bytes);
+}
+
+pub fn readVerifiedGptPtr(
+    img: *const Image,
     io: Io,
     allocator: std.mem.Allocator,
     max_partition_array_bytes: u64,
@@ -1142,7 +1164,7 @@ fn verifySourceMetadataUnchanged(
 ) RewriteIdentityError!void {
     var current_primary: [sector_size]u8 = undefined;
     try preadExact(
-        img.*,
+        img,
         io,
         &current_primary,
         try sectorOffset(verified.primary_header.current_lba),
@@ -1153,7 +1175,7 @@ fn verifySourceMetadataUnchanged(
 
     var current_backup: [sector_size]u8 = undefined;
     try preadExact(
-        img.*,
+        img,
         io,
         &current_backup,
         try sectorOffset(verified.backup_header.current_lba),
@@ -1163,7 +1185,7 @@ fn verifySourceMetadataUnchanged(
     }
 
     var current_mbr: [sector_size]u8 = undefined;
-    try preadExact(img.*, io, &current_mbr, 0);
+    try preadExact(img, io, &current_mbr, 0);
     if (!std.mem.eql(u8, &current_mbr, &verified.protective_mbr_sector)) {
         return error.SourceMetadataChanged;
     }
@@ -1172,7 +1194,7 @@ fn verifySourceMetadataUnchanged(
     defer allocator.free(current_array);
 
     try preadExact(
-        img.*,
+        img,
         io,
         current_array,
         try sectorOffset(verified.primary_header.partition_entry_lba),
@@ -1182,7 +1204,7 @@ fn verifySourceMetadataUnchanged(
     }
 
     try preadExact(
-        img.*,
+        img,
         io,
         current_array,
         try sectorOffset(verified.backup_header.partition_entry_lba),
@@ -1270,10 +1292,10 @@ pub fn growPartitionToEnd(
     }
 
     var primary_sector: [sector_size]u8 = undefined;
-    try preadExact(img.*, io, &primary_sector, sector_size);
+    try preadExact(img, io, &primary_sector, sector_size);
     var backup_sector: [sector_size]u8 = undefined;
     try preadExact(
-        img.*,
+        img,
         io,
         &backup_sector,
         try sectorOffset(relocation.new_backup_lba),
@@ -1305,7 +1327,7 @@ pub fn growPartitionToEnd(
     const backup_array_lba = std.mem.readInt(u64, backup_sector[72..80], .little);
     const array = try allocator.alloc(u8, array_len);
     defer allocator.free(array);
-    try preadExact(img.*, io, array, try sectorOffset(primary_array_lba));
+    try preadExact(img, io, array, try sectorOffset(primary_array_lba));
     const current_last = std.mem.readInt(
         u64,
         array[entry_offset + 40 ..][0..8],
@@ -1363,7 +1385,7 @@ pub fn relocateBackup(
     }
 
     var current_primary: [sector_size]u8 = undefined;
-    try preadExact(img.*, io, &current_primary, sector_size);
+    try preadExact(img, io, &current_primary, sector_size);
     if (!std.mem.eql(
         u8,
         &current_primary,
@@ -1375,7 +1397,7 @@ pub fn relocateBackup(
     );
     defer allocator.free(current_array);
     try preadExact(
-        img.*,
+        img,
         io,
         current_array,
         try sectorOffset(verified.primary_header.partition_entry_lba),
@@ -1384,7 +1406,7 @@ pub fn relocateBackup(
         return error.SourceMetadataChanged;
     }
     var current_mbr: [sector_size]u8 = undefined;
-    try preadExact(img.*, io, &current_mbr, 0);
+    try preadExact(img, io, &current_mbr, 0);
     if (!std.mem.eql(u8, &current_mbr, &verified.protective_mbr_sector)) {
         return error.SourceMetadataChanged;
     }
@@ -1505,8 +1527,10 @@ fn sectorOffset(lba: u64) error{InvalidPartitionArrayBounds}!u64 {
         error.InvalidPartitionArrayBounds;
 }
 
+const zero_chunk: [64 * 1024]u8 = @splat(0);
+
 fn preadExact(
-    img: Image,
+    img: *const Image,
     io: Io,
     buffer: []u8,
     offset: u64,
@@ -1522,11 +1546,10 @@ fn writeZeros(
     offset: u64,
     len: u64,
 ) Image.PwriteError!void {
-    const zeros: [64 * 1024]u8 = @as([(64 * 1024)]u8, @splat(0));
     var written: u64 = 0;
     while (written < len) {
-        const chunk_len: usize = @intCast(@min(len - written, zeros.len));
-        try img.pwrite(io, zeros[0..chunk_len], offset + written);
+        const chunk_len: usize = @intCast(@min(len - written, zero_chunk.len));
+        try img.pwrite(io, zero_chunk[0..chunk_len], offset + written);
         written += chunk_len;
     }
 }
@@ -1692,10 +1715,10 @@ test "invalidateDestinationPartitionStructures clears both GPT metadata regions"
     var cleared_end: [end_len]u8 = undefined;
     var preserved_start_guard: [sector_size]u8 = undefined;
     var preserved_end_guard: [sector_size]u8 = undefined;
-    try preadExact(img, io, &cleared_start, 0);
-    try preadExact(img, io, &cleared_end, size - end_len);
-    try preadExact(img, io, &preserved_start_guard, start_len);
-    try preadExact(img, io, &preserved_end_guard, end_guard_offset);
+    try preadExact(&img, io, &cleared_start, 0);
+    try preadExact(&img, io, &cleared_end, size - end_len);
+    try preadExact(&img, io, &preserved_start_guard, start_len);
+    try preadExact(&img, io, &preserved_end_guard, end_guard_offset);
     try std.testing.expect(std.mem.allEqual(u8, &cleared_start, 0));
     try std.testing.expect(std.mem.allEqual(u8, &cleared_end, 0));
     try std.testing.expectEqualSlices(u8, &start_guard, &preserved_start_guard);
@@ -1723,7 +1746,7 @@ test "invalidateDestinationPartitionStructures clears small destinations safely"
     try img.pwrite(io, &(@as([sector_size]u8, @splat(0xa5))), 0);
     try invalidateDestinationPartitionStructures(&img, io, array_bytes);
     var first_sector: [sector_size]u8 = undefined;
-    try preadExact(img, io, &first_sector, 0);
+    try preadExact(&img, io, &first_sector, 0);
     try std.testing.expect(std.mem.allEqual(u8, &first_sector, 0));
     try std.testing.expectError(
         error.InvalidPartitionArrayLimit,
@@ -1767,7 +1790,7 @@ test "invalidateDestinationPartitionStructures clears an advertised intermediate
 
     var backup: [sector_size]u8 = undefined;
     try preadExact(
-        img,
+        &img,
         io,
         &backup,
         advertised_backup_lba * sector_size,
@@ -1830,7 +1853,7 @@ test "detectVerifiedGpt passes through non-GPT and rejects malformed GPT" {
     try std.testing.expect(!relocation.was_relocated);
 
     var primary: [sector_size]u8 = undefined;
-    try preadExact(img, io, &primary, sector_size);
+    try preadExact(&img, io, &primary, sector_size);
     primary[16] ^= 0xff;
     try img.pwrite(io, &primary, sector_size);
     try std.testing.expectError(
@@ -1875,7 +1898,7 @@ test "readVerifiedGpt and relocateBackup preserve partition bytes and extents" {
     try writePartitionTables(&img, io, disk_guid, &entries);
 
     var mbr_sector: [sector_size]u8 = undefined;
-    try preadExact(img, io, &mbr_sector, 0);
+    try preadExact(&img, io, &mbr_sector, 0);
     mbr_sector[17] = 0xa5;
     try img.pwrite(io, &mbr_sector, 0);
 
@@ -1972,7 +1995,7 @@ test "readVerifiedGpt rejects backup corruption and overlapping partitions" {
     const backup_array_lba =
         size / sector_size - 1 - partition_array_sectors;
     var byte: [1]u8 = undefined;
-    try preadExact(img, io, &byte, try sectorOffset(backup_array_lba));
+    try preadExact(&img, io, &byte, try sectorOffset(backup_array_lba));
     byte[0] ^= 0xff;
     try img.pwrite(io, &byte, try sectorOffset(backup_array_lba));
     try std.testing.expectError(
@@ -2438,7 +2461,7 @@ test "rewriteIdentity preserves opaque GPT entry bytes on same-size disks" {
     );
 
     var mbr_sector: [sector_size]u8 = undefined;
-    try preadExact(img, io, &mbr_sector, 0);
+    try preadExact(&img, io, &mbr_sector, 0);
     mbr_sector[17] = 0x7a;
     std.mem.writeInt(u32, mbr_sector[0x1B8..0x1BC], 0x7856_3412, .little);
     try img.pwrite(io, &mbr_sector, 0);
@@ -2576,7 +2599,7 @@ test "rewriteIdentity preserves relocated GPT geometry with generated GUIDs" {
     try writePartitionTables(&img, io, disk_guid, &entries);
 
     var mbr_sector: [sector_size]u8 = undefined;
-    try preadExact(img, io, &mbr_sector, 0);
+    try preadExact(&img, io, &mbr_sector, 0);
     mbr_sector[23] = 0x9d;
     try img.pwrite(io, &mbr_sector, 0);
 
@@ -2684,7 +2707,7 @@ test "rewriteIdentity refuses when source GPT metadata changed" {
         try sectorOffset(verified.primary_header.partition_entry_lba),
         40,
     );
-    try preadExact(img, io, &one, mutate_offset);
+    try preadExact(&img, io, &one, mutate_offset);
     one[0] ^= 0xff;
     try img.pwrite(io, &one, mutate_offset);
 
@@ -2706,7 +2729,7 @@ test "rewriteIdentity refuses when source GPT metadata changed" {
     );
 
     var primary_header_sector: [sector_size]u8 = undefined;
-    try preadExact(img, io, &primary_header_sector, sector_size);
+    try preadExact(&img, io, &primary_header_sector, sector_size);
     const header = try Header.decode(&primary_header_sector);
     try std.testing.expectEqualSlices(u8, &disk_guid, &header.disk_guid);
 }

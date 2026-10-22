@@ -68,7 +68,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     miz.output.validate(spec, destination, level) catch |err|
         return fail("convert: -O {s}: {s}", .{ spec.displayName(), opts.describeOutputError(err) });
 
-    var src = miz.Image.openPathReadOnly(io, src_path) catch |err|
+    var src: miz.Image = undefined;
+    miz.Image.openPathReadOnlyInto(io, src_path, &src) catch |err|
         return fail("convert: failed to open '{s}': {s}", .{ src_path, @errorName(err) });
     defer src.close(io);
 
@@ -77,16 +78,17 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     // data, which a forward-only stream cannot express.
     if (spec.compression == .none and destination == .path) {
         const dst_path = destination.path;
-        var dst = miz.Image.create(io, dst_path, spec.format, src.virtual_size, options) catch |err|
+        var dst: miz.Image = undefined;
+        miz.Image.createInto(io, dst_path, spec.format, src.virtual_size, options, &dst) catch |err|
             return fail("convert: failed to create '{s}': {s}", .{ dst_path, @errorName(err) });
         defer dst.close(io);
 
-        _ = miz.copyAll(io, src, &dst, gpa) catch |err|
+        _ = miz.Image.copyAllPtr(io, &src, &dst, gpa) catch |err|
             return fail("convert: copy failed: {s}", .{@errorName(err)});
         return 0;
     }
 
-    miz.output.writeImageTo(gpa, io, src, destination, .{
+    miz.output.writeImageToPtr(gpa, io, &src, destination, .{
         .compression = spec.compression,
         .level = level orelse miz.output.default_level,
     }) catch |err|
@@ -106,7 +108,8 @@ test "convert still refuses a block-device destination through Image.create" {
     const source = "test-convert-device-source.raw";
     defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
 
-    var src = try miz.Image.create(io, source, .raw, 4096, .{});
+    var src: miz.Image = undefined;
+    try miz.Image.createInto(io, source, .raw, 4096, .{}, &src);
     src.close(io);
 
     try std.testing.expectEqual(

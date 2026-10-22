@@ -96,7 +96,7 @@ fn readImageAt(
     return read_context.image.pread(read_context.io, buffer, offset);
 }
 
-fn readSector(image: Image, io: Io) ![mbr.sector_size]u8 {
+fn readSector(image: *const Image, io: Io) ![mbr.sector_size]u8 {
     var sector: [mbr.sector_size]u8 = undefined;
     if (try image.pread(io, &sector, 0) != sector.len) {
         return error.UnexpectedEndOfFile;
@@ -177,6 +177,16 @@ pub fn preflight(
     options: Options,
     max_partition_array_bytes: u64,
 ) !Plan {
+    return preflightPtr(allocator, io, &source, options, max_partition_array_bytes);
+}
+
+pub fn preflightPtr(
+    allocator: std.mem.Allocator,
+    io: Io,
+    source: *const Image,
+    options: Options,
+    max_partition_array_bytes: u64,
+) !Plan {
     if (options.grow_filesystem and !options.grow_partition) {
         return error.FilesystemGrowthRequiresPartitionGrowth;
     }
@@ -220,7 +230,7 @@ pub fn preflight(
         };
     }
 
-    var verified = try gpt.readVerifiedGpt(
+    var verified = try gpt.readVerifiedGptPtr(
         source,
         io,
         allocator,
@@ -238,7 +248,7 @@ pub fn preflight(
         const length = try ext4Length(
             allocator,
             io,
-            &source,
+            source,
             try partitionOffset(partition),
         );
         if (length > try partitionLength(partition)) {

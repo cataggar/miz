@@ -368,7 +368,8 @@ pub fn assemble(
     };
     if (options.dry_run) return report;
 
-    var img = try Image.createExclusive(io, options.raw_path, .raw, planned.disk_size, .{});
+    var img: Image = undefined;
+    try Image.createExclusiveInto(io, options.raw_path, .raw, planned.disk_size, .{}, &img);
     var img_open = true;
     defer if (img_open) img.close(io);
     // Creation is exclusive, so a half-written disk left behind by a failure

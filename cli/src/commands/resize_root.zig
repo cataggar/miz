@@ -34,10 +34,8 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
     const magnitude = miz.parseSize(magnitude_text) catch |err|
         return fail("resize-root: invalid size '{s}': {s}", .{ requested_size, @errorName(err) });
 
-    var image = miz.Image.openPathReadOnlyStandalone(io, image_path) catch |err|
+    const current_size = readCurrentVirtualSize(io, image_path) catch |err|
         return fail("resize-root: failed to open '{s}': {s}", .{ image_path, @errorName(err) });
-    const current_size = image.virtual_size;
-    image.close(io);
     const target_size = if (relative)
         std.math.add(u64, current_size, magnitude) catch
             return fail("resize-root: requested size is too large", .{})
@@ -66,6 +64,13 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, args: []const []const u8) u8 {
         },
     );
     return 0;
+}
+
+noinline fn readCurrentVirtualSize(io: std.Io, image_path: []const u8) !u64 {
+    var image: miz.Image = undefined;
+    try miz.Image.openPathReadOnlyStandaloneInto(io, image_path, &image);
+    defer image.close(io);
+    return image.virtual_size;
 }
 
 fn fail(comptime format: []const u8, args: anytype) u8 {

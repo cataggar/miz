@@ -87,7 +87,8 @@ const Operations = struct {
         u64,
         bool,
         ?[]const u8,
-    ) anyerror!miz.Image = openDestination,
+        *miz.Image,
+    ) anyerror!void = openDestination,
     preflight_report_fn: *const fn (
         ?*anyopaque,
         *const miz.Image,
@@ -109,7 +110,7 @@ const Operations = struct {
     ) anyerror!bool = confirm,
     detect_gpt_fn: *const fn (
         ?*anyopaque,
-        miz.Image,
+        *const miz.Image,
         std.Io,
         std.mem.Allocator,
     ) anyerror!miz.gpt.DetectedGpt = detectGpt,
@@ -121,7 +122,7 @@ const Operations = struct {
     copy_fn: *const fn (
         ?*anyopaque,
         std.Io,
-        miz.Image,
+        *const miz.Image,
         *miz.Image,
         std.mem.Allocator,
     ) anyerror!void = copyBytes,
@@ -157,7 +158,7 @@ const Operations = struct {
     ) anyerror!miz.ext4.FilesystemInfo = resizeExt4,
     verify_fn: *const fn (
         ?*anyopaque,
-        miz.Image,
+        *const miz.Image,
         std.Io,
         std.mem.Allocator,
     ) anyerror!miz.gpt.VerifiedGpt = verifyGpt,
@@ -254,12 +255,14 @@ fn runWithOperations(
 
     const source_path = positional[0];
     const destination_path = positional[1];
-    var source = miz.Image.openPathReadOnly(io, source_path) catch |err| {
+    var source: miz.Image = undefined;
+    miz.Image.openPathReadOnlyInto(io, source_path, &source) catch |err| {
         return fail("write: failed to open source '{s}': {s}", .{ source_path, @errorName(err) });
     };
     defer source.close(io);
 
-    var destination = operations.open_destination_fn(
+    var destination: miz.Image = undefined;
+    operations.open_destination_fn(
         operations.context,
         gpa,
         io,
@@ -267,6 +270,7 @@ fn runWithOperations(
         source.virtual_size,
         allow_device_write,
         expected_serial,
+        &destination,
     ) catch |err| {
         if (expected_serial) |expected| switch (err) {
             error.DeviceSerialUnavailable => return fail(
@@ -307,7 +311,7 @@ fn runWithOperations(
 
     var detected = operations.detect_gpt_fn(
         operations.context,
-        source,
+        &source,
         io,
         gpa,
     ) catch |err| {
@@ -418,7 +422,7 @@ fn runWithOperations(
     operations.copy_fn(
         operations.context,
         io,
-        source,
+        &source,
         &destination,
         gpa,
     ) catch |err| {
@@ -522,7 +526,7 @@ fn runWithOperations(
 
             var destination_gpt = operations.verify_fn(
                 operations.context,
-                destination,
+                &destination,
                 io,
                 gpa,
             ) catch |err| {
@@ -655,12 +659,13 @@ fn openDestination(
     source_virtual_size: u64,
     allow_device_write: bool,
     expected_serial: ?[]const u8,
-) anyerror!miz.Image {
-    return miz.Image.openDeviceForWrite(io, path, source_virtual_size, .{
+    out: *miz.Image,
+) anyerror!void {
+    return miz.Image.openDeviceForWriteInto(io, path, source_virtual_size, .{
         .allow_device_write = allow_device_write,
         .expected_serial = expected_serial,
         .allocator = allocator,
-    });
+    }, out);
 }
 
 fn preflightReport(
@@ -2481,11 +2486,11 @@ fn confirm(_: ?*anyopaque, io: std.Io, destination_path: []const u8) anyerror!bo
 
 fn detectGpt(
     _: ?*anyopaque,
-    source: miz.Image,
+    source: *const miz.Image,
     io: std.Io,
     allocator: std.mem.Allocator,
 ) anyerror!miz.gpt.DetectedGpt {
-    return miz.gpt.detectVerifiedGpt(
+    return miz.gpt.detectVerifiedGptPtr(
         source,
         io,
         allocator,
@@ -2508,11 +2513,11 @@ fn invalidateDestination(
 fn copyBytes(
     _: ?*anyopaque,
     io: std.Io,
-    source: miz.Image,
+    source: *const miz.Image,
     destination: *miz.Image,
     allocator: std.mem.Allocator,
 ) anyerror!void {
-    return miz.copyAllBytes(io, source, destination, allocator);
+    return miz.copyAllBytesPtr(io, source, destination, allocator);
 }
 
 fn relocateBackup(
@@ -2646,11 +2651,11 @@ fn resizeExt4(
 
 fn verifyGpt(
     _: ?*anyopaque,
-    destination: miz.Image,
+    destination: *const miz.Image,
     io: std.Io,
     allocator: std.mem.Allocator,
 ) anyerror!miz.gpt.VerifiedGpt {
-    return miz.gpt.readVerifiedGpt(
+    return miz.gpt.readVerifiedGptPtr(
         destination,
         io,
         allocator,
@@ -3183,13 +3188,14 @@ const FakeOperations = struct {
         _: u64,
         allow_device_write: bool,
         expected_serial: ?[]const u8,
-    ) anyerror!miz.Image {
+        out: *miz.Image,
+    ) anyerror!void {
         const self: *FakeOperations = @ptrCast(@alignCast(context.?));
         self.open_calls += 1;
         self.allow_device_write_seen = allow_device_write;
         self.expected_serial_seen = expected_serial;
         if (self.open_error) |err| return err;
-        return miz.Image.openPath(io, path);
+        return miz.Image.openPathInto(io, path, out);
     }
 
     fn preflightReportFake(
@@ -3248,7 +3254,7 @@ const FakeOperations = struct {
 
     fn detectGptFake(
         context: ?*anyopaque,
-        source: miz.Image,
+        source: *const miz.Image,
         io: std.Io,
         allocator: std.mem.Allocator,
     ) anyerror!miz.gpt.DetectedGpt {
@@ -3279,7 +3285,7 @@ const FakeOperations = struct {
     fn copyFake(
         context: ?*anyopaque,
         io: std.Io,
-        source: miz.Image,
+        source: *const miz.Image,
         destination: *miz.Image,
         allocator: std.mem.Allocator,
     ) anyerror!void {
@@ -3368,7 +3374,7 @@ const FakeOperations = struct {
 
     fn verifyFake(
         context: ?*anyopaque,
-        destination: miz.Image,
+        destination: *const miz.Image,
         io: std.Io,
         allocator: std.mem.Allocator,
     ) anyerror!miz.gpt.VerifiedGpt {
@@ -3760,7 +3766,7 @@ fn prepareFreshIdentityForTest(
     source: *miz.Image,
 ) !PreparedIdentity {
     var report = testReport();
-    var detected = try detectGpt(null, source.*, io, allocator);
+    var detected = try detectGpt(null, source, io, allocator);
     defer detected.deinit(allocator);
     return prepareIdentityWithHooks(
         &test_identity_scan_hooks,
@@ -4922,7 +4928,7 @@ test "write new-uuids refuses unsupported filesystem inventory" {
     inventory.partitions[0].filesystem.kind = .ambiguous;
     inventory.partitions[0].filesystem.identifier_len = 0;
 
-    var detected = try detectGpt(null, source, io, allocator);
+    var detected = try detectGpt(null, &source, io, allocator);
     defer detected.deinit(allocator);
     const verified = switch (detected) {
         .verified => |gpt| gpt,

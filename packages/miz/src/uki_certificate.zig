@@ -62,8 +62,8 @@ pub fn extractAlloc(
     }
     if (dependencies.len != 0) return error.Qcow2BackingUnsupported;
 
-    var verified = try gpt.readVerifiedGpt(
-        image.*,
+    var verified = try gpt.readVerifiedGptPtr(
+        image,
         io,
         allocator,
         options.max_partition_array_bytes,

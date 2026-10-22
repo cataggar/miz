@@ -303,7 +303,7 @@ fn openEntryFiles(
     image: *Image,
     files: *std.array_list.Managed(EntryFile),
 ) ApplyError!fat32.FileSystem {
-    const esp = try findEsp(image.*, io, arena);
+    const esp = try findEsp(image, io, arena);
     var filesystem = try fat32.open(image, io, .{ .offset = esp.offset, .length = esp.length });
     try refuseUnifiedKernelImages(&filesystem, io, arena);
     try collectGrubConfigs(&filesystem, io, arena, files);
@@ -317,8 +317,8 @@ const EspRegion = struct {
     length: u64,
 };
 
-fn findEsp(image: Image, io: Io, allocator: std.mem.Allocator) ApplyError!EspRegion {
-    const parsed = gpt.readGpt(image, io, allocator) catch |err| switch (err) {
+fn findEsp(image: *const Image, io: Io, allocator: std.mem.Allocator) ApplyError!EspRegion {
+    const parsed = gpt.readGptPtr(image, io, allocator) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.MissingPartitionTable,
     };
