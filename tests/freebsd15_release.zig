@@ -2250,6 +2250,7 @@ test "validation mode cannot reach a release mutation" {
     try support.expectContains(source, "        type: boolean");
     try support.expectContains(source, "        required: true");
     try support.expectContains(source, "        default: false");
+    try support.expectAbsent(source, "max-parallel: 2");
     try support.expectContains(source, "test \"$RELEASE_SET\" = zfs");
     try support.expectContains(stage_block, "needs: [prepare, build, azure_acceptance]");
     try support.expectContains(source, "environment: azurelinux4-release");

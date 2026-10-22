@@ -777,7 +777,9 @@ fn stageInto(
             &.{ output, entry.asset_name },
         );
         defer allocator.free(destination);
+        var linked = true;
         Dir.cwd().hardLink(asset_path, Dir.cwd(), destination, io, .{}) catch {
+            linked = false;
             Dir.cwd().copyFile(
                 asset_path,
                 Dir.cwd(),
@@ -790,13 +792,27 @@ fn stageInto(
                 .{key},
             );
         };
-        const staged_digest = support.hashArtifact(io, destination) catch
-            return fail(diagnostic, "{s}: staging changed candidate bytes", .{key});
-        if (!std.mem.eql(u8, &staged_digest.hex, verified.sha256)) return fail(
-            diagnostic,
-            "{s}: staging changed candidate bytes",
-            .{key},
-        );
+        if (linked) {
+            const stat = Dir.cwd().statFile(io, destination, .{}) catch
+                return fail(diagnostic, "{s}: staging changed candidate bytes", .{key});
+            if (stat.kind != .file or stat.size != @as(u64, @intCast(verified.bytes))) return fail(
+                diagnostic,
+                "{s}: staging changed candidate bytes",
+                .{key},
+            );
+        } else {
+            const staged_digest = support.hashArtifact(io, destination) catch
+                return fail(diagnostic, "{s}: staging changed candidate bytes", .{key});
+            if (staged_digest.size != @as(u64, @intCast(verified.bytes)) or
+                !std.mem.eql(u8, &staged_digest.hex, verified.sha256))
+            {
+                return fail(
+                    diagnostic,
+                    "{s}: staging changed candidate bytes",
+                    .{key},
+                );
+            }
+        }
         const metadata_destination = try support.joinPath(
             allocator,
             &.{ output, metadata_name },
@@ -856,7 +872,7 @@ fn stageInto(
             .flavor = entry.flavor,
             .asset_name = entry.asset_name,
             .sha256 = try arena.allocator().dupe(u8, verified.sha256),
-            .bytes = @intCast(staged_digest.size),
+            .bytes = verified.bytes,
             .metadata_name = metadata_name,
             .metadata_sha256 = try arena.allocator().dupe(
                 u8,

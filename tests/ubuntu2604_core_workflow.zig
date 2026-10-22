@@ -31,6 +31,7 @@ fn job(workflow: *const Source, name: []const u8, following: ?[]const u8) ![]con
 test "the core build job re-validates the size inventory it measured" {
     var workflow = try open();
     defer workflow.deinit();
+    try workflow.expectOmits("max-parallel: 2");
     const build_job = try job(&workflow, "build", "native_qemu");
     try source.expectOrder(
         build_job,
