@@ -417,6 +417,12 @@ pub const Image = struct {
     /// node. Devices are opened read-only unless
     /// `options.allow_device_write` is set.
     pub fn openPathWithOptions(io: Io, path: []const u8, options: OpenOptions) OpenError!Image {
+        var image: Image = undefined;
+        try openPathWithOptionsInto(io, path, options, &image);
+        return image;
+    }
+
+    fn openPathWithOptionsInto(io: Io, path: []const u8, options: OpenOptions, out: *Image) OpenError!void {
         // Classify the path *before* opening it so a writable descriptor
         // onto a live disk is never created in the first place. A failure
         // here is deliberately not diagnosed separately: the open below
@@ -443,14 +449,14 @@ pub const Image = struct {
             const file = try Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
             errdefer file.close(io);
             try verifyPreparedDevice(io, file, prepared, null);
-            var image = try openFileFromSource(io, file, path, options.standalone_qcow2, .{
+            try openFileFromSourceInto(io, file, path, options.standalone_qcow2, .{
                 .device = .{
                     .geometry = prepared.geometry,
                     .write_allowed = true,
                 },
-            });
-            image.attachPreflight(prepared);
-            return image;
+            }, out);
+            out.attachPreflight(prepared);
+            return;
         }
         const write = options.write and (!path_is_device or options.allow_device_write);
 
@@ -461,7 +467,7 @@ pub const Image = struct {
         if (write and (try file.stat(io)).kind == .block_device) {
             return error.BlockDeviceChangedDuringOpen;
         }
-        return openFileWithPath(io, file, path, options);
+        return openFileWithPathInto(io, file, path, options, out);
     }
 
     /// Opens an existing block device as a raw write destination. Unlike
@@ -474,6 +480,18 @@ pub const Image = struct {
         source_virtual_size: u64,
         options: DeviceWriteOptions,
     ) OpenDeviceForWriteError!Image {
+        var image: Image = undefined;
+        try openDeviceForWriteInto(io, path, source_virtual_size, options, &image);
+        return image;
+    }
+
+    fn openDeviceForWriteInto(
+        io: Io,
+        path: []const u8,
+        source_virtual_size: u64,
+        options: DeviceWriteOptions,
+        out: *Image,
+    ) OpenDeviceForWriteError!void {
         if (!options.allow_device_write) return error.BlockDeviceWriteNotPermitted;
         const expected_serial = try normalizeExpectedSerial(options.expected_serial);
 
@@ -501,25 +519,33 @@ pub const Image = struct {
         errdefer file.close(io);
         try verifyPreparedDevice(io, file, prepared, expected_serial);
 
-        var image = try deviceWriteImage(
+        try deviceWriteImageInto(
             file,
             prepared.geometry,
             source_virtual_size,
             options,
+            out,
         );
-        image.attachPreflight(prepared);
-        return image;
+        out.attachPreflight(prepared);
     }
 
     /// Takes ownership of `file` (closing the returned `Image` closes it).
     pub fn openFile(io: Io, file: Io.File) OpenError!Image {
-        return openFileWithPath(io, file, null, .{});
+        var image: Image = undefined;
+        try openFileWithPathInto(io, file, null, .{}, &image);
+        return image;
     }
 
     /// Takes ownership of `file`, which may be an already-open block-device
     /// handle. Only writes through a device when the caller opted in with
     /// `options.allow_device_write` *and* opened the handle writable.
     pub fn openFileWithOptions(io: Io, file: Io.File, options: OpenOptions) OpenError!Image {
+        var image: Image = undefined;
+        try openFileWithOptionsInto(io, file, options, &image);
+        return image;
+    }
+
+    fn openFileWithOptionsInto(io: Io, file: Io.File, options: OpenOptions, out: *Image) OpenError!void {
         const file_stat = try file.stat(io);
         if (file_stat.kind == .block_device and options.write and options.allow_device_write) {
             var prepared = try prepareDeviceForWrite(
@@ -530,30 +556,32 @@ pub const Image = struct {
                 options.force,
             );
             errdefer prepared.deinit();
-            var image = try openFileFromSource(io, file, null, options.standalone_qcow2, .{
+            try openFileFromSourceInto(io, file, null, options.standalone_qcow2, .{
                 .device = .{
                     .geometry = prepared.geometry,
                     .write_allowed = true,
                 },
-            });
-            image.attachPreflight(prepared);
-            return image;
+            }, out);
+            out.attachPreflight(prepared);
+            return;
         }
-        return openFileWithPath(io, file, null, options);
+        return openFileWithPathInto(io, file, null, options, out);
     }
 
     /// Takes ownership of a standalone qcow2 file on success without
     /// resolving or opening any path named by its header. On error ownership
     /// remains with the caller. Closing the returned `Image` closes `file`.
     pub fn openStandaloneQcow2File(io: Io, file: Io.File) OpenError!Image {
-        const qcow2_info = try qcow2.openStandalone(io, file);
-        return .{
+        var image: Image = .{
             .file = file,
             .format = .qcow2,
             .data_offset = 0,
-            .virtual_size = qcow2_info.virtual_size,
-            .qcow2 = qcow2_info,
+            .virtual_size = 0,
+            .qcow2 = undefined,
         };
+        try qcow2.openStandaloneInto(io, file, &image.qcow2.?);
+        image.virtual_size = image.qcow2.?.virtual_size;
+        return image;
     }
 
     /// Bounded form of `openStandaloneQcow2File`. Header-derived limits are
@@ -564,34 +592,37 @@ pub const Image = struct {
         file: Io.File,
         limits: qcow2.StandaloneOpenLimits,
     ) BoundedStandaloneQcow2OpenError!Image {
-        const qcow2_info = try qcow2.openStandaloneWithLimits(io, file, limits);
-        return .{
+        var image: Image = .{
             .file = file,
             .format = .qcow2,
             .data_offset = 0,
-            .virtual_size = qcow2_info.virtual_size,
-            .qcow2 = qcow2_info,
+            .virtual_size = 0,
+            .qcow2 = undefined,
         };
+        try qcow2.openStandaloneWithLimitsInto(io, file, limits, &image.qcow2.?);
+        image.virtual_size = image.qcow2.?.virtual_size;
+        return image;
     }
 
     /// Lists path-resolved host files, excluding the top-level image, that
     /// contribute guest-visible data. Only qcow2 currently has dependencies.
     pub fn sourceDependencyPaths(
-        self: Image,
+        self: *const Image,
         allocator: std.mem.Allocator,
     ) std.mem.Allocator.Error![][]u8 {
-        if (self.qcow2) |qcow_info| {
+        if (self.qcow2) |*qcow_info| {
             return qcow2.sourceDependencyPaths(allocator, qcow_info);
         }
         return allocator.alloc([]u8, 0);
     }
 
-    fn openFileWithPath(
+    fn openFileWithPathInto(
         io: Io,
         file: Io.File,
         path: ?[]const u8,
         options: OpenOptions,
-    ) OpenError!Image {
+        out: *Image,
+    ) OpenError!void {
         const file_stat = try file.stat(io);
         // The kind of the *opened handle* -- not of the path stat'ed before
         // opening -- decides device treatment, so a path swapped between the
@@ -604,7 +635,7 @@ pub const Image = struct {
             else => .{ .file = file_stat.size },
         };
 
-        return openFileFromSource(io, file, path, options.standalone_qcow2, source);
+        return openFileFromSourceInto(io, file, path, options.standalone_qcow2, source, out);
     }
 
     /// Opens `file` against an already-resolved `source`, stamping the
@@ -616,9 +647,21 @@ pub const Image = struct {
         standalone_qcow2: bool,
         source: Source,
     ) OpenError!Image {
-        var image = try sniffFormat(io, file, path, standalone_qcow2, source.sizeBytes());
-        image.device = source.deviceInfo();
+        var image: Image = undefined;
+        try openFileFromSourceInto(io, file, path, standalone_qcow2, source, &image);
         return image;
+    }
+
+    fn openFileFromSourceInto(
+        io: Io,
+        file: Io.File,
+        path: ?[]const u8,
+        standalone_qcow2: bool,
+        source: Source,
+        out: *Image,
+    ) OpenError!void {
+        try sniffFormatInto(io, file, path, standalone_qcow2, source.sizeBytes(), out);
+        out.device = source.deviceInfo();
     }
 
     fn deviceWriteImage(
@@ -627,9 +670,21 @@ pub const Image = struct {
         source_virtual_size: u64,
         options: DeviceWriteOptions,
     ) OpenDeviceForWriteError!Image {
+        var image: Image = undefined;
+        try deviceWriteImageInto(file, geometry, source_virtual_size, options, &image);
+        return image;
+    }
+
+    fn deviceWriteImageInto(
+        file: Io.File,
+        geometry: block_device.Geometry,
+        source_virtual_size: u64,
+        options: DeviceWriteOptions,
+        out: *Image,
+    ) OpenDeviceForWriteError!void {
         if (!options.allow_device_write) return error.BlockDeviceWriteNotPermitted;
         if (source_virtual_size > geometry.size_bytes) return error.DestinationTooSmall;
-        return .{
+        out.* = .{
             .file = file,
             .format = .raw,
             .data_offset = 0,
@@ -649,13 +704,14 @@ pub const Image = struct {
     /// Sniffs the format at `source`'s authoritative size. Every read stays
     /// within that size, so a device is never read past its end even though
     /// the VHD probe works backwards from the last sector.
-    fn sniffFormat(
+    fn sniffFormatInto(
         io: Io,
         file: Io.File,
         path: ?[]const u8,
         standalone_qcow2: bool,
         file_size: u64,
-    ) OpenError!Image {
+        out: *Image,
+    ) OpenError!void {
 
         // qcow2 and VHDX signatures both live at the very start of the file
         // (unlike VHD's footer, which trails the data); sniff them first so
@@ -666,29 +722,32 @@ pub const Image = struct {
             var sig_buf: [8]u8 = undefined;
             const n = try file.readPositionalAll(io, &sig_buf, 0);
             if (n >= 4 and std.mem.eql(u8, sig_buf[0..4], &qcow2.file_signature)) {
-                const qcow2_info = if (standalone_qcow2)
-                    try qcow2.openStandalone(io, file)
-                else if (path) |p|
-                    try qcow2.openAtPath(io, file, p)
-                else
-                    try qcow2.open(io, file);
-                return .{
+                out.* = .{
                     .file = file,
                     .format = .qcow2,
                     .data_offset = 0,
-                    .virtual_size = qcow2_info.virtual_size,
-                    .qcow2 = qcow2_info,
+                    .virtual_size = 0,
+                    .qcow2 = undefined,
                 };
+                if (standalone_qcow2)
+                    try qcow2.openStandaloneInto(io, file, &out.qcow2.?)
+                else if (path) |p|
+                    try qcow2.openAtPathInto(io, file, p, &out.qcow2.?)
+                else
+                    try qcow2.openInto(io, file, &out.qcow2.?);
+                out.virtual_size = out.qcow2.?.virtual_size;
+                return;
             }
             if (n == 8 and std.mem.eql(u8, &sig_buf, &vhdx.file_signature)) {
                 const vhdx_info = try vhdx.open(io, file);
-                return .{
+                out.* = .{
                     .file = file,
                     .format = .vhdx,
                     .data_offset = 0,
                     .virtual_size = vhdx_info.virtual_size,
                     .vhdx = vhdx_info,
                 };
+                return;
             }
         }
 
@@ -698,13 +757,19 @@ pub const Image = struct {
             if (n == vhd.footer_size) {
                 if (vhd.Footer.decode(&footer_buf)) |footer| {
                     switch (footer.disk_type) {
-                        .fixed => return .{
-                            .file = file,
-                            .format = .vhd,
-                            .data_offset = 0,
-                            .virtual_size = footer.virtualSize(),
+                        .fixed => {
+                            out.* = .{
+                                .file = file,
+                                .format = .vhd,
+                                .data_offset = 0,
+                                .virtual_size = footer.virtualSize(),
+                            };
+                            return;
                         },
-                        .dynamic => return try openDynamic(io, file, footer, footer_buf),
+                        .dynamic => {
+                            try openDynamicInto(io, file, footer, footer_buf, out);
+                            return;
+                        },
                         else => return error.UnsupportedVhdDiskType,
                     }
                 } else |_| {
@@ -713,7 +778,7 @@ pub const Image = struct {
             }
         }
 
-        return .{
+        out.* = .{
             .file = file,
             .format = .raw,
             .data_offset = 0,
@@ -721,7 +786,7 @@ pub const Image = struct {
         };
     }
 
-    fn openDynamic(io: Io, file: Io.File, footer: vhd.Footer, footer_buf: [vhd.footer_size]u8) OpenError!Image {
+    fn openDynamicInto(io: Io, file: Io.File, footer: vhd.Footer, footer_buf: [vhd.footer_size]u8, out: *Image) OpenError!void {
         var header_buf: [vhd.dynamic_header_size]u8 = undefined;
         _ = try file.readPositionalAll(io, &header_buf, footer.data_offset);
         const header = try vhd.DynamicHeader.decode(&header_buf);
@@ -739,7 +804,7 @@ pub const Image = struct {
             header.block_size,
         );
 
-        return .{
+        out.* = .{
             .file = file,
             .format = .vhd,
             .data_offset = 0,
@@ -775,6 +840,20 @@ pub const Image = struct {
         options: CreateOptions,
         exclusive: bool,
     ) CreateError!Image {
+        var image: Image = undefined;
+        try createPathInto(io, path, format, size, options, exclusive, &image);
+        return image;
+    }
+
+    fn createPathInto(
+        io: Io,
+        path: []const u8,
+        format: Format,
+        size: u64,
+        options: CreateOptions,
+        exclusive: bool,
+        out: *Image,
+    ) CreateError!void {
         try validateCreate(format, size, options);
         try rejectDeviceTarget(existingTargetKind(io, path));
 
@@ -785,31 +864,45 @@ pub const Image = struct {
         });
         errdefer if (exclusive) Io.Dir.cwd().deleteFile(io, path) catch {};
         errdefer file.close(io);
-        return initializeFile(io, file, format, size, options);
+        try initializeFileInto(io, file, format, size, options, out);
     }
 
     /// Initializes an already-open file as a new image and takes ownership of
     /// its handle. Callers can use this with descriptor-pinned atomic staging
     /// files without reopening a pathname.
     pub fn createFile(io: Io, file: Io.File, format: Format, size: u64, options: CreateOptions) CreateError!Image {
-        errdefer file.close(io);
-        try validateCreate(format, size, options);
-        try rejectDeviceTarget((try file.stat(io)).kind);
-        try file.setLength(io, 0);
-        return initializeFile(io, file, format, size, options);
+        var image: Image = undefined;
+        try createFileInto(io, file, format, size, options, &image);
+        return image;
     }
 
-    fn initializeFile(
+    fn createFileInto(
         io: Io,
         file: Io.File,
         format: Format,
         size: u64,
         options: CreateOptions,
-    ) CreateError!Image {
+        out: *Image,
+    ) CreateError!void {
+        errdefer file.close(io);
+        try validateCreate(format, size, options);
+        try rejectDeviceTarget((try file.stat(io)).kind);
+        try file.setLength(io, 0);
+        try initializeFileInto(io, file, format, size, options, out);
+    }
+
+    fn initializeFileInto(
+        io: Io,
+        file: Io.File,
+        format: Format,
+        size: u64,
+        options: CreateOptions,
+        out: *Image,
+    ) CreateError!void {
         switch (format) {
             .raw => {
                 try file.setLength(io, size);
-                return .{ .file = file, .format = .raw, .data_offset = 0, .virtual_size = size };
+                out.* = .{ .file = file, .format = .raw, .data_offset = 0, .virtual_size = size };
             },
             .vhd => switch (options.vhd_subformat) {
                 .fixed => {
@@ -821,17 +914,17 @@ pub const Image = struct {
                     );
                     const encoded = footer.encode();
                     try file.writePositionalAll(io, &encoded, size);
-                    return .{ .file = file, .format = .vhd, .data_offset = 0, .virtual_size = size };
+                    out.* = .{ .file = file, .format = .vhd, .data_offset = 0, .virtual_size = size };
                 },
-                .dynamic => return try createDynamic(io, file, size, options),
+                .dynamic => try createDynamicInto(io, file, size, options, out),
             },
             .qcow2 => {
-                const qcow2_info = try qcow2.create(io, file, size);
-                return .{ .file = file, .format = .qcow2, .data_offset = 0, .virtual_size = size, .qcow2 = qcow2_info };
+                out.* = .{ .file = file, .format = .qcow2, .data_offset = 0, .virtual_size = size, .qcow2 = undefined };
+                try qcow2.createInto(io, file, size, &out.qcow2.?);
             },
             .vhdx => {
                 const vhdx_info = try vhdx.createWithOptions(io, file, size, options.vhdx);
-                return .{ .file = file, .format = .vhdx, .data_offset = 0, .virtual_size = size, .vhdx = vhdx_info };
+                out.* = .{ .file = file, .format = .vhdx, .data_offset = 0, .virtual_size = size, .vhdx = vhdx_info };
             },
         }
     }
@@ -870,7 +963,7 @@ pub const Image = struct {
         }
     }
 
-    fn createDynamic(io: Io, file: Io.File, size: u64, options: CreateOptions) CreateError!Image {
+    fn createDynamicInto(io: Io, file: Io.File, size: u64, options: CreateOptions, out: *Image) CreateError!void {
         const block_size: u32 = vhd.default_block_size;
         const bitmap_size = vhd.bitmapSize(block_size);
         const total_sectors = size / 512;
@@ -903,7 +996,7 @@ pub const Image = struct {
         try file.setLength(io, free_offset + vhd.footer_size);
         try file.writePositionalAll(io, &footer_bytes, free_offset);
 
-        return .{
+        out.* = .{
             .file = file,
             .format = .vhd,
             .data_offset = 0,
@@ -919,7 +1012,7 @@ pub const Image = struct {
         };
     }
 
-    pub fn info(self: Image, io: Io) Io.File.StatError!Info {
+    pub fn info(self: *const Image, io: Io) Io.File.StatError!Info {
         // A device node's `stat` size is 0, so its occupied size is its full
         // extent: nothing about a device is sparse.
         const file_size = if (self.device) |dev|
@@ -934,9 +1027,9 @@ pub const Image = struct {
 
     pub const PreadError = vhdx.PreadError || qcow2.PreadError || Io.File.ReadPositionalError;
 
-    pub fn pread(self: Image, io: Io, buffer: []u8, offset: u64) PreadError!usize {
-        if (self.qcow2) |q| return qcow2.pread(self.file, io, q, buffer, offset);
-        if (self.dynamic) |d| {
+    pub fn pread(self: *const Image, io: Io, buffer: []u8, offset: u64) PreadError!usize {
+        if (self.qcow2) |*q| return qcow2.pread(self.file, io, q, buffer, offset);
+        if (self.dynamic) |*d| {
             var total: usize = 0;
             var off = offset;
             var remaining = buffer.len;
@@ -1004,7 +1097,7 @@ pub const Image = struct {
         try self.file.writePositionalAll(io, buffer, self.data_offset + offset);
     }
 
-    fn copyPolicy(self: Image) CopyPolicy {
+    fn copyPolicy(self: *const Image) CopyPolicy {
         return if (self.device == null)
             .skip_zero_chunks
         else
@@ -1162,7 +1255,7 @@ pub const Image = struct {
     /// Validates format metadata: VHD footer/header checksums and BAT bounds,
     /// VHDX header/region/metadata parsing, and qcow2 header/L1/L2 mapping
     /// sanity for the active image state.
-    pub fn check(self: Image, io: Io) CheckError!CheckResult {
+    pub fn check(self: *const Image, io: Io) CheckError!CheckResult {
         if (self.format == .raw) return .{ .ok = true, .message = "raw image: nothing to check" };
 
         if (self.format == .vhdx) {
@@ -1173,7 +1266,7 @@ pub const Image = struct {
             return .{ .ok = true, .message = "vhdx header/region/metadata checks passed" };
         }
 
-        if (self.qcow2) |q| {
+        if (self.qcow2) |*q| {
             qcow2.check(self.file, io, q) catch |err| return .{
                 .ok = false,
                 .message = @errorName(err),
@@ -1197,7 +1290,7 @@ pub const Image = struct {
             },
         };
 
-        if (self.dynamic) |d| {
+        if (self.dynamic) |*d| {
             var header_buf: [vhd.dynamic_header_size]u8 = undefined;
             _ = try self.file.readPositionalAll(io, &header_buf, footer.data_offset);
             const header_ok = if (vhd.DynamicHeader.decode(&header_buf)) |_| true else |_| false;
@@ -1230,8 +1323,8 @@ pub const Image = struct {
     /// report a single, fully allocated extent (neither format has a sparse
     /// concept); dynamic `vhd`, `vhdx`, and `qcow2` walk their format-specific
     /// mapping tables.
-    pub fn mapExtents(self: Image, io: Io, allocator: std.mem.Allocator) MapError![]Extent {
-        if (self.dynamic) |d| {
+    pub fn mapExtents(self: *const Image, io: Io, allocator: std.mem.Allocator) MapError![]Extent {
+        if (self.dynamic) |*d| {
             var extents = std.array_list.Managed(Extent).init(allocator);
             errdefer extents.deinit();
 
@@ -1277,7 +1370,7 @@ pub const Image = struct {
             return extents.toOwnedSlice();
         }
 
-        if (self.qcow2) |q| {
+        if (self.qcow2) |*q| {
             const src_extents = try qcow2.mapExtents(self.file, io, q, allocator);
             defer allocator.free(src_extents);
 
@@ -1451,10 +1544,11 @@ pub const CopyError = CopyBytesError || Image.FinishDeviceWriteError;
 /// partial success rather than hidden.
 pub fn copyAll(
     io: Io,
-    src: Image,
+    src_arg: anytype,
     dst: *Image,
     allocator: std.mem.Allocator,
 ) CopyError!CopyResult {
+    const src: *const Image = if (@TypeOf(src_arg) == Image) &src_arg else src_arg;
     return copyAllWithDeviceWriteOperations(io, src, dst, allocator, .{});
 }
 
@@ -1463,11 +1557,12 @@ pub fn copyAll(
 /// `Image.finishDeviceWrite` partition-table refresh.
 pub fn copyAllWithFinalization(
     io: Io,
-    src: Image,
+    src_arg: anytype,
     dst: *Image,
     allocator: std.mem.Allocator,
     finalization: CopyFinalization,
 ) CopyError!CopyResult {
+    const src: *const Image = if (@TypeOf(src_arg) == Image) &src_arg else src_arg;
     return copyAllWithFinalizationAndDeviceWriteOperations(
         io,
         src,
@@ -1483,13 +1578,14 @@ pub fn copyAllWithFinalization(
 /// final `Image.finishDeviceWrite`.
 pub fn copyAllBytes(
     io: Io,
-    src: Image,
+    src_arg: anytype,
     dst: *Image,
     allocator: std.mem.Allocator,
 ) CopyBytesError!void {
+    const src: *const Image = if (@TypeOf(src_arg) == Image) &src_arg else src_arg;
     if (dst.virtual_size < src.virtual_size) return error.DestinationTooSmall;
     const copy_policy = dst.copyPolicy();
-    const layout = copyLayout(src, dst.*);
+    const layout = copyLayout(src, dst);
     const buf = try allocator.alloc(u8, layout.buffer_size);
     defer allocator.free(buf);
 
@@ -1513,24 +1609,24 @@ const CopyLayout = struct {
     zero_chunk_size: usize,
 };
 
-fn copyLayout(src: Image, dst: Image) CopyLayout {
+fn copyLayout(src: *const Image, dst: *const Image) CopyLayout {
     const default_chunk_size = 4 * 1024 * 1024;
-    const buffer_size: usize = if (dst.dynamic) |d|
+    const buffer_size: usize = if (dst.dynamic) |*d|
         d.block_size
     else if (dst.vhdx) |v|
         v.block_size
-    else if (dst.qcow2) |q|
+    else if (dst.qcow2) |*q|
         @intCast(q.cluster_size)
     else
         default_chunk_size;
 
     var zero_chunk_size = buffer_size;
     if (dst.format == .raw and dst.device == null) {
-        const source_allocation_unit: ?u64 = if (src.dynamic) |d|
+        const source_allocation_unit: ?u64 = if (src.dynamic) |*d|
             d.block_size
         else if (src.vhdx) |v|
             v.block_size
-        else if (src.qcow2) |q|
+        else if (src.qcow2) |*q|
             if (q.incompatible_features & qcow2.incompatible_extl2 != 0)
                 q.cluster_size / 32
             else
@@ -1572,11 +1668,12 @@ fn writeNonZeroRuns(
 
 fn copyAllWithDeviceWriteOperations(
     io: Io,
-    src: Image,
+    src_arg: anytype,
     dst: *Image,
     allocator: std.mem.Allocator,
     operations: DeviceWriteOperations,
 ) CopyError!CopyResult {
+    const src: *const Image = if (@TypeOf(src_arg) == Image) &src_arg else src_arg;
     return copyAllWithFinalizationAndDeviceWriteOperations(
         io,
         src,
@@ -1589,12 +1686,13 @@ fn copyAllWithDeviceWriteOperations(
 
 fn copyAllWithFinalizationAndDeviceWriteOperations(
     io: Io,
-    src: Image,
+    src_arg: anytype,
     dst: *Image,
     allocator: std.mem.Allocator,
     finalization: CopyFinalization,
     operations: DeviceWriteOperations,
 ) CopyError!CopyResult {
+    const src: *const Image = if (@TypeOf(src_arg) == Image) &src_arg else src_arg;
     try copyAllBytes(io, src, dst, allocator);
     return switch (finalization) {
         .flush_device => blk: {
@@ -1737,7 +1835,7 @@ test "convert raw to fixed vhd round-trips data" {
     try src.pwrite(io, "some payload bytes", 4096);
 
     var dst = try Image.create(io, dst_path, .vhd, size, .{ .vhd_subformat = .fixed });
-    _ = try copyAll(io, src, &dst, std.testing.allocator);
+    _ = try copyAll(io, &src, &dst, std.testing.allocator);
     src.close(io);
     dst.close(io);
 
@@ -1753,8 +1851,9 @@ test "convert raw to dynamic vhd keeps full and final partial zero regions spars
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root_buf = try allocator.create([Io.Dir.max_path_bytes]u8);
+    defer allocator.destroy(root_buf);
+    const root_len = try tmp.dir.realPath(io, root_buf);
     const src_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "source.img" });
     defer allocator.free(src_path);
     const dst_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "destination.vhd" });
@@ -1766,7 +1865,7 @@ test "convert raw to dynamic vhd keeps full and final partial zero regions spars
     try src.pwrite(io, "only-block-1", vhd.default_block_size + 123);
 
     var dst = try Image.create(io, dst_path, .vhd, size, .{ .vhd_subformat = .dynamic });
-    _ = try copyAll(io, src, &dst, allocator);
+    _ = try copyAll(io, &src, &dst, allocator);
     src.close(io);
 
     const extents = try dst.mapExtents(io, allocator);
@@ -1797,7 +1896,7 @@ test "convert raw to qcow2 allocates only non-zero clusters" {
     try src.pwrite(io, "only-cluster-1", cluster_size + 123);
 
     var dst = try Image.create(io, dst_path, .qcow2, size, .{});
-    _ = try copyAll(io, src, &dst, std.testing.allocator);
+    _ = try copyAll(io, &src, &dst, std.testing.allocator);
     src.close(io);
 
     const extents = try dst.mapExtents(io, std.testing.allocator);
@@ -1817,8 +1916,9 @@ test "convert qcow2 to raw preserves zero clusters and a partial final cluster" 
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root_buf = try allocator.create([Io.Dir.max_path_bytes]u8);
+    defer allocator.destroy(root_buf);
+    const root_len = try tmp.dir.realPath(io, root_buf);
     const src_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "source.qcow2" });
     defer allocator.free(src_path);
     const small_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "small.raw" });
@@ -1852,16 +1952,16 @@ test "convert qcow2 to raw preserves zero clusters and a partial final cluster" 
     var too_small = try Image.create(io, small_path, .raw, size - 512, .{});
     try std.testing.expectError(
         error.DestinationTooSmall,
-        copyAllBytes(io, src, &too_small, allocator),
+        copyAllBytes(io, &src, &too_small, allocator),
     );
     too_small.close(io);
 
     var dst = try Image.create(io, dst_path, .raw, size, .{});
     defer dst.close(io);
-    const layout = copyLayout(src, dst);
+    const layout = copyLayout(&src, &dst);
     try std.testing.expectEqual(@as(usize, 4 * 1024 * 1024), layout.buffer_size);
     try std.testing.expectEqual(cluster_size, layout.zero_chunk_size);
-    try copyAllBytes(io, src, &dst, allocator);
+    try copyAllBytes(io, &src, &dst, allocator);
     try std.testing.expectEqual(size, (try dst.file.stat(io)).size);
 
     const expected = try allocator.alloc(u8, @intCast(size));
@@ -2440,7 +2540,7 @@ test "copyAll flushes a device before refreshing its partition table" {
     var operations = TestDeviceWriteOperations{};
     const result = try copyAllWithDeviceWriteOperations(
         io,
-        source,
+        &source,
         &destination,
         allocator,
         operations.operations(),
@@ -2484,7 +2584,7 @@ test "copy finalization can defer partition refresh until after mutations" {
     var operations = TestDeviceWriteOperations{ .refresh_allowed = false };
     const copy_result = try copyAllWithFinalizationAndDeviceWriteOperations(
         io,
-        source,
+        &source,
         &destination,
         std.testing.allocator,
         .flush_device,
@@ -2528,7 +2628,7 @@ test "copyAllBytes leaves one final flush and refresh for its caller" {
     defer destination.close(io);
 
     var operations = TestDeviceWriteOperations{};
-    try copyAllBytes(io, source, &destination, std.testing.allocator);
+    try copyAllBytes(io, &source, &destination, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), operations.sync_attempts);
     try std.testing.expectEqual(@as(usize, 0), operations.refresh_attempts);
 
@@ -2566,7 +2666,7 @@ test "copyAll propagates a device flush failure without attempting refresh" {
         error.NoSpaceLeft,
         copyAllWithDeviceWriteOperations(
             io,
-            source,
+            &source,
             &destination,
             allocator,
             operations.operations(),
@@ -2638,7 +2738,7 @@ test "copyAll preserves ordinary file behavior without device finalization" {
     };
     const result = try copyAllWithDeviceWriteOperations(
         io,
-        source,
+        &source,
         &destination,
         std.testing.allocator,
         operations.operations(),
@@ -2658,8 +2758,9 @@ test "copyAll overwrites full and final partial zero chunks on a used device" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var root_buf: [Io.Dir.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root_buf = try allocator.create([Io.Dir.max_path_bytes]u8);
+    defer allocator.destroy(root_buf);
+    const root_len = try tmp.dir.realPath(io, root_buf);
     const src_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "source.img" });
     defer allocator.free(src_path);
     const dst_path = try std.fs.path.join(allocator, &.{ root_buf[0..root_len], "destination.img" });
@@ -2677,7 +2778,7 @@ test "copyAll overwrites full and final partial zero chunks on a used device" {
     {
         var backing = try Image.create(io, dst_path, .raw, device_size, .{});
         defer backing.close(io);
-        const pattern = @as([(64 * 1024)]u8, @splat(0xa5));
+        const pattern = @as([(16 * 1024)]u8, @splat(0xa5));
         var offset: u64 = 0;
         while (offset < device_size) {
             const n: usize = @intCast(@min(device_size - offset, pattern.len));
@@ -2693,7 +2794,7 @@ test "copyAll overwrites full and final partial zero chunks on a used device" {
     }, source_size, .{ .allow_device_write = true });
     defer dst.close(io);
 
-    _ = try copyAll(io, src, &dst, allocator);
+    _ = try copyAll(io, &src, &dst, allocator);
 
     var leading: [64]u8 = undefined;
     _ = try dst.pread(io, &leading, 0);
