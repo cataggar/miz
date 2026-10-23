@@ -2327,7 +2327,7 @@ test "only the Azure acceptance job receives protected Azure configuration" {
 
     try support.expectContains(section, "id-token: write");
     try support.expectContains(section, "azure/login@");
-    try support.expectContains(section, "environment: azurelinux4-release");
+    try support.expectContains(section, "environment: ubuntu2604-release");
     for ([_][]const u8{
         "secrets.AZURE_CLIENT_ID",
         "secrets.AZURE_TENANT_ID",
@@ -2356,7 +2356,7 @@ test "only the Azure acceptance job receives protected Azure configuration" {
         u8,
         flow,
         index,
-        "environment: azurelinux4-release",
+        "environment: ubuntu2604-release",
     )) |at| {
         environments += 1;
         index = at + 1;

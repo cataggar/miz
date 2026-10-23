@@ -2253,7 +2253,7 @@ test "validation mode cannot reach a release mutation" {
     try support.expectAbsent(source, "max-parallel: 2");
     try support.expectContains(source, "test \"$RELEASE_SET\" = zfs");
     try support.expectContains(stage_block, "needs: [prepare, build, azure_acceptance]");
-    try support.expectContains(source, "environment: azurelinux4-release");
+    try support.expectContains(source, "environment: ubuntu2604-release");
     try support.expectContains(stage_block, "scripts/freebsd15_stage_release.sh");
     try support.expectContains(stage_block, "if: inputs.validation_only");
     try support.expectContains(stage_block, "freebsd15-validation-evidence-");

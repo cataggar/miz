@@ -271,8 +271,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     # Reuse the established OIDC subscription and architecture-specific
-    # location/VM configuration used by Azure Linux acceptance.
-    environment: azurelinux4-release
+    # location/VM configuration used by Ubuntu 26.04 acceptance.
+    environment: ubuntu2604-release
     permissions:
       actions: read
       contents: read
@@ -539,7 +539,7 @@ jobs:
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    environment: azurelinux4-release
+    environment: ubuntu2604-release
     permissions:
       actions: read
       contents: read
