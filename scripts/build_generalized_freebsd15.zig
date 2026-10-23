@@ -634,7 +634,7 @@ const customization_user_data_template =
     \\      MIZ_SHUTDOWN
     \\      chmod 0555 /etc/rc.d/miz_generalize
     \\      /usr/sbin/daemon -cf /bin/sh -c \
-    \\          '/bin/sleep 2; /sbin/shutdown -p now "miz customization complete"'
+    \\          'i=0; while [ "$i" -lt 30 ] && ! pgrep -x getty >/dev/null 2>&1; do i=$((i + 1)); /bin/sleep 1; done; /bin/sleep 5; /sbin/shutdown -p now "miz customization complete"'
     \\      trap - EXIT HUP INT TERM
     \\runcmd:
     \\  - /bin/sh /root/miz-generalize.sh
@@ -2045,7 +2045,8 @@ const generalized_guest_contract = [_][]const u8{
     "rm -rf /var/lib/waagent /var/log/azure /var/cache/nuageinit",
     "touch /firstboot",
     "/usr/sbin/daemon -cf",
-    "/bin/sleep 2; /sbin/shutdown -p now",
+    "pgrep -x getty",
+    "/sbin/shutdown -p now",
     // First-boot growth is part of the contract for both filesystems.
     "sysrc growfs_enable=YES",
     "sysrc growfs_swap_size=0",
