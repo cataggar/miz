@@ -2368,7 +2368,7 @@ pub fn validateProvenance(
         return context.fail(
             "Ubuntu debz build_stage initramfs record is invalid",
             .{},
-         );
+        );
     }
     _ = try requireSha256(
         getField(initramfs, "sha256"),
