@@ -2193,4 +2193,3 @@ test "provenance validation requires size budget disk layout and initramfs build
         &fixture.context,
     ));
 }
-
