@@ -423,6 +423,7 @@ fn executeDebz(
     const native_backend: debz.NativePackageFamilyBackend = .{
         .io = io,
         .now_unix = request.inputs.now_unix orelse backend.now_unix,
+        .archive_digest_policy = .published_digests,
     };
     return native_backend.execute(allocator, debz_request);
 }

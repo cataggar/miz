@@ -1671,7 +1671,6 @@ test "benchmark cache requirements match debz 0.4.0 repository and configuration
                         },
                     },
                     .freshness_witnesses = &.{ "resolute-updates", "resolute-security" },
-                    .archive_binding = .signed_sha256_derived_sha512,
                     .deadlines = unbounded_deadlines,
                 },
             },
@@ -1683,7 +1682,6 @@ test "benchmark cache requirements match debz 0.4.0 repository and configuration
                     .freshness = .{
                         .allow_missing_valid_until_with_max_age_seconds = 31 * 24 * 60 * 60,
                     },
-                    .archive_binding = .signed_sha256_derived_sha512,
                     .deadlines = unbounded_deadlines,
                 },
             },

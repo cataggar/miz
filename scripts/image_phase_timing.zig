@@ -31,13 +31,20 @@ const Outcome = enum {
 };
 
 const max_records = 64;
+const max_item_bytes = 256;
 
 const Record = struct {
     phase: Phase,
-    item: ?[]const u8,
+    item_storage: [max_item_bytes]u8 = undefined,
+    item_len: ?usize = null,
     elapsed_ns: u64,
     outcome: Outcome,
     error_name: ?[]const u8,
+
+    fn item(self: *const Record) ?[]const u8 {
+        const len = self.item_len orelse return null;
+        return self.item_storage[0..len];
+    }
 };
 
 /// A fixed-capacity, opt-in recorder. Disabled recorders do not read the
@@ -61,28 +68,37 @@ pub const Recorder = struct {
         if (self.output_path == null) return .{
             .recorder = self,
             .phase = phase,
-            .item = item,
             .started_ns = 0,
             .enabled = false,
         };
-        return .{
+        var scope: Scope = .{
             .recorder = self,
             .phase = phase,
-            .item = item,
             .started_ns = Io.Clock.Timestamp.now(self.io, .awake).raw.nanoseconds,
             .enabled = true,
         };
+        if (item) |slice| {
+            std.debug.assert(slice.len <= max_item_bytes);
+            @memcpy(scope.item_storage[0..slice.len], slice);
+            scope.item_len = slice.len;
+        }
+        return scope;
     }
 
     pub fn skip(self: *Recorder, phase: Phase, item: ?[]const u8) void {
         if (self.output_path == null) return;
-        self.append(.{
+        var record: Record = .{
             .phase = phase,
-            .item = item,
             .elapsed_ns = 0,
             .outcome = .skipped,
             .error_name = null,
-        });
+        };
+        if (item) |slice| {
+            std.debug.assert(slice.len <= max_item_bytes);
+            @memcpy(record.item_storage[0..slice.len], slice);
+            record.item_len = slice.len;
+        }
+        self.append(record);
     }
 
     pub fn serializeAlloc(self: *const Recorder, status: Status) ![]u8 {
@@ -94,10 +110,10 @@ pub const Recorder = struct {
             error_name: ?[]const u8,
         };
         var json_records: [max_records]JsonRecord = undefined;
-        for (self.records[0..self.record_count], 0..) |record, index| {
+        for (self.records[0..self.record_count], 0..) |*record, index| {
             json_records[index] = .{
                 .name = @tagName(record.phase),
-                .item = record.item,
+                .item = record.item(),
                 .elapsed_ns = record.elapsed_ns,
                 .outcome = @tagName(record.outcome),
                 .error_name = record.error_name,
@@ -111,7 +127,7 @@ pub const Recorder = struct {
             .duration_unit = "nanoseconds",
             .status = @tagName(status),
             .failed_phase = if (failed) |record| @tagName(record.phase) else null,
-            .failed_item = if (failed) |record| record.item else null,
+            .failed_item = if (failed) |record| record.item() else null,
             .error_name = if (failed) |record| record.error_name else null,
             .phases = json_records[0..self.record_count],
         }, .{ .whitespace = .indent_2 });
@@ -124,7 +140,7 @@ pub const Recorder = struct {
 
     /// Atomically replaces the requested timing file. Every serialization,
     /// write, and rename error is returned to the caller.
-    pub fn write(self: *const Recorder, status: Status) !void {
+    pub fn write(self: *Recorder, status: Status) !void {
         const output_path = self.output_path orelse return;
         const json = try self.serializeAlloc(status);
         defer self.allocator.free(json);
@@ -151,8 +167,8 @@ pub const Recorder = struct {
         self.record_count += 1;
     }
 
-    fn firstFailure(self: *const Recorder) ?Record {
-        for (self.records[0..self.record_count]) |record| {
+    fn firstFailure(self: *const Recorder) ?*const Record {
+        for (self.records[0..self.record_count]) |*record| {
             if (record.outcome == .failure) return record;
         }
         return null;
@@ -162,7 +178,8 @@ pub const Recorder = struct {
 pub const Scope = struct {
     recorder: *Recorder,
     phase: Phase,
-    item: ?[]const u8,
+    item_storage: [max_item_bytes]u8 = undefined,
+    item_len: ?usize = null,
     started_ns: i96,
     enabled: bool,
     finished: bool = false,
@@ -185,16 +202,20 @@ pub const Scope = struct {
         if (!self.enabled) return;
         const finished_ns = Io.Clock.Timestamp.now(self.recorder.io, .awake).raw.nanoseconds;
         const elapsed = finished_ns - self.started_ns;
-        self.recorder.append(.{
+        var record: Record = .{
             .phase = self.phase,
-            .item = self.item,
+            .item_len = self.item_len,
             .elapsed_ns = if (elapsed <= 0)
                 0
             else
                 std.math.cast(u64, elapsed) orelse std.math.maxInt(u64),
             .outcome = outcome,
             .error_name = error_name,
-        });
+        };
+        if (self.item_len) |len| {
+            @memcpy(record.item_storage[0..len], self.item_storage[0..len]);
+        }
+        self.recorder.append(record);
     }
 };
 
@@ -295,7 +316,9 @@ test "failure is recorded and timing output errors propagate" {
             var aggregate = timing.begin(.debz_aggregate, null);
             defer aggregate.end();
             errdefer aggregate.fail(@errorName(phase_error));
-            var transaction = timing.begin(.debz_transaction, "linux-azure");
+            const transient_item = try std.testing.allocator.dupe(u8, "linux-azure");
+            defer std.testing.allocator.free(transient_item);
+            var transaction = timing.begin(.debz_transaction, transient_item);
             defer transaction.end();
             errdefer transaction.fail(@errorName(phase_error));
             const result: anyerror!void = error.DebzFailed;
@@ -348,7 +371,6 @@ test "failure is recorded and timing output errors propagate" {
     );
     unwritable.append(.{
         .phase = .total_runtime,
-        .item = null,
         .elapsed_ns = 1,
         .outcome = .failure,
         .error_name = "BuildFailed",
