@@ -766,8 +766,6 @@ pub fn debzRepositoryId(
     hashInt(&hash, debz_unbounded_deadline_ms);
     hashInt(&hash, debz_unbounded_deadline_ms);
     hashInt(&hash, debz_unbounded_deadline_ms);
-    hashPart(&hash, "archive-binding");
-    hashPart(&hash, "signed_sha256_derived_sha512");
     var raw: [Sha256.digest_length]u8 = undefined;
     hash.final(&raw);
     return digest_support.hex(raw);

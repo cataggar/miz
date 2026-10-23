@@ -4394,7 +4394,6 @@ fn customizeRootWithDebz(
     const source_config = std.json.Stringify.valueAlloc(allocator, .{
         .source_path = absolute_source,
         .immutable = true,
-        .archive_binding = "signed_sha256_derived_sha512",
         .freshness = .{
             .mode = "frozen_release_with_witnesses",
             .frozen_release_digest = frozen_resolute_release_digest,
@@ -4426,7 +4425,6 @@ fn customizeRootWithDebz(
     const witness_source_config = std.json.Stringify.valueAlloc(allocator, .{
         .source_path = absolute_witness_source,
         .immutable = true,
-        .archive_binding = "signed_sha256_derived_sha512",
         .freshness = .{
             .mode = "allow_missing_valid_until_with_max_age_seconds",
             .maximum_release_age_seconds = snapshot_witness_max_age_seconds,
