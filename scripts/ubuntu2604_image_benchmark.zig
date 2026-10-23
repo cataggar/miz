@@ -29,7 +29,8 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const release = @import("release/root.zig");
-const size_inventory = @import("ubuntu2604/size_inventory.zig");
+pub const size_budget = @import("ubuntu2604/size_budget.zig");
+pub const size_inventory = @import("ubuntu2604/size_inventory.zig");
 
 const Allocator = std.mem.Allocator;
 const Dir = std.Io.Dir;
@@ -81,6 +82,10 @@ pub const package_roots = [_][]const u8{
     "sudo",
     "ca-certificates",
 };
+
+pub const baremetal_kernel_release = "7.0.0-2015-nvidia-bos-64k";
+pub const build_stage_roots = [_][]const u8{"initramfs-tools"};
+pub const lock_roots = package_roots ++ build_stage_roots;
 
 /// The `debz_transaction` item the initramfs build stage records. It is one
 /// phase rather than one per stage root, because the stage is a unit: it exists
@@ -1433,7 +1438,7 @@ pub fn verifyLockSet(
     }
     var locks: std.ArrayList(LockRecord) = .empty;
     var final_closure: []ClosurePackage = &.{};
-    for (package_roots) |package| {
+    for (lock_roots, 0..) |package, root_index| {
         const filename = try lockFilename(allocator, package);
         const path = try joinPath(allocator, &.{ lock_dir, filename });
         const label = try std.fmt.allocPrint(allocator, "{s} exact lock", .{package});
@@ -1516,7 +1521,7 @@ pub fn verifyLockSet(
             .digest_sha256 = lock_digest,
             .packages = @intCast(closure.len),
         });
-        final_closure = closure;
+        if (root_index < package_roots.len) final_closure = closure;
     }
 
     var closure_json = JsonArray.init(allocator);
@@ -1985,12 +1990,14 @@ const build_provenance_fields = [_][]const u8{
     "flavor",
     "release",
     "size_inventory",
+    "size_budget",
     "virtual_size",
     "minimum_root_free_bytes",
     "validated_root_free_bytes",
     "snapshot",
     "canonical_key_fingerprint",
     "sha256sums_signature_verified",
+    "disk_layout",
     "artifacts",
     "debz",
 };
@@ -2035,6 +2042,143 @@ fn validateSizeInventory(
         error.Failed => return context.fail("{s}", .{diagnostic.message()}),
     };
     parsed.deinit();
+}
+
+/// The size-budget report the builder bound into its fresh-root provenance.
+fn validateSizeBudget(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    build: Value,
+    context: *Context,
+) !void {
+    const binding = getField(build, "size_budget") orelse Value.null;
+    const expected_name = "ubuntu2604-size-budget-" ++ flavor ++ "-" ++
+        architecture ++ ".json";
+    if (binding != .object or
+        !hasExactFields(binding, &.{ "filename", "sha256" }) or
+        !stringEquals(binding, "filename", expected_name))
+    {
+        return context.fail("Ubuntu size budget binding is invalid", .{});
+    }
+    const path = try joinPath(allocator, &.{ root, expected_name });
+    const hex = try hashFileHex(io, path);
+    if (!stringEquals(binding, "sha256", &hex)) {
+        return context.fail("Ubuntu size budget digest does not match", .{});
+    }
+    var diagnostic: size_budget.Diagnostic = .{};
+    var parsed = size_budget.readValidated(allocator, io, path, .{
+        .architecture = architecture,
+        .flavor = flavor,
+    }, &diagnostic) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Failed => return context.fail("{s}", .{diagnostic.message()}),
+    };
+    parsed.deinit();
+}
+
+/// The Arm64 bare-metal disk-layout provenance the builder emits.
+fn validateDiskLayout(
+    value: ?Value,
+    context: *Context,
+) !void {
+    const layout = value orelse Value.null;
+    if (layout != .object or
+        !hasExactFields(layout, &.{ "esp", "retired_xbootldr", "source", "transform" }) or
+        !stringEquals(layout, "source", "canonical-gen2-gpt") or
+        !stringEquals(layout, "transform", "arm64-esp-rebuild-v1"))
+    {
+        return context.fail("Ubuntu Arm64 disk-layout provenance is invalid", .{});
+    }
+    const esp = getField(layout, "esp") orelse Value.null;
+    if (esp != .object or
+        !hasExactFields(
+            esp,
+            &.{ "content", "fat32", "first_lba", "last_lba", "size_bytes", "table_index" },
+        ) or
+        integerField(esp, "table_index") != @as(i64, 14) or
+        integerField(esp, "first_lba") != @as(i64, 2048) or
+        integerField(esp, "last_lba") != @as(i64, 1_050_623) or
+        integerField(esp, "size_bytes") != @as(i64, 512 * 1024 * 1024) or
+        !stringEquals(esp, "fat32", "reformatted-preserve-volume-id") or
+        !stringEquals(esp, "content", "signed-fallback-only"))
+    {
+        return context.fail("Ubuntu Arm64 ESP provenance is invalid", .{});
+    }
+    const retired = getField(layout, "retired_xbootldr") orelse Value.null;
+    const cleared = switch (getField(retired, "cleared") orelse Value.null) {
+        .bool => |flag| flag,
+        else => false,
+    };
+    if (retired != .object or
+        !hasExactFields(retired, &.{ "cleared", "table_index" }) or
+        integerField(retired, "table_index") != @as(i64, 12) or
+        !cleared)
+    {
+        return context.fail("Ubuntu Arm64 XBOOTLDR provenance is invalid", .{});
+    }
+}
+
+fn validateBoundTransaction(
+    allocator: Allocator,
+    io: Io,
+    root: []const u8,
+    lock_set: *const LockSet,
+    package: []const u8,
+    transaction: Value,
+    contracts: *JsonArray,
+    files: *JsonArray,
+    context: *Context,
+) !void {
+    if (transaction != .object or !stringEquals(transaction, "package", package)) {
+        return context.fail("Ubuntu debz transactions are not stably ordered", .{});
+    }
+    const lock_binding = getField(transaction, "exact_lock") orelse Value.null;
+    const provenance_binding =
+        getField(transaction, "transaction_provenance") orelse Value.null;
+    if (lock_binding != .object or provenance_binding != .object) {
+        return context.fail("{s} transaction bindings are absent", .{package});
+    }
+    const expected_lock = lock_set.find(package) orelse return context.fail(
+        "{s} output exact lock differs from the pinned input",
+        .{package},
+    );
+    var lock_matches = stringEquals(lock_binding, "filename", expected_lock.filename) and
+        stringEquals(lock_binding, "sha256", expected_lock.file_sha256) and
+        stringEquals(lock_binding, "digest_sha256", expected_lock.digest_sha256);
+    if (lock_matches) {
+        const bound_path = try joinPath(
+            allocator,
+            &.{ root, stringField(lock_binding, "filename").? },
+        );
+        const hex = try hashFileHex(io, bound_path);
+        lock_matches = std.mem.eql(u8, &hex, expected_lock.file_sha256);
+    }
+    if (!lock_matches) return context.fail(
+        "{s} output exact lock differs from the pinned input",
+        .{package},
+    );
+    if (!stringEquals(provenance_binding, "lock_sha256", expected_lock.digest_sha256)) {
+        return context.fail(
+            "{s} transaction is not bound to its exact lock",
+            .{package},
+        );
+    }
+    const provenance_path = try joinPath(
+        allocator,
+        &.{ root, stringField(provenance_binding, "filename") orelse "" },
+    );
+    const evidence = try validateTransaction(
+        allocator,
+        io,
+        provenance_path,
+        provenance_binding,
+        expected_lock.digest_sha256,
+        package,
+        context,
+    );
+    try contracts.append(evidence.contract);
+    try files.append(evidence.file);
 }
 
 /// `validate_provenance`: the whole output-side contract -- pinned source
@@ -2134,7 +2278,9 @@ pub fn validateProvenance(
         }
     }
 
+    try validateDiskLayout(getField(build, "disk_layout"), context);
     try validateSizeInventory(allocator, io, root, build, context);
+    try validateSizeBudget(allocator, io, root, build, context);
 
     const debz = getField(build, "debz") orelse Value.null;
     const baseline = getField(debz, "baseline") orelse Value.null;
@@ -2151,7 +2297,10 @@ pub fn validateProvenance(
         }
     }
     if (debz != .object or
-        !hasExactFields(debz, &.{ "api_commit", "baseline", "package_roots", "transactions" }) or
+        !hasExactFields(
+            debz,
+            &.{ "api_commit", "baseline", "build_stage", "package_roots", "transactions" },
+        ) or
         !stringEquals(debz, "api_commit", debz_api_commit) or
         !baseline_matches or
         !roots_match)
@@ -2166,55 +2315,87 @@ pub fn validateProvenance(
     var contracts = JsonArray.init(allocator);
     var files = JsonArray.init(allocator);
     for (package_roots, transactions.array.items) |package, transaction| {
-        if (transaction != .object or !stringEquals(transaction, "package", package)) {
-            return context.fail("Ubuntu debz transactions are not stably ordered", .{});
-        }
-        const lock_binding = getField(transaction, "exact_lock") orelse Value.null;
-        const provenance_binding =
-            getField(transaction, "transaction_provenance") orelse Value.null;
-        if (lock_binding != .object or provenance_binding != .object) {
-            return context.fail("{s} transaction bindings are absent", .{package});
-        }
-        const expected_lock = lock_set.find(package) orelse return context.fail(
-            "{s} output exact lock differs from the pinned input",
-            .{package},
-        );
-        var lock_matches = stringEquals(lock_binding, "filename", expected_lock.filename) and
-            stringEquals(lock_binding, "sha256", expected_lock.file_sha256) and
-            stringEquals(lock_binding, "digest_sha256", expected_lock.digest_sha256);
-        if (lock_matches) {
-            const bound_path = try joinPath(
-                allocator,
-                &.{ root, stringField(lock_binding, "filename").? },
-            );
-            const hex = try hashFileHex(io, bound_path);
-            lock_matches = std.mem.eql(u8, &hex, expected_lock.file_sha256);
-        }
-        if (!lock_matches) return context.fail(
-            "{s} output exact lock differs from the pinned input",
-            .{package},
-        );
-        if (!stringEquals(provenance_binding, "lock_sha256", expected_lock.digest_sha256)) {
-            return context.fail(
-                "{s} transaction is not bound to its exact lock",
-                .{package},
-            );
-        }
-        const provenance_path = try joinPath(
-            allocator,
-            &.{ root, stringField(provenance_binding, "filename") orelse "" },
-        );
-        const evidence = try validateTransaction(
+        try validateBoundTransaction(
             allocator,
             io,
-            provenance_path,
-            provenance_binding,
-            expected_lock.digest_sha256,
+            root,
+            lock_set,
             package,
+            transaction,
+            &contracts,
+            &files,
             context,
         );
-        try contracts.append(evidence.contract);
-        try files.append(evidence.file);
+    }
+
+    const build_stage = getField(debz, "build_stage") orelse Value.null;
+    const stage_roots = getField(build_stage, "package_roots") orelse Value.null;
+    var stage_roots_match = stage_roots == .array and
+        stage_roots.array.items.len == build_stage_roots.len;
+    if (stage_roots_match) {
+        for (stage_roots.array.items, build_stage_roots) |actual, expected| {
+            if (actual != .string or !std.mem.eql(u8, actual.string, expected)) {
+                stage_roots_match = false;
+            }
+        }
+    }
+    if (build_stage != .object or
+        !hasExactFields(
+            build_stage,
+            &.{ "initramfs", "package_roots", "purpose", "transactions" },
+        ) or
+        !stringEquals(build_stage, "purpose", "initramfs-generation") or
+        !stage_roots_match)
+    {
+        return context.fail("Ubuntu debz build_stage provenance is invalid", .{});
+    }
+    const initramfs = getField(build_stage, "initramfs") orelse Value.null;
+    const initramfs_bytes = integerField(initramfs, "bytes");
+    if (initramfs != .object or
+        !hasExactFields(
+            initramfs,
+            &.{ "bytes", "kernel_release", "path", "sha256" },
+        ) or
+        !stringEquals(initramfs, "kernel_release", baremetal_kernel_release) or
+        !stringEquals(
+            initramfs,
+            "path",
+            "/boot/initrd.img-" ++ baremetal_kernel_release,
+        ) or
+        initramfs_bytes == null or
+        initramfs_bytes.? <= 0)
+    {
+        return context.fail(
+            "Ubuntu debz build_stage initramfs record is invalid",
+            .{},
+         );
+    }
+    _ = try requireSha256(
+        getField(initramfs, "sha256"),
+        "Ubuntu debz build_stage initramfs sha256",
+        context,
+    );
+    const stage_transactions = getField(build_stage, "transactions") orelse Value.null;
+    if (stage_transactions != .array or
+        stage_transactions.array.items.len != build_stage_roots.len)
+    {
+        return context.fail(
+            "Ubuntu debz build_stage transaction count is not exact",
+            .{},
+        );
+    }
+    for (build_stage_roots, stage_transactions.array.items) |package, transaction| {
+        try validateBoundTransaction(
+            allocator,
+            io,
+            root,
+            lock_set,
+            package,
+            transaction,
+            &contracts,
+            &files,
+            context,
+        );
     }
 
     const boot_path = try joinPath(
@@ -4238,7 +4419,7 @@ pub fn verifyStaging(
     const locks = try joinPath(allocator, &.{ input_root, "locks" });
     const inventory = try verifyBenchmarkCache(allocator, io, cache, inputs, context);
     const lock_set = try verifyLockSet(allocator, io, locks, &inventory, context);
-    if (lock_set.locks.len != package_roots.len) {
+    if (lock_set.locks.len != lock_roots.len) {
         return context.fail(
             "staging did not produce the exact benchmark lock set",
             .{},
