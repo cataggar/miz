@@ -36,6 +36,11 @@ test {
 const release = "20260731";
 const release_base = "https://cloud-images.ubuntu.com/releases/26.04/release-" ++ release;
 const snapshot_base = "https://snapshot.ubuntu.com/ubuntu/20260731T000000Z";
+const snapshot_unix: i64 = 1_785_456_000;
+const frozen_resolute_release_digest =
+    "sha256:596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834";
+const snapshot_witness_suites = [_][]const u8{ "resolute-updates", "resolute-security" };
+const snapshot_witness_max_age_seconds: u64 = 31 * 24 * 60 * 60;
 const canonical_fingerprint = "D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81";
 const canonical_fingerprint_lower = "d2eb44626fddc30b513d5bb71a5d6c4c7db87c81";
 const canonical_fingerprint_bytes = [_]u8{
@@ -854,6 +859,7 @@ fn packageFamilyRequest(
             .allow_downgrade = false,
             .conffile = .keep_existing,
             .installed_baseline = installed_baseline,
+            .now_unix = snapshot_unix,
         },
     };
 }
@@ -4373,7 +4379,7 @@ fn customizeRootWithDebz(
     const source_document = allocator.print(
         \\Types: deb
         \\URIs: {s}
-        \\Suites: resolute resolute-updates resolute-security
+        \\Suites: resolute
         \\Components: main restricted universe multiverse
         \\Architectures: {s}
         \\Signed-By: {s}
@@ -4389,16 +4395,55 @@ fn customizeRootWithDebz(
         .source_path = absolute_source,
         .immutable = true,
         .archive_binding = "signed_sha256_derived_sha512",
+        .freshness = .{
+            .mode = "frozen_release_with_witnesses",
+            .frozen_release_digest = frozen_resolute_release_digest,
+            .witness_suites = snapshot_witness_suites,
+        },
     }, .{}) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(source_config);
     Dir.cwd().writeFile(io, .{ .sub_path = source_config_path, .data = source_config }) catch |err| return phaseError(&phase_error, err);
     const absolute_source_config = Dir.cwd().realPathFileAlloc(io, source_config_path, allocator) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(absolute_source_config);
 
-    // Caller-owned single-element input slices. Their storage outlives every
-    // resolve and customize request so the package-family boundary never reads
-    // dangling pointers, and both requests reuse the same trusted keyring copy.
-    const config_inputs = [_][]const u8{absolute_source_config};
+    const witness_source_path = std.fs.path.join(allocator, &.{ absolute_repository_input_dir, "ubuntu-snapshot-witnesses.sources" }) catch |err| return phaseError(&phase_error, err);
+    defer allocator.free(witness_source_path);
+    const witness_source_document = allocator.print(
+        \\Types: deb
+        \\URIs: {s}
+        \\Suites: resolute-updates resolute-security
+        \\Components: main restricted universe multiverse
+        \\Architectures: {s}
+        \\Signed-By: {s}
+        \\
+    , .{ snapshot_base, profile.ubuntu_architecture, absolute_keyring }) catch |err| return phaseError(&phase_error, err);
+    defer allocator.free(witness_source_document);
+    Dir.cwd().writeFile(io, .{ .sub_path = witness_source_path, .data = witness_source_document }) catch |err| return phaseError(&phase_error, err);
+    const absolute_witness_source = Dir.cwd().realPathFileAlloc(io, witness_source_path, allocator) catch |err| return phaseError(&phase_error, err);
+    defer allocator.free(absolute_witness_source);
+    const witness_source_config_path = std.fs.path.join(allocator, &.{ absolute_repository_input_dir, "ubuntu-snapshot-witnesses.json" }) catch |err| return phaseError(&phase_error, err);
+    defer allocator.free(witness_source_config_path);
+    const witness_source_config = std.json.Stringify.valueAlloc(allocator, .{
+        .source_path = absolute_witness_source,
+        .immutable = true,
+        .archive_binding = "signed_sha256_derived_sha512",
+        .freshness = .{
+            .mode = "allow_missing_valid_until_with_max_age_seconds",
+            .maximum_release_age_seconds = snapshot_witness_max_age_seconds,
+        },
+    }, .{}) catch |err| return phaseError(&phase_error, err);
+    defer allocator.free(witness_source_config);
+    Dir.cwd().writeFile(io, .{ .sub_path = witness_source_config_path, .data = witness_source_config }) catch |err| return phaseError(&phase_error, err);
+    const absolute_witness_source_config = Dir.cwd().realPathFileAlloc(io, witness_source_config_path, allocator) catch |err| return phaseError(&phase_error, err);
+    defer allocator.free(absolute_witness_source_config);
+
+    // Caller-owned input slices. Their storage outlives every resolve and
+    // customize request so the package-family boundary never reads dangling
+    // pointers, and both requests reuse the same trusted keyring copy.
+    const config_inputs = [_][]const u8{
+        absolute_source_config,
+        absolute_witness_source_config,
+    };
     const keyring_inputs = [_][]const u8{absolute_keyring};
 
     // One content-addressed cache for every stage, kept across runs. Objects are

@@ -1612,6 +1612,126 @@ test "the evidence scan rejects private key material anywhere it is uploaded" {
     }
 }
 
+test "benchmark cache requirements match debz 0.4.0 repository and configuration identities" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const debz = @import("debz");
+    var fixture = try Fixture.create();
+    defer fixture.deinit();
+    const allocator = fixture.allocator();
+    const debz_inputs = try fixture.mkdir(&.{"debz-inputs"});
+    const keyring = try fixture.write(
+        &.{ "debz-inputs", "ubuntu-archive-keyring.gpg" },
+        "keyring",
+    );
+
+    const frozen_source = try std.fmt.allocPrint(
+        allocator,
+        \\Types: deb
+        \\URIs: https://snapshot.ubuntu.com/ubuntu/20260731T000000Z
+        \\Suites: resolute
+        \\Components: main restricted universe multiverse
+        \\Architectures: arm64
+        \\Signed-By: {s}
+        \\
+    ,
+        .{keyring},
+    );
+    const witness_source = try std.fmt.allocPrint(
+        allocator,
+        \\Types: deb
+        \\URIs: https://snapshot.ubuntu.com/ubuntu/20260731T000000Z
+        \\Suites: resolute-updates resolute-security
+        \\Components: main restricted universe multiverse
+        \\Architectures: arm64
+        \\Signed-By: {s}
+        \\
+    ,
+        .{keyring},
+    );
+    const frozen_digest = try debz.repository_refresh.parseFrozenReleaseDigest(
+        "sha256:596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834",
+    );
+    const unbounded: u64 = @intCast(std.math.maxInt(i64));
+    const unbounded_deadlines: debz.repository_acquisition.Deadlines = .{
+        .connect_ms = unbounded,
+        .read_ms = unbounded,
+        .overall_ms = unbounded,
+    };
+    const normalized = try debz.repository_policy.normalize(
+        allocator,
+        &.{
+            .{
+                .bytes = frozen_source,
+                .format = .deb822,
+                .policy = .{
+                    .immutability = .{ .kind = .immutable_url },
+                    .freshness = .{
+                        .frozen_release_with_witnesses = .{
+                            .release_digest = frozen_digest,
+                        },
+                    },
+                    .freshness_witnesses = &.{ "resolute-updates", "resolute-security" },
+                    .archive_binding = .signed_sha256_derived_sha512,
+                    .deadlines = unbounded_deadlines,
+                },
+            },
+            .{
+                .bytes = witness_source,
+                .format = .deb822,
+                .policy = .{
+                    .immutability = .{ .kind = .immutable_url },
+                    .freshness = .{
+                        .allow_missing_valid_until_with_max_age_seconds = 31 * 24 * 60 * 60,
+                    },
+                    .archive_binding = .signed_sha256_derived_sha512,
+                    .deadlines = unbounded_deadlines,
+                },
+            },
+        },
+        "arm64",
+        .{},
+    );
+    try std.testing.expect(normalized == .configuration);
+    var configuration = normalized.configuration;
+    defer configuration.deinit();
+
+    const requirements = try benchmark.benchmarkCacheRequirements(
+        allocator,
+        fixture.io,
+        debz_inputs,
+    );
+    try std.testing.expectEqual(@as(usize, 12), configuration.repositories.len);
+    try std.testing.expectEqual(@as(usize, 25), requirements.len);
+
+    for (configuration.repositories, 0..) |repository, index| {
+        const expected_id = benchmark.debzRepositoryId(
+            repository.suite,
+            repository.component,
+            keyring,
+        );
+        try std.testing.expectEqualStrings(&expected_id, repository.id.slice());
+        const refresh_req = requirements[index * 2];
+        const policy_req = requirements[index * 2 + 1];
+        try std.testing.expectEqualStrings(repository.id.slice(), refresh_req.repository);
+        try std.testing.expectEqualStrings(
+            if (std.mem.eql(u8, repository.suite, "resolute"))
+                "repository-refresh-v5"
+            else
+                "repository-refresh-v4",
+            refresh_req.snapshot,
+        );
+        try std.testing.expectEqualStrings(repository.id.slice(), policy_req.repository);
+        try std.testing.expectEqualStrings("repository-policy-v1", policy_req.snapshot);
+    }
+    const aggregate_req = requirements[requirements.len - 1];
+    try std.testing.expectEqualStrings("repository-aggregate", aggregate_req.phase);
+    try std.testing.expectEqualStrings(
+        configuration.identity.slice(),
+        aggregate_req.repository,
+    );
+    try std.testing.expectEqualStrings("multi-repository-v1", aggregate_req.snapshot);
+}
+
 const canonical_manifest_xz_base64 =
     "/Td6WFoAAATm1rRGBMCUMcmcASEBHAAAAAAAAMNu6JLgTkgYjF0AGZjKBqtszlqKy3xBWh5oFwq+tO5l" ++
     "YdYSSWMZ7jz1YrjFGGIofm4zFMsBHew/cuUY5YDAMQzXJwaiISQl3ceVl8UzJMHub350+BYaWDE0SErm" ++

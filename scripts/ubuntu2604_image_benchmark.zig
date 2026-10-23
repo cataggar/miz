@@ -150,7 +150,12 @@ pub const timing_phases = [_][]const u8{
 const debz_snapshot_base = "https://snapshot.ubuntu.com/ubuntu/20260731T000000Z";
 const debz_suites = [_][]const u8{ "resolute", "resolute-updates", "resolute-security" };
 const debz_components = [_][]const u8{ "main", "restricted", "universe", "multiverse" };
-const debz_refresh_snapshot = "repository-refresh-v2";
+const debz_frozen_resolute_release_digest =
+    "sha256:596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834";
+const debz_witness_suites_sorted = [_][]const u8{ "resolute-security", "resolute-updates" };
+const debz_missing_valid_until_max_age_seconds: i64 = 31 * 24 * 60 * 60;
+const debz_refresh_snapshot = "repository-refresh-v4";
+const debz_frozen_refresh_snapshot = "repository-refresh-v5";
 const debz_policy_snapshot = "repository-policy-v1";
 const debz_aggregate_snapshot = "multi-repository-v1";
 const debz_unbounded_deadline_ms: i64 = std.math.maxInt(i64);
@@ -570,6 +575,7 @@ pub fn prepareSessionDir(
     const parent_path = std.fs.path.dirname(path) orelse ".";
     const parent = Dir.cwd().realPathFileAlloc(io, parent_path, allocator) catch
         return context.fail("output root parent must be a real directory", .{});
+    defer allocator.free(parent);
     if (!isDirectoryNoFollow(io, parent)) {
         return context.fail("output root parent must be a real directory", .{});
     }
@@ -696,6 +702,7 @@ pub fn cleanupRun(
         context,
     );
     const resolved_run = try Dir.cwd().realPathFileAlloc(io, run_dir, allocator);
+    defer allocator.free(resolved_run);
     var removed: std.ArrayList([]const u8) = .empty;
     errdefer removed.deinit(allocator);
     for (decisions) |decision| {
@@ -746,6 +753,15 @@ pub fn debzRepositoryId(
     hashPart(&hash, "");
     hashPart(&hash, "immutable_url");
     hashPart(&hash, "");
+    if (std.mem.eql(u8, suite, "resolute")) {
+        hashPart(&hash, "frozen_release_with_witnesses");
+        hashPart(&hash, debz_frozen_resolute_release_digest);
+        hashInt(&hash, debz_witness_suites_sorted.len);
+        for (debz_witness_suites_sorted) |witness| hashPart(&hash, witness);
+    } else {
+        hashPart(&hash, "allow_missing_valid_until_with_max_age_seconds");
+        hashInt(&hash, debz_missing_valid_until_max_age_seconds);
+    }
     hashPart(&hash, "direct");
     hashInt(&hash, debz_unbounded_deadline_ms);
     hashInt(&hash, debz_unbounded_deadline_ms);
@@ -788,27 +804,43 @@ pub fn benchmarkCacheRequirements(
         &.{ resolved_input, "ubuntu-archive-keyring.gpg" },
     );
 
-    var repositories: std.ArrayList([]const u8) = .empty;
+    const RepositoryEntry = struct {
+        id: []const u8,
+        refresh_snapshot: []const u8,
+
+        fn lessThan(_: void, left: @This(), right: @This()) bool {
+            return std.mem.order(u8, left.id, right.id) == .lt;
+        }
+    };
+
+    var repositories: std.ArrayList(RepositoryEntry) = .empty;
     defer repositories.deinit(allocator);
     for (debz_suites) |suite| {
+        const refresh_snapshot = if (std.mem.eql(u8, suite, "resolute"))
+            debz_frozen_refresh_snapshot
+        else
+            debz_refresh_snapshot;
         for (debz_components) |component| {
             const identity = debzRepositoryId(suite, component, keyring);
-            try repositories.append(allocator, try allocator.dupe(u8, &identity));
+            try repositories.append(allocator, .{
+                .id = try allocator.dupe(u8, &identity),
+                .refresh_snapshot = refresh_snapshot,
+            });
         }
     }
-    std.mem.sort([]const u8, repositories.items, {}, lessThanString);
+    std.mem.sort(RepositoryEntry, repositories.items, {}, RepositoryEntry.lessThan);
 
     var requirements: std.ArrayList(CacheRequirement) = .empty;
     errdefer requirements.deinit(allocator);
     for (repositories.items) |repository| {
-        inline for (.{
-            .{ "repository-refresh", debz_refresh_snapshot },
+        for ([_][2][]const u8{
+            .{ "repository-refresh", repository.refresh_snapshot },
             .{ "repository-policy", debz_policy_snapshot },
         }) |pair| {
-            const filename = debzManifestName(repository, pair[1]);
+            const filename = debzManifestName(repository.id, pair[1]);
             try requirements.append(allocator, .{
                 .phase = pair[0],
-                .repository = repository,
+                .repository = repository.id,
                 .snapshot = pair[1],
                 .filename = try allocator.dupe(u8, &filename),
             });
@@ -816,8 +848,8 @@ pub fn benchmarkCacheRequirements(
     }
 
     var configuration = Sha256.init(.{});
-    hashPart(&configuration, "debz-multi-repository-configuration-v1");
-    for (repositories.items) |repository| hashPart(&configuration, repository);
+    hashPart(&configuration, "debz-multi-repository-configuration-v3");
+    for (repositories.items) |repository| hashPart(&configuration, repository.id);
     var configuration_raw: [Sha256.digest_length]u8 = undefined;
     configuration.final(&configuration_raw);
     const configuration_id = try allocator.dupe(
