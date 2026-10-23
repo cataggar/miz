@@ -1279,7 +1279,13 @@ pub fn build(b: *std.Build) void {
         .name = "azure_vhd",
         .root_module = azure_vhd_mod,
     });
-    b.installArtifact(azure_vhd_exe);
+    const install_azure_vhd = b.addInstallArtifact(azure_vhd_exe, .{});
+    b.getInstallStep().dependOn(&install_azure_vhd.step);
+    const install_azure_vhd_step = b.step(
+        "install-azure-vhd",
+        "Build and install zig-out/bin/azure_vhd without the rest of the default install graph",
+    );
+    install_azure_vhd_step.dependOn(&install_azure_vhd.step);
     const azure_vhd_tests = b.addTest(.{ .root_module = azure_vhd_mod });
     const run_azure_vhd_tests = b.addRunArtifact(azure_vhd_tests);
     const azure_vhd_test_step = b.step(
@@ -1562,7 +1568,7 @@ pub fn build(b: *std.Build) void {
         &b.addInstallArtifact(freebsd15_release_exe, .{}).step,
     );
     run_freebsd15_acceptance_tests.step.dependOn(
-        &b.addInstallArtifact(azure_vhd_exe, .{}).step,
+        &install_azure_vhd.step,
     );
     const freebsd15_acceptance_test_step = b.step(
         "test-freebsd15-acceptance",

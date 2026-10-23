@@ -2278,7 +2278,14 @@ test "the release workflow runs no Python and builds the ported tooling" {
     );
     try support.expectAbsent(source, support.interpreter_name);
     try support.expectContains(source, "zig build freebsd15-release-tools");
-    try support.expectContains(source, "zig build install-miz -Doptimize=safe");
+    try support.expectContains(
+        source,
+        "zig build install-miz freebsd15-release-tools install-azure-vhd -Doptimize=safe",
+    );
+    try support.expectContains(
+        source,
+        "for tool in miz freebsd15_release freebsd15_azure_metadata azure_vhd; do",
+    );
     try support.expectAbsent(source, "zig build -Doptimize=safe");
     try support.expectContains(source, "\"$release_tool\" matrix \\");
     try support.expectContains(source, "\"$release_tool\" azure-matrix \\");
