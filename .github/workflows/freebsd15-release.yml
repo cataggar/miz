@@ -359,8 +359,10 @@ jobs:
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
           zig build --fetch=all
-          zig build install-miz -Doptimize=safe
-          test -x zig-out/bin/miz
+          zig build install-miz freebsd15-release-tools install-azure-vhd -Doptimize=safe
+          for tool in miz freebsd15_release freebsd15_azure_metadata azure_vhd; do
+            test -x "zig-out/bin/$tool"
+          done
 
       - name: Refresh Azure OIDC credential before acceptance
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
