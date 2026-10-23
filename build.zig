@@ -1400,6 +1400,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    if (debz_mod) |mod| {
+        ubuntu2604_image_benchmark_tests.root_module.addImport("debz", mod);
+    }
     const run_ubuntu2604_image_benchmark_tests = b.addRunArtifact(
         ubuntu2604_image_benchmark_tests,
     );

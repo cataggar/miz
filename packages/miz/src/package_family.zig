@@ -95,6 +95,7 @@ pub const Inputs = struct {
     installed_baseline: InstalledBaselinePolicy = .none,
     deadline_ms: ?u64 = null,
     lock_wait_ms: u64 = 30_000,
+    now_unix: ?i64 = null,
     rpm: ?RpmOptions = null,
 };
 
@@ -158,6 +159,7 @@ pub const ExistingBackend = struct {
 pub const DebianBackend = struct {
     capabilities: ?debz.NativePackageFamilyCapabilities = null,
     product_executor: ?debz.ProductBackend = null,
+    now_unix: ?i64 = null,
 };
 
 pub fn defaultDebianCapabilities() debz.NativePackageFamilyCapabilities {
@@ -418,7 +420,10 @@ fn executeDebz(
         }
         return .{ .result = result, .arena = arena };
     }
-    const native_backend: debz.NativePackageFamilyBackend = .{ .io = io };
+    const native_backend: debz.NativePackageFamilyBackend = .{
+        .io = io,
+        .now_unix = request.inputs.now_unix orelse backend.now_unix,
+    };
     return native_backend.execute(allocator, debz_request);
 }
 
