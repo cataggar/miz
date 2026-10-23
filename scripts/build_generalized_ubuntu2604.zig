@@ -3950,6 +3950,9 @@ fn runDebzTransaction(
     const restricted_permissions = try copyRootStage(allocator, io, current, current_contents, stage);
     const absolute_stage = try Dir.cwd().realPathFileAlloc(io, stage, allocator);
     defer allocator.free(absolute_stage);
+    if (apply_operation == .create) {
+        try seedFreshRootCaseWitness(allocator, io, absolute_stage);
+    }
     const absolute_published = if (std.fs.path.isAbsolute(published))
         try allocator.dupe(u8, published)
     else blk: {
@@ -3986,6 +3989,9 @@ fn runDebzTransaction(
         return error.DebzProvenanceMissing;
     defer allocator.free(customized.provenance_path.?);
     try restoreRestrictedRootEntry(allocator, io, absolute_published, restricted_permissions);
+    if (apply_operation == .create) {
+        try removeFreshRootCaseWitness(allocator, io, absolute_published);
+    }
     const expected_provenance = try std.fs.path.join(
         allocator,
         &.{ transaction.state, "transaction-result.json" },
@@ -4962,6 +4968,55 @@ fn restoreRestrictedRootEntry(
     const path = try std.fs.path.join(allocator, &.{ root, restricted_root_entry });
     defer allocator.free(path);
     try Dir.cwd().setFilePermissions(io, path, value, .{});
+}
+
+const fresh_root_case_witness_path = "usr/share/man/man7/.miz-case-witness";
+const fresh_root_case_witness_bytes = "witness\n";
+
+/// `libpam-runtime` ships both `usr/share/man/man7/PAM.7.gz` and the
+/// lowercase symlink `usr/share/man/man7/pam.7.gz`. `debz` requires an
+/// untouched regular-file witness already present in `usr/share/man/man7`
+/// before unpacking a case-only alias pair so `root_mutation` can prove the
+/// directory is case-sensitive. When `libsolv` orders `libpam-runtime`
+/// (in `resolute-updates`) ahead of `bash` (in `resolute`) during a fresh-root
+/// `.create` transaction, `usr/share/man/man7` has no package-owned files yet,
+/// so we seed a temporary witness before `.create` and remove it immediately
+/// after publication.
+fn seedFreshRootCaseWitness(allocator: Allocator, io: Io, root_stage: []const u8) !void {
+    for (&[_][]const u8{
+        "usr",
+        "usr/share",
+        "usr/share/man",
+        "usr/share/man/man7",
+    }) |rel_dir| {
+        const dir_path = try std.fs.path.join(allocator, &.{ root_stage, rel_dir });
+        defer allocator.free(dir_path);
+        try Dir.cwd().createDirPath(io, dir_path);
+        try Dir.cwd().setFilePermissions(
+            io,
+            dir_path,
+            std.Io.File.Permissions.fromMode(0o755),
+            .{},
+        );
+    }
+    const witness_path = try std.fs.path.join(
+        allocator,
+        &.{ root_stage, fresh_root_case_witness_path },
+    );
+    defer allocator.free(witness_path);
+    try Dir.cwd().writeFile(
+        io,
+        .{ .sub_path = witness_path, .data = fresh_root_case_witness_bytes },
+    );
+}
+
+fn removeFreshRootCaseWitness(allocator: Allocator, io: Io, published_root: []const u8) !void {
+    const witness_path = try std.fs.path.join(
+        allocator,
+        &.{ published_root, fresh_root_case_witness_path },
+    );
+    defer allocator.free(witness_path);
+    try Dir.cwd().deleteFile(io, witness_path);
 }
 
 /// What the build did to the signed publication's partition table.
@@ -8250,6 +8305,45 @@ test "root staging preserves intentionally inaccessible snapd directory" {
     try std.testing.expectEqual(
         @as(std.posix.mode_t, 0),
         (try temporary.dir.statFile(io, "stage/var/lib/snapd/void", .{})).permissions.toMode() & 0o777,
+    );
+}
+
+test "fresh-root case witness seeds 0755 man7 hierarchy and removes cleanly" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    try temporary.dir.createDirPath(io, "stage");
+
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    const stage = try std.fs.path.join(allocator, &.{ root_buffer[0..root_length], "stage" });
+    defer allocator.free(stage);
+
+    try seedFreshRootCaseWitness(allocator, io, stage);
+    for (&[_][]const u8{
+        "stage/usr",
+        "stage/usr/share",
+        "stage/usr/share/man",
+        "stage/usr/share/man/man7",
+    }) |rel_dir| {
+        const stat = try temporary.dir.statFile(io, rel_dir, .{});
+        try std.testing.expectEqual(std.Io.File.Kind.directory, stat.kind);
+        try std.testing.expectEqual(@as(std.posix.mode_t, 0o755), stat.permissions.toMode() & 0o777);
+    }
+    const witness = try temporary.dir.readFileAlloc(
+        io,
+        "stage/" ++ fresh_root_case_witness_path,
+        allocator,
+        .limited(64),
+    );
+    defer allocator.free(witness);
+    try std.testing.expectEqualStrings(fresh_root_case_witness_bytes, witness);
+
+    try removeFreshRootCaseWitness(allocator, io, stage);
+    try std.testing.expectError(
+        error.FileNotFound,
+        temporary.dir.statFile(io, "stage/" ++ fresh_root_case_witness_path, .{}),
     );
 }
 
