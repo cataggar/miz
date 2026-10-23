@@ -490,7 +490,8 @@ fn resolveExisting(
     depth: usize,
 ) ![]u8 {
     if (Dir.cwd().realPathFileAlloc(io, lexical, allocator)) |resolved| {
-        return resolved;
+        defer allocator.free(resolved);
+        return allocator.dupe(u8, resolved);
     } else |_| {}
     // A path component that does not exist yet cannot hold a symlink, so the
     // lexical spelling of the tail is already its resolved spelling.
@@ -598,8 +599,10 @@ pub fn requireRunPath(
 ) ![]u8 {
     const resolved_run = Dir.cwd().realPathFileAlloc(io, run_dir, allocator) catch
         return context.fail("unsafe benchmark cleanup path: {s}", .{path});
+    defer allocator.free(resolved_run);
     const resolved = Dir.cwd().realPathFileAlloc(io, path, allocator) catch
         return context.fail("unsafe benchmark cleanup path: {s}", .{path});
+    defer allocator.free(resolved);
     const run_stat = statNoFollow(io, run_dir) catch
         return context.fail("unsafe benchmark cleanup path: {s}", .{path});
     if (run_stat.kind == .sym_link) {
@@ -612,7 +615,7 @@ pub fn requireRunPath(
             .{path},
         );
     }
-    return resolved;
+    return allocator.dupe(u8, resolved);
 }
 
 pub const CleanupKind = enum { file, tree };
