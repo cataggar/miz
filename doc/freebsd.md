@@ -400,9 +400,9 @@ The required procedure is:
 
 Validation-only uploads short-lived evidence and cannot create a tag, draft,
 asset, or release. Publication is possible only from merged `main`; the
-protected `azurelinux4-release` environment remains the credential boundary
+protected `ubuntu2604-release` environment remains the credential boundary
 for Azure acceptance. The publication job separately requires the protected
-`azurelinux4-release` environment, restricted to `main`, with required
+`ubuntu2604-release` environment, restricted to `main`, with required
 reviewers, self-review disabled, and the shared `RELEASE_GITHUB_APP_ID` and
 `RELEASE_GITHUB_APP_PRIVATE_KEY` secrets. The shared App has repository
 Administration-write, Contents-write, and Workflows-write permissions. The
@@ -433,8 +433,8 @@ protected Azure boot-and-contract runs (using
 accepted by the QEMU step, and the publication script refuses to proceed unless
 the exact result matrix is present.
 The Azure acceptance job reuses the existing protected
-`azurelinux4-release` GitHub environment so FreeBSD validation runs in the
-same Azure subscription as Azure Linux validation. It authenticates only with
+`ubuntu2604-release` GitHub environment so FreeBSD validation runs in the
+same Azure subscription as Ubuntu 26.04 validation. It authenticates only with
 OIDC through the `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and
 `AZURE_SUBSCRIPTION_ID` secrets and selects the architecture-specific
 `AZURE_LOCATION_X64`/`AZURE_VM_SIZE_X64` or
