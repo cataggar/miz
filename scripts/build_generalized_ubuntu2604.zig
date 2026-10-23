@@ -3786,8 +3786,8 @@ const DebzContext = struct {
 /// One transaction's scratch directory: its dpkg admin state and the exact lock
 /// the transaction is bound to.
 const DebzTransactionDir = struct {
-    path: []u8,
-    state: []u8,
+    path: [:0]u8,
+    state: [:0]u8,
     lock: []u8,
 
     fn deinit(self: *DebzTransactionDir, allocator: Allocator) void {
