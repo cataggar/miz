@@ -1361,10 +1361,18 @@ pub fn build(b: *std.Build) void {
     // staging, gate, and evidence subcommands its workflow drives. Replaces
     // scripts/ubuntu2604_image_benchmark.py and the workflow's inline Python.
     // ----
+    const ubuntu2604_runtime_contract_mod =
+        addUbuntu2604RuntimeContractModule(b, b.graph.host, optimize);
     const ubuntu2604_image_benchmark_mod = b.createModule(.{
         .root_source_file = b.path("scripts/ubuntu2604_image_benchmark.zig"),
         .target = b.graph.host,
         .optimize = optimize,
+        .imports = &.{
+            .{
+                .name = "ubuntu2604_runtime_contract",
+                .module = ubuntu2604_runtime_contract_mod,
+            },
+        },
     });
     const ubuntu2604_image_benchmark_exe = b.addExecutable(.{
         .name = "ubuntu2604-image-benchmark",
@@ -1581,8 +1589,6 @@ pub fn build(b: *std.Build) void {
     // scripts/ubuntu2604_release.py and the inline Python its callers
     // embedded. Validation only, so it is host-native everywhere the release
     // and core-validation jobs run. ----
-    const ubuntu2604_runtime_contract_mod =
-        addUbuntu2604RuntimeContractModule(b, b.graph.host, optimize);
     const ubuntu2604_release_mod = b.createModule(.{
         .root_source_file = b.path("scripts/ubuntu2604_release.zig"),
         .target = b.graph.host,

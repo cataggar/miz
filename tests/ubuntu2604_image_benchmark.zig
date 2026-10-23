@@ -294,7 +294,7 @@ fn makeCache(fixture: *Fixture, input_dir: ?[]const u8) !CacheFixture {
 fn makeLocks(fixture: *Fixture, package_digest: []const u8) ![]const u8 {
     const allocator = fixture.allocator();
     const locks = try fixture.mkdir(&.{"lock-fixture"});
-    for (benchmark.package_roots, 0..) |package, index| {
+    for (benchmark.lock_roots, 0..) |package, index| {
         const digest = try allocator.alloc(u8, 64);
         @memset(digest, std.fmt.digitToChar(@intCast(index + 1), .lower));
         const document = try std.fmt.allocPrint(allocator,
@@ -762,7 +762,13 @@ test "the lock set fails closed on a cache miss" {
         &inventory,
         &fixture.context,
     );
-    try std.testing.expectEqual(benchmark.package_roots.len, verified.locks.len);
+    try std.testing.expectEqual(benchmark.lock_roots.len, verified.locks.len);
+    const final_guest = verified.final_closure.array.items;
+    try std.testing.expectEqual(@as(usize, 1), final_guest.len);
+    try std.testing.expectEqualStrings(
+        benchmark.package_roots[benchmark.package_roots.len - 1],
+        final_guest[0].object.get("name").?.string,
+    );
 
     const filename = try benchmark.lockFilename(allocator, benchmark.package_roots[0]);
     const target = try std.fs.path.join(allocator, &.{ locks, filename });
@@ -1605,3 +1611,586 @@ test "the evidence scan rejects private key material anywhere it is uploaded" {
         try Dir.cwd().deleteFile(fixture.io, path);
     }
 }
+
+const canonical_manifest_xz_base64 =
+    "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";
+
+fn decompressManifestAlloc(allocator: Allocator) ![]u8 {
+    const decoder = std.base64.standard.Decoder;
+    const compressed = try allocator.alloc(
+        u8,
+        try decoder.calcSizeForSlice(canonical_manifest_xz_base64),
+    );
+    try decoder.decode(compressed, canonical_manifest_xz_base64);
+    var input = std.Io.Reader.fixed(compressed);
+    var decompressor = try std.compress.xz.Decompress.init(&input, allocator, &.{});
+    defer decompressor.deinit();
+    return decompressor.reader.allocRemaining(allocator, .unlimited);
+}
+
+const ProvenanceFixture = struct {
+    dir: []const u8,
+    build_path: []const u8,
+    build_json: []const u8,
+    budget_path: []const u8,
+    budget_json: []const u8,
+    lock_set: benchmark.LockSet,
+};
+
+fn makeProvenanceFixture(fixture: *Fixture) !ProvenanceFixture {
+    const allocator = fixture.allocator();
+    const cache = try makeCache(fixture, null);
+    const inventory = try benchmark.verifyWarmCache(
+        allocator,
+        fixture.io,
+        cache.cache,
+        &fixture.context,
+    );
+    const locks = try makeLocks(fixture, cache.package_digest);
+    const lock_set = try benchmark.verifyLockSet(
+        allocator,
+        fixture.io,
+        locks,
+        &inventory,
+        &fixture.context,
+    );
+
+    const provenance = try fixture.mkdir(&.{"provenance-fixture"});
+    const sums_bytes = try Dir.cwd().readFileAlloc(
+        fixture.io,
+        "scripts/fixtures/openpgp/canonical-SHA256SUMS",
+        allocator,
+        .limited(64 * 1024),
+    );
+    _ = try fixture.write(&.{ "provenance-fixture", "SHA256SUMS" }, sums_bytes);
+    const sig_bytes = try Dir.cwd().readFileAlloc(
+        fixture.io,
+        "scripts/fixtures/openpgp/canonical-SHA256SUMS.gpg",
+        allocator,
+        .limited(64 * 1024),
+    );
+    _ = try fixture.write(&.{ "provenance-fixture", "SHA256SUMS.gpg" }, sig_bytes);
+    const manifest_bytes = try decompressManifestAlloc(allocator);
+    _ = try fixture.write(
+        &.{ "provenance-fixture", benchmark.manifest_name },
+        manifest_bytes,
+    );
+
+    // Measure a complete miniature root and emit both size_inventory and
+    // size_budget through the real writers so their schemas and digests match
+    // what `build_generalized_ubuntu2604.zig` writes for `baremetal`.
+    const measured_root = try fixture.mkdir(&.{"measured-root"});
+    const root_files = [_]struct { path: []const u8, contents: []const u8 }{
+        .{
+            .path = benchmark.size_inventory.package_lock_path,
+            .contents = "alpha\t1.0-1\tarm64\n",
+        },
+        .{
+            .path = "/var/lib/dpkg/info/alpha.list",
+            .contents = "/boot\n/boot/vmlinuz-" ++ benchmark.baremetal_kernel_release ++
+                "\n/etc\n/usr\n/usr/bin\n/usr/bin/alpha\n/var\n/var/lib\n",
+        },
+        .{ .path = "/usr/bin/alpha", .contents = "owned payload" },
+        .{ .path = "/etc/ld.so.cache", .contents = "generated cache" },
+        .{
+            .path = "/boot/vmlinuz-" ++ benchmark.baremetal_kernel_release,
+            .contents = "kernel",
+        },
+    };
+    for (root_files) |file| {
+        const target = try std.fs.path.join(
+            allocator,
+            &.{ measured_root, file.path[1..] },
+        );
+        if (std.fs.path.dirname(target)) |parent| {
+            try Dir.cwd().createDirPath(fixture.io, parent);
+        }
+        try Dir.cwd().writeFile(fixture.io, .{
+            .sub_path = target,
+            .data = file.contents,
+        });
+    }
+
+    var inv_diag: benchmark.size_inventory.Diagnostic = .{};
+    var report = try benchmark.size_inventory.Report.init(allocator, .{
+        .architecture = .aarch64,
+        .flavor = .baremetal,
+    });
+    const section = try benchmark.size_inventory.measureRootBuild(
+        report.allocator(),
+        allocator,
+        fixture.io,
+        .{
+            .root_path = measured_root,
+            .flavor = .baremetal,
+            .kernel_release = benchmark.baremetal_kernel_release,
+        },
+        &inv_diag,
+    );
+    try report.addPhase(.root_build, section, &inv_diag);
+    try report.addPhase(
+        .image_build,
+        try benchmark.size_inventory.imageBuildValue(
+            report.allocator(),
+            .{
+                .virtual_size = @intCast(benchmark.virtual_size),
+                .root = .{
+                    .block_size = 4096,
+                    .total_blocks = 1_179_131,
+                    .free_blocks = 900_000,
+                    .total_inodes = 294_912,
+                    .free_inodes = 280_000,
+                },
+                .uki_bytes = 58_039_112,
+                .esp_partition_bytes = 512 * 1024 * 1024,
+                .esp_total_bytes = 510 * 1024 * 1024,
+                .esp_free_bytes = 450 * 1024 * 1024,
+            },
+            &inv_diag,
+        ),
+        &inv_diag,
+    );
+    try report.addPhase(
+        .publication,
+        try benchmark.size_inventory.publicationValue(
+            report.allocator(),
+            .{
+                .artifact_name = benchmark.asset_name,
+                .compressed_artifact_bytes = 256 * 1024 * 1024,
+                .qcow2_allocated_bytes = 512 * 1024 * 1024,
+            },
+        ),
+        &inv_diag,
+    );
+    const inventory_name = "ubuntu2604-size-inventory-baremetal-aarch64.json";
+    const inventory_json = try report.toJsonAlloc(allocator);
+    _ = try fixture.write(&.{ "provenance-fixture", inventory_name }, inventory_json);
+    const inventory_sha256 = try hexDigest(allocator, inventory_json);
+
+    const parsed_inventory = try fixture.parse(inventory_json);
+    var budget_diag: benchmark.size_budget.Diagnostic = .{};
+    var evaluation = try benchmark.size_budget.evaluate(
+        allocator,
+        parsed_inventory,
+        .{
+            .architecture = benchmark.architecture,
+            .flavor = benchmark.flavor,
+        },
+        &budget_diag,
+    );
+    const budget_name = "ubuntu2604-size-budget-baremetal-aarch64.json";
+    const budget_path = try std.fs.path.join(
+        allocator,
+        &.{ provenance, budget_name },
+    );
+    try benchmark.size_budget.write(
+        allocator,
+        fixture.io,
+        budget_path,
+        &evaluation,
+        &budget_diag,
+    );
+    const budget_json = try fixture.read(budget_path);
+    const budget_sha256 = try hexDigest(allocator, budget_json);
+
+    var guest_transactions: std.ArrayList(u8) = .empty;
+    var stage_transactions: std.ArrayList(u8) = .empty;
+    for (benchmark.lock_roots, 0..) |package, index| {
+        const lock_record = lock_set.find(package).?;
+        const source_lock = try std.fs.path.join(
+            allocator,
+            &.{ locks, lock_record.filename },
+        );
+        const lock_bytes = try fixture.read(source_lock);
+        _ = try fixture.write(
+            &.{ "provenance-fixture", lock_record.filename },
+            lock_bytes,
+        );
+
+        const tx_digest = try allocator.alloc(u8, 64);
+        @memset(tx_digest, 'a' + @as(u8, @intCast(index)));
+        const tx_name = try std.fmt.allocPrint(
+            allocator,
+            "debz-transaction-provenance-{s}-arm64.json",
+            .{package},
+        );
+        const tx_doc = try std.fmt.allocPrint(allocator,
+            \\{{"schema": "https://debz.dev/schema/native-transaction-provenance-v2",
+            \\  "version": 2, "backend": "native",
+            \\  "install_root": "/bench/run-warmup/work/root-stage-{d}",
+            \\  "attempt_id": "{s}", "root_inode": 100,
+            \\  "exact_lock_sha256": "{s}",
+            \\  "final_state_kind": "package_database_closure_v1",
+            \\  "outcome": "succeeded", "digest_sha256": "{s}"}}
+        , .{ index, digest_a, lock_record.digest_sha256, tx_digest });
+        _ = try fixture.write(&.{ "provenance-fixture", tx_name }, tx_doc);
+        const tx_file_sha256 = try hexDigest(allocator, tx_doc);
+
+        const entry_json = try std.fmt.allocPrint(allocator,
+            \\{{"package": "{s}",
+            \\  "exact_lock": {{"filename": "{s}", "sha256": "{s}", "digest_sha256": "{s}"}},
+            \\  "transaction_provenance": {{"filename": "{s}", "sha256": "{s}",
+            \\                              "digest_sha256": "{s}", "lock_sha256": "{s}"}}}}
+        , .{
+            package,
+            lock_record.filename,
+            lock_record.file_sha256,
+            lock_record.digest_sha256,
+            tx_name,
+            tx_file_sha256,
+            tx_digest,
+            lock_record.digest_sha256,
+        });
+        if (index < benchmark.package_roots.len) {
+            if (guest_transactions.items.len > 0) {
+                try guest_transactions.appendSlice(allocator, ", ");
+            }
+            try guest_transactions.appendSlice(allocator, entry_json);
+        } else {
+            if (stage_transactions.items.len > 0) {
+                try stage_transactions.appendSlice(allocator, ", ");
+            }
+            try stage_transactions.appendSlice(allocator, entry_json);
+        }
+    }
+
+    _ = try fixture.write(
+        &.{ "provenance-fixture", "ubuntu2604-boot-input-evidence.json" },
+        try std.fmt.allocPrint(allocator,
+            \\{{"schema": 1, "type": "miz-ubuntu2604-boot-input-evidence",
+            \\  "architecture": "aarch64",
+            \\  "kernel_release": "{s}",
+            \\  "package_lock": "/var/lib/miz/ubuntu2604-package-lock.tsv",
+            \\  "package_lock_sha256": "{s}"}}
+        , .{ benchmark.baremetal_kernel_release, digest_b }),
+    );
+    _ = try fixture.write(
+        &.{ "provenance-fixture", "uki-signing-baremetal-aarch64.json" },
+        try std.fmt.allocPrint(allocator,
+            \\{{"schema": 1, "type": "miz-uki-signing",
+            \\  "architecture": "aarch64", "flavor": "baremetal",
+            \\  "signer_mode": "local-key",
+            \\  "certificate_sha256": "{s}",
+            \\  "signature_verification": "success",
+            \\  "uki_stub": {{"sha256": "{s}"}}}}
+        , .{ digest_c, digest_d }),
+    );
+
+    const build_json = try std.fmt.allocPrint(allocator,
+        \\{{"schema": 1, "type": "miz-ubuntu2604-build-provenance",
+        \\  "architecture": "aarch64", "flavor": "baremetal", "release": "26.04",
+        \\  "size_inventory": {{"filename": "{s}", "sha256": "{s}"}},
+        \\  "size_budget": {{"filename": "{s}", "sha256": "{s}"}},
+        \\  "virtual_size": {d},
+        \\  "minimum_root_free_bytes": 1073741824,
+        \\  "validated_root_free_bytes": 2147483648,
+        \\  "snapshot": {{"id": "release-20260731",
+        \\                "base_url": "https://cloud-images.ubuntu.com/releases/26.04/release-20260731/"}},
+        \\  "canonical_key_fingerprint": "{s}",
+        \\  "sha256sums_signature_verified": true,
+        \\  "disk_layout": {{
+        \\    "source": "canonical-gen2-gpt",
+        \\    "transform": "arm64-esp-rebuild-v1",
+        \\    "esp": {{
+        \\      "table_index": 14,
+        \\      "first_lba": 2048,
+        \\      "last_lba": 1050623,
+        \\      "size_bytes": 536870912,
+        \\      "fat32": "reformatted-preserve-volume-id",
+        \\      "content": "signed-fallback-only"
+        \\    }},
+        \\    "retired_xbootldr": {{"table_index": 12, "cleared": true}}
+        \\  }},
+        \\  "artifacts": {{
+        \\    "sha256sums": {{"filename": "SHA256SUMS", "sha256": "{s}"}},
+        \\    "sha256sums_signature": {{"filename": "SHA256SUMS.gpg", "sha256": "{s}"}},
+        \\    "source_image": {{"filename": "{s}", "sha256": "{s}", "role": "signed-gpt-esp-substrate"}},
+        \\    "image_manifest": {{"filename": "{s}", "sha256": "{s}"}}
+        \\  }},
+        \\  "debz": {{
+        \\    "api_commit": "{s}",
+        \\    "baseline": {{"source": "empty-debz-root", "enforcement": "exact-final-closure"}},
+        \\    "package_roots": [
+        \\      "linux-image-7.0.0-2015-nvidia-bos-64k",
+        \\      "linux-modules-7.0.0-2015-nvidia-bos-64k",
+        \\      "openssh-server",
+        \\      "sudo",
+        \\      "ca-certificates"
+        \\    ],
+        \\    "transactions": [{s}],
+        \\    "build_stage": {{
+        \\      "purpose": "initramfs-generation",
+        \\      "package_roots": ["initramfs-tools"],
+        \\      "transactions": [{s}],
+        \\      "initramfs": {{
+        \\        "path": "/boot/initrd.img-{s}",
+        \\        "kernel_release": "{s}",
+        \\        "sha256": "{s}",
+        \\        "bytes": 16777216
+        \\      }}
+        \\    }}
+        \\  }}}}
+    , .{
+        inventory_name,
+        inventory_sha256,
+        budget_name,
+        budget_sha256,
+        benchmark.virtual_size,
+        benchmark.canonical_fingerprint,
+        benchmark.sums_sha256,
+        benchmark.sums_signature_sha256,
+        benchmark.source_name,
+        benchmark.source_sha256,
+        benchmark.manifest_name,
+        benchmark.manifest_sha256,
+        benchmark.debz_api_commit,
+        guest_transactions.items,
+        stage_transactions.items,
+        benchmark.baremetal_kernel_release,
+        benchmark.baremetal_kernel_release,
+        digest_e,
+    });
+    const build_path = try fixture.write(
+        &.{ "provenance-fixture", "ubuntu2604-build-provenance.json" },
+        build_json,
+    );
+    return .{
+        .dir = provenance,
+        .build_path = build_path,
+        .build_json = build_json,
+        .budget_path = budget_path,
+        .budget_json = budget_json,
+        .lock_set = lock_set,
+    };
+}
+
+test "provenance validation requires size budget disk layout and initramfs build stage" {
+    var fixture = try Fixture.create();
+    defer fixture.deinit();
+    const allocator = fixture.allocator();
+    const prov = try makeProvenanceFixture(&fixture);
+
+    const validated = try benchmark.validateProvenance(
+        allocator,
+        fixture.io,
+        prov.dir,
+        &prov.lock_set,
+        digest_c,
+        &fixture.context,
+    );
+    const tx_contracts = validated.contract.object.get("transaction_provenance").?.array.items;
+    try std.testing.expectEqual(benchmark.lock_roots.len, tx_contracts.len);
+    try std.testing.expectEqualStrings(
+        "initramfs-tools",
+        tx_contracts[benchmark.package_roots.len].object.get("package").?.string,
+    );
+
+    const build_mutations = [_][2][]const u8{
+        .{
+            "\"ubuntu2604-size-budget-baremetal-aarch64.json\"",
+            "\"ubuntu2604-size-budget-core-aarch64.json\"",
+        },
+        .{
+            "\"transform\": \"arm64-esp-rebuild-v1\"",
+            "\"transform\": \"preserved\"",
+        },
+        .{
+            "\"last_lba\": 1050623",
+            "\"last_lba\": 1050622",
+        },
+        .{
+            "\"cleared\": true",
+            "\"cleared\": false",
+        },
+        .{
+            "\"purpose\": \"initramfs-generation\"",
+            "\"purpose\": \"guest-root\"",
+        },
+        .{
+            "\"package_roots\": [\"initramfs-tools\"]",
+            "\"package_roots\": [\"sudo\"]",
+        },
+        .{
+            "\"path\": \"/boot/initrd.img-7.0.0-2015-nvidia-bos-64k\"",
+            "\"path\": \"/boot/initrd.img-generic\"",
+        },
+        .{
+            "\"bytes\": 16777216",
+            "\"bytes\": 0",
+        },
+    };
+    for (build_mutations) |mutation| {
+        const mutated = try std.mem.replaceOwned(
+            u8,
+            allocator,
+            prov.build_json,
+            mutation[0],
+            mutation[1],
+        );
+        try std.testing.expect(!std.mem.eql(u8, prov.build_json, mutated));
+        try Dir.cwd().writeFile(fixture.io, .{
+            .sub_path = prov.build_path,
+            .data = mutated,
+        });
+        try expectFailure(benchmark.validateProvenance(
+            allocator,
+            fixture.io,
+            prov.dir,
+            &prov.lock_set,
+            digest_c,
+            &fixture.context,
+        ));
+    }
+    try Dir.cwd().writeFile(fixture.io, .{
+        .sub_path = prov.build_path,
+        .data = prov.build_json,
+    });
+
+    // Tampering with the bound size-budget document must fail closed both on
+    // file-digest mismatch and when the digest is re-bound to an invalid result.
+    const tampered_budget = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        prov.budget_json,
+        "\"result\": \"baseline-recorded\"",
+        "\"result\": \"pass\"",
+    );
+    try std.testing.expect(!std.mem.eql(u8, prov.budget_json, tampered_budget));
+    try Dir.cwd().writeFile(fixture.io, .{
+        .sub_path = prov.budget_path,
+        .data = tampered_budget,
+    });
+    try expectFailure(benchmark.validateProvenance(
+        allocator,
+        fixture.io,
+        prov.dir,
+        &prov.lock_set,
+        digest_c,
+        &fixture.context,
+    ));
+    const rebound_build = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        prov.build_json,
+        try hexDigest(allocator, prov.budget_json),
+        try hexDigest(allocator, tampered_budget),
+    );
+    try Dir.cwd().writeFile(fixture.io, .{
+        .sub_path = prov.build_path,
+        .data = rebound_build,
+    });
+    try expectFailure(benchmark.validateProvenance(
+        allocator,
+        fixture.io,
+        prov.dir,
+        &prov.lock_set,
+        digest_c,
+        &fixture.context,
+    ));
+}
+
