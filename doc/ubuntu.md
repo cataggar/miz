@@ -1344,6 +1344,148 @@ Because `workflow_dispatch` definitions are loaded from the default branch,
 review and merge the workflow before triggering it. Do not run a branch copy
 or treat the networked staging build as a benchmark result.
 
+#### Zig 0.17.0 native Arm64 production benchmark baseline
+
+The separately attributed Zig 0.17.0 production baseline for issue #731 was
+established on `main` in workflow run
+[`40126004664`](https://github.com/cataggar/miz/actions/runs/40126004664)
+using the existing protocol without rewriting or relabeling the historical
+Zig 0.16.0 (`debz 0.3.x`) result from run `32785516977` (commit
+`2b86bac1b5217538b32e55ab44ab1c79661096be`, median `485.108 s` against the
+`530.000 s` / `8m50s` ceiling).
+
+Provenance and environment:
+
+- Source commit: `474c2a6c5b24e48a374f30db8756ac45b8e481b2`
+- Embedded `debz` revision: `a6c2732e2cab880b60a4affadb7e087bf007d1e8` (`0.4.0`,
+  `NativePackageFamilyBackend`, `native-transaction-provenance-v2`)
+- Compiler: Zig `0.17.0` (`aarch64-linux`, binary `171,691,896` bytes, SHA-256
+  `5165c9a2d17938a8173839b3adf81d025b558d38d9e9711237a6fa5b8d8bb3f7`),
+  optimization mode `safe`
+- Host: GitHub-hosted `ubuntu-24.04-arm` (`aarch64` Linux `6.17.0-1022-azure`,
+  4 CPUs)
+- Protocol: one warm-up plus three measured offline builds under `unshare --net`
+  (`status: "valid"`, `raw_image_materialization: "required"`)
+- Source inputs: `ubuntu-26.04-server-cloudimg-arm64.img` (`940,920,832` bytes,
+  SHA-256 `3e113fdd41f39e13729375173bb2ae793f87dc6db4294e5251ff2476971788ba`),
+  `SHA256SUMS` (`d562d59dac70f68d67d00e994db5cd89e49e9d93f7f80b4cb868a5eeb057ec36`),
+  `SHA256SUMS.gpg` (`2bf5fae8be0c79cc30c5c10223f1d4790b6ef541240896bfe48c7ac57c3404ed`),
+  Canonical signing fingerprint `d2eb44626fddc30b513d5bb71a5d6c4c7db87c81`,
+  manifest `ubuntu-26.04-server-cloudimg-arm64.manifest` (`20,041` bytes,
+  SHA-256 `2889120db0432e8029f8f01622efb40ce964e434ba2c81e98937ad1e2616e4f5`)
+- Boot and signing inputs: UKI stub `/usr/lib/systemd/boot/efi/linuxaa64.efi.stub`
+  (`61,952` bytes, SHA-256
+  `28cd98e4b93b694345d4472f60bb91df1e4838eef42d8a7f7217abebfdf6d665`),
+  certificate PEM (`1,050` bytes, SHA-256
+  `4cc0ab5ec60d771a6b97bbdb0466f7e7d20ef2ce761e4705ae51c04495306a24`,
+  canonical DER SHA-256
+  `8ca3b80b1a2272a4f3a6d13246a65cfdd89764eb83beb8a0709e3cf591490279`),
+  administrator public key (`109` bytes, SHA-256
+  `da2f8207cbcfce5c0698e623c257449f43f966cc510603118f6a98a228dad89e`)
+- Exact lock set (`closure_sha256`
+  `44acd8769446cb756074db4e8ec582ec9a6eacb31747efadc83b4e5df71deb95`):
+  - `linux-modules-7.0.0-2015-nvidia-bos-64k` (`60` packages, `digest_sha256`
+    `ff7aafe4d01ade9016c986d91bdeebde66713d28adc4ed1aaa9db9259a4993f1`,
+    `file_sha256`
+    `54260590a9cbd4a1d058e13a3238169d31b7f492c7b280274403de2ce5d07988`)
+  - `linux-image-7.0.0-2015-nvidia-bos-64k` (`64` packages, `digest_sha256`
+    `1dbf47b4cfb6d0977d9c3b07bdb3a39eddf1b93f8e816878f6cebc18461bd3c8`,
+    `file_sha256`
+    `369884600aedb034613278a4ceecf4084e2f37945b094dcc839bb8ed473361a0`)
+  - `openssh-server` (`92` packages, `digest_sha256`
+    `c96f3452da0ab44b7f268c097d68783ffc7194fcdbd78609f91ddd92ceea8a2d`,
+    `file_sha256`
+    `5c77b123d5dab3c225cb0f506501a840b8cfc4d8c2c23dd9a14f2332fbc6844e`)
+  - `sudo` (`95` packages, `digest_sha256`
+    `bc790a80b5e51813032acf1742a2890b641b209c79d1e8f265346ba696992152`,
+    `file_sha256`
+    `6f13eaffbbe570ed69116afd8ed894e2184a2590bb93395ff4f2cf1ab1b9a921`)
+  - `ca-certificates` (`97` packages, `digest_sha256`
+    `876d02657cab7c3ba98c0ec5a853e85670efedcbd3a6f6208b2d2e36ac57e0bb`,
+    `file_sha256`
+    `a1e3c48005556383f4a3411847f86a2f383420722284224c51da779f835c0b74`)
+  - `initramfs-tools` (`112` packages, `digest_sha256`
+    `7b659cb47d2f1524b2c44d827847b61dd3c016e67a8e474465828286416be143`,
+    `file_sha256`
+    `8950bc33c9e8d02a86b311e781369378a659f22e89a6213c630a7134d8a171b5`)
+- Warm `debz` cache (`inventory_sha256`
+  `631f33fe3633d3054b343701181bbb3c648a28cffb045b1078bb5442a93103e2`,
+  `manifest_inventory_sha256`
+  `3008f25b69fe04ce6853084deaf1357e98bda65bfcf2f5c8b7de9f849d3af283`,
+  `object_inventory_sha256`
+  `ffe3ec9dfbd64f64d08dc34675f3dce45573ebfb09b8aa477fe8f84bd925db45`): `25`
+  metadata objects (`24,382,885` bytes), `25` metadata manifests, `112` package
+  objects (`333,557,898` bytes)
+- Correctness across all four runs (`run-warmup`, `run-measured-01`,
+  `run-measured-02`, `run-measured-03`): `identical` (`reference_sha256`
+  `61f672d2ad4f44571a76250e5b68b159925c92b963319e3db3a9383e3a426262`); every
+  raw output was a non-symlink regular file of exactly `5,368,709,120` bytes
+  validated with native `miz check` and `miz info`, and every finalized QCOW2
+  was `1,151,664,128` bytes (`run-warmup`
+  `36da7b14e99c115a2a3f8bcb884bb97fb731ab7dd8086e4620633c503e6c636e`,
+  `run-measured-01`
+  `4b58598f6a6e565cab81cafd7885a17e801d5e8af0fda8d35844ae30f347d245`,
+  `run-measured-02`
+  `d898251c12de20930d78e4d08adb7daf8df3b041654dcbddc7a50f33f39df543`,
+  `run-measured-03`
+  `4422be4bfdbdd0045830182db2ae0156f2cf53d3a2006cb972d97d2ae31044cf`).
+
+Phase and resource medians across the three measured offline runs:
+
+| Phase / metric | Zig 0.16.0 (`32785516977`) | Zig 0.17.0 (`40126004664`) |
+|---|---:|---:|
+| `input_acquisition` | — | `0.547 s` (`546,669,029 ns`) |
+| `source_qcow2_setup` | `39.440 s` | `35.914 s` (`35,914,060,557 ns`) |
+| `debz_transaction:linux-modules-7.0.0-2015-nvidia-bos-64k` | — | `1920.254 s` (`1,920,253,549,578 ns`) |
+| `debz_transaction:linux-image-7.0.0-2015-nvidia-bos-64k` | — | `11.265 s` (`11,265,395,664 ns`) |
+| `debz_transaction:openssh-server` | — | `43.309 s` (`43,309,171,528 ns`) |
+| `debz_transaction:sudo` | — | `7.235 s` (`7,234,843,944 ns`) |
+| `debz_transaction:ca-certificates` | — | `8.910 s` (`8,910,493,699 ns`) |
+| `debz_aggregate` | `111.405 s` | `2014.228 s` (`2,014,227,628,311 ns`) |
+| `debz_transaction:initramfs-build-stage` | — | `30.917 s` (`30,916,599,420 ns`) |
+| `initramfs_ext4_import` | `112.805 s` | `162.066 s` (`162,066,194,240 ns`) |
+| `uki_assembly` | `10.363 s` (combined) | `9.291 s` (`9,290,922,269 ns`) |
+| `uki_signing` | (included above) | `0.354 s` (`354,197,197 ns`) |
+| `qcow2_finalization` | `63.703 s` | `15.484 s` (`15,484,086,910 ns`) |
+| `final_image_validation` | `72.495 s` | `68.130 s` (`68,130,160,432 ns`) |
+| `raw_image_materialization` | `71.975 s` | `64.672 s` (`64,672,237,709 ns`) |
+| `provenance_output` | — | `0.001 s` (`1,430,782 ns`) |
+| `total_runtime` | `485.108 s` | `2371.902 s` (`2,371,901,906,014 ns`) |
+| Host wall time | `485.230 s` | `2371.967 s` (`2,371,967,127,271 ns`) |
+| User CPU time | — | `1364.270 s` (`1,364,270,281,000 ns`) |
+| System CPU time | — | `871.882 s` (`871,881,817,000 ns`) |
+| Peak RSS | — | `6,412,300,288` bytes |
+| Sampled read bytes (`/proc`) | — | `1,761,280` bytes |
+| Sampled write bytes (`/proc`) | — | `44,602,318,848` bytes |
+| `getrusage` block inputs / outputs | — | `3,184` / `86,149,136` |
+
+Non-regression gate assessment against the preserved `530.000 s` (`8m50s`)
+ceiling (`NON_REGRESSION_CEILING_NS: "530000000000"`):
+
+- `non-regression-gate.json` recorded `status: "fail"` (`median_total_ns`
+  `2,371,901,906,014` vs `ceiling_ns` `530,000,000,000`). The `530.000 s`
+  ceiling is intentionally preserved without relaxation.
+- Every `miz`-owned non-`debz` phase improved or held steady relative to the
+  Zig 0.16.0 baseline: `source_qcow2_setup` (`39.440 s` -> `35.914 s`),
+  `uki_assembly` + `uki_signing` (`10.363 s` -> `9.645 s`),
+  `qcow2_finalization` (`63.703 s` -> `15.484 s`), `final_image_validation`
+  (`72.495 s` -> `68.130 s`), and `raw_image_materialization` (`71.975 s` ->
+  `64.672 s`). Excluding `debz_aggregate`, all remaining phases sum to
+  `357.674 s` (`5m57.674s`).
+- The regression is isolated to `debz 0.4.0` (`NativePackageFamilyBackend`,
+  adopted in #737), specifically the initial `.create` transaction
+  `debz_transaction:linux-modules-7.0.0-2015-nvidia-bos-64k` (`1920.254 s`,
+  `95.3%` of `debz_aggregate` and `81.0%` of `total_runtime`). Once
+  `linux-modules-7.0.0-2015-nvidia-bos-64k` unpacks at step `241` of that
+  transaction's `1,273` progress records, `var/lib/debz/native-managed-state-v1.json`
+  reaches `10,912,990` bytes, and `native_recovery.zig`
+  (`validateStableManagedState` and `updateManagedState`) re-observes all
+  managed paths and durably rewrites the full managed-state snapshot on each
+  remaining step, producing `44.60 GiB` of writes (`86,149,136` block outputs)
+  and `6.41 GiB` peak RSS. Subsequent `.customize` transactions start with a
+  fresh per-transaction managed-state snapshot (`81–534 KiB`) and complete in
+  `7.235 s` to `43.309 s`.
+
 #### Raw-materialization optimization evidence
 
 The source-allocation-unit raw-copy change was also measured locally before
