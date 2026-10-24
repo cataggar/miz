@@ -81,6 +81,7 @@ build_log="$WORK_DIR/build.log"
 
 echo "== building $ASSET_NAME (local self-signed UKI) =="
 sudo -E "$ZIG" build \
+  -Doptimize=safe \
   -Dubuntu2604-arch="$ARCH" \
   generalized-ubuntu2604 -- \
   --work-dir "$WORK_DIR" \

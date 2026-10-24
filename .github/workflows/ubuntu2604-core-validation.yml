@@ -278,6 +278,7 @@ jobs:
           mkdir -p "$GITHUB_WORKSPACE/$WORK_DIR"
           build_log="$GITHUB_WORKSPACE/$WORK_DIR/build.log"
           sudo -E "$(command -v zig)" build \
+            -Doptimize=safe \
             -Dubuntu2604-arch="$ARCHITECTURE" \
             -Dubuntu2604-flavor="$FLAVOR" \
             generalized-ubuntu2604 -- \

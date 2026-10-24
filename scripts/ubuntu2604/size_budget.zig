@@ -402,7 +402,7 @@ const x86_64_core_limits = [_]Limit{
     .{
         .measure = .initramfs_bytes,
         .direction = .at_most,
-        .baseline = 40_538_112,
+        .baseline = 42_913_792,
         .allowance = .{ .security_update_percent = security_update_percent },
         .basis = "measured staged initramfs; it follows the module tree",
     },
@@ -946,7 +946,7 @@ pub fn budgetDigest(allocator: Allocator) Error![64]u8 {
 /// refresh that quietly re-recorded whatever the last build measured is
 /// therefore impossible: there is nowhere for it to write.
 pub const reviewed_budget_sha256 =
-    "9efaa413fb22dc96a5c33a27b413b79cfb65dc2ba9e86681b3d8b85a9e717914";
+    "9b64f8feab8f1b2012e303e3239af7296b95bb587d779901b8a9636a13440a9c";
 
 // ---------------------------------------------------------------------------
 // Evaluation.

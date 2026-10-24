@@ -460,15 +460,15 @@ pub const fixture_kernel_version = "7.0.0-1010.10";
 pub const fixture_kernel_image = "linux-image-" ++ fixture_kernel_release;
 pub const fixture_kernel_modules = "linux-modules-" ++ fixture_kernel_release;
 
-/// The core guest roots in publication order: the selected kernel image, its
-/// module tree, then the contract's literal roots.
+/// The core guest roots in publication order: the selected kernel module tree,
+/// its kernel image, then the contract's literal roots.
 pub fn coreDebzPackages(arena: Allocator) ![]const []const u8 {
     const names = try arena.alloc(
         []const u8,
         contracts.core_package_root_count,
     );
-    names[0] = fixture_kernel_image;
-    names[1] = fixture_kernel_modules;
+    names[0] = fixture_kernel_modules;
+    names[1] = fixture_kernel_image;
     for (contracts.core_guest_package_roots, 0..) |package, index| {
         names[contracts.core_kernel_root_count + index] = package;
     }
