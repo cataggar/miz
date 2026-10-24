@@ -64,7 +64,7 @@ pub const sums_sha256 =
     "d562d59dac70f68d67d00e994db5cd89e49e9d93f7f80b4cb868a5eeb057ec36";
 pub const sums_signature_sha256 =
     "2bf5fae8be0c79cc30c5c10223f1d4790b6ef541240896bfe48c7ac57c3404ed";
-pub const debz_api_commit = "7dd6e8e30b33a7898b12c80b7aa0fe89dc4cbc6f";
+pub const debz_api_commit = "35ac08fc6103cd73a8c712af557886cfccb20187";
 pub const canonical_fingerprint = "d2eb44626fddc30b513d5bb71a5d6c4c7db87c81";
 pub const asset_name = "Ubuntu-26.04-aarch64.baremetal.qcow2";
 pub const raw_asset_name = "Ubuntu-26.04-aarch64.baremetal.raw";
@@ -76,8 +76,8 @@ pub const raw_asset_name = "Ubuntu-26.04-aarch64.baremetal.raw";
 /// removed `initramfs-tools`, which is now resolved by the separately timed
 /// build stage below rather than into the image.
 pub const package_roots = [_][]const u8{
-    "linux-image-7.0.0-2015-nvidia-bos-64k",
     "linux-modules-7.0.0-2015-nvidia-bos-64k",
+    "linux-image-7.0.0-2015-nvidia-bos-64k",
     "openssh-server",
     "sudo",
     "ca-certificates",
@@ -147,7 +147,7 @@ pub const timing_phases = [_][]const u8{
     "total_runtime",
 };
 
-const debz_snapshot_base = "https://snapshot.ubuntu.com/ubuntu/20260731T000000Z";
+const debz_snapshot_base = "https://snapshot.ubuntu.com/ubuntu/20261001T000000Z";
 const debz_suites = [_][]const u8{ "resolute", "resolute-updates", "resolute-security" };
 const debz_components = [_][]const u8{ "main", "restricted", "universe", "multiverse" };
 const debz_frozen_resolute_release_digest =
@@ -4692,8 +4692,12 @@ const usage_text =
 const usage_exit_code = 2;
 const failure_exit_code = 1;
 
+fn runtimeAllocator(init: std.process.Init) Allocator {
+    return if (builtin.link_libc) std.heap.c_allocator else init.gpa;
+}
+
 pub fn main(init: std.process.Init) !void {
-    var arena_state: std.heap.ArenaAllocator = .init(init.gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(runtimeAllocator(init));
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const io = init.io;

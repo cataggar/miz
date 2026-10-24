@@ -366,7 +366,7 @@ pub fn sizeBudgetFilename(
     ) catch null;
 }
 
-pub const debz_api_commit = "7dd6e8e30b33a7898b12c80b7aa0fe89dc4cbc6f";
+pub const debz_api_commit = "35ac08fc6103cd73a8c712af557886cfccb20187";
 pub const full_debz_packages = [_][]const u8{ "linux-azure", "walinuxagent" };
 
 /// The literal package roots the core appliance installs into the final guest,
@@ -433,8 +433,8 @@ pub fn validateCorePackageRoots(
     const selection = runtime_contract.selectKernel(
         names[0..core_kernel_root_count],
     ) catch return error.InvalidCorePackageRoots;
-    if (!std.mem.eql(u8, names[0], selection.image_package) or
-        !std.mem.eql(u8, names[1], selection.modules_package))
+    if (!std.mem.eql(u8, names[0], selection.modules_package) or
+        !std.mem.eql(u8, names[1], selection.image_package))
         return error.InvalidCorePackageRoots;
     for (names[core_kernel_root_count..], core_guest_package_roots) |actual, expected| {
         if (!std.mem.eql(u8, actual, expected)) return error.InvalidCorePackageRoots;
@@ -485,7 +485,7 @@ test "core package roots are the contract's guest set without ubuntu-minimal" {
 test "published core package roots must select a kernel rather than name one" {
     const allocator = std.testing.allocator;
     const good = try std.json.parseFromSlice(std.json.Value, allocator,
-        \\["linux-image-7.0.0-1010-azure","linux-modules-7.0.0-1010-azure",
+        \\["linux-modules-7.0.0-1010-azure","linux-image-7.0.0-1010-azure",
         \\ "openssh-server","sudo","ca-certificates"]
     , .{});
     defer good.deinit();
@@ -494,16 +494,16 @@ test "published core package roots must select a kernel rather than name one" {
 
     for ([_][]const u8{
         // The convenience metapackage is not a selection.
-        \\["linux-azure","linux-modules-7.0.0-1010-azure","openssh-server","sudo","ca-certificates"]
+        \\["linux-modules-7.0.0-1010-azure","linux-azure","openssh-server","sudo","ca-certificates"]
         ,
         // Image and modules from different kernels.
-        \\["linux-image-7.0.0-1010-azure","linux-modules-7.0.0-1004-azure","openssh-server","sudo","ca-certificates"]
+        \\["linux-modules-7.0.0-1004-azure","linux-image-7.0.0-1010-azure","openssh-server","sudo","ca-certificates"]
         ,
         // The generator is a build root and must not be published as a guest one.
-        \\["linux-image-7.0.0-1010-azure","linux-modules-7.0.0-1010-azure","initramfs-tools","openssh-server","sudo","ca-certificates"]
+        \\["linux-modules-7.0.0-1010-azure","linux-image-7.0.0-1010-azure","initramfs-tools","openssh-server","sudo","ca-certificates"]
         ,
         // A dropped literal root.
-        \\["linux-image-7.0.0-1010-azure","linux-modules-7.0.0-1010-azure","openssh-server","sudo"]
+        \\["linux-modules-7.0.0-1010-azure","linux-image-7.0.0-1010-azure","openssh-server","sudo"]
         ,
     }) |document| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, document, .{});

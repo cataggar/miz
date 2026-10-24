@@ -81,19 +81,19 @@ https://github.com/cataggar/tls.zig/blob/481b2a677244b994d216eb02a73bad89623610a
 ## debz
 
 Host-side Debian-family package operations embed `cataggar/debz` 0.4.0 at
-immutable commit `7dd6e8e30b33a7898b12c80b7aa0fe89dc4cbc6f`.
+immutable commit `35ac08fc6103cd73a8c712af557886cfccb20187`.
 
 Copyright (c) debz contributors.
 
 Licensed under the Apache License 2.0. See:
-https://github.com/cataggar/debz/blob/7dd6e8e30b33a7898b12c80b7aa0fe89dc4cbc6f/LICENSE
+https://github.com/cataggar/debz/blob/35ac08fc6103cd73a8c712af557886cfccb20187/LICENSE
 
 debz links its statically configured Debian-semantics `openSUSE/libsolv`
 dependency (commit `e190ef1433e5df60a2238b01438927eb76c285f5`) and static
 liblzma and libzstd, together with libc, through its Zig package build
 conventions.
 See debz's notices for the corresponding BSD-3-Clause and 0BSD terms:
-https://github.com/cataggar/debz/blob/7dd6e8e30b33a7898b12c80b7aa0fe89dc4cbc6f/THIRD_PARTY_NOTICES
+https://github.com/cataggar/debz/blob/35ac08fc6103cd73a8c712af557886cfccb20187/THIRD_PARTY_NOTICES
 
 ## zerde (transitive dependency)
 

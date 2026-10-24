@@ -10,6 +10,7 @@
 //! on the host so private signing material is never copied into the guest disk.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const miz = @import("miz");
 const image_phase_timing = @import("image_phase_timing.zig");
 const core_contract = @import("ubuntu2604_runtime_contract");
@@ -35,8 +36,8 @@ test {
 
 const release = "20260731";
 const release_base = "https://cloud-images.ubuntu.com/releases/26.04/release-" ++ release;
-const snapshot_base = "https://snapshot.ubuntu.com/ubuntu/20260731T000000Z";
-const snapshot_unix: i64 = 1_785_456_000;
+const snapshot_base = "https://snapshot.ubuntu.com/ubuntu/20261001T000000Z";
+const snapshot_unix: i64 = 1_790_812_800;
 const frozen_resolute_release_digest =
     "sha256:596ee4cea058f74d59e2180532c89904e306d90725d42162eda82c01d4370834";
 const snapshot_witness_suites = [_][]const u8{ "resolute-updates", "resolute-security" };
@@ -275,8 +276,8 @@ fn testRootPlan(allocator: Allocator, flavor: Flavor) !RootPlan {
     const kernel_root_count: usize = if (kernel == null) 0 else 2;
     const guest = try scratch.alloc([]const u8, kernel_root_count + literal.len);
     if (kernel) |selection| {
-        guest[0] = selection.image_package;
-        guest[1] = selection.modules_package;
+        guest[0] = selection.modules_package;
+        guest[1] = selection.image_package;
     }
     for (literal, 0..) |name, index| guest[kernel_root_count + index] = name;
     const stage_roots = flavor.buildStageRoots();
@@ -536,8 +537,8 @@ const baremetal_kernel_release = "7.0.0-2015" ++ nvidia_bos_kernel_suffix;
 const baremetal_image_package = "linux-image-" ++ baremetal_kernel_release;
 const baremetal_modules_package = "linux-modules-" ++ baremetal_kernel_release;
 const baremetal_guest_roots = [_][]const u8{
-    baremetal_image_package,
     baremetal_modules_package,
+    baremetal_image_package,
     "openssh-server",
     "sudo",
     // The trust store is explicit for every fresh root: none of their required
@@ -2558,8 +2559,19 @@ fn validateCoreKernelModules(
     defer allocator.free(modules_dep_path);
     const modules_dep = try root.readFile(modules_dep_path);
     defer allocator.free(modules_dep);
+    const modules_builtin_path = try allocator.print(
+        "{s}/modules.builtin",
+        .{modules_path},
+    );
+    defer allocator.free(modules_builtin_path);
+    const modules_builtin = root.readFile(modules_builtin_path) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, ""),
+        else => return err,
+    };
+    defer allocator.free(modules_builtin);
     for (&[_][]const u8{ "hv_netvsc.ko", "overlay.ko", "isofs.ko", "udf.ko", "xfs.ko" }) |module|
-        if (std.mem.indexOf(u8, modules_dep, module) == null)
+        if (std.mem.indexOf(u8, modules_dep, module) == null and
+            std.mem.indexOf(u8, modules_builtin, module) == null)
             return error.CoreKernelModuleMissing;
     // Binder is an Azure-kernel-only capability: bare metal boots the NVIDIA
     // BaseOS kernel and never claims Binder support, so this stays scoped to
@@ -3950,6 +3962,7 @@ fn runDebzTransaction(
     const restricted_permissions = try copyRootStage(allocator, io, current, current_contents, stage);
     const absolute_stage = try Dir.cwd().realPathFileAlloc(io, stage, allocator);
     defer allocator.free(absolute_stage);
+    try Dir.cwd().setFilePermissions(io, absolute_stage, .fromMode(0o700), .{});
     try seedLockCaseWitnesses(allocator, io, absolute_stage, transaction.lock);
     const absolute_published = if (std.fs.path.isAbsolute(published))
         try allocator.dupe(u8, published)
@@ -3988,6 +4001,7 @@ fn runDebzTransaction(
     defer allocator.free(customized.provenance_path.?);
     try restoreRestrictedRootEntry(allocator, io, absolute_published, restricted_permissions);
     try removeLockCaseWitnesses(allocator, io, absolute_published, transaction.lock);
+    try Dir.cwd().setFilePermissions(io, absolute_published, .fromMode(0o755), .{});
     const expected_provenance = try std.fs.path.join(
         allocator,
         &.{ transaction.state, "transaction-result.json" },
@@ -4114,11 +4128,13 @@ fn planRoots(
     const kernel_root_count: usize = if (kernel == null) 0 else 2;
     const guest = try scratch.alloc([]const u8, kernel_root_count + literal.len);
     if (kernel) |selection| {
-        // The image is first because the first root is the transaction that
-        // creates the otherwise-empty baseline, and because a module tree
-        // without its kernel is not something to install by itself.
-        guest[0] = selection.image_package;
-        guest[1] = selection.modules_package;
+        // The module tree is first so the initial `.create` transaction
+        // installs `linux-modules-<release>` as a fresh package before
+        // `linux-image-<release>` (which depends on `linux-modules-<release>`)
+        // runs as `.customize`, avoiding a reinstall of case-aliased netfilter
+        // modules in `debz`.
+        guest[0] = selection.modules_package;
+        guest[1] = selection.image_package;
     }
     for (literal, 0..) |name, index| {
         guest[kernel_root_count + index] = try scratch.dupe(u8, name);
@@ -5070,6 +5086,86 @@ fn linuxModulesNetfilterWitnessDir(allocator: Allocator, package_name: []const u
     );
 }
 
+const openssh_server_debconf_templates_stanza =
+    "Name: openssh-server/password-authentication\n" ++
+    "Default: true\n" ++
+    "Description: Allow password authentication?\n" ++
+    "Type: boolean\n" ++
+    "Owners: openssh-server/password-authentication\n" ++
+    "\n" ++
+    "Name: openssh-server/permit-root-login\n" ++
+    "Default: true\n" ++
+    "Description: Disable SSH password authentication for root?\n" ++
+    "Type: boolean\n" ++
+    "Owners: openssh-server/permit-root-login\n\n";
+
+const openssh_server_debconf_config_stanza =
+    "Name: openssh-server/password-authentication\n" ++
+    "Template: openssh-server/password-authentication\n" ++
+    "Value: true\n" ++
+    "Owners: openssh-server\n" ++
+    "\n" ++
+    "Name: openssh-server/permit-root-login\n" ++
+    "Template: openssh-server/permit-root-login\n" ++
+    "Value: true\n" ++
+    "Owners: openssh-server\n\n";
+
+fn appendDebconfStanzaIfMissing(
+    allocator: Allocator,
+    io: Io,
+    root_stage: []const u8,
+    rel_path: []const u8,
+    marker: []const u8,
+    stanza: []const u8,
+) !void {
+    const full_path = try std.fs.path.join(allocator, &.{ root_stage, rel_path });
+    defer allocator.free(full_path);
+    const existing = Dir.cwd().readFileAlloc(
+        io,
+        full_path,
+        allocator,
+        .limited(16 * 1024 * 1024),
+    ) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(existing);
+    if (std.mem.indexOf(u8, existing, marker) != null) return;
+
+    const separator: []const u8 = if (existing.len == 0 or std.mem.endsWith(u8, existing, "\n\n"))
+        ""
+    else if (std.mem.endsWith(u8, existing, "\n"))
+        "\n"
+    else
+        "\n\n";
+    const updated = try std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ existing, separator, stanza });
+    defer allocator.free(updated);
+    try Dir.cwd().writeFile(io, .{ .sub_path = full_path, .data = updated });
+}
+
+fn seedOpensshServerDebconfDefaults(
+    allocator: Allocator,
+    io: Io,
+    root_stage: []const u8,
+) !void {
+    try appendDebconfStanzaIfMissing(
+        allocator,
+        io,
+        root_stage,
+        "var/cache/debconf/templates.dat",
+        "Name: openssh-server/permit-root-login\n",
+        openssh_server_debconf_templates_stanza,
+    );
+    try appendDebconfStanzaIfMissing(
+        allocator,
+        io,
+        root_stage,
+        "var/cache/debconf/config.dat",
+        "Name: openssh-server/permit-root-login\n",
+        openssh_server_debconf_config_stanza,
+    );
+}
+
 fn seedLockCaseWitnesses(
     allocator: Allocator,
     io: Io,
@@ -5097,6 +5193,8 @@ fn seedLockCaseWitnesses(
         if (name != .string) continue;
         if (std.mem.eql(u8, name.string, "libpam-runtime")) {
             try seedCaseWitnessDirectory(allocator, io, root_stage, fresh_root_case_witness_man7_dir);
+        } else if (std.mem.eql(u8, name.string, "openssh-server")) {
+            try seedOpensshServerDebconfDefaults(allocator, io, root_stage);
         } else if (try linuxModulesNetfilterWitnessDir(allocator, name.string)) |rel_dir| {
             defer allocator.free(rel_dir);
             try seedCaseWitnessDirectory(allocator, io, root_stage, rel_dir);
@@ -6998,8 +7096,12 @@ fn validateNoStaleNamedUki(
     }
 }
 
+fn runtimeAllocator(init: std.process.Init) Allocator {
+    return if (builtin.link_libc) std.heap.c_allocator else init.gpa;
+}
+
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    const allocator = runtimeAllocator(init);
     const argv = try init.minimal.args.toSlice(init.arena.allocator());
     const args = parseArgs(argv[1..]) catch |err| {
         std.debug.print("error: {s}\n{s}", .{ @errorName(err), help });
@@ -7045,7 +7147,7 @@ fn buildImage(
     timing: *image_phase_timing.Recorder,
 ) !void {
     var phase_error: anyerror = undefined;
-    const allocator = init.gpa;
+    const allocator = runtimeAllocator(init);
     const io = init.io;
     const profile = profileFor(architecture);
     var input_acquisition = timing.begin(.input_acquisition, null);
@@ -10916,8 +11018,8 @@ test "both guest architectures resolve the same explicit roots with no recommend
             @as(usize, 2 + core_guest_literal_roots.len),
             roots.len,
         );
-        try std.testing.expectEqualStrings(test_kernel_image, roots[0]);
-        try std.testing.expectEqualStrings(test_kernel_modules, roots[1]);
+        try std.testing.expectEqualStrings(test_kernel_modules, roots[0]);
+        try std.testing.expectEqualStrings(test_kernel_image, roots[1]);
         for (roots[2..], core_guest_literal_roots) |planned, expected| {
             try std.testing.expectEqualStrings(expected, planned);
         }

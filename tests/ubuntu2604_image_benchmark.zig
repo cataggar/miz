@@ -1627,7 +1627,7 @@ test "benchmark cache requirements match debz 0.4.0 repository and configuration
     const frozen_source = try std.fmt.allocPrint(
         allocator,
         \\Types: deb
-        \\URIs: https://snapshot.ubuntu.com/ubuntu/20260731T000000Z
+        \\URIs: https://snapshot.ubuntu.com/ubuntu/20261001T000000Z
         \\Suites: resolute
         \\Components: main restricted universe multiverse
         \\Architectures: arm64
@@ -1639,7 +1639,7 @@ test "benchmark cache requirements match debz 0.4.0 repository and configuration
     const witness_source = try std.fmt.allocPrint(
         allocator,
         \\Types: deb
-        \\URIs: https://snapshot.ubuntu.com/ubuntu/20260731T000000Z
+        \\URIs: https://snapshot.ubuntu.com/ubuntu/20261001T000000Z
         \\Suites: resolute-updates resolute-security
         \\Components: main restricted universe multiverse
         \\Architectures: arm64
@@ -2134,8 +2134,8 @@ fn makeProvenanceFixture(fixture: *Fixture) !ProvenanceFixture {
         \\    "api_commit": "{s}",
         \\    "baseline": {{"source": "empty-debz-root", "enforcement": "exact-final-closure"}},
         \\    "package_roots": [
-        \\      "linux-image-7.0.0-2015-nvidia-bos-64k",
         \\      "linux-modules-7.0.0-2015-nvidia-bos-64k",
+        \\      "linux-image-7.0.0-2015-nvidia-bos-64k",
         \\      "openssh-server",
         \\      "sudo",
         \\      "ca-certificates"

@@ -78,7 +78,7 @@ than `Ubuntu --model core`.
 
 `scripts/build_generalized_ubuntu2604.zig` uses Canonical's immutable
 `release-20260731` cloud-image publication and
-`https://snapshot.ubuntu.com/ubuntu/20260731T000000Z`.
+`https://snapshot.ubuntu.com/ubuntu/20261001T000000Z`.
 
 For full, the official server cloud disk is the authoritative filesystem and
 installed-package baseline. The embedded `miz.package_family` debz backend
@@ -88,15 +88,16 @@ root from packages.
 For core, the same signed cloud disk is used only as the pinned Gen2 GPT and
 EFI-system-partition substrate. The server root is discarded and a fresh root
 is assembled from an empty debz baseline with exact package roots, in stable
-order: the selected `linux-image-<release>-azure`, its matching
-`linux-modules-<release>-azure`, then `openssh-server`, `sudo`, and
+order: the selected `linux-modules-<release>-azure`, its matching
+`linux-image-<release>-azure`, then `openssh-server`, `sudo`, and
 `ca-certificates`. The literal three are not a hand-written list: they are
 exactly the `guest_runtime` `package` requirements of the runtime contract, and
 `build_generalized_ubuntu2604.zig` and `scripts/ubuntu2604/contracts.zig` both
 fail to compile if the two ever disagree, so a guest root exists only for a
 behavior the contract names. The order is a build decision the builder owns:
-the kernel image is first because the first root is the transaction that
-creates the empty baseline.
+the kernel module tree is first so the initial `.create` transaction installs
+`linux-modules-<release>-azure` as a fresh package before
+`linux-image-<release>-azure` (which depends on it) runs as `.customize`.
 
 Issue #677 step 3 removed the `ubuntu-minimal` metapackage from that list. It
 was what pulled an apt client, an init system, an editor, a pager, locales, a
@@ -278,7 +279,7 @@ The following inputs are compiled into the builder:
 - arm64 manifest SHA-256:
   `2889120db0432e8029f8f01622efb40ce964e434ba2c81e98937ad1e2616e4f5`
 - embedded debz API commit:
-  `7dd6e8e30b33a7898b12c80b7aa0fe89dc4cbc6f`
+  `35ac08fc6103cd73a8c712af557886cfccb20187`
 
 The builder first verifies the pinned checksum files with its bounded native
 OpenPGP verifier. It embeds Canonical's ASCII-armored public key, pins the
@@ -530,7 +531,7 @@ diffs numbers rather than structure, but they share no measured quantity:
 | packages | 100 | 100 |
 | installed bytes | 312455680 | 367523299 |
 | kernel bytes | 17403904 | 22024192 |
-| initramfs bytes | 40538112 | 58855424 |
+| initramfs bytes | 42913792 | 58855424 |
 | module tree bytes | 155000832 | 170225664 |
 | signed UKI bytes | 58015648 | 130871200 |
 | calculated virtual size | 611319808 (583 MiB) | 818937856 (781 MiB) |

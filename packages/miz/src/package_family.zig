@@ -13,7 +13,7 @@ const Dir = Io.Dir;
 pub const api_version: u32 = 4;
 pub const request_schema = "io.github.cataggar.miz.package-family.request.v4";
 pub const result_schema = "io.github.cataggar.miz.package-family.result.v4";
-pub const debz_commit = "7dd6e8e30b33a7898b12c80b7aa0fe89dc4cbc6f";
+pub const debz_commit = "35ac08fc6103cd73a8c712af557886cfccb20187";
 pub const debz_api_commit = debz_commit;
 pub const debz_capability_schema = "io.github.cataggar.debz.package-family.capabilities.v2";
 pub const debz_request_schema = "io.github.cataggar.debz.package-family.request.v2";
@@ -425,7 +425,405 @@ fn executeDebz(
         .now_unix = request.inputs.now_unix orelse backend.now_unix,
         .archive_digest_policy = .published_digests,
     };
-    return native_backend.execute(allocator, debz_request);
+    return executeNativeDebz(
+        native_backend,
+        allocator,
+        debz_request,
+        request.inputs.installed_baseline,
+    );
+}
+
+fn executeNativeDebz(
+    native_backend: debz.NativePackageFamilyBackend,
+    allocator: Allocator,
+    request: debz.PackageFamilyRequest,
+    installed_baseline: InstalledBaselinePolicy,
+) !debz.PackageFamilyOwnedResult {
+    switch (request.operation) {
+        .inspect => return native_backend.execute(allocator, request),
+        .resolve_lock => {
+            var resolved = try native_backend.execute(allocator, request);
+            errdefer resolved.deinit();
+            if (resolved.result.succeeded and
+                installed_baseline == .none and
+                request.package != null and
+                !std.mem.eql(u8, request.package.?, "mawk"))
+            {
+                if (resolved.result.lock_path) |lock_path| {
+                    try preferMawkOverGawkInFreshRootLock(
+                        native_backend,
+                        allocator,
+                        request,
+                        lock_path,
+                    );
+                }
+            }
+            return resolved;
+        },
+        .create, .customize, .update, .recover => {},
+    }
+    var arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    var native_install: ?debz.product_api.NativeInstallEvidence = null;
+    var native_completion: ?debz.product_api.NativeCompletionEvidence = null;
+    var result: debz.PackageFamilyResult = output: {
+        const product_operation: debz.ProductOperation = switch (request.operation) {
+            .resolve_lock => .plan,
+            .create, .customize => .install,
+            .update => if (request.package == null) .upgrade_all else .upgrade,
+            .recover => .recover,
+            .inspect => .list_installed,
+        };
+        const packages: []const []const u8 = if (request.package) |package|
+            try owned.dupe([]const u8, &.{package})
+        else
+            &.{};
+        const offline = request.cache_mode == .offline;
+        const foreign_architectures = try owned.alloc([]const u8, request.foreign_architectures.len);
+        for (request.foreign_architectures, 0..) |architecture, index|
+            foreign_architectures[index] = architecture.spelling();
+        const product_request: debz.ProductRequest = .{
+            .operation = product_operation,
+            .packages = packages,
+            .options = .{
+                .install_root = request.root,
+                .source_paths = request.sources,
+                .config_paths = request.configs,
+                .keyring_paths = request.keyrings,
+                .cache_path = request.cache,
+                .state_path = request.state,
+                .architecture = request.architecture.spelling(),
+                .foreign_architectures = foreign_architectures,
+                .repository_policy = request.repository_policy,
+                .proxy = request.proxy,
+                .credential_reference = request.credential_reference,
+                .lock_input_path = request.lock_input,
+                .lock_output_path = request.lock_output,
+                .offline = offline,
+                .cache_only = offline,
+                .recommends = request.recommends,
+                .allow_downgrade = request.allow_downgrade,
+                .deadline_ms = request.deadline_ms,
+                .lock_wait_ms = request.lock_wait_ms,
+                .assume_yes = product_operation.mutates(),
+                .noninteractive = product_operation.mutates(),
+                .conffile = request.conffile,
+            },
+        };
+        const lock_path = if (request.lock_output orelse request.lock_input) |path|
+            try owned.dupe(u8, path)
+        else
+            null;
+        const provenance_path = if (request.operation != .resolve_lock)
+            try std.fmt.allocPrint(owned, "{s}/{s}", .{ request.root, debz.native_provenance.document_path })
+        else
+            null;
+        var native: debz.ProductionBackend = .{
+            .io = native_backend.io,
+            .transaction_backend = .native,
+            .native_runtime_allocator = allocator,
+            .now_unix = native_backend.now_unix,
+            .native_archive_digest_policy = native_backend.archive_digest_policy,
+        };
+        const response = try debz.executeProductRequest(owned, product_request, native.interface());
+        native_install = response.native_install;
+        native_completion = response.native_completion;
+        if (!consistentNativeDebzEvidence(product_request, response))
+            break :output nativeDebzEvidenceFailure(request.operation, response.changed, "native package-family result evidence is inconsistent");
+        if (response.exit_status != .success) {
+            var failed_result = debzFamilyFailure(
+                request.operation,
+                response.exit_status,
+                .backend_failed,
+                response.summary,
+                response.exit_status == .transaction or response.exit_status == .recovery,
+            );
+            failed_result.changed = response.changed;
+            if (native_completion != null) failed_result.provenance_path = provenance_path;
+            break :output failed_result;
+        }
+        if (response.changed and request.operation != .recover) {
+            var verified = verifyCompletedProductSuccess(
+                native_backend,
+                allocator,
+                request,
+                product_request,
+                native_completion.?,
+            ) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                break :output nativeDebzEvidenceFailure(
+                    request.operation,
+                    response.changed,
+                    try std.fmt.allocPrint(owned, "native completion verification failed: {s}", .{@errorName(err)}),
+                );
+            };
+            defer verified.deinit();
+            if (native_install) |install|
+                if (verified.summary.package_count != install.package_count)
+                    break :output nativeDebzEvidenceFailure(request.operation, response.changed, "native completion package count differs from the returned install evidence");
+        }
+        break :output .{
+            .operation = request.operation,
+            .succeeded = true,
+            .changed = response.changed,
+            .exit_status = .success,
+            .lock_path = lock_path,
+            .provenance_path = if (native_completion != null) provenance_path else null,
+        };
+    };
+    result.schema = debz_result_schema;
+    result.version = debz_schema_version;
+    return .{
+        .result = result,
+        .arena = arena,
+        .native_install = native_install,
+        .native_completion = native_completion,
+        .native_inspection = null,
+    };
+}
+
+fn verifyCompletedProductSuccess(
+    native_backend: debz.NativePackageFamilyBackend,
+    allocator: Allocator,
+    original: debz.PackageFamilyRequest,
+    product_request: debz.ProductRequest,
+    returned: debz.product_api.NativeCompletionEvidence,
+) !debz.NativePackageFamilyVerifiedCompletion {
+    if (returned.outcome != .succeeded or returned.settlement != .cleared)
+        return error.InvalidNativeFamilyCompletion;
+    if (debz.product_api.validate(product_request) != null)
+        return error.InvalidNativeFamilyVerificationRequest;
+    const path = original.lock_input.?;
+    var parent = try debz.root_fs.openAbsoluteRoot(native_backend.io, std.fs.path.dirname(path).?);
+    defer parent.close();
+    const store = try debz.exact_lock_v3.Store.init(native_backend.io, parent.root.dir, std.fs.path.basename(path));
+    var lock = try store.read(allocator, debz.exact_lock_v3.maximum_document_bytes);
+    defer lock.deinit();
+    var root = try debz.root_fs.openAbsoluteRoot(native_backend.io, original.root);
+    defer root.close();
+    var locks: debz.root_operation.SystemLockBackend = .{ .allocator = allocator, .io = native_backend.io };
+    var summary = debz.native_transaction_result.verifyForCaller(
+        allocator,
+        root.root,
+        original.root,
+        lock.lock,
+        original.architecture.spelling(),
+        .{
+            .operation = product_request.operation,
+            .request_sha256 = debz.production_backend.productRequestDigest(product_request),
+            .policy_sha256 = debz.production_backend.planningPolicyDigest(.native, product_request.options),
+            .foreign_architectures = product_request.options.foreign_architectures,
+            .completion = returned,
+            .archive_digest_policy = native_backend.archive_digest_policy,
+        },
+        locks.interface(),
+    ) catch |err| switch (err) {
+        error.CallerRequestMismatch => return error.NativeFamilyRequestMismatch,
+        error.CompletionResultMismatch => return error.NativeFamilyCompletionMismatch,
+        else => return err,
+    };
+    summary.install_root = try allocator.dupe(u8, summary.install_root);
+    return .{ .summary = summary, .allocator = allocator };
+}
+
+fn isGawkOnlyBootstrapDependency(name: []const u8) bool {
+    inline for (.{
+        "gawk",
+        "libmpfr6",
+        "libreadline8t64",
+        "readline-common",
+    }) |candidate| {
+        if (std.mem.eql(u8, name, candidate)) return true;
+    }
+    return false;
+}
+
+fn preferMawkOverGawkInFreshRootLock(
+    native_backend: debz.NativePackageFamilyBackend,
+    allocator: Allocator,
+    request: debz.PackageFamilyRequest,
+    lock_path: []const u8,
+) !void {
+    const io = native_backend.io;
+    const lock_bytes = try readRegularFile(
+        allocator,
+        io,
+        lock_path,
+        debz.exact_lock_v3.maximum_document_bytes,
+    );
+    defer allocator.free(lock_bytes);
+    var lock = try debz.decodeExactClosureLockV3(
+        allocator,
+        lock_bytes,
+        debz.exact_lock_v3.maximum_document_bytes,
+    );
+    defer lock.deinit();
+
+    var has_gawk_dependency = false;
+    for (lock.lock.packages) |pkg| {
+        if (std.mem.eql(u8, pkg.name, "mawk")) return;
+        if (std.mem.eql(u8, pkg.name, "gawk") and pkg.retention == .dependency) {
+            has_gawk_dependency = true;
+        }
+    }
+    if (!has_gawk_dependency) return;
+
+    const mawk_state = try allocator.print("{s}/mawk-bootstrap-state", .{request.state});
+    defer allocator.free(mawk_state);
+    const mawk_lock_path = try allocator.print("{s}/mawk-bootstrap-lock.json", .{request.state});
+    defer allocator.free(mawk_lock_path);
+    Dir.cwd().deleteTree(io, mawk_state) catch {};
+    Dir.cwd().deleteFile(io, mawk_lock_path) catch {};
+    try Dir.cwd().createDirPath(io, mawk_state);
+    defer Dir.cwd().deleteTree(io, mawk_state) catch {};
+    defer Dir.cwd().deleteFile(io, mawk_lock_path) catch {};
+
+    var mawk_request = request;
+    mawk_request.package = "mawk";
+    mawk_request.state = mawk_state;
+    mawk_request.lock_output = mawk_lock_path;
+    var mawk_resolved = try native_backend.execute(allocator, mawk_request);
+    defer mawk_resolved.deinit();
+    if (!mawk_resolved.result.succeeded) return error.MawkBootstrapResolveFailed;
+
+    const mawk_lock_bytes = try readRegularFile(
+        allocator,
+        io,
+        mawk_lock_path,
+        debz.exact_lock_v3.maximum_document_bytes,
+    );
+    defer allocator.free(mawk_lock_bytes);
+    var mawk_lock = try debz.decodeExactClosureLockV3(
+        allocator,
+        mawk_lock_bytes,
+        debz.exact_lock_v3.maximum_document_bytes,
+    );
+    defer mawk_lock.deinit();
+
+    var mawk_pkg: ?debz.exact_lock_v3.Package = null;
+    for (mawk_lock.lock.packages) |pkg| {
+        if (std.mem.eql(u8, pkg.name, "mawk")) {
+            var copy = pkg;
+            copy.retention = .dependency;
+            mawk_pkg = copy;
+            break;
+        }
+    }
+    const replacement_mawk = mawk_pkg orelse return error.MawkBootstrapPackageMissing;
+
+    var new_packages: std.ArrayListUnmanaged(debz.exact_lock_v3.Package) = .empty;
+    defer new_packages.deinit(allocator);
+    for (lock.lock.packages) |pkg| {
+        if (pkg.retention == .dependency and isGawkOnlyBootstrapDependency(pkg.name)) continue;
+        try new_packages.append(allocator, pkg);
+    }
+    try new_packages.append(allocator, replacement_mawk);
+
+    var new_repositories: std.ArrayListUnmanaged(debz.exact_lock_v3.Repository) = .empty;
+    defer new_repositories.deinit(allocator);
+    for ([_][]const debz.exact_lock_v3.Repository{
+        lock.lock.repositories,
+        mawk_lock.lock.repositories,
+    }) |repo_slice| {
+        for (repo_slice) |repo| {
+            var already_added = false;
+            for (new_repositories.items) |existing| {
+                if (std.mem.eql(u8, &existing.id, &repo.id)) {
+                    already_added = true;
+                    break;
+                }
+            }
+            if (already_added) continue;
+            var referenced = false;
+            for (new_packages.items) |pkg| switch (pkg.origin) {
+                .authenticated_repository => |origin| {
+                    if (std.mem.eql(u8, &origin.repository_id, &repo.id)) {
+                        referenced = true;
+                        break;
+                    }
+                },
+                .local_artifact => {},
+            };
+            if (referenced) try new_repositories.append(allocator, repo);
+        }
+    }
+
+    var rebuilt = try debz.createExactClosureLockV3(allocator, .{
+        .target_architecture = lock.lock.target_architecture,
+        .request_sha256 = lock.lock.request_sha256,
+        .policy_sha256 = lock.lock.policy_sha256,
+        .repositories = new_repositories.items,
+        .local_artifacts = lock.lock.local_artifacts,
+        .packages = new_packages.items,
+        .verified_origins = true,
+    });
+    defer rebuilt.deinit();
+    const canonical = try rebuilt.lock.canonicalJson(allocator);
+    defer allocator.free(canonical);
+    try writeRegularFile(io, lock_path, canonical);
+}
+
+fn nativeDebzEvidenceFailure(
+    operation: debz.package_family_backend.Operation,
+    changed: bool,
+    message: []const u8,
+) debz.PackageFamilyResult {
+    var result = debzFamilyFailure(operation, .recovery, .native_evidence_unavailable, message, true);
+    result.changed = changed;
+    return result;
+}
+
+fn debzFamilyFailure(
+    operation: debz.package_family_backend.Operation,
+    status: debz.ProductExitStatus,
+    id: debz.package_family_backend.ErrorId,
+    message: []const u8,
+    recoverable: bool,
+) debz.PackageFamilyResult {
+    return .{
+        .operation = operation,
+        .succeeded = false,
+        .exit_status = status,
+        .diagnostic = .{ .id = id, .message = message, .recoverable = recoverable },
+    };
+}
+
+fn consistentNativeDebzEvidence(request: debz.ProductRequest, response: debz.ProductResult) bool {
+    if (response.operation != request.operation) return false;
+    if (response.native_completion) |completion| {
+        if (!response.changed or completion.settlement != .cleared or
+            (completion.outcome == .succeeded) != (response.exit_status == .success) or
+            (completion.outcome == .failed and response.exit_status != .transaction))
+            return false;
+        if (request.operation != .recover and
+            (completion.operation != request.operation or
+                !std.mem.eql(u8, &completion.caller_request_sha256, &debz.production_backend.productRequestDigest(request)) or
+                !std.mem.eql(u8, &completion.caller_policy_sha256, &debz.production_backend.planningPolicyDigest(.native, request.options))))
+            return false;
+    }
+    if (request.operation == .plan)
+        return !response.changed and response.native_install == null and response.native_completion == null;
+    if (request.operation == .recover)
+        return response.native_install == null and
+            (response.exit_status != .success or response.changed == (response.native_completion != null));
+    if (response.exit_status != .success) return response.native_install == null;
+    if (request.operation == .upgrade or request.operation == .upgrade_all)
+        return response.native_install == null and response.changed == (response.native_completion != null);
+    const install = response.native_install orelse return false;
+    if (!std.mem.eql(u8, &install.caller_request_sha256, &debz.production_backend.productRequestDigest(request)) or
+        !std.mem.eql(u8, &install.caller_policy_sha256, &debz.production_backend.planningPolicyDigest(.native, request.options)) or
+        response.changed != (install.receipt != null) or
+        response.changed != (response.native_completion != null))
+        return false;
+    if (install.receipt) |receipt| {
+        const completion = response.native_completion.?;
+        return std.mem.eql(u8, &install.lock_sha256, &completion.lock_sha256) and
+            std.mem.eql(u8, &receipt.transaction_digest_sha256, &completion.transaction_digest_sha256) and
+            std.mem.eql(u8, &receipt.completion_digest_sha256, &completion.completion_digest_sha256) and
+            std.mem.eql(u8, &receipt.program_sha256, &completion.program_sha256);
+    }
+    return true;
 }
 
 fn debzArchitectures(

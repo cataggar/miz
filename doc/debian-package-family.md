@@ -29,8 +29,8 @@ operation. miz exposes a package list but rejects more than one name with a
 typed diagnostic rather than silently dropping names.
 
 The immutable Zig dependency is debz 0.4.0 at commit
-`7dd6e8e30b33a7898b12c80b7aa0fe89dc4cbc6f` (hash
-`debz-0.4.0-Mmw8sETsXgN6ozDL0PAz3EIV7OvYNvwvnw7dHgpnneX1`). At every call
+`35ac08fc6103cd73a8c712af557886cfccb20187` (hash
+`debz-0.4.0-Mmw8sDY6XwP13tMivZJ8tdR9ksJEhG22JxhTmTzGMp5A`). At every call
 boundary miz checks the debz capability
 (`io.github.cataggar.debz.package-family.capabilities.v2`), request
 (`io.github.cataggar.debz.package-family.request.v2`), and result
