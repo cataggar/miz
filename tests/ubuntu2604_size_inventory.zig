@@ -1606,3 +1606,58 @@ test "the full flavor keeps its broad rules and its own policy" {
         try std.testing.expect(!std.mem.eql(u8, rule.pattern, "/etc/systemd/system/**"));
     }
 }
+
+test "merged-usr dpkg file lists attribute /lib descendants walked under /usr/lib" {
+    var root = try GeneratedRoot.create();
+    defer root.deinit();
+    try root.fixture.write(
+        size_inventory.package_lock_path,
+        "alpha\t1.0-1\tarm64\ngawk\t1:5.3.2-1\tarm64\nopenssh-server\t1:10.2p1-5\tarm64\nwireless-regdb\t2026.02.04-0ubuntu1\tall\n",
+    );
+    try root.fixture.write(
+        "/var/lib/dpkg/info/wireless-regdb.list",
+        "/.\n/lib\n/lib/firmware\n/lib/firmware/regulatory.db\n/lib/firmware/regulatory.db.p7s\n",
+    );
+    try root.fixture.write("/usr/lib/firmware/regulatory.db", "regulatory database");
+    try root.fixture.write("/usr/lib/firmware/regulatory.db.p7s", "detached signature");
+
+    const section = try size_inventory.measureRootBuild(
+        root.fixture.allocator(),
+        root.fixture.scratch(),
+        root.fixture.io,
+        .{
+            .root_path = root.fixture.root,
+            .flavor = .baremetal,
+            .kernel_release = kernel_release,
+            .require_allowlisted_unowned = true,
+        },
+        &root.fixture.diagnostic,
+    );
+    try std.testing.expectEqual(
+        @as(i64, 0),
+        count(section, &.{ "unowned", "unexpected", "file_count" }),
+    );
+    const regdb = entryBy(
+        field(section, &.{"packages"}),
+        "name",
+        "wireless-regdb",
+    ).?;
+    try std.testing.expectEqual(
+        @as(i64, 3),
+        count(regdb, &.{"file_count"}),
+    );
+    try std.testing.expect(
+        count(regdb, &.{"installed_bytes"}) >= @as(i64, "regulatory database".len + "detached signature".len),
+    );
+
+    var owned = try size_inventory.readOwnedPaths(
+        std.testing.allocator,
+        root.fixture.io,
+        root.fixture.root,
+    );
+    defer owned.deinit();
+    try std.testing.expectEqualStrings(
+        "wireless-regdb",
+        owned.owner("/usr/lib/firmware/regulatory.db").?,
+    );
+}

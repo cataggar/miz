@@ -2088,7 +2088,7 @@ fn forEachOwnershipRecord(
                 const text = std.mem.trimEnd(u8, line, "\r");
                 const path = if (conffiles) conffilePath(text) orelse continue else text;
                 if (path.len == 0 or path[0] != '/') continue;
-                try visit(context, path, package);
+                try visitOwnershipPath(strings, path, package, context, visit);
             }
         }
     }
@@ -2113,7 +2113,39 @@ fn forEachOwnershipRecord(
         // `:` is dpkg's spelling of a local administrator diversion, which no
         // package owns and which a fresh root must therefore never carry.
         if (package.len == 0 or std.mem.eql(u8, package, ":")) continue;
-        try visit(context, try strings.dupe(u8, to), try strings.dupe(u8, package));
+        try visitOwnershipPath(
+            strings,
+            try strings.dupe(u8, to),
+            try strings.dupe(u8, package),
+            context,
+            visit,
+        );
+    }
+}
+
+/// Visits `path` and, when `path` is a strict descendant of a merged-`/usr`
+/// alias (`/bin/...`, `/sbin/...`, `/lib/...`, etc.), also visits its `/usr`
+/// canonical path (`/usr/bin/...`, `/usr/sbin/...`, `/usr/lib/...`).
+///
+/// Pre-usrmerge packages such as `wireless-regdb` still record `/lib/firmware/regulatory.db`
+/// in their `.list` file, while a merged-`/usr` root stores the directory at
+/// `/usr/lib/firmware` behind the top-level `/lib -> usr/lib` symlink. The
+/// top-level alias itself (`/lib`) is not duplicated to `/usr/lib` because the
+/// root walk visits `/lib` as the symlink and `/usr/lib` as the directory.
+fn visitOwnershipPath(
+    strings: Allocator,
+    path: []const u8,
+    package: []const u8,
+    context: anytype,
+    comptime visit: fn (@TypeOf(context), []const u8, []const u8) Error!void,
+) Error!void {
+    try visit(context, path, package);
+    for (&merged_usr_aliases) |alias| {
+        if (!std.mem.startsWith(u8, path, alias)) continue;
+        if (path.len <= alias.len or path[alias.len] != '/') continue;
+        const normalized = try strings.print("/usr{s}", .{path});
+        try visit(context, normalized, package);
+        return;
     }
 }
 
