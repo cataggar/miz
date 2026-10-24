@@ -339,6 +339,18 @@ test "candidate reuse is bound to the exact source, run, and attempt" {
     try source.expectContainsIn(prepare, ".expired == false and .size_in_bytes > 0", workflow_path);
     try source.expectContainsIn(prepare, "git ls-remote origin \"refs/heads/main\"", workflow_path);
 
+    const azure = try job(&workflow, "azure_acceptance", "validate");
+    try source.expectContainsIn(
+        azure,
+        "CANDIDATE_RUN_ID: ${{ needs.prepare.outputs.candidate_run_id }}",
+        workflow_path,
+    );
+    try source.expectContainsIn(
+        azure,
+        "CANDIDATE_RUN_ATTEMPT: ${{ needs.prepare.outputs.candidate_run_attempt }}",
+        workflow_path,
+    );
+
     const gate = try job(&workflow, "validate", null);
     try source.expectContainsIn(gate, "--candidate-run-id \"$CANDIDATE_RUN_ID\"", workflow_path);
     try source.expectContainsIn(
