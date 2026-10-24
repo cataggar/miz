@@ -64,7 +64,7 @@ pub const sums_sha256 =
     "d562d59dac70f68d67d00e994db5cd89e49e9d93f7f80b4cb868a5eeb057ec36";
 pub const sums_signature_sha256 =
     "2bf5fae8be0c79cc30c5c10223f1d4790b6ef541240896bfe48c7ac57c3404ed";
-pub const debz_api_commit = "35ac08fc6103cd73a8c712af557886cfccb20187";
+pub const debz_api_commit = "a6c2732e2cab880b60a4affadb7e087bf007d1e8";
 pub const canonical_fingerprint = "d2eb44626fddc30b513d5bb71a5d6c4c7db87c81";
 pub const asset_name = "Ubuntu-26.04-aarch64.baremetal.qcow2";
 pub const raw_asset_name = "Ubuntu-26.04-aarch64.baremetal.raw";
