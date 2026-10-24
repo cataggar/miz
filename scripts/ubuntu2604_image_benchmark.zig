@@ -1944,6 +1944,8 @@ const non_semantic_transaction_fields = [_][]const u8{
     "attempt_id",
     "root_identity_sha256",
     "root_inode",
+    "request_sha256",
+    "program_sha256",
     "authorization_sha256",
     "execution_intent_sha256",
     "progress_head_sha256",

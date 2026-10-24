@@ -1013,6 +1013,8 @@ test "transaction correctness uses a semantic identity" {
     const lock_digest = digest_b;
     const transaction_digests = [_][]const u8{ digest_a, digest_c };
     const attempt_ids = [_][]const u8{ digest_d, digest_e };
+    const request_digests = [_][]const u8{ digest_a, digest_d };
+    const program_digests = [_][]const u8{ digest_c, digest_e };
     const root_inodes = [_]u64{ 101, 202 };
     const run_names = [_][]const u8{ "run-warmup", "run-measured-01" };
     var contracts: [2]Value = undefined;
@@ -1023,15 +1025,17 @@ test "transaction correctness uses a semantic identity" {
         run_names,
         transaction_digests,
         attempt_ids,
+        request_digests,
+        program_digests,
         root_inodes,
         0..,
-    ) |run_name, transaction_digest, attempt_id, root_inode, index| {
+    ) |run_name, transaction_digest, attempt_id, request_digest, program_digest, root_inode, index| {
         const run_root = try fixture.path(&.{ run_name, "work", "root-stage-0" });
         const document = try std.fmt.allocPrint(allocator,
             \\{{"schema": "https://debz.dev/schema/native-transaction-provenance-v2",
             \\  "version": 2, "backend": "native",
             \\  "install_root": "{s}", "attempt_id": "{s}",
-            \\  "root_inode": {d}, "program_sha256": "{s}",
+            \\  "root_inode": {d}, "request_sha256": "{s}", "program_sha256": "{s}",
             \\  "exact_lock_sha256": "{s}", "final_state_sha256": "{s}",
             \\  "final_state_kind": "package_database_closure_v1",
             \\  "outcome": "succeeded", "digest_sha256": "{s}"}}
@@ -1039,7 +1043,8 @@ test "transaction correctness uses a semantic identity" {
             run_root,
             attempt_id,
             root_inode,
-            digest_a,
+            request_digest,
+            program_digest,
             lock_digest,
             digest_f,
             transaction_digest,
