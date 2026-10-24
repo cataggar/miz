@@ -25,11 +25,11 @@ test "public consumer can model lock review and locked creation" {
         resolve.inputs.installed_baseline,
     );
     try std.testing.expectEqualStrings(
-        "35ac08fc6103cd73a8c712af557886cfccb20187",
+        "a6c2732e2cab880b60a4affadb7e087bf007d1e8",
         package_family.debz_api_commit,
     );
     try std.testing.expectEqualStrings(
-        "35ac08fc6103cd73a8c712af557886cfccb20187",
+        "a6c2732e2cab880b60a4affadb7e087bf007d1e8",
         package_family.debz_commit,
     );
     const capabilities = package_family.defaultDebianCapabilities();
