@@ -604,6 +604,54 @@ test "the warm cache verifies its content-addressed objects" {
     try std.testing.expectEqual(@as(usize, 1), inventory.package_objects);
     try std.testing.expect(inventory.hasPackageObject(cache.package_digest));
 
+    const sha512_bytes = "sha512-primary-package";
+    const sha512_sha256 = try hexDigest(fixture.allocator(), sha512_bytes);
+    var sha512_raw: [std.crypto.hash.sha2.Sha512.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha512.hash(sha512_bytes, &sha512_raw, .{});
+    const sha512_hex = std.fmt.bytesToHex(sha512_raw, .lower);
+    const sha512_object = try std.fmt.allocPrint(
+        fixture.allocator(),
+        "sha512-{s}",
+        .{&sha512_hex},
+    );
+    _ = try fixture.write(
+        &.{ "cache-fixture", "packages-v2", "objects", sha512_object },
+        sha512_bytes,
+    );
+    inventory = try benchmark.verifyWarmCache(
+        fixture.allocator(),
+        fixture.io,
+        cache.cache,
+        &fixture.context,
+    );
+    try std.testing.expectEqual(@as(usize, 2), inventory.package_objects);
+    try std.testing.expect(inventory.hasPackageObject(sha512_sha256));
+    try std.testing.expect(inventory.hasPackageObject(sha512_object));
+
+    const locks = try makeLocks(&fixture, sha512_sha256);
+    _ = try benchmark.verifyLockSet(
+        fixture.allocator(),
+        fixture.io,
+        locks,
+        &inventory,
+        &fixture.context,
+    );
+
+    _ = try fixture.write(
+        &.{ "cache-fixture", "packages-v2", "objects", sha512_object },
+        "corrupt-sha512",
+    );
+    try expectFailure(benchmark.verifyWarmCache(
+        fixture.allocator(),
+        fixture.io,
+        cache.cache,
+        &fixture.context,
+    ));
+    _ = try fixture.write(
+        &.{ "cache-fixture", "packages-v2", "objects", sha512_object },
+        sha512_bytes,
+    );
+
     const package_object = try std.fmt.allocPrint(
         fixture.allocator(),
         "sha256-{s}",

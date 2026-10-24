@@ -37,6 +37,7 @@ const Dir = std.Io.Dir;
 const File = std.Io.File;
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha512 = std.crypto.hash.sha2.Sha512;
 const Value = std.json.Value;
 const ObjectMap = std.json.ObjectMap;
 const JsonArray = std.json.Array;
@@ -238,6 +239,48 @@ fn isSha512Name(text: []const u8) bool {
 pub fn hashFileHex(io: Io, path: []const u8) ![64]u8 {
     const result = try digest_support.hashFile(io, path, std.math.maxInt(u64));
     return result.hex;
+}
+
+fn hashFileSha256AndSha512Hex(
+    io: Io,
+    path: []const u8,
+) !struct { sha256: [64]u8, sha512: [128]u8 } {
+    const file = try Dir.cwd().openFile(io, path, .{
+        .mode = .read_only,
+        .allow_directory = false,
+        .follow_symlinks = true,
+    });
+    defer file.close(io);
+
+    const before = try file.stat(io);
+    if (before.kind != .file) return error.NotRegularFile;
+
+    var sha256 = Sha256.init(.{});
+    var sha512 = Sha512.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < before.size) {
+        const length: usize = @intCast(@min(before.size - offset, buffer.len));
+        if (try file.readPositionalAll(io, buffer[0..length], offset) != length) {
+            return error.ShortRead;
+        }
+        sha256.update(buffer[0..length]);
+        sha512.update(buffer[0..length]);
+        offset += length;
+    }
+
+    const after = try file.stat(io);
+    const identity = digest_support.Identity.of(before);
+    if (!identity.eql(digest_support.Identity.of(after))) return error.FileChangedDuringRead;
+
+    var sha256_raw: [Sha256.digest_length]u8 = undefined;
+    sha256.final(&sha256_raw);
+    var sha512_raw: [Sha512.digest_length]u8 = undefined;
+    sha512.final(&sha512_raw);
+    return .{
+        .sha256 = std.fmt.bytesToHex(sha256_raw, .lower),
+        .sha512 = std.fmt.bytesToHex(sha512_raw, .lower),
+    };
 }
 
 /// `canonical_digest(value)`: SHA-256 over
@@ -940,7 +983,8 @@ fn requireSha256Text(
 }
 
 /// `verify_cache_objects`: every entry is a non-symlink regular file whose
-/// name is its own SHA-256.
+/// name is its own content digest (`sha256-` or `sha512-` for `packages-v2`
+/// objects, bare SHA-256 for `metadata-v1` objects).
 fn verifyCacheObjects(
     allocator: Allocator,
     io: Io,
@@ -960,12 +1004,36 @@ fn verifyCacheObjects(
     for (names) |name| {
         const path = try joinPath(allocator, &.{ directory, name });
         const stat = try statNoFollow(io, path);
+        if (stat.kind != .file) {
+            return context.fail("{s} contains a non-CAS entry: {s}", .{ label, path });
+        }
+        if (std.mem.eql(u8, label, "package") and
+            std.mem.startsWith(u8, name, "sha512-"))
+        {
+            const hex_digest_part = name["sha512-".len..];
+            if (!isSha512Name(hex_digest_part)) {
+                return context.fail("{s} contains a non-CAS entry: {s}", .{ label, path });
+            }
+            const digests = try hashFileSha256AndSha512Hex(io, path);
+            if (!std.mem.eql(u8, &digests.sha512, hex_digest_part)) {
+                return context.fail(
+                    "{s} object digest does not match its name: {s}",
+                    .{ label, path },
+                );
+            }
+            try records.append(allocator, .{
+                .path = name,
+                .bytes = @intCast(stat.size),
+                .sha256 = try allocator.dupe(u8, &digests.sha256),
+            });
+            continue;
+        }
         const hex_digest_part = if (std.mem.eql(u8, label, "package") and
             std.mem.startsWith(u8, name, "sha256-"))
             name["sha256-".len..]
         else
             name;
-        if (stat.kind != .file or !isSha256Name(hex_digest_part)) {
+        if (!isSha256Name(hex_digest_part)) {
             return context.fail("{s} contains a non-CAS entry: {s}", .{ label, path });
         }
         const hex = try hashFileHex(io, path);
