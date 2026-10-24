@@ -3,6 +3,16 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const arm64_linux_magic_offset = 0x38;
 const arm64_linux_magic = "ARM\x64";
+const linux_pe_magic = "\xcd\x23\x82\x81";
+const zboot_image_magic = "MZ\x00\x00zimg";
+const zboot_compression_types = [_][]const u8{
+    "gzip",
+    "lz4",
+    "lzma",
+    "lzo",
+    "xzkern",
+    "zstd",
+};
 const gzip_magic: u16 = 0x8b1f;
 
 pub const Architecture = enum {
@@ -40,14 +50,43 @@ pub fn peMachine(bytes: []const u8) !u16 {
     return std.mem.readInt(u16, machine, .little);
 }
 
+fn isArm64ZbootKernel(bytes: []const u8) bool {
+    if (bytes.len < 0x40) return false;
+    if (!std.mem.eql(u8, bytes[0..zboot_image_magic.len], zboot_image_magic)) return false;
+    if (!std.mem.eql(
+        u8,
+        bytes[arm64_linux_magic_offset .. arm64_linux_magic_offset + linux_pe_magic.len],
+        linux_pe_magic,
+    )) return false;
+    if (!std.mem.allEqual(u8, bytes[0x10..0x18], 0)) return false;
+
+    const payload_offset: usize = @intCast(std.mem.readInt(u32, bytes[0x08..0x0c], .little));
+    const payload_size: usize = @intCast(std.mem.readInt(u32, bytes[0x0c..0x10], .little));
+    if (payload_offset < 0x40 or payload_size == 0) return false;
+    const payload_end = std.math.add(usize, payload_offset, payload_size) catch return false;
+    if (payload_end > bytes.len) return false;
+
+    const comp_field = bytes[0x18..0x38];
+    for (zboot_compression_types) |comp| {
+        if (std.mem.startsWith(u8, comp_field, comp) and
+            std.mem.allEqual(u8, comp_field[comp.len..], 0))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn validateArm64EfiKernel(bytes: []const u8) !void {
     if (try peMachine(bytes) != 0xaa64) return error.WrongKernelArchitecture;
     const magic_end = arm64_linux_magic_offset + arm64_linux_magic.len;
-    if (bytes.len < magic_end or
-        !std.mem.eql(u8, bytes[arm64_linux_magic_offset..magic_end], arm64_linux_magic))
+    if (bytes.len >= magic_end and
+        std.mem.eql(u8, bytes[arm64_linux_magic_offset..magic_end], arm64_linux_magic))
     {
-        return error.InvalidArm64LinuxImage;
+        return;
     }
+    if (isArm64ZbootKernel(bytes)) return;
+    return error.InvalidArm64LinuxImage;
 }
 
 pub fn normalize(
@@ -109,6 +148,22 @@ fn arm64EfiKernel() [0x86]u8 {
     return bytes;
 }
 
+fn arm64ZbootKernel() [0x100]u8 {
+    var bytes: [0x100]u8 = @splat(0);
+    @memcpy(bytes[0..zboot_image_magic.len], zboot_image_magic);
+    std.mem.writeInt(u32, bytes[0x08..0x0c], 0x90, .little);
+    std.mem.writeInt(u32, bytes[0x0c..0x10], 0x40, .little);
+    @memcpy(bytes[0x18..0x1c], "zstd");
+    @memcpy(
+        bytes[arm64_linux_magic_offset .. arm64_linux_magic_offset + linux_pe_magic.len],
+        linux_pe_magic,
+    );
+    std.mem.writeInt(u32, bytes[0x3c..0x40], 0x40, .little);
+    @memcpy(bytes[0x40..0x44], "PE\x00\x00");
+    std.mem.writeInt(u16, bytes[0x44..0x46], 0xaa64, .little);
+    return bytes;
+}
+
 fn gzip(allocator: Allocator, bytes: []const u8) ![]u8 {
     var output = try std.Io.Writer.Allocating.initCapacity(allocator, 4096);
     errdefer output.deinit();
@@ -143,6 +198,36 @@ test "uncompressed Arm64 EFI kernel is borrowed" {
     defer payload.deinit(allocator);
     try std.testing.expect(payload.owned == null);
     try std.testing.expectEqualSlices(u8, &arm64, payload.bytes);
+}
+
+test "Arm64 EFI zboot kernel is borrowed" {
+    const allocator = std.testing.allocator;
+    const zboot = arm64ZbootKernel();
+    var payload = try normalize(allocator, .aarch64, &zboot, zboot.len);
+    defer payload.deinit(allocator);
+    try std.testing.expect(payload.owned == null);
+    try std.testing.expectEqualSlices(u8, &zboot, payload.bytes);
+
+    var bad_comp = zboot;
+    @memcpy(bad_comp[0x18..0x1c], "bz2\x00");
+    try std.testing.expectError(
+        error.InvalidArm64LinuxImage,
+        normalize(allocator, .aarch64, &bad_comp, bad_comp.len),
+    );
+
+    var bad_bounds = zboot;
+    std.mem.writeInt(u32, bad_bounds[0x0c..0x10], 0x80, .little);
+    try std.testing.expectError(
+        error.InvalidArm64LinuxImage,
+        normalize(allocator, .aarch64, &bad_bounds, bad_bounds.len),
+    );
+
+    var bad_reserved = zboot;
+    bad_reserved[0x10] = 1;
+    try std.testing.expectError(
+        error.InvalidArm64LinuxImage,
+        normalize(allocator, .aarch64, &bad_reserved, bad_reserved.len),
+    );
 }
 
 test "x86 kernel remains byte-for-byte unchanged" {
