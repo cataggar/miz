@@ -3950,9 +3950,7 @@ fn runDebzTransaction(
     const restricted_permissions = try copyRootStage(allocator, io, current, current_contents, stage);
     const absolute_stage = try Dir.cwd().realPathFileAlloc(io, stage, allocator);
     defer allocator.free(absolute_stage);
-    if (apply_operation == .create) {
-        try seedFreshRootCaseWitness(allocator, io, absolute_stage);
-    }
+    try seedLockCaseWitnesses(allocator, io, absolute_stage, transaction.lock);
     const absolute_published = if (std.fs.path.isAbsolute(published))
         try allocator.dupe(u8, published)
     else blk: {
@@ -3989,9 +3987,7 @@ fn runDebzTransaction(
         return error.DebzProvenanceMissing;
     defer allocator.free(customized.provenance_path.?);
     try restoreRestrictedRootEntry(allocator, io, absolute_published, restricted_permissions);
-    if (apply_operation == .create) {
-        try removeFreshRootCaseWitness(allocator, io, absolute_published);
-    }
+    try removeLockCaseWitnesses(allocator, io, absolute_published, transaction.lock);
     const expected_provenance = try std.fs.path.join(
         allocator,
         &.{ transaction.state, "transaction-result.json" },
@@ -4970,38 +4966,67 @@ fn restoreRestrictedRootEntry(
     try Dir.cwd().setFilePermissions(io, path, value, .{});
 }
 
-const fresh_root_case_witness_path = "usr/share/man/man7/.miz-case-witness";
+const fresh_root_case_witness_filename = ".miz-case-witness";
+const fresh_root_case_witness_man7_dir = "usr/share/man/man7";
 const fresh_root_case_witness_bytes = "witness\n";
+const linux_modules_prefix = "linux-modules-";
+const linux_modules_extra_prefix = "linux-modules-extra-";
 
-/// `libpam-runtime` ships both `usr/share/man/man7/PAM.7.gz` and the
-/// lowercase symlink `usr/share/man/man7/pam.7.gz`. `debz` requires an
-/// untouched regular-file witness already present in `usr/share/man/man7`
-/// before unpacking a case-only alias pair so `root_mutation` can prove the
-/// directory is case-sensitive. When `libsolv` orders `libpam-runtime`
-/// (in `resolute-updates`) ahead of `bash` (in `resolute`) during a fresh-root
-/// `.create` transaction, `usr/share/man/man7` has no package-owned files yet,
-/// so we seed a temporary witness before `.create` and remove it immediately
-/// after publication.
-fn seedFreshRootCaseWitness(allocator: Allocator, io: Io, root_stage: []const u8) !void {
-    for (&[_][]const u8{
-        "usr",
-        "usr/share",
-        "usr/share/man",
-        "usr/share/man/man7",
-    }) |rel_dir| {
-        const dir_path = try std.fs.path.join(allocator, &.{ root_stage, rel_dir });
-        defer allocator.free(dir_path);
-        try Dir.cwd().createDirPath(io, dir_path);
-        try Dir.cwd().setFilePermissions(
-            io,
-            dir_path,
-            std.Io.File.Permissions.fromMode(0o755),
-            .{},
-        );
+/// Two package families in the Ubuntu 26.04 closures ship case-only sibling
+/// paths within a single `.deb` payload:
+/// - `libpam-runtime`: `usr/share/man/man7/PAM.7.gz` and `usr/share/man/man7/pam.7.gz`
+/// - `linux-modules-<release>`: `xt_DSCP.ko.zst`/`xt_dscp.ko.zst`,
+///   `xt_HL.ko.zst`/`xt_hl.ko.zst`, `xt_RATEEST.ko.zst`/`xt_rateest.ko.zst`,
+///   and `xt_TCPMSS.ko.zst`/`xt_tcpmss.ko.zst` in
+///   `usr/lib/modules/<release>/kernel/net/netfilter`
+///
+/// `debz` requires an untouched regular-file witness already present in the
+/// parent directory before unpacking a case-only alias pair so `root_mutation`
+/// can prove the directory is case-sensitive. When a transaction's lock
+/// contains `libpam-runtime` or `linux-modules-<release>` and that target
+/// directory does not yet exist in `root_stage`, seed `.miz-case-witness` (and
+/// any missing 0755 ancestor directories) before execution and remove the
+/// witness file immediately after publication.
+fn seedCaseWitnessDirectory(
+    allocator: Allocator,
+    io: Io,
+    root_stage: []const u8,
+    rel_dir: []const u8,
+) !void {
+    const target_dir = try std.fs.path.join(allocator, &.{ root_stage, rel_dir });
+    defer allocator.free(target_dir);
+    if (Dir.cwd().statFile(io, target_dir, .{})) |_| {
+        return;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
     }
+
+    var end: usize = 0;
+    while (end < rel_dir.len) {
+        const next_slash = std.mem.indexOfScalarPos(u8, rel_dir, end, '/') orelse rel_dir.len;
+        const prefix = rel_dir[0..next_slash];
+        end = next_slash + 1;
+        if (prefix.len == 0) continue;
+        const dir_path = try std.fs.path.join(allocator, &.{ root_stage, prefix });
+        defer allocator.free(dir_path);
+        if (Dir.cwd().statFile(io, dir_path, .{})) |_| {} else |err| switch (err) {
+            error.FileNotFound => {
+                try Dir.cwd().createDirPath(io, dir_path);
+                try Dir.cwd().setFilePermissions(
+                    io,
+                    dir_path,
+                    std.Io.File.Permissions.fromMode(0o755),
+                    .{},
+                );
+            },
+            else => return err,
+        }
+    }
+
     const witness_path = try std.fs.path.join(
         allocator,
-        &.{ root_stage, fresh_root_case_witness_path },
+        &.{ target_dir, fresh_root_case_witness_filename },
     );
     defer allocator.free(witness_path);
     try Dir.cwd().writeFile(
@@ -5010,13 +5035,107 @@ fn seedFreshRootCaseWitness(allocator: Allocator, io: Io, root_stage: []const u8
     );
 }
 
-fn removeFreshRootCaseWitness(allocator: Allocator, io: Io, published_root: []const u8) !void {
+fn removeCaseWitnessDirectory(
+    allocator: Allocator,
+    io: Io,
+    published_root: []const u8,
+    rel_dir: []const u8,
+) !void {
     const witness_path = try std.fs.path.join(
         allocator,
-        &.{ published_root, fresh_root_case_witness_path },
+        &.{ published_root, rel_dir, fresh_root_case_witness_filename },
     );
     defer allocator.free(witness_path);
-    try Dir.cwd().deleteFile(io, witness_path);
+    Dir.cwd().deleteFile(io, witness_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+}
+
+fn linuxModulesNetfilterWitnessDir(allocator: Allocator, package_name: []const u8) !?[]u8 {
+    if (!std.mem.startsWith(u8, package_name, linux_modules_prefix)) return null;
+    if (std.mem.startsWith(u8, package_name, linux_modules_extra_prefix)) return null;
+    const kernel_release = package_name[linux_modules_prefix.len..];
+    if (kernel_release.len == 0 or
+        std.mem.indexOfScalar(u8, kernel_release, '/') != null or
+        std.mem.eql(u8, kernel_release, ".") or
+        std.mem.eql(u8, kernel_release, ".."))
+    {
+        return null;
+    }
+    return try std.fmt.allocPrint(
+        allocator,
+        "usr/lib/modules/{s}/kernel/net/netfilter",
+        .{kernel_release},
+    );
+}
+
+fn seedLockCaseWitnesses(
+    allocator: Allocator,
+    io: Io,
+    root_stage: []const u8,
+    lock_path: []const u8,
+) !void {
+    const bytes = try Dir.cwd().readFileAlloc(
+        io,
+        lock_path,
+        allocator,
+        .limited(16 * 1024 * 1024),
+    );
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const packages = switch (parsed.value) {
+        .object => |object| object.get("packages") orelse return,
+        else => return,
+    };
+    if (packages != .array) return;
+
+    for (packages.array.items) |item| {
+        if (item != .object) continue;
+        const name = item.object.get("name") orelse continue;
+        if (name != .string) continue;
+        if (std.mem.eql(u8, name.string, "libpam-runtime")) {
+            try seedCaseWitnessDirectory(allocator, io, root_stage, fresh_root_case_witness_man7_dir);
+        } else if (try linuxModulesNetfilterWitnessDir(allocator, name.string)) |rel_dir| {
+            defer allocator.free(rel_dir);
+            try seedCaseWitnessDirectory(allocator, io, root_stage, rel_dir);
+        }
+    }
+}
+
+fn removeLockCaseWitnesses(
+    allocator: Allocator,
+    io: Io,
+    published_root: []const u8,
+    lock_path: []const u8,
+) !void {
+    const bytes = try Dir.cwd().readFileAlloc(
+        io,
+        lock_path,
+        allocator,
+        .limited(16 * 1024 * 1024),
+    );
+    defer allocator.free(bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+    defer parsed.deinit();
+    const packages = switch (parsed.value) {
+        .object => |object| object.get("packages") orelse return,
+        else => return,
+    };
+    if (packages != .array) return;
+
+    for (packages.array.items) |item| {
+        if (item != .object) continue;
+        const name = item.object.get("name") orelse continue;
+        if (name != .string) continue;
+        if (std.mem.eql(u8, name.string, "libpam-runtime")) {
+            try removeCaseWitnessDirectory(allocator, io, published_root, fresh_root_case_witness_man7_dir);
+        } else if (try linuxModulesNetfilterWitnessDir(allocator, name.string)) |rel_dir| {
+            defer allocator.free(rel_dir);
+            try removeCaseWitnessDirectory(allocator, io, published_root, rel_dir);
+        }
+    }
 }
 
 /// What the build did to the signed publication's partition table.
@@ -8308,7 +8427,7 @@ test "root staging preserves intentionally inaccessible snapd directory" {
     );
 }
 
-test "fresh-root case witness seeds 0755 man7 hierarchy and removes cleanly" {
+test "lock case witnesses seed 0755 man7 and netfilter hierarchies and remove cleanly" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
     const io = std.testing.io;
@@ -8319,32 +8438,74 @@ test "fresh-root case witness seeds 0755 man7 hierarchy and removes cleanly" {
     const root_length = try temporary.dir.realPath(io, &root_buffer);
     const stage = try std.fs.path.join(allocator, &.{ root_buffer[0..root_length], "stage" });
     defer allocator.free(stage);
+    const lock_path = try std.fs.path.join(allocator, &.{ root_buffer[0..root_length], "exact-lock.json" });
+    defer allocator.free(lock_path);
 
-    try seedFreshRootCaseWitness(allocator, io, stage);
+    try temporary.dir.writeFile(
+        io,
+        .{
+            .sub_path = "exact-lock.json",
+            .data =
+            \\{"packages":[{"name":"libpam-runtime"},{"name":"linux-modules-7.0.0-1010-azure"},{"name":"linux-modules-extra-7.0.0-1010-azure"}]}
+            ,
+        },
+    );
+
+    try seedLockCaseWitnesses(allocator, io, stage, lock_path);
     for (&[_][]const u8{
         "stage/usr",
         "stage/usr/share",
         "stage/usr/share/man",
         "stage/usr/share/man/man7",
+        "stage/usr/lib",
+        "stage/usr/lib/modules",
+        "stage/usr/lib/modules/7.0.0-1010-azure",
+        "stage/usr/lib/modules/7.0.0-1010-azure/kernel",
+        "stage/usr/lib/modules/7.0.0-1010-azure/kernel/net",
+        "stage/usr/lib/modules/7.0.0-1010-azure/kernel/net/netfilter",
     }) |rel_dir| {
         const stat = try temporary.dir.statFile(io, rel_dir, .{});
         try std.testing.expectEqual(std.Io.File.Kind.directory, stat.kind);
         try std.testing.expectEqual(@as(std.posix.mode_t, 0o755), stat.permissions.toMode() & 0o777);
     }
-    const witness = try temporary.dir.readFileAlloc(
-        io,
-        "stage/" ++ fresh_root_case_witness_path,
-        allocator,
-        .limited(64),
-    );
-    defer allocator.free(witness);
-    try std.testing.expectEqualStrings(fresh_root_case_witness_bytes, witness);
-
-    try removeFreshRootCaseWitness(allocator, io, stage);
     try std.testing.expectError(
         error.FileNotFound,
-        temporary.dir.statFile(io, "stage/" ++ fresh_root_case_witness_path, .{}),
+        temporary.dir.statFile(io, "stage/usr/lib/modules/extra-7.0.0-1010-azure", .{}),
     );
+
+    for (&[_][]const u8{
+        "stage/usr/share/man/man7/.miz-case-witness",
+        "stage/usr/lib/modules/7.0.0-1010-azure/kernel/net/netfilter/.miz-case-witness",
+    }) |witness_rel| {
+        const witness = try temporary.dir.readFileAlloc(io, witness_rel, allocator, .limited(64));
+        defer allocator.free(witness);
+        try std.testing.expectEqualStrings(fresh_root_case_witness_bytes, witness);
+    }
+
+    try removeLockCaseWitnesses(allocator, io, stage, lock_path);
+    for (&[_][]const u8{
+        "stage/usr/share/man/man7/.miz-case-witness",
+        "stage/usr/lib/modules/7.0.0-1010-azure/kernel/net/netfilter/.miz-case-witness",
+    }) |witness_rel| {
+        try std.testing.expectError(
+            error.FileNotFound,
+            temporary.dir.statFile(io, witness_rel, .{}),
+        );
+    }
+
+    // Re-running seed when target directories already exist must be a no-op,
+    // and remove when witnesses are absent must succeed cleanly.
+    try seedLockCaseWitnesses(allocator, io, stage, lock_path);
+    for (&[_][]const u8{
+        "stage/usr/share/man/man7/.miz-case-witness",
+        "stage/usr/lib/modules/7.0.0-1010-azure/kernel/net/netfilter/.miz-case-witness",
+    }) |witness_rel| {
+        try std.testing.expectError(
+            error.FileNotFound,
+            temporary.dir.statFile(io, witness_rel, .{}),
+        );
+    }
+    try removeLockCaseWitnesses(allocator, io, stage, lock_path);
 }
 
 const RecoveryDisposalProbe = struct {
