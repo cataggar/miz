@@ -36,6 +36,8 @@ test {
 
 const release = "20260731";
 const release_base = "https://cloud-images.ubuntu.com/releases/26.04/release-" ++ release;
+const full_snapshot_base = "https://snapshot.ubuntu.com/ubuntu/20260731T000000Z";
+const full_snapshot_unix: i64 = 1_785_456_000;
 const snapshot_base = "https://snapshot.ubuntu.com/ubuntu/20261001T000000Z";
 const snapshot_unix: i64 = 1_790_812_800;
 const frozen_resolute_release_digest =
@@ -163,6 +165,20 @@ const Flavor = enum {
     /// build's structure actually turns on.
     fn freshRoot(self: Flavor) bool {
         return self != .full;
+    }
+
+    /// The Ubuntu archive snapshot this flavor resolves and customizes against.
+    /// `full` customizes Canonical's `release-20260731` cloud root in place, so
+    /// its retained dpkg baseline is authenticated against the matching
+    /// `20260731T000000Z` snapshot; fresh-root flavors (`core`, `baremetal`)
+    /// assemble from an empty root against `20261001T000000Z`, which matches
+    /// `debz 0.4.0`'s version-bound fresh-root lifecycle pins.
+    fn snapshotBase(self: Flavor) []const u8 {
+        return if (self.freshRoot()) snapshot_base else full_snapshot_base;
+    }
+
+    fn snapshotUnix(self: Flavor) i64 {
+        return if (self.freshRoot()) snapshot_unix else full_snapshot_unix;
     }
 
     /// Whether the image expects to find Azure underneath it. Bare metal has
@@ -3785,6 +3801,7 @@ const DebzContext = struct {
     lock_dir: ?[]const u8,
     proxy: ?[]const u8,
     offline: bool,
+    now_unix: i64 = snapshot_unix,
 
     fn lockFilename(self: DebzContext, package: []const u8) ![]u8 {
         return self.allocator.print(
@@ -3866,7 +3883,7 @@ fn resolveDebzLock(
     );
     defer allocator.free(dummy);
     const packages = [_][]const u8{package};
-    const request = packageFamilyRequest(
+    var request = packageFamilyRequest(
         .resolve_lock,
         context.profile,
         &packages,
@@ -3881,6 +3898,7 @@ fn resolveDebzLock(
         context.proxy,
         context.offline,
     );
+    request.inputs.now_unix = context.now_unix;
     try assertRequestSeparation(request);
     const resolved = try package_family.execute(allocator, io, .{}, request);
     try requireSucceeded(resolved, request, package);
@@ -3963,6 +3981,8 @@ fn runDebzTransaction(
     const absolute_stage = try Dir.cwd().realPathFileAlloc(io, stage, allocator);
     defer allocator.free(absolute_stage);
     try Dir.cwd().setFilePermissions(io, absolute_stage, .fromMode(0o700), .{});
+    var stashed_cmethopt = try stashUnsupportedDpkgEntry(allocator, io, absolute_stage);
+    defer stashed_cmethopt.deinit(allocator);
     try seedLockCaseWitnesses(allocator, io, absolute_stage, transaction.lock);
     const absolute_published = if (std.fs.path.isAbsolute(published))
         try allocator.dupe(u8, published)
@@ -3978,7 +3998,7 @@ fn runDebzTransaction(
     errdefer if (!published_transferred) allocator.free(absolute_published);
 
     const packages = [_][]const u8{package};
-    const customize_request = packageFamilyRequest(
+    var customize_request = packageFamilyRequest(
         apply_operation,
         context.profile,
         &packages,
@@ -3993,6 +4013,7 @@ fn runDebzTransaction(
         context.proxy,
         context.offline,
     );
+    customize_request.inputs.now_unix = context.now_unix;
     try assertRequestSeparation(customize_request);
     const customized = try package_family.execute(allocator, io, .{}, customize_request);
     try requireSucceeded(customized, customize_request, package);
@@ -4000,6 +4021,7 @@ fn runDebzTransaction(
         return error.DebzProvenanceMissing;
     defer allocator.free(customized.provenance_path.?);
     try restoreRestrictedRootEntry(allocator, io, absolute_published, restricted_permissions);
+    try restoreUnsupportedDpkgEntry(allocator, io, absolute_published, stashed_cmethopt);
     try removeLockCaseWitnesses(allocator, io, absolute_published, transaction.lock);
     try Dir.cwd().setFilePermissions(io, absolute_published, .fromMode(0o755), .{});
     const expected_provenance = try std.fs.path.join(
@@ -4402,7 +4424,7 @@ fn customizeRootWithDebz(
         \\Architectures: {s}
         \\Signed-By: {s}
         \\
-    , .{ snapshot_base, profile.ubuntu_architecture, absolute_keyring }) catch |err| return phaseError(&phase_error, err);
+    , .{ flavor.snapshotBase(), profile.ubuntu_architecture, absolute_keyring }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(source_document);
     Dir.cwd().writeFile(io, .{ .sub_path = source_path, .data = source_document }) catch |err| return phaseError(&phase_error, err);
     const absolute_source = Dir.cwd().realPathFileAlloc(io, source_path, allocator) catch |err| return phaseError(&phase_error, err);
@@ -4433,7 +4455,7 @@ fn customizeRootWithDebz(
         \\Architectures: {s}
         \\Signed-By: {s}
         \\
-    , .{ snapshot_base, profile.ubuntu_architecture, absolute_keyring }) catch |err| return phaseError(&phase_error, err);
+    , .{ flavor.snapshotBase(), profile.ubuntu_architecture, absolute_keyring }) catch |err| return phaseError(&phase_error, err);
     defer allocator.free(witness_source_document);
     Dir.cwd().writeFile(io, .{ .sub_path = witness_source_path, .data = witness_source_document }) catch |err| return phaseError(&phase_error, err);
     const absolute_witness_source = Dir.cwd().realPathFileAlloc(io, witness_source_path, allocator) catch |err| return phaseError(&phase_error, err);
@@ -4499,6 +4521,7 @@ fn customizeRootWithDebz(
         .lock_dir = debz_lock_dir,
         .proxy = proxy,
         .offline = offline,
+        .now_unix = flavor.snapshotUnix(),
     };
 
     // Issue #677 step 4: which roots the guest installs is decided before any
@@ -4982,11 +5005,214 @@ fn restoreRestrictedRootEntry(
     try Dir.cwd().setFilePermissions(io, path, value, .{});
 }
 
+const unsupported_dpkg_entry = "var/lib/dpkg/cmethopt";
+const overflow_alternatives_groups = [_][]const u8{
+    "jsondiff",
+    "pybabel",
+};
+const installed_case_alias_info_packages = [_][]const u8{
+    "libperl5.40:amd64",
+    "libperl5.40:arm64",
+    "perl-modules-5.40",
+    "ncurses-term",
+};
+const minimal_dpkg_info_list_bytes = "/.\n";
+
+const StashedAlternativeGroup = struct {
+    record_bytes: ?[]u8 = null,
+    record_permissions: std.Io.File.Permissions = .fromMode(0o644),
+    selector_target: ?[]u8 = null,
+
+    fn deinit(self: *StashedAlternativeGroup, allocator: Allocator) void {
+        if (self.record_bytes) |bytes| allocator.free(bytes);
+        if (self.selector_target) |target| allocator.free(target);
+        self.* = .{};
+    }
+};
+
+const StashedPackageInventory = struct {
+    list_bytes: ?[]u8 = null,
+    list_permissions: std.Io.File.Permissions = .fromMode(0o644),
+    md5sums_bytes: ?[]u8 = null,
+    md5sums_permissions: std.Io.File.Permissions = .fromMode(0o644),
+
+    fn deinit(self: *StashedPackageInventory, allocator: Allocator) void {
+        if (self.list_bytes) |bytes| allocator.free(bytes);
+        if (self.md5sums_bytes) |bytes| allocator.free(bytes);
+        self.* = .{};
+    }
+};
+
+/// Canonical's `release-20260731` cloud root carries:
+/// - `/var/lib/dpkg/cmethopt` (`apt apt\n`), legacy `dselect` access-method
+///   state rejected by `debz 0.4.0`'s `validateImportedDatabaseLayout`
+///   (`UnsupportedDatabaseEntry`).
+/// - 33 `/var/lib/dpkg/alternatives/*` groups, above `debz 0.4.0`'s
+///   `native_alternatives.Limits.max_groups = 32` (`invalid_alternatives_state`).
+/// - Pre-installed `libperl5.40`, `perl-modules-5.40`, and `ncurses-term`
+///   ownership inventories containing case-only directory aliases (`Sys`/`sys`,
+///   `Pod`/`pod`, `terminfo/{A,E,L,M,N,P,Q,X}` vs lowercase) that `debz 0.4.0`'s
+///   `proveCaseEvidence` refuses (`case_alias`).
+/// Neither `linux-azure` nor `walinuxagent` invokes `update-alternatives` or
+/// touches those Perl/terminfo inventories, so stashing them out of `root_stage`
+/// before `package_family.execute` and restoring them into `published_root`
+/// immediately after preserves the exact cloud-root state.
+const StashedDpkgEntry = struct {
+    cmethopt_bytes: ?[]u8 = null,
+    cmethopt_permissions: std.Io.File.Permissions = .fromMode(0o644),
+    alternatives_groups: [overflow_alternatives_groups.len]StashedAlternativeGroup = @splat(.{}),
+    package_inventories: [installed_case_alias_info_packages.len]StashedPackageInventory = @splat(.{}),
+
+    fn deinit(self: *StashedDpkgEntry, allocator: Allocator) void {
+        if (self.cmethopt_bytes) |bytes| allocator.free(bytes);
+        for (&self.alternatives_groups) |*group| group.deinit(allocator);
+        for (&self.package_inventories) |*inventory| inventory.deinit(allocator);
+        self.* = .{};
+    }
+};
+
+fn stashUnsupportedDpkgEntry(
+    allocator: Allocator,
+    io: Io,
+    root_stage: []const u8,
+) !StashedDpkgEntry {
+    var stashed: StashedDpkgEntry = .{};
+    errdefer stashed.deinit(allocator);
+
+    const cmethopt_path = try std.fs.path.join(allocator, &.{ root_stage, unsupported_dpkg_entry });
+    defer allocator.free(cmethopt_path);
+    if (Dir.cwd().statFile(io, cmethopt_path, .{ .follow_symlinks = false })) |stat| {
+        if (stat.kind != .file) return error.UnsupportedDpkgEntryNotRegularFile;
+        stashed.cmethopt_bytes = try Dir.cwd().readFileAlloc(io, cmethopt_path, allocator, .limited(4096));
+        stashed.cmethopt_permissions = stat.permissions;
+        try Dir.cwd().deleteFile(io, cmethopt_path);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    for (overflow_alternatives_groups, 0..) |group_name, idx| {
+        const record_rel = try std.fmt.allocPrint(allocator, "var/lib/dpkg/alternatives/{s}", .{group_name});
+        defer allocator.free(record_rel);
+        const selector_rel = try std.fmt.allocPrint(allocator, "etc/alternatives/{s}", .{group_name});
+        defer allocator.free(selector_rel);
+        const record_path = try std.fs.path.join(allocator, &.{ root_stage, record_rel });
+        defer allocator.free(record_path);
+        const selector_path = try std.fs.path.join(allocator, &.{ root_stage, selector_rel });
+        defer allocator.free(selector_path);
+        if (Dir.cwd().statFile(io, record_path, .{ .follow_symlinks = false })) |stat| {
+            if (stat.kind != .file) return error.UnsupportedDpkgEntryNotRegularFile;
+            var target_buf: [4096]u8 = undefined;
+            const target_len = try Dir.cwd().readLink(io, selector_path, &target_buf);
+            stashed.alternatives_groups[idx].record_bytes =
+                try Dir.cwd().readFileAlloc(io, record_path, allocator, .limited(4096));
+            stashed.alternatives_groups[idx].record_permissions = stat.permissions;
+            stashed.alternatives_groups[idx].selector_target =
+                try allocator.dupe(u8, target_buf[0..target_len]);
+            try Dir.cwd().deleteFile(io, record_path);
+            try Dir.cwd().deleteFile(io, selector_path);
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+    }
+
+    for (installed_case_alias_info_packages, 0..) |pkg, idx| {
+        const list_rel = try std.fmt.allocPrint(allocator, "var/lib/dpkg/info/{s}.list", .{pkg});
+        defer allocator.free(list_rel);
+        const list_path = try std.fs.path.join(allocator, &.{ root_stage, list_rel });
+        defer allocator.free(list_path);
+        if (Dir.cwd().statFile(io, list_path, .{ .follow_symlinks = false })) |stat| {
+            if (stat.kind != .file) return error.UnsupportedDpkgEntryNotRegularFile;
+            stashed.package_inventories[idx].list_bytes =
+                try Dir.cwd().readFileAlloc(io, list_path, allocator, .limited(2 * 1024 * 1024));
+            stashed.package_inventories[idx].list_permissions = stat.permissions;
+            try Dir.cwd().writeFile(io, .{ .sub_path = list_path, .data = minimal_dpkg_info_list_bytes });
+            try Dir.cwd().setFilePermissions(io, list_path, stat.permissions, .{});
+        } else |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        }
+
+        const md5_rel = try std.fmt.allocPrint(allocator, "var/lib/dpkg/info/{s}.md5sums", .{pkg});
+        defer allocator.free(md5_rel);
+        const md5_path = try std.fs.path.join(allocator, &.{ root_stage, md5_rel });
+        defer allocator.free(md5_path);
+        if (Dir.cwd().statFile(io, md5_path, .{ .follow_symlinks = false })) |stat| {
+            if (stat.kind != .file) return error.UnsupportedDpkgEntryNotRegularFile;
+            stashed.package_inventories[idx].md5sums_bytes =
+                try Dir.cwd().readFileAlloc(io, md5_path, allocator, .limited(2 * 1024 * 1024));
+            stashed.package_inventories[idx].md5sums_permissions = stat.permissions;
+            try Dir.cwd().deleteFile(io, md5_path);
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+    }
+
+    return stashed;
+}
+
+fn restoreUnsupportedDpkgEntry(
+    allocator: Allocator,
+    io: Io,
+    published_root: []const u8,
+    stashed: StashedDpkgEntry,
+) !void {
+    if (stashed.cmethopt_bytes) |bytes| {
+        const cmethopt_path = try std.fs.path.join(allocator, &.{ published_root, unsupported_dpkg_entry });
+        defer allocator.free(cmethopt_path);
+        try Dir.cwd().writeFile(io, .{ .sub_path = cmethopt_path, .data = bytes });
+        try Dir.cwd().setFilePermissions(io, cmethopt_path, stashed.cmethopt_permissions, .{});
+    }
+    for (overflow_alternatives_groups, 0..) |group_name, idx| {
+        const group = stashed.alternatives_groups[idx];
+        const bytes = group.record_bytes orelse continue;
+        const record_rel = try std.fmt.allocPrint(allocator, "var/lib/dpkg/alternatives/{s}", .{group_name});
+        defer allocator.free(record_rel);
+        const selector_rel = try std.fmt.allocPrint(allocator, "etc/alternatives/{s}", .{group_name});
+        defer allocator.free(selector_rel);
+        const record_path = try std.fs.path.join(allocator, &.{ published_root, record_rel });
+        defer allocator.free(record_path);
+        const selector_path = try std.fs.path.join(allocator, &.{ published_root, selector_rel });
+        defer allocator.free(selector_path);
+        try Dir.cwd().writeFile(io, .{ .sub_path = record_path, .data = bytes });
+        try Dir.cwd().setFilePermissions(io, record_path, group.record_permissions, .{});
+        try Dir.cwd().symLink(io, group.selector_target.?, selector_path, .{});
+    }
+    for (installed_case_alias_info_packages, 0..) |pkg, idx| {
+        const inventory = stashed.package_inventories[idx];
+        if (inventory.list_bytes) |bytes| {
+            const list_rel = try std.fmt.allocPrint(allocator, "var/lib/dpkg/info/{s}.list", .{pkg});
+            defer allocator.free(list_rel);
+            const list_path = try std.fs.path.join(allocator, &.{ published_root, list_rel });
+            defer allocator.free(list_path);
+            try Dir.cwd().writeFile(io, .{ .sub_path = list_path, .data = bytes });
+            try Dir.cwd().setFilePermissions(io, list_path, inventory.list_permissions, .{});
+        }
+        if (inventory.md5sums_bytes) |bytes| {
+            const md5_rel = try std.fmt.allocPrint(allocator, "var/lib/dpkg/info/{s}.md5sums", .{pkg});
+            defer allocator.free(md5_rel);
+            const md5_path = try std.fs.path.join(allocator, &.{ published_root, md5_rel });
+            defer allocator.free(md5_path);
+            try Dir.cwd().writeFile(io, .{ .sub_path = md5_path, .data = bytes });
+            try Dir.cwd().setFilePermissions(io, md5_path, inventory.md5sums_permissions, .{});
+        }
+    }
+}
+
 const fresh_root_case_witness_filename = ".miz-case-witness";
 const fresh_root_case_witness_man7_dir = "usr/share/man/man7";
 const fresh_root_case_witness_bytes = "witness\n";
 const linux_modules_prefix = "linux-modules-";
 const linux_modules_extra_prefix = "linux-modules-extra-";
+const linux_azure_headers_prefix = "linux-azure-headers-";
+const linux_cloud_tools_prefix = "linux-cloud-tools-";
+const linux_headers_uapi_netfilter_subdirs = [_][]const u8{
+    "include/uapi/linux/netfilter",
+    "include/uapi/linux/netfilter_ipv4",
+    "include/uapi/linux/netfilter_ipv6",
+};
 
 /// Two package families in the Ubuntu 26.04 closures ship case-only sibling
 /// paths within a single `.deb` payload:
@@ -5084,6 +5310,70 @@ fn linuxModulesNetfilterWitnessDir(allocator: Allocator, package_name: []const u
         "usr/lib/modules/{s}/kernel/net/netfilter",
         .{kernel_release},
     );
+}
+
+fn isLinuxAzureHeadersPackage(package_name: []const u8) bool {
+    if (!std.mem.startsWith(u8, package_name, linux_azure_headers_prefix)) return false;
+    const kernel_release = package_name[linux_azure_headers_prefix.len..];
+    return kernel_release.len != 0 and
+        std.mem.indexOfScalar(u8, kernel_release, '/') == null and
+        !std.mem.eql(u8, kernel_release, ".") and
+        !std.mem.eql(u8, kernel_release, "..");
+}
+
+fn linuxCloudToolsAbiRelease(package_name: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, package_name, linux_cloud_tools_prefix)) return null;
+    const kernel_release = package_name[linux_cloud_tools_prefix.len..];
+    if (kernel_release.len == 0 or
+        !std.ascii.isDigit(kernel_release[0]) or
+        std.mem.indexOfScalar(u8, kernel_release, '/') != null or
+        std.mem.eql(u8, kernel_release, ".") or
+        std.mem.eql(u8, kernel_release, ".."))
+    {
+        return null;
+    }
+    return kernel_release;
+}
+
+/// In Ubuntu 26.04's `linux-azure` closure (`7.0.0-1010.10`), both
+/// `linux-tools-<release>` and `linux-cloud-tools-<release>` ship the same
+/// `/usr/lib/linux-tools/<release>` symlink without declaring `Replaces` on
+/// each other. Registering a dpkg diversion owned by `linux-tools-<release>`
+/// keeps `/usr/lib/linux-tools/<release>` at its canonical path while routing
+/// `linux-cloud-tools-<release>`'s duplicate claim to `.distrib`.
+fn seedLinuxToolsDiversion(
+    allocator: Allocator,
+    io: Io,
+    root_stage: []const u8,
+    kernel_release: []const u8,
+) !void {
+    const diversions_path = try std.fs.path.join(
+        allocator,
+        &.{ root_stage, "var/lib/dpkg/diversions" },
+    );
+    defer allocator.free(diversions_path);
+    const existing = Dir.cwd().readFileAlloc(
+        io,
+        diversions_path,
+        allocator,
+        .limited(8 * 1024 * 1024),
+    ) catch |err| switch (err) {
+        error.FileNotFound => try allocator.dupe(u8, ""),
+        else => return err,
+    };
+    defer allocator.free(existing);
+
+    const record = try std.fmt.allocPrint(
+        allocator,
+        "/usr/lib/linux-tools/{s}\n/usr/lib/linux-tools/{s}.distrib\nlinux-tools-{s}\n",
+        .{ kernel_release, kernel_release, kernel_release },
+    );
+    defer allocator.free(record);
+    if (std.mem.indexOf(u8, existing, record) != null) return;
+
+    const updated = try std.fmt.allocPrint(allocator, "{s}{s}", .{ existing, record });
+    defer allocator.free(updated);
+    try Dir.cwd().writeFile(io, .{ .sub_path = diversions_path, .data = updated });
 }
 
 const openssh_server_debconf_templates_stanza =
@@ -5198,6 +5488,14 @@ fn seedLockCaseWitnesses(
         } else if (try linuxModulesNetfilterWitnessDir(allocator, name.string)) |rel_dir| {
             defer allocator.free(rel_dir);
             try seedCaseWitnessDirectory(allocator, io, root_stage, rel_dir);
+        } else if (isLinuxAzureHeadersPackage(name.string)) {
+            for (linux_headers_uapi_netfilter_subdirs) |subdir| {
+                const rel_dir = try std.fmt.allocPrint(allocator, "usr/src/{s}/{s}", .{ name.string, subdir });
+                defer allocator.free(rel_dir);
+                try seedCaseWitnessDirectory(allocator, io, root_stage, rel_dir);
+            }
+        } else if (linuxCloudToolsAbiRelease(name.string)) |kernel_release| {
+            try seedLinuxToolsDiversion(allocator, io, root_stage, kernel_release);
         }
     }
 }
@@ -5232,6 +5530,12 @@ fn removeLockCaseWitnesses(
         } else if (try linuxModulesNetfilterWitnessDir(allocator, name.string)) |rel_dir| {
             defer allocator.free(rel_dir);
             try removeCaseWitnessDirectory(allocator, io, published_root, rel_dir);
+        } else if (isLinuxAzureHeadersPackage(name.string)) {
+            for (linux_headers_uapi_netfilter_subdirs) |subdir| {
+                const rel_dir = try std.fmt.allocPrint(allocator, "usr/src/{s}/{s}", .{ name.string, subdir });
+                defer allocator.free(rel_dir);
+                try removeCaseWitnessDirectory(allocator, io, published_root, rel_dir);
+            }
         }
     }
 }
@@ -11097,3 +11401,172 @@ test "both guest architectures resolve the same explicit roots with no recommend
         }
     }
 }
+
+test "full flavor resolves against the release-matching 20260731 snapshot while fresh roots use 20261001" {
+    try std.testing.expectEqualStrings(
+        "https://snapshot.ubuntu.com/ubuntu/20260731T000000Z",
+        Flavor.full.snapshotBase(),
+    );
+    try std.testing.expectEqual(@as(i64, 1_785_456_000), Flavor.full.snapshotUnix());
+    for ([_]Flavor{ .core, .baremetal }) |flavor| {
+        try std.testing.expectEqualStrings(
+            "https://snapshot.ubuntu.com/ubuntu/20261001T000000Z",
+            flavor.snapshotBase(),
+        );
+        try std.testing.expectEqual(@as(i64, 1_790_812_800), flavor.snapshotUnix());
+    }
+}
+
+test "full root debz staging stashes and restores unsupported dpkg entries and seeds linux-azure witnesses and diversions" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPath(io, &root_buffer);
+    const root_path = root_buffer[0..root_length];
+
+    try temporary.dir.createDirPath(io, "var/lib/dpkg/alternatives");
+    try temporary.dir.createDirPath(io, "var/lib/dpkg/info");
+    try temporary.dir.createDirPath(io, "etc/alternatives");
+    try temporary.dir.writeFile(io, .{
+        .sub_path = "var/lib/dpkg/cmethopt",
+        .data = "apt apt\n",
+    });
+    try temporary.dir.writeFile(io, .{
+        .sub_path = "var/lib/dpkg/alternatives/jsondiff",
+        .data = "auto\n/usr/bin/jsondiff\n\n/usr/bin/alt-jsondiff\n300\n\n",
+    });
+    try temporary.dir.symLink(
+        io,
+        "/usr/bin/alt-jsondiff",
+        "etc/alternatives/jsondiff",
+        .{},
+    );
+    const original_perl_list = "/.\n/usr/share/perl/5.40.1/Pod\n/usr/share/perl/5.40.1/pod\n";
+    const original_perl_md5 = "0123456789abcdef0123456789abcdef  usr/share/perl/5.40.1/pod/perl.pod\n";
+    try temporary.dir.writeFile(io, .{
+        .sub_path = "var/lib/dpkg/info/perl-modules-5.40.list",
+        .data = original_perl_list,
+    });
+    try temporary.dir.writeFile(io, .{
+        .sub_path = "var/lib/dpkg/info/perl-modules-5.40.md5sums",
+        .data = original_perl_md5,
+    });
+    try temporary.dir.writeFile(io, .{
+        .sub_path = "var/lib/dpkg/diversions",
+        .data = "/bin/sh\n/bin/sh.distrib\ndash\n",
+    });
+
+    var stashed = try stashUnsupportedDpkgEntry(allocator, io, root_path);
+    defer stashed.deinit(allocator);
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        temporary.dir.statFile(io, "var/lib/dpkg/cmethopt", .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        temporary.dir.statFile(io, "var/lib/dpkg/alternatives/jsondiff", .{}),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        temporary.dir.statFile(io, "etc/alternatives/jsondiff", .{ .follow_symlinks = false }),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        temporary.dir.statFile(io, "var/lib/dpkg/info/perl-modules-5.40.md5sums", .{}),
+    );
+    const staged_perl_list = try temporary.dir.readFileAlloc(
+        io,
+        "var/lib/dpkg/info/perl-modules-5.40.list",
+        allocator,
+        .limited(1024),
+    );
+    defer allocator.free(staged_perl_list);
+    try std.testing.expectEqualStrings(minimal_dpkg_info_list_bytes, staged_perl_list);
+
+    const lock_path = try std.fs.path.join(allocator, &.{ root_path, "lock.json" });
+    defer allocator.free(lock_path);
+    try temporary.dir.writeFile(io, .{
+        .sub_path = "lock.json",
+        .data =
+        \\{"packages":[
+        \\  {"name":"linux-azure-headers-7.0.0-1010"},
+        \\  {"name":"linux-cloud-tools-7.0.0-1010-azure"},
+        \\  {"name":"linux-cloud-tools-common"},
+        \\  {"name":"linux-cloud-tools-azure"}
+        \\]}
+        ,
+    });
+
+    try seedLockCaseWitnesses(allocator, io, root_path, lock_path);
+    for (linux_headers_uapi_netfilter_subdirs) |subdir| {
+        const witness = try std.fmt.allocPrint(
+            allocator,
+            "usr/src/linux-azure-headers-7.0.0-1010/{s}/{s}",
+            .{ subdir, fresh_root_case_witness_filename },
+        );
+        defer allocator.free(witness);
+        _ = try temporary.dir.statFile(io, witness, .{});
+    }
+    const diversions = try temporary.dir.readFileAlloc(
+        io,
+        "var/lib/dpkg/diversions",
+        allocator,
+        .limited(4096),
+    );
+    defer allocator.free(diversions);
+    try std.testing.expectEqualStrings(
+        "/bin/sh\n/bin/sh.distrib\ndash\n" ++
+            "/usr/lib/linux-tools/7.0.0-1010-azure\n" ++
+            "/usr/lib/linux-tools/7.0.0-1010-azure.distrib\n" ++
+            "linux-tools-7.0.0-1010-azure\n",
+        diversions,
+    );
+
+    try removeLockCaseWitnesses(allocator, io, root_path, lock_path);
+    for (linux_headers_uapi_netfilter_subdirs) |subdir| {
+        const witness = try std.fmt.allocPrint(
+            allocator,
+            "usr/src/linux-azure-headers-7.0.0-1010/{s}/{s}",
+            .{ subdir, fresh_root_case_witness_filename },
+        );
+        defer allocator.free(witness);
+        try std.testing.expectError(error.FileNotFound, temporary.dir.statFile(io, witness, .{}));
+    }
+
+    try restoreUnsupportedDpkgEntry(allocator, io, root_path, stashed);
+    const restored_cmethopt = try temporary.dir.readFileAlloc(
+        io,
+        "var/lib/dpkg/cmethopt",
+        allocator,
+        .limited(1024),
+    );
+    defer allocator.free(restored_cmethopt);
+    try std.testing.expectEqualStrings("apt apt\n", restored_cmethopt);
+    var target_buf: [256]u8 = undefined;
+    const target_len = try temporary.dir.readLink(
+        io,
+        "etc/alternatives/jsondiff",
+        &target_buf,
+    );
+    try std.testing.expectEqualStrings("/usr/bin/alt-jsondiff", target_buf[0..target_len]);
+    const restored_perl_list = try temporary.dir.readFileAlloc(
+        io,
+        "var/lib/dpkg/info/perl-modules-5.40.list",
+        allocator,
+        .limited(1024),
+    );
+    defer allocator.free(restored_perl_list);
+    try std.testing.expectEqualStrings(original_perl_list, restored_perl_list);
+    const restored_perl_md5 = try temporary.dir.readFileAlloc(
+        io,
+        "var/lib/dpkg/info/perl-modules-5.40.md5sums",
+        allocator,
+        .limited(1024),
+    );
+    defer allocator.free(restored_perl_md5);
+    try std.testing.expectEqualStrings(original_perl_md5, restored_perl_md5);
+}
+
