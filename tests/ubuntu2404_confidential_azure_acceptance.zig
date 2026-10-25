@@ -95,11 +95,13 @@ test "acceptance deploys and attests the exact Confidential VM contract" {
         "test -c /dev/tpmrm0",
         "cloud-init status --wait",
         "walinuxagent.service",
+        "lsblk -nr -s -o NAME,TYPE",
         "metadata/instance?api-version=2025-04-07",
         "az vm disk attach",
         "sudo -n reboot",
         "sudo -n rm -f /tmp/azguestattestation1.deb /tmp/AttestationClient",
     }) |needle| try expectContains(guest_library, needle);
+    try expectAbsent(guest_library, "lsblk -n -s -o NAME,TYPE");
     try expectContains(script, "beginGetAccess?api-version=2025-01-02");
     for ([_][]const u8{
         "--features SecurityType=ConfidentialVMSupported",
