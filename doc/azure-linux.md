@@ -165,7 +165,7 @@ for this purpose: Artifact Signing leaves rotate, so the profile's current
 leaf may differ from the one embedded in an older release. Pin the release
 image digest and/or expected certificate fingerprint before enrollment.
 
-Create a dedicated Private Trust certificate profile named `miz-uki` in the existing `cataggar` Artifact Signing account. Configure the Entra federated credential for audience `api://AzureADTokenExchange`, issuer `https://token.actions.githubusercontent.com`, and subject `repo:cataggar/miz:environment:azurelinux4-signing`, then grant `Artifact Signing Certificate Profile Signer` at the `miz-uki` profile scope. The observed Private Trust chain terminates at a shared Microsoft Enterprise identity hierarchy, and UEFI cannot restrict trust with Artifact Signing's subscriber-unique EKU. Secure Boot therefore enrolls the exact short-lived signing leaf for each release, never the broad AOC intermediate or Microsoft root. The workflow fetches the current leaf immediately before signing and fails if the operation returns another leaf; release validation also fails if the leaf or provider identity changes across candidates. Artifact Signing leaves rotate daily and are valid for about three days. The raw digest API does not add an RFC 3161 timestamp; firmware and `sbverify` do not enforce signing-certificate wall-clock validity, but general long-term Authenticode validation requires a separately implemented timestamp policy.
+Create a dedicated Private Trust certificate profile named `miz-uki` in the existing `cataggar` Artifact Signing account. Configure the Entra federated credential for audience `api://AzureADTokenExchange`, issuer `https://token.actions.githubusercontent.com`, and subject `repo:cataggar/miz:environment:ubuntu2604-signing`, then grant `Artifact Signing Certificate Profile Signer` at the `miz-uki` profile scope. The observed Private Trust chain terminates at a shared Microsoft Enterprise identity hierarchy, and UEFI cannot restrict trust with Artifact Signing's subscriber-unique EKU. Secure Boot therefore enrolls the exact short-lived signing leaf for each release, never the broad AOC intermediate or Microsoft root. The workflow fetches the current leaf immediately before signing and fails if the operation returns another leaf; release validation also fails if the leaf or provider identity changes across candidates. Artifact Signing leaves rotate daily and are valid for about three days. The raw digest API does not add an RFC 3161 timestamp; firmware and `sbverify` do not enforce signing-certificate wall-clock validity, but general long-term Authenticode validation requires a separately implemented timestamp policy.
 
 The builder requires Zig 0.17.0, `curl`, `dnf`, GNU tar, `qemu-img`, and
 passwordless or interactive `sudo`. On a host that differs from the selected
@@ -282,7 +282,7 @@ It must print `architecture=aarch64 accelerator=kvm`. Use `x86_64` and install
 `qemu-system-x86` for optional x86_64 validation. This probe is not part of
 the hosted release gate.
 
-Build/sign/local acceptance use the separate protected `azurelinux4-signing` GitHub environment, restricted to `main` with required reviewers. It defines these variables:
+Build/sign/local acceptance use the separate protected `ubuntu2604-signing` GitHub environment, restricted to `main` with required reviewers. It defines these variables:
 
 ```text
 MIZ_AZURE_TENANT_ID=<Microsoft-Entra-tenant-UUID>
@@ -295,12 +295,12 @@ MIZ_ARTIFACT_SIGNING_PROFILE=miz-uki
 The workflow builds `miz` from the accepted source commit, uses `miz sign certificate` to fetch the current public leaf, and uses the absolute `zig-out/bin/miz sign` path; no separately installed adapter or static certificate secret is trusted. The signer receives `id-token: write`; all other build permissions remain read-only. Grant the federated application `Artifact Signing Certificate Profile Signer` only at the `miz-uki` profile scope. No production private key, access token, OIDC token, or raw provider response is stored in the repository, image, provenance, logs, workflow artifacts, or release assets.
 
 Real-Azure validation and publication use the protected
-`azurelinux4-release` GitHub environment. Configure it with required
+`ubuntu2604-release` GitHub environment. Configure it with required
 reviewers, allow deployments only from `main`, and create this OIDC federated
 subject:
 
 ```text
-repo:cataggar/miz:environment:azurelinux4-release
+repo:cataggar/miz:environment:ubuntu2604-release
 ```
 
 The environment must define these secrets:
