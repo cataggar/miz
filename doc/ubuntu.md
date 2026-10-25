@@ -77,11 +77,15 @@ than `Ubuntu --model core`.
 ## Immutable source and package provenance
 
 `scripts/build_generalized_ubuntu2604.zig` uses Canonical's immutable
-`release-20260731` cloud-image publication and
-`https://snapshot.ubuntu.com/ubuntu/20261001T000000Z`.
+`release-20260731` cloud-image publication together with
+`https://snapshot.ubuntu.com/ubuntu/20260731T000000Z` for `full` and
+`https://snapshot.ubuntu.com/ubuntu/20261001T000000Z` for fresh-root flavors
+(`core` and `baremetal`).
 
 For full, the official server cloud disk is the authoritative filesystem and
-installed-package baseline. The embedded `miz.package_family` debz backend
+installed-package baseline. Resolving against the matching `20260731T000000Z`
+archive snapshot authenticates every retained package in `/var/lib/dpkg/status`
+within `exact_lock_v3`, while the embedded `miz.package_family` debz backend
 adds exact `linux-azure` and `walinuxagent` closures without reconstructing the
 root from packages.
 
