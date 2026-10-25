@@ -365,6 +365,10 @@ test "core contract checks are explicit and the full checks are preserved" {
     try script.expectOmits(
         "test \"$(systemctl --failed --no-legend --plain | wc -l)\" -eq 0",
     );
+    try script.expectContains(
+        "cloud-init status --wait >/dev/null\n" ++
+            "for unit in cloud-final.service walinuxagent.service ssh.service systemd-networkd.service networkd-dispatcher.service; do",
+    );
 }
 
 test "core root growth is measured from the plan, not the inherited offset" {

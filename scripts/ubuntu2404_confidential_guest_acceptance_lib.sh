@@ -57,6 +57,13 @@ ubuntu2404_confidential_guest_check_readiness() {
     "$UBUNTU2404_CONFIDENTIAL_GUEST_SSH_TARGET" \
     "/usr/bin/bash -s -- '$expected_virtual_size'" <<'GUEST'
 set -Eeuo pipefail
+guest_error() {
+  status=$1
+  trap - ERR
+  printf 'guest readiness failed at line %s: %s\n' "$2" "$3" >&2
+  exit "$status"
+}
+trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 expected_virtual_size=$1
 test "$(uname -m)" = x86_64
 grep -Fxq 'VERSION_ID="24.04"' /etc/os-release
@@ -68,7 +75,7 @@ test -d /sys/firmware/efi
 test -c /dev/tpmrm0
 sudo -n mokutil --sb-state | grep -Fqx 'SecureBoot enabled'
 root_source=$(findmnt -n -o SOURCE /)
-root_disk=$(lsblk -n -s -o NAME,TYPE "$root_source" | awk '$2 == "disk" {print "/dev/"$1; exit}')
+root_disk=$(lsblk -nr -s -o NAME,TYPE "$root_source" | awk '$2 == "disk" {print "/dev/"$1; exit}')
 test -b "$root_disk"
 root_bytes=$(lsblk -b -dn -o SIZE "$root_disk")
 test "$root_bytes" -ge "$expected_virtual_size"

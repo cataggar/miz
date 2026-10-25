@@ -1525,6 +1525,7 @@ diagnose_failed_units() {
     head -n 8 |
     while IFS= read -r unit; do diagnose_unit "$unit"; done
 }
+cloud-init status --wait >/dev/null
 for unit in cloud-final.service walinuxagent.service ssh.service systemd-networkd.service networkd-dispatcher.service; do
   systemctl is-active --quiet "$unit" || {
     diagnose_unit "$unit"
