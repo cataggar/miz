@@ -851,8 +851,13 @@ test "CI native smoke covers all hosts and optimization modes" {
     try expectAbsent(native, "MIZ_RUN_PRIVILEGED_TEST");
     try expectAbsent(native, "MIZ_RUN_VM_BOOT_TEST");
 
+    const quality = try section(workflow, "  quality:", "\n  zig-tests:");
+    try expectContains(quality, "name: format + workflow tests");
+    try expectContains(quality, "run: zig fmt --check .");
+
     const protected = try section(workflow, "  zig-tests:", "\n  native-smoke:");
     try expectContains(protected, "name: build + test");
+    try expectContains(protected, "run: zig fmt --check .");
     for ([_][]const u8{
         try section(workflow, "  vm-backend:", "\n  windows:"),
         try section(workflow, "  unsafe-chroot:", "\n  vm-boot:"),
