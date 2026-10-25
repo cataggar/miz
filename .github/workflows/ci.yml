@@ -59,6 +59,9 @@ jobs:
           tools: |
             cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
+      - name: zig fmt --check
+        run: zig fmt --check .
+
       - name: Build production artifacts and run Zig tests
         run: |
           if grep -n 'std\.process\.spawn' packages/miz/src/package_family.zig; then

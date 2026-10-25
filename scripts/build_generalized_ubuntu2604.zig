@@ -11569,4 +11569,3 @@ test "full root debz staging stashes and restores unsupported dpkg entries and s
     defer allocator.free(restored_perl_md5);
     try std.testing.expectEqualStrings(original_perl_md5, restored_perl_md5);
 }
-
