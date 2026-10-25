@@ -479,13 +479,6 @@ jobs:
           [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
           [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
 
-      - name: Log in to Azure with protected-environment OIDC
-        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
       - name: Install Zig via ghr
         uses: cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1
         env:
@@ -509,7 +502,7 @@ jobs:
         run: |
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
-          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          export ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-global-cache
           bash scripts/zig_fetch_retry.sh
           zig build install-azurelinux4-release -Doptimize=safe
           test -x "$AZURELINUX4_RELEASE"
@@ -519,10 +512,18 @@ jobs:
         run: |
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
-          export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          export ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-global-cache
           bash scripts/zig_fetch_retry.sh
           zig build install-miz -Doptimize=safe
           test -x zig-out/bin/miz
+
+      - name: Log in to Azure with protected-environment OIDC
+        id: azure_login
+        uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Run exact-artifact Azure acceptance
         env:
@@ -530,12 +531,14 @@ jobs:
           RUN_ID_VALUE: ${{ github.run_id }}
           RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
         run: |
+          set -euo pipefail
           export GITHUB_RUN_ID=$RUN_ID_VALUE
           export GITHUB_RUN_ATTEMPT=$RUN_ATTEMPT_VALUE
+          az account get-access-token --resource https://management.azure.com/ --query accessToken --output tsv >/dev/null
           scripts/azurelinux4_azure_acceptance.sh run
 
       - name: Refresh Azure OIDC credential for unconditional cleanup
-        if: always()
+        if: always() && steps.azure_login.outcome == 'success'
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}

@@ -2339,14 +2339,19 @@ test "only the Azure acceptance job receives protected Azure configuration" {
             occurrences += 1;
             index = at + 1;
         }
-        try std.testing.expectEqual(@as(usize, 4), occurrences);
+        try std.testing.expectEqual(@as(usize, 3), occurrences);
     }
-    const refresh = try support.indexOf(
+    const build_miz = try support.indexOf(
         section,
-        "Refresh Azure OIDC credential before acceptance",
+        "Build accepted-source miz",
+    );
+    const login = try support.indexOf(
+        section,
+        "Log in to Azure with protected-environment OIDC",
     );
     const acceptance = try support.indexOf(section, "Run exact-artifact Azure acceptance");
-    try std.testing.expect(refresh < acceptance);
+    try std.testing.expect(build_miz < login);
+    try std.testing.expect(login < acceptance);
     try support.expectAbsent(section, "AZURE_CLIENT_SECRET");
     try support.expectAbsent(section, "client-secret:");
 

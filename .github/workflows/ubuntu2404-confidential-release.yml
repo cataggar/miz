@@ -277,7 +277,10 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: Run exact-digest Confidential VM acceptance
-        run: scripts/ubuntu2404_confidential_azure_acceptance.sh run
+        run: |
+          set -euo pipefail
+          az account get-access-token --resource https://management.azure.com/ --query accessToken --output tsv >/dev/null
+          scripts/ubuntu2404_confidential_azure_acceptance.sh run
 
       - name: Refresh Azure OIDC credential for unconditional cleanup
         if: always() && steps.azure_login.outcome == 'success'

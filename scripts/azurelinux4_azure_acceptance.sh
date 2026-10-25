@@ -626,7 +626,8 @@ done
 test -n "$master"
 if mountpoint -q /d; then
   mountpoint -q /d
-  test "$(findmnt -n -o FSTYPE /d)" = ext4
+  mount_fstype=$(findmnt -n -o FSTYPE --target /d)
+  [[ "$mount_fstype" == ext4 || "$mount_fstype" == xfs ]]
   test -f /d/DATALOSS_WARNING_README.txt
   while read -r swap_path _; do
     test "$swap_path" = Filename && continue
