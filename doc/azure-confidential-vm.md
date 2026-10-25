@@ -187,6 +187,15 @@ from the Actions page or with:
 gh workflow run ubuntu2404-confidential-release.yml --ref main
 ```
 
+To run the full candidate build, protected Azure SEV-SNP acceptance, and
+release-bundle staging/verification gate on `main` without requiring the
+release tag on `origin` or mutating a GitHub release, pass
+`validation_only=true`:
+
+```console
+gh workflow run ubuntu2404-confidential-release.yml --ref main -f validation_only=true
+```
+
 The release graph is fail-closed:
 
 1. The build job authenticates Canonical's pinned publication, builds the

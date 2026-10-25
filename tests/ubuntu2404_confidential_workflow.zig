@@ -70,12 +70,59 @@ fn indexOf(text: []const u8, needle: []const u8) !usize {
         error.RequiredTextMissing;
 }
 
+fn runShellFixture(
+    allocator: Allocator,
+    name: []const u8,
+    source: []const u8,
+) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repository = try rootAlloc(allocator);
+    defer allocator.free(repository);
+    const root = try allocator.print(
+        "{s}/.zig-cache/tmp/{s}",
+        .{ repository, tmp.sub_path },
+    );
+    defer allocator.free(root);
+    const path = try allocator.print(
+        "{s}/{s}",
+        .{ root, name },
+    );
+    defer allocator.free(path);
+    try Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = path,
+        .data = source,
+        .flags = .{ .permissions = .fromMode(0o755) },
+    });
+    const result = try std.process.run(allocator, std.testing.io, .{
+        .argv = &.{ "bash", path },
+        .cwd = .{ .path = root },
+        .stdout_limit = .limited(max_output_bytes),
+        .stderr_limit = .limited(max_output_bytes),
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    switch (result.term) {
+        .exited => |code| {
+            if (code == 0) return;
+            std.debug.print("fixture failed:\n{s}\n{s}\n", .{
+                result.stdout,
+                result.stderr,
+            });
+            return error.ShellFixtureFailed;
+        },
+        else => return error.ShellFixtureFailed,
+    }
+}
+
 test "workflow dispatch and protected identity are fail closed" {
     const allocator = std.testing.allocator;
     const workflow = try readTracked(allocator, workflow_path);
     defer allocator.free(workflow);
 
     try expectCount(workflow, "workflow_dispatch:", 1);
+    try expectContains(workflow, "validation_only:");
+    try expectContains(workflow, "default: false\n        type: boolean");
     try expectAbsent(workflow, "\n  push:");
     try expectAbsent(workflow, "\n  pull_request:");
     try expectContains(
@@ -86,7 +133,9 @@ test "workflow dispatch and protected identity are fail closed" {
         workflow,
         "RELEASE_TAG: Ubuntu-24.04-confidential-20260907",
     );
+    try expectContains(workflow, "if [[ \"$VALIDATION_ONLY\" != true ]]; then");
     try expectContains(workflow, "test \"$tag_commit\" = \"$commit\"");
+    try expectContains(workflow, "echo \"Mode: \\`validation_only\\`\" >> \"$GITHUB_STEP_SUMMARY\"");
     try expectCount(workflow, "environment: ubuntu2404-confidential-release", 2);
     try expectCount(workflow, "id-token: write", 1);
     try expectContains(
@@ -202,9 +251,15 @@ test "publication revalidates both artifacts before a three-asset release" {
         "contents: write",
         "Download exact build candidate and provenance",
         "Download exact protected acceptance result",
+        "- name: Stage and verify release bundle (validation-only)",
+        "VALIDATION_ONLY: ${{ inputs.validation_only && 'true' || 'false' }}",
+        "if: inputs.validation_only != true",
         "scripts/ubuntu2404_confidential_publish.sh",
     }) |needle| try expectContains(publish, needle);
     for ([_][]const u8{
+        "VALIDATION_ONLY=${VALIDATION_ONLY:-false}",
+        "if [[ \"$VALIDATION_ONLY\" == true ]]; then",
+        "### Ubuntu 24.04 Confidential VM release bundle verified (validation-only)",
         "\"$RELEASE_TOOL\" verify-acceptance",
         "--source-commit \"$SOURCE_COMMIT\"",
         "--run-id \"$GITHUB_RUN_ID\"",
@@ -231,6 +286,142 @@ test "publication revalidates both artifacts before a three-asset release" {
     try expectAbsent(publisher, "\njq ");
     try expectAbsent(publisher, "eval ");
     try expectAbsent(publisher, "--draft >/dev/null 2>&1 || true");
+}
+
+test "publisher supports both validation_only and normal publication" {
+    try runShellFixture(std.testing.allocator, "publisher-validation-and-publish-fixture.sh",
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\mkdir -p bin input scripts/release
+        \\printf 'qcow-bytes' >input/Ubuntu-24.04-x86_64.confidential.qcow2
+        \\printf '{"schema":1}' >input/Ubuntu-24.04-x86_64.confidential.qcow2.provenance.json
+        \\printf '{"accepted":true}' >input/azure-result.json
+        \\qcow_sha=$(sha256sum input/Ubuntu-24.04-x86_64.confidential.qcow2 | awk '{print $1}')
+        \\qcow_size=$(stat --format='%s' input/Ubuntu-24.04-x86_64.confidential.qcow2)
+        \\export MOCK_QCOW_SHA="$qcow_sha"
+        \\export MOCK_QCOW_SIZE="$qcow_size"
+        \\cat >bin/release_tool <<'EOF'
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\cmd=${1:?}
+        \\shift
+        \\case "$cmd" in
+        \\  verify-acceptance)
+        \\    printf '%s\n%s\n%s\n' "$MOCK_QCOW_SHA" "$MOCK_QCOW_SIZE" 32212254720
+        \\    ;;
+        \\  check-release-metadata|check-release-policy)
+        \\    ;;
+        \\  check-draft-assets)
+        \\    mode=
+        \\    while (($#)); do
+        \\      if [[ "$1" == "--mode" ]]; then
+        \\        mode=$2
+        \\        shift 2
+        \\      else
+        \\        shift
+        \\      fi
+        \\    done
+        \\    if [[ "$mode" == asset ]]; then
+        \\      printf 'upload\n'
+        \\    fi
+        \\    ;;
+        \\  *)
+        \\    exit 99
+        \\    ;;
+        \\esac
+        \\EOF
+        \\chmod +x bin/release_tool
+        \\cat >scripts/release/check_repository_release_policy.sh <<'POLICY'
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\printf 'policy:%s:%s\n' "$1" "${GH_TOKEN:-}" >>"$CALL_LOG"
+        \\POLICY
+        \\chmod +x scripts/release/check_repository_release_policy.sh
+        \\cat >bin/git <<'GIT'
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\printf 'git:%s\n' "$*" >>"$CALL_LOG"
+        \\if [[ "$*" == *"^{}"* ]]; then
+        \\  exit 0
+        \\fi
+        \\printf '%s\trefs/tags/%s\n' "$SOURCE_COMMIT" "$RELEASE_TAG"
+        \\GIT
+        \\chmod +x bin/git
+        \\cat >bin/gh <<'GH'
+        \\#!/usr/bin/env bash
+        \\set -euo pipefail
+        \\printf 'gh:%s\n' "$*" >>"$CALL_LOG"
+        \\if [[ "$1" == release && "$2" == view ]]; then
+        \\  if [[ "$*" == *isDraft* ]]; then
+        \\    exit 1
+        \\  fi
+        \\  printf '42\n'
+        \\  exit 0
+        \\fi
+        \\if [[ "$1" == release && "$2" == create ]]; then
+        \\  exit 0
+        \\fi
+        \\if [[ "$1" == release && "$2" == download ]]; then
+        \\  dir=
+        \\  while (($#)); do
+        \\    if [[ "$1" == "--dir" ]]; then
+        \\      dir=$2
+        \\      shift 2
+        \\    else
+        \\      shift
+        \\    fi
+        \\  done
+        \\  cp "$STAGING_ROOT"/assets/* "$dir/"
+        \\  exit 0
+        \\fi
+        \\if [[ "$1" == api ]]; then
+        \\  printf '{"id":42}\n'
+        \\  exit 0
+        \\fi
+        \\exit 98
+        \\GH
+        \\chmod +x bin/gh
+        \\export PATH="$PWD/bin:$PATH"
+        \\export CANDIDATE="$PWD/input/Ubuntu-24.04-x86_64.confidential.qcow2"
+        \\export PROVENANCE="$PWD/input/Ubuntu-24.04-x86_64.confidential.qcow2.provenance.json"
+        \\export ACCEPTANCE_RESULT="$PWD/input/azure-result.json"
+        \\export SOURCE_COMMIT=0123456789abcdef0123456789abcdef01234567
+        \\export AZURE_LOCATION=westeurope
+        \\export AZURE_VM_SIZE=Standard_DC2as_v5
+        \\export RELEASE_TAG=Ubuntu-24.04-confidential-20260907
+        \\export RELEASE_TITLE='Ubuntu 24.04 Confidential VM - 20260907'
+        \\export REPOSITORY=cataggar/miz
+        \\export GITHUB_RUN_ID=12345
+        \\export GITHUB_RUN_ATTEMPT=1
+        \\export UBUNTU2404_CONFIDENTIAL_RELEASE_TOOL="$PWD/bin/release_tool"
+        \\publisher="$MIZ_UBUNTU2404_CONFIDENTIAL_ROOT/scripts/ubuntu2404_confidential_publish.sh"
+        \\
+        \\export STAGING_ROOT="$PWD/staging-validation"
+        \\export GITHUB_STEP_SUMMARY="$PWD/summary-validation.md"
+        \\export CALL_LOG="$PWD/calls-validation.log"
+        \\: >"$CALL_LOG"
+        \\: >"$GITHUB_STEP_SUMMARY"
+        \\if VALIDATION_ONLY=invalid "$publisher" >/dev/null 2>&1; then
+        \\  exit 90
+        \\fi
+        \\VALIDATION_ONLY=true "$publisher"
+        \\test ! -s "$CALL_LOG"
+        \\test "$(wc -l <"$STAGING_ROOT/expected.tsv")" -eq 3
+        \\test -s "$STAGING_ROOT/release-notes.md"
+        \\grep -F '### Ubuntu 24.04 Confidential VM release bundle verified (validation-only)' "$GITHUB_STEP_SUMMARY" >/dev/null
+        \\grep -F 'Validation-only run completed; no GitHub release or tag was mutated.' "$GITHUB_STEP_SUMMARY" >/dev/null
+        \\
+        \\export STAGING_ROOT="$PWD/staging-publish"
+        \\export GITHUB_STEP_SUMMARY="$PWD/summary-publish.md"
+        \\export CALL_LOG="$PWD/calls-publish.log"
+        \\: >"$CALL_LOG"
+        \\: >"$GITHUB_STEP_SUMMARY"
+        \\RELEASE_POLICY_GH_TOKEN=policy-tok GH_TOKEN=pub-tok VALIDATION_ONLY=false "$publisher"
+        \\grep -F 'policy:' "$CALL_LOG" >/dev/null
+        \\grep -F 'gh:release create' "$CALL_LOG" >/dev/null
+        \\grep -F '### Ubuntu 24.04 Confidential VM release published' "$GITHUB_STEP_SUMMARY" >/dev/null
+        \\
+    );
 }
 
 test "publisher is executable valid shell and documents the exact support boundary" {
@@ -266,5 +457,6 @@ test "publisher is executable valid shell and documents the exact support bounda
         "`AZURE_CLIENT_ID`",
         "`AZURE_TENANT_ID`",
         "`AZURE_SUBSCRIPTION_ID`",
+        "validation_only=true",
     }) |needle| try expectContains(guide, needle);
 }
