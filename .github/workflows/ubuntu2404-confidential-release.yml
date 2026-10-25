@@ -1,9 +1,9 @@
 # Protected-environment setup required before dispatch:
-# - `ubuntu2404-confidential-release`: restrict deployments to `main`, define
+# - `ubuntu2604-release`: restrict deployments to `main`, define
 #   secrets AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID, and define
 #   variables AZURE_LOCATION=westeurope and AZURE_VM_SIZE=Standard_DC2as_v5.
 #   The Entra federated credential subject is
-#   `repo:cataggar/miz:environment:ubuntu2404-confidential-release`.
+#   `repo:cataggar/miz:environment:ubuntu2604-release`.
 # Before dispatch, create or retarget RELEASE_TAG to the exact current `main`
 # commit. Publication preserves the accepted result and build provenance next
 # to the exact QCOW2 that passed nonce-bound SEV-SNP guest attestation.
@@ -192,7 +192,7 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 240
-    environment: ubuntu2404-confidential-release
+    environment: ubuntu2604-release
     permissions:
       actions: read
       contents: read
@@ -269,6 +269,7 @@ jobs:
           test -x "$RELEASE_TOOL"
 
       - name: Log in to Azure with protected-environment OIDC
+        id: azure_login
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -279,7 +280,7 @@ jobs:
         run: scripts/ubuntu2404_confidential_azure_acceptance.sh run
 
       - name: Refresh Azure OIDC credential for unconditional cleanup
-        if: always()
+        if: always() && steps.azure_login.outcome == 'success'
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -332,7 +333,7 @@ jobs:
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    environment: ubuntu2404-confidential-release
+    environment: ubuntu2604-release
     permissions:
       actions: read
       contents: read

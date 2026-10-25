@@ -136,11 +136,12 @@ test "workflow dispatch and protected identity are fail closed" {
     try expectContains(workflow, "if [[ \"$VALIDATION_ONLY\" != true ]]; then");
     try expectContains(workflow, "test \"$tag_commit\" = \"$commit\"");
     try expectContains(workflow, "echo \"Mode: \\`validation_only\\`\" >> \"$GITHUB_STEP_SUMMARY\"");
-    try expectCount(workflow, "environment: ubuntu2404-confidential-release", 2);
+    try expectCount(workflow, "environment: ubuntu2604-release", 2);
+    try expectAbsent(workflow, "environment: ubuntu2404-confidential-release");
     try expectCount(workflow, "id-token: write", 1);
     try expectContains(
         workflow,
-        "repo:cataggar/miz:environment:ubuntu2404-confidential-release",
+        "repo:cataggar/miz:environment:ubuntu2604-release",
     );
     for ([_][]const u8{
         "secrets.AZURE_CLIENT_ID",
@@ -200,11 +201,12 @@ test "acceptance uses the exact artifact OIDC and unconditional owned cleanup" {
 
     for ([_][]const u8{
         "needs: [prepare, build]",
-        "environment: ubuntu2404-confidential-release",
+        "environment: ubuntu2604-release",
         "name: ubuntu2404-confidential-candidate-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}",
         "install-miz install-ubuntu2404-confidential-release",
+        "id: azure_login",
         "scripts/ubuntu2404_confidential_azure_acceptance.sh run",
-        "- name: Refresh Azure OIDC credential for unconditional cleanup\n        if: always()",
+        "- name: Refresh Azure OIDC credential for unconditional cleanup\n        if: always() && steps.azure_login.outcome == 'success'",
         "- name: Delete only exact ownership-tagged Azure resources\n        if: always()",
         "scripts/ubuntu2404_confidential_azure_acceptance.sh cleanup",
         "name: ubuntu2404-confidential-azure-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}",
@@ -247,7 +249,7 @@ test "publication revalidates both artifacts before a three-asset release" {
         "needs.prepare.result == 'success'",
         "needs.build.result == 'success'",
         "needs.azure_acceptance.result == 'success'",
-        "environment: ubuntu2404-confidential-release",
+        "environment: ubuntu2604-release",
         "contents: write",
         "Download exact build candidate and provenance",
         "Download exact protected acceptance result",
@@ -453,7 +455,7 @@ test "publisher is executable valid shell and documents the exact support bounda
         "`VMGuestStateOnly`",
         "Canonical's stock Microsoft/Canonical Secure Boot trust",
         "nonce-bound Microsoft Azure Attestation",
-        "`repo:cataggar/miz:environment:ubuntu2404-confidential-release`",
+        "`repo:cataggar/miz:environment:ubuntu2604-release`",
         "`AZURE_CLIENT_ID`",
         "`AZURE_TENANT_ID`",
         "`AZURE_SUBSCRIPTION_ID`",

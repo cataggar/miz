@@ -152,7 +152,7 @@ release tag to resolve to that same commit, including through an annotated
 tag. Every checkout, candidate artifact name, acceptance artifact name, and
 published result is then bound to that immutable commit.
 
-Create a GitHub environment named `ubuntu2404-confidential-release`, restrict
+Create a GitHub environment named `ubuntu2604-release`, restrict
 it to the `main` branch, and configure:
 
 | Kind | Name | Required value |
@@ -173,7 +173,7 @@ receives only the latter as `GH_TOKEN`; policy checks explicitly substitute
 the former.
 
 The Entra application needs a federated credential with subject
-`repo:cataggar/miz:environment:ubuntu2404-confidential-release`. Grant only
+`repo:cataggar/miz:environment:ubuntu2604-release`. Grant only
 the Azure permissions needed to create and delete the temporary resource group
 and its compute, disk, network, managed-image, and gallery resources. The
 workflow does not use a stored Azure client secret.
