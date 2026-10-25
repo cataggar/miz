@@ -149,7 +149,7 @@ test "workflow dispatch and protected identity are fail closed" {
         "secrets.AZURE_SUBSCRIPTION_ID",
         "vars.AZURE_LOCATION",
         "vars.AZURE_VM_SIZE",
-        "test \"$AZURE_LOCATION\" = westeurope",
+        "[[ \"$AZURE_LOCATION\" =~ ^[a-z0-9-]+$ ]]",
         "test \"$AZURE_VM_SIZE\" = Standard_DC2as_v5",
     }) |needle| try expectContains(workflow, needle);
     try expectCount(
@@ -259,6 +259,7 @@ test "publication revalidates both artifacts before a three-asset release" {
         "scripts/ubuntu2404_confidential_publish.sh",
     }) |needle| try expectContains(publish, needle);
     for ([_][]const u8{
+        "[[ \"$AZURE_LOCATION\" =~ ^[a-z0-9-]+$ ]]",
         "VALIDATION_ONLY=${VALIDATION_ONLY:-false}",
         "if [[ \"$VALIDATION_ONLY\" == true ]]; then",
         "### Ubuntu 24.04 Confidential VM release bundle verified (validation-only)",
@@ -388,7 +389,7 @@ test "publisher supports both validation_only and normal publication" {
         \\export PROVENANCE="$PWD/input/Ubuntu-24.04-x86_64.confidential.qcow2.provenance.json"
         \\export ACCEPTANCE_RESULT="$PWD/input/azure-result.json"
         \\export SOURCE_COMMIT=0123456789abcdef0123456789abcdef01234567
-        \\export AZURE_LOCATION=westeurope
+        \\export AZURE_LOCATION=swedencentral
         \\export AZURE_VM_SIZE=Standard_DC2as_v5
         \\export RELEASE_TAG=Ubuntu-24.04-confidential-20260907
         \\export RELEASE_TITLE='Ubuntu 24.04 Confidential VM - 20260907'

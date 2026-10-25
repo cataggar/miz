@@ -234,7 +234,7 @@ jobs:
           [[ "$AZURE_CLIENT_ID_VALUE" =~ $uuid ]]
           [[ "$AZURE_TENANT_ID_VALUE" =~ $uuid ]]
           [[ "$AZURE_SUBSCRIPTION_ID_VALUE" =~ $uuid ]]
-          test "$AZURE_LOCATION" = westeurope
+          [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
           test "$AZURE_VM_SIZE" = Standard_DC2as_v5
 
       - name: Install Zig via ghr
