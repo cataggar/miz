@@ -220,6 +220,37 @@ test "azure acceptance uses protected-environment OIDC and keeps no secret" {
     );
     try expectAbsent(acceptance, "clientSecret");
     try expectAbsent(acceptance, "AZURE_CLIENT_SECRET");
+    try expectContains(acceptance, "id: azure_login");
+    try expectContains(
+        acceptance,
+        "if: always() && steps.azure_login.outcome == 'success'",
+    );
+    try expectCount(
+        acceptance,
+        "export ZIG_GLOBAL_CACHE_DIR=$GITHUB_WORKSPACE/.zig-global-cache",
+        2,
+    );
+    try expectContains(
+        acceptance,
+        "az account get-access-token --resource https://management.azure.com/ --query accessToken --output tsv >/dev/null",
+    );
+    const build_miz = std.mem.indexOf(
+        u8,
+        acceptance,
+        "- name: Build accepted-source miz",
+    ) orelse return error.RequiredTextMissing;
+    const login = std.mem.indexOf(
+        u8,
+        acceptance,
+        "- name: Log in to Azure with protected-environment OIDC",
+    ) orelse return error.RequiredTextMissing;
+    const run_acceptance = std.mem.indexOf(
+        u8,
+        acceptance,
+        "- name: Run exact-artifact Azure acceptance",
+    ) orelse return error.RequiredTextMissing;
+    try std.testing.expect(build_miz < login);
+    try std.testing.expect(login < run_acceptance);
     try expectContains(acceptance, "Upload failed Azure acceptance diagnostics");
     try expectAbsent(acceptance, "AZURE_CORE_OUTPUT");
 
@@ -355,6 +386,8 @@ test "azure acceptance allows Arm64 without a temporary resource disk" {
     try expectContains(script, "\"$release_tool\" check-vm-sku \\");
     try expectContains(script, "--architecture \"$expected_azure_architecture\"");
     try expectContains(script, "if mountpoint -q /d; then");
+    try expectContains(script, "mount_fstype=$(findmnt -n -o FSTYPE --target /d)");
+    try expectContains(script, "[[ \"$mount_fstype\" == ext4 || \"$mount_fstype\" == xfs ]]");
     try expectContains(script, "test \"$has_resource_disk\" = false");
 
     const azure_module = try readTracked(allocator, std.testing.io, azure_module_path);

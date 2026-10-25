@@ -1169,6 +1169,7 @@ jobs:
           set -euo pipefail
           export GITHUB_RUN_ID=$RUN_ID_VALUE
           export GITHUB_RUN_ATTEMPT=$RUN_ATTEMPT_VALUE
+          az account get-access-token --resource https://management.azure.com/ --query accessToken --output tsv >/dev/null
           scripts/ubuntu2604_azure_acceptance.sh run
 
       - name: Refresh Azure OIDC credential for unconditional cleanup
