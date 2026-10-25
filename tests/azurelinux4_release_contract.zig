@@ -705,7 +705,7 @@ test "CI actions are pinned to audited commits" {
     const allowed = [_][]const u8{
         "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4",
         "cataggar/ghr/actions/install@" ++
-            "7d8c3ef0886dd428a97727fce3b74909d6eace78 # v0.6.6",
+            "a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9 # v0.9.1",
         "actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4",
     };
     var found: usize = 0;

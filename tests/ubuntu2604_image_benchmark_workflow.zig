@@ -25,7 +25,7 @@ const max_workflow_bytes = 256 * 1024;
 /// to a full commit SHA.
 const pinned_actions = [_][]const u8{
     "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
-    "cataggar/ghr/actions/install@7d8c3ef0886dd428a97727fce3b74909d6eace78",
+    "cataggar/ghr/actions/install@a3be8c61b9d5c2bd6d38e6d067c69d70434a6db9",
     "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
 };
 
