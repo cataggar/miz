@@ -57,6 +57,25 @@ rm -rf -- "$assets_dir" "$verify_dir"
   --source-commit "$SOURCE_COMMIT" >"$expected_file"
 test "$(wc -l <"$expected_file")" -eq 8
 
+if [[ "${VALIDATION_ONLY:-false}" == true ]]; then
+  while IFS=$'\t' read -r asset_name _ expected_bytes; do
+    test "$(stat --format='%s' "$assets_dir/$asset_name")" = "$expected_bytes"
+    [[ "$asset_name" =~ ^[A-Za-z0-9._-]+$ ]]
+  done <"$expected_file"
+  {
+    echo "### Ubuntu 26.04 release bundle verified (validation-only)"
+    echo
+    echo "- Target release tag: \`$RELEASE_TAG\` (unmodified)"
+    echo "- Source commit: \`$SOURCE_COMMIT\`"
+    while IFS=$'\t' read -r asset_name expected_sha _; do
+      echo "- \`$asset_name\`: \`$expected_sha\`"
+    done <"$expected_file"
+    echo
+    echo "Validation-only run completed; no GitHub release or tag was mutated."
+  } >>"$GITHUB_STEP_SUMMARY"
+  exit 0
+fi
+
 release_mutated=false
 publish_attempted=false
 release_published=false

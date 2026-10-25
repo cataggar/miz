@@ -21,6 +21,11 @@ on:
         description: Completed Ubuntu release run whose successful candidates should be reused
         required: false
         type: string
+      validation_only:
+        description: Build, QEMU-accept, Azure-accept, and stage the release bundle without mutating the GitHub release
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   actions: read
@@ -58,6 +63,7 @@ jobs:
         id: source
         env:
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          VALIDATION_ONLY: ${{ inputs.validation_only }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -85,15 +91,20 @@ jobs:
           fi
 
           test "$(git ls-remote origin "refs/heads/main" | awk '{print $1}')" = "$commit"
-          direct_tag=$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')
-          peeled_tag=$(git ls-remote origin "refs/tags/$RELEASE_TAG^{}" | awk '{print $1}')
-          tag_commit=${peeled_tag:-$direct_tag}
-          test "$tag_commit" = "$commit"
+          if [[ "${VALIDATION_ONLY:-false}" != true ]]; then
+            direct_tag=$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')
+            peeled_tag=$(git ls-remote origin "refs/tags/$RELEASE_TAG^{}" | awk '{print $1}')
+            tag_commit=${peeled_tag:-$direct_tag}
+            test "$tag_commit" = "$commit"
+          fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "candidate_run_id=$candidate_run_id" >> "$GITHUB_OUTPUT"
           echo "reuse_candidates=$reuse_candidates" >> "$GITHUB_OUTPUT"
           echo "Accepted source commit: \`$commit\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Candidate run: \`$candidate_run_id\`" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${VALIDATION_ONLY:-false}" == true ]]; then
+            echo "Mode: \`validation_only\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   build:
     name: build/native ${{ matrix.key }}
@@ -1352,7 +1363,14 @@ jobs:
             --run-id "$RUN_ID_VALUE" \
             --require-size-budget enforced
 
+      - name: Stage and verify release bundle (validation-only)
+        if: inputs.validation_only == true
+        env:
+          VALIDATION_ONLY: true
+        run: scripts/ubuntu2604_publish.sh
+
       - name: Mint protected release policy token
+        if: inputs.validation_only != true
         id: github_policy_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
@@ -1364,6 +1382,7 @@ jobs:
           permission-contents: read
 
       - name: Mint isolated release publication token
+        if: inputs.validation_only != true
         id: github_publication_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
@@ -1375,6 +1394,7 @@ jobs:
           permission-workflows: write
 
       - name: Publish four accepted Ubuntu image and metadata pairs
+        if: inputs.validation_only != true
         env:
           GH_TOKEN: ${{ steps.github_publication_token.outputs.token }}
           RELEASE_POLICY_GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
