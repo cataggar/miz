@@ -7,6 +7,11 @@ on:
         description: Completed release run whose successful candidates should be reused
         required: false
         type: string
+      validation_only:
+        description: Build, Azure-accept, and stage the release bundle without mutating the GitHub release
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   actions: read
@@ -45,6 +50,7 @@ jobs:
         id: source
         env:
           CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          VALIDATION_ONLY: ${{ inputs.validation_only }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -98,13 +104,18 @@ jobs:
             reuse_candidates=true
           fi
 
-          test "$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')" = "$commit"
+          if [[ "${VALIDATION_ONLY:-false}" != true ]]; then
+            test "$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')" = "$commit"
+          fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "candidate_run_id=$candidate_run_id" >> "$GITHUB_OUTPUT"
           echo "candidate_run_attempt=$candidate_run_attempt" >> "$GITHUB_OUTPUT"
           echo "reuse_candidates=$reuse_candidates" >> "$GITHUB_OUTPUT"
           echo "Accepted source commit: \`$commit\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Candidate run: \`$candidate_run_id\` attempt \`$candidate_run_attempt\`" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${VALIDATION_ONLY:-false}" == true ]]; then
+            echo "Mode: \`validation_only\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   build:
     name: build/hosted ${{ matrix.key }}
@@ -205,6 +216,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
+          bash scripts/zig_fetch_retry.sh
           zig build install-miz install-azurelinux4-release
           test -x "$UKI_SIGN_COMMAND"
           test -x "$AZURELINUX4_RELEASE"
@@ -497,7 +509,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch=all
+          bash scripts/zig_fetch_retry.sh
           zig build install-azurelinux4-release -Doptimize=safe
           test -x "$AZURELINUX4_RELEASE"
 
@@ -507,7 +519,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch=all
+          bash scripts/zig_fetch_retry.sh
           zig build install-miz -Doptimize=safe
           test -x zig-out/bin/miz
 
@@ -624,7 +636,7 @@ jobs:
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
           export ZIG_GLOBAL_CACHE_DIR=$PWD/.zig-global-cache
-          zig build --fetch=all
+          bash scripts/zig_fetch_retry.sh
           zig build install-azurelinux4-release -Doptimize=safe
           test -x "$AZURELINUX4_RELEASE"
 
@@ -644,7 +656,19 @@ jobs:
           path: ${{ env.AZURE_RESULTS_DIR }}
           merge-multiple: false
 
+      - name: Stage and verify release bundle (validation-only)
+        if: inputs.validation_only == true
+        env:
+          VALIDATION_ONLY: true
+        run: |
+          set -euo pipefail
+          test "$PREPARE_RESULT" = success
+          test "$BUILD_RESULT" = success
+          test "$AZURE_RESULT" = success
+          scripts/azurelinux4_publish.sh
+
       - name: Mint protected release policy token
+        if: inputs.validation_only != true
         id: github_policy_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
@@ -656,6 +680,7 @@ jobs:
           permission-contents: read
 
       - name: Mint isolated release publication token
+        if: inputs.validation_only != true
         id: github_publication_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
@@ -667,6 +692,7 @@ jobs:
           permission-workflows: write
 
       - name: Publish only after explicit complete matrix validation
+        if: inputs.validation_only != true
         env:
           GH_TOKEN: ${{ steps.github_publication_token.outputs.token }}
           RELEASE_POLICY_GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}

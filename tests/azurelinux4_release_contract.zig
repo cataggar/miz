@@ -177,6 +177,7 @@ test "release reuse is bound to completed, successful candidates" {
     defer allocator.free(workflow);
 
     try expectContains(workflow, "candidate_run_id:");
+    try expectContains(workflow, "validation_only:");
     try expectContains(workflow, "test \"$(jq -r .status <<<\"$run\")\" = completed");
     try expectContains(workflow, ".conclusion == \"success\"");
     try expectContains(workflow, ".expired == false");
@@ -189,6 +190,15 @@ test "release reuse is bound to completed, successful candidates" {
         "run-id: ${{ needs.prepare.outputs.candidate_run_id }}",
         2,
     );
+    try expectCount(workflow, "bash scripts/zig_fetch_retry.sh", 4);
+    try expectContains(
+        workflow,
+        "- name: Stage and verify release bundle (validation-only)",
+    );
+
+    const publish_script = try readTracked(allocator, std.testing.io, publish_path);
+    defer allocator.free(publish_script);
+    try expectContains(publish_script, "if [[ \"${VALIDATION_ONLY:-false}\" == true ]]; then");
 }
 
 test "azure acceptance uses protected-environment OIDC and keeps no secret" {

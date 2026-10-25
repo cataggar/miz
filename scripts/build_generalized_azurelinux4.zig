@@ -342,7 +342,7 @@ const x86_64 = ArchitectureDescriptor{
     .base_manifest_digest = "sha256:9070b05147f01e5a4bac47723c95f2555e11b9d3324c1df1910ff3545b7ce319",
     .repository_base_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/x86_64",
     .repomd_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/x86_64/repodata/repomd.xml",
-    .repomd_sha256 = "37c9d781347148a6e5d0a299897eb1fef3e209ca918cf1db5e578c35d548e9f5",
+    .repomd_sha256 = "f3460ca3c5f6fbf5ce752cb34db93342465619e3e1bfd373fc139fc292046b87",
     .signing_key_path = "etc/pki/rpm-gpg/RPM-GPG-KEY-azurelinux-4.0-x86_64",
     .systemd_boot_rpm_name = "systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm",
     .systemd_boot_rpm_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/x86_64/Packages/s/systemd-boot-unsigned-258.4-4.azl4.x86_64.rpm",
@@ -380,7 +380,7 @@ const aarch64 = ArchitectureDescriptor{
     .base_manifest_digest = "sha256:e541db83a8511c25fa1dd989161263874b7395ddd588f5caaa25453ea4e23263",
     .repository_base_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/aarch64",
     .repomd_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/aarch64/repodata/repomd.xml",
-    .repomd_sha256 = "79b9aad3e2b82d465e232d7f51cd72b7712bf25a600f3d195004f8cc636c27ba",
+    .repomd_sha256 = "c3893c274242cc95bfa8626ec8bf5b42fa4e9f4fde3cad636ec5d88044910ee2",
     .signing_key_path = "etc/pki/rpm-gpg/RPM-GPG-KEY-azurelinux-4.0-aarch64",
     .systemd_boot_rpm_name = "systemd-boot-unsigned-258.4-4.azl4.aarch64.rpm",
     .systemd_boot_rpm_url = "https://packages.microsoft.com/azurelinux/4.0/beta/base/aarch64/Packages/s/systemd-boot-unsigned-258.4-4.azl4.aarch64.rpm",
@@ -4250,11 +4250,11 @@ test "architecture and flavor descriptors pin inputs and output namespaces" {
         aarch64.base_manifest_digest,
     );
     try std.testing.expectEqualStrings(
-        "37c9d781347148a6e5d0a299897eb1fef3e209ca918cf1db5e578c35d548e9f5",
+        "f3460ca3c5f6fbf5ce752cb34db93342465619e3e1bfd373fc139fc292046b87",
         x86_64.repomd_sha256,
     );
     try std.testing.expectEqualStrings(
-        "79b9aad3e2b82d465e232d7f51cd72b7712bf25a600f3d195004f8cc636c27ba",
+        "c3893c274242cc95bfa8626ec8bf5b42fa4e9f4fde3cad636ec5d88044910ee2",
         aarch64.repomd_sha256,
     );
     try std.testing.expectEqualStrings("AzureLinux-4.0-x86_64.core.qcow2", defaultOutputPath(.x86_64, .core));

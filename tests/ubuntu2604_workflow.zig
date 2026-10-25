@@ -599,6 +599,8 @@ test "the release identifier uses one calendar date everywhere" {
     try workflow.expectContains("RELEASE_TAG: Ubuntu-26.04-20260907");
     try workflow.expectContains("RELEASE_TITLE: Ubuntu 26.04 full and core - 20260907");
     try workflow.expectContains("create or retarget RELEASE_TAG");
+    try workflow.expectContains("validation_only:");
+    try workflow.expectContains("- name: Stage and verify release bundle (validation-only)");
 }
 
 test "forbidden image tools appear only in explicitly optional oracle jobs" {
