@@ -207,6 +207,9 @@ test "azure acceptance uses protected-environment OIDC and keeps no secret" {
     defer allocator.free(workflow);
     const acceptance = try section(workflow, "  azure_acceptance:", "\n  publish:");
 
+    try expectContains(acceptance, "environment: ubuntu2604-release");
+    try expectCount(workflow, "environment: ubuntu2604-release", 2);
+    try expectAbsent(workflow, "environment: azurelinux4-release");
     try expectContains(acceptance, "id-token: write");
     try expectCount(acceptance, "client-id: ${{ secrets.AZURE_CLIENT_ID }}", 2);
     try expectCount(acceptance, "tenant-id: ${{ secrets.AZURE_TENANT_ID }}", 2);
@@ -470,7 +473,8 @@ test "the release workflow requires built-in signing and Secure Boot" {
     const workflow = try readTracked(allocator, std.testing.io, workflow_path);
     defer allocator.free(workflow);
 
-    try expectContains(workflow, "environment: azurelinux4-signing");
+    try expectContains(workflow, "environment: ubuntu2604-signing");
+    try expectAbsent(workflow, "environment: azurelinux4-signing");
     try expectAbsent(workflow, "AZURELINUX4_UKI_SIGN_COMMAND");
     try expectContains(
         workflow,
@@ -488,7 +492,12 @@ test "the release workflow requires built-in signing and Secure Boot" {
         "\"$UKI_SIGN_COMMAND\" uki verify " ++
             "--certificate \"$UKI_SIGNING_CERTIFICATE\" \"$signed\"",
     );
+    try expectContains(workflow, "id: signing_probe");
     try expectContains(workflow, "Upload failed signing probe");
+    try expectContains(
+        workflow,
+        "if: failure() && steps.signing_probe.outcome == 'failure'",
+    );
     try expectContains(
         workflow,
         "SIGNING_PROBE_DIR: ${{ github.workspace }}/signing-probe-",

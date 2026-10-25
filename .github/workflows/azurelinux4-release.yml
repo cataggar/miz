@@ -123,7 +123,7 @@ jobs:
     if: needs.prepare.outputs.reuse_candidates != 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
-    environment: azurelinux4-signing
+    environment: ubuntu2604-signing
     permissions:
       contents: read
       id-token: write
@@ -239,6 +239,7 @@ jobs:
           echo "UKI_SIGNING_CERTIFICATE_SHA256=$actual" >> "$GITHUB_ENV"
 
       - name: Prove protected signing end to end
+        id: signing_probe
         run: |
           set -euo pipefail
           unset ZIG_LOCAL_CACHE_DIR
@@ -271,7 +272,7 @@ jobs:
           rm -rf -- "$scratch"
 
       - name: Upload failed signing probe
-        if: failure()
+        if: failure() && steps.signing_probe.outcome == 'failure'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: azurelinux4-signing-probe-${{ matrix.key }}-${{ needs.prepare.outputs.source_commit }}-${{ github.run_attempt }}
@@ -376,7 +377,7 @@ jobs:
         if: always()
         run: |
           sudo rm -rf -- "$WORK_DIR"
-          rm -rf -- "$BUNDLE_DIR"
+          rm -rf -- "$BUNDLE_DIR" "$SIGNING_PROBE_DIR"
           rm -f -- "${UKI_SIGNING_CERTIFICATE:-}"
 
   azure_acceptance:
@@ -396,7 +397,7 @@ jobs:
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 240
-    environment: azurelinux4-release
+    environment: ubuntu2604-release
     permissions:
       actions: read
       contents: read
@@ -599,7 +600,7 @@ jobs:
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    environment: azurelinux4-release
+    environment: ubuntu2604-release
     permissions:
       actions: read
       contents: read
