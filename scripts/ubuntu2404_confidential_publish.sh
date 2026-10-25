@@ -29,6 +29,14 @@ RELEASE_TOOL=${UBUNTU2404_CONFIDENTIAL_RELEASE_TOOL:-zig-out/bin/ubuntu2404_conf
 [[ "$AZURE_VM_SIZE" == Standard_DC2as_v5 ]]
 [[ "$RELEASE_TAG" =~ ^Ubuntu-24\.04-confidential-[0-9]{8}$ ]]
 [[ "$REPOSITORY" == cataggar/miz ]]
+VALIDATION_ONLY=${VALIDATION_ONLY:-false}
+case "$VALIDATION_ONLY" in
+  true|false) ;;
+  *)
+    echo "::error::VALIDATION_ONLY must be true or false"
+    exit 1
+    ;;
+esac
 
 candidate_name=Ubuntu-24.04-x86_64.confidential.qcow2
 provenance_name=$candidate_name.provenance.json
@@ -95,6 +103,27 @@ The provenance and acceptance JSON assets bind the published QCOW2 to the
 authenticated Canonical input, fixed-VHD conversion, gallery image version,
 deployed VM identity, and attested guest security state.
 EOF
+
+if [[ "$VALIDATION_ONLY" == true ]]; then
+  while IFS=$'\t' read -r asset_name expected_sha expected_bytes; do
+    test "$(sha256sum "$assets_dir/$asset_name" | awk '{print $1}')" = "$expected_sha"
+    test "$(stat --format='%s' "$assets_dir/$asset_name")" = "$expected_bytes"
+    [[ "$asset_name" =~ ^[A-Za-z0-9._-]+$ ]]
+  done <"$expected_file"
+  test -s "$notes_file"
+  {
+    echo "### Ubuntu 24.04 Confidential VM release bundle verified (validation-only)"
+    echo
+    echo "- Target release tag: \`$RELEASE_TAG\` (unmodified)"
+    echo "- Source commit: \`$SOURCE_COMMIT\`"
+    while IFS=$'\t' read -r asset_name expected_sha _; do
+      echo "- \`$asset_name\`: \`$expected_sha\`"
+    done <"$expected_file"
+    echo
+    echo "Validation-only run completed; no GitHub release or tag was mutated."
+  } >>"$GITHUB_STEP_SUMMARY"
+  exit 0
+fi
 
 direct_tag=$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')
 peeled_tag=$(git ls-remote origin "refs/tags/$RELEASE_TAG^{}" | awk '{print $1}')

@@ -11,6 +11,12 @@ name: Publish Ubuntu 24.04 Confidential VM image
 
 on:
   workflow_dispatch:
+    inputs:
+      validation_only:
+        description: Build, Azure-accept, and stage the release bundle without mutating the GitHub release
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   actions: read
@@ -45,18 +51,33 @@ jobs:
 
       - name: Bind release tag to the immutable source
         id: source
+        env:
+          VALIDATION_ONLY: ${{ inputs.validation_only && 'true' || 'false' }}
         run: |
           set -euo pipefail
+          VALIDATION_ONLY=${VALIDATION_ONLY:-false}
+          case "$VALIDATION_ONLY" in
+            true|false) ;;
+            *)
+              echo "::error::validation_only must be true or false"
+              exit 1
+              ;;
+          esac
           commit=$(git rev-parse HEAD)
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse origin/main)" = "$commit"
           test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "$commit"
-          direct_tag=$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')
-          peeled_tag=$(git ls-remote origin "refs/tags/$RELEASE_TAG^{}" | awk '{print $1}')
-          tag_commit=${peeled_tag:-$direct_tag}
-          test "$tag_commit" = "$commit"
+          if [[ "$VALIDATION_ONLY" != true ]]; then
+            direct_tag=$(git ls-remote origin "refs/tags/$RELEASE_TAG" | awk '{print $1}')
+            peeled_tag=$(git ls-remote origin "refs/tags/$RELEASE_TAG^{}" | awk '{print $1}')
+            tag_commit=${peeled_tag:-$direct_tag}
+            test "$tag_commit" = "$commit"
+          fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
           echo "Accepted source commit: \`$commit\`" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$VALIDATION_ONLY" == true ]]; then
+            echo "Mode: \`validation_only\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   build:
     name: build authenticated x86_64 candidate
@@ -329,6 +350,7 @@ jobs:
       AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
       AZURE_VM_SIZE: ${{ vars.AZURE_VM_SIZE }}
       REPOSITORY: ${{ github.repository }}
+      VALIDATION_ONLY: ${{ inputs.validation_only && 'true' || 'false' }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Check out accepted source
@@ -367,7 +389,14 @@ jobs:
           zig build -Doptimize=safe install-ubuntu2404-confidential-release
           test -x "$RELEASE_TOOL"
 
+      - name: Stage and verify release bundle (validation-only)
+        if: inputs.validation_only == true
+        env:
+          VALIDATION_ONLY: ${{ inputs.validation_only && 'true' || 'false' }}
+        run: scripts/ubuntu2404_confidential_publish.sh
+
       - name: Mint protected release policy token
+        if: inputs.validation_only != true
         id: github_policy_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
@@ -379,6 +408,7 @@ jobs:
           permission-contents: read
 
       - name: Mint isolated release publication token
+        if: inputs.validation_only != true
         id: github_publication_token
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
@@ -390,7 +420,9 @@ jobs:
           permission-workflows: write
 
       - name: Revalidate the exact protected result and publish
+        if: inputs.validation_only != true
         env:
+          VALIDATION_ONLY: ${{ inputs.validation_only && 'true' || 'false' }}
           GH_TOKEN: ${{ steps.github_publication_token.outputs.token }}
           RELEASE_POLICY_GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
         run: scripts/ubuntu2404_confidential_publish.sh
