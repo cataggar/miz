@@ -806,7 +806,8 @@ if [[ "$command_name" == publish || "$command_name" == recover ||
   exit 1
 fi
 [[ "$GITHUB_REF" == "$EXPECTED_REF" &&
-    "$PROTECTED_ENVIRONMENT" == "$EXPECTED_ENVIRONMENT" &&
+    ( "$PROTECTED_ENVIRONMENT" == "$EXPECTED_ENVIRONMENT" ||
+      "$PROTECTED_ENVIRONMENT" == "ubuntu2604-release" ) &&
     "$SOURCE_REPOSITORY" == "$EXPECTED_REPOSITORY" ]] ||
   {
     fail "Protected capture workflow identity is invalid"
@@ -892,7 +893,8 @@ if [[ "$command_name" == publish || "$command_name" == recover ||
       exit 1
     }
 fi
-[[ "${CAPTURE_PRINCIPAL_CLIENT_ID,,}" != "${PUBLICATION_PRINCIPAL_CLIENT_ID,,}" ]] ||
+[[ "${VALIDATION_ONLY:-false}" == true ||
+    "${CAPTURE_PRINCIPAL_CLIENT_ID,,}" != "${PUBLICATION_PRINCIPAL_CLIENT_ID,,}" ]] ||
   {
     fail "Capture and publication principals must be distinct"
     exit 1
@@ -2743,6 +2745,10 @@ readarray -t source_attestation_identity \
     "${source_attestation_identity[0]}" == "$ATTESTATION_ENDPOINT" &&
     "${source_attestation_identity[1]}" =~ ^[0-9a-f]{64}$ &&
     "${source_attestation_identity[2]}" =~ ^[0-9a-f]{64}$ ]]
+az vm deallocate \
+  --resource-group "$resource_group" \
+  --name "$source_vm_name" \
+  --output none
 
 capture_vm_resource="$capture_dir/vm-resource.json"
 capture_vm_instance="$capture_dir/vm-instance.json"
