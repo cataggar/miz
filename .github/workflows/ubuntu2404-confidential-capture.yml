@@ -1228,6 +1228,7 @@ jobs:
           RECOVERY_ACTION: ${{ steps.inspect.outputs.recovery_action }}
         run: |
           set -euo pipefail
+          rm -f -- "$AZURE_CONFIG_DIR"/msal_token_cache* "$PUBLICATION_AZURE_CONFIG_DIR"/msal_token_cache*
           az account get-access-token --resource https://management.azure.com/ --query accessToken --output tsv >/dev/null
           AZURE_CONFIG_DIR="$PUBLICATION_AZURE_CONFIG_DIR" az account get-access-token --resource https://management.azure.com/ --query accessToken --output tsv >/dev/null
           if [[ "$RECOVERY_MODE" == true &&
@@ -1271,7 +1272,7 @@ jobs:
 
       - name: Arm fail-closed unconditional cleanup login
         if: always() && steps.result_discovery.outputs.result_artifact_id == ''
-        run: rm -f -- "$CLEANUP_LOGIN_MARKER"
+        run: rm -f -- "$CLEANUP_LOGIN_MARKER" "$AZURE_CONFIG_DIR"/msal_token_cache*
 
       - name: Refresh capture OIDC for unconditional exact cleanup
         id: cleanup_login
@@ -1292,6 +1293,9 @@ jobs:
             steps.cleanup_login.outcome == 'success'
           }}
         run: |
+          set -euo pipefail
+          rm -f -- "$AZURE_CONFIG_DIR"/msal_token_cache*
+          az account get-access-token --resource https://management.azure.com/ --query accessToken --output tsv >/dev/null
           umask 077
           : >"$CLEANUP_LOGIN_MARKER"
 
