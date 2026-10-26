@@ -94,6 +94,7 @@ test "acceptance deploys and attests the exact Confidential VM contract" {
         "sudo -n mokutil --sb-state",
         "test -c /dev/tpmrm0",
         "cloud-init status --wait",
+        "cloud_init_rc != 2",
         "walinuxagent.service",
         "lsblk -nr -s -o NAME,TYPE",
         "metadata/instance?api-version=2025-04-07",
