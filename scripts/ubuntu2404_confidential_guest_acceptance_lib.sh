@@ -60,14 +60,21 @@ set -Eeuo pipefail
 guest_error() {
   status=$1
   trap - ERR
-  printf 'guest readiness failed at line %s: %s\n' "$2" "$3" >&2
+  printf 'guest readiness failed (exit %s) at line %s: %s\n' "$status" "$2" "$3" >&2
   exit "$status"
 }
 trap 'guest_error "$?" "$LINENO" "$BASH_COMMAND"' ERR
 expected_virtual_size=$1
 test "$(uname -m)" = x86_64
 grep -Fxq 'VERSION_ID="24.04"' /etc/os-release
-sudo -n cloud-init status --wait >/dev/null
+cloud_init_rc=0
+sudo -n cloud-init status --wait >/dev/null || cloud_init_rc=$?
+cloud_init_status=$(sudo -n cloud-init status || true)
+if (( cloud_init_rc != 0 && cloud_init_rc != 2 )) ||
+   ! grep -Eq '(^|[[:space:]])status:[[:space:]]*done$' <<<"$cloud_init_status"; then
+  sudo -n cloud-init status --long >&2 || true
+  exit "$(( cloud_init_rc != 0 ? cloud_init_rc : 1 ))"
+fi
 systemctl is-active --quiet walinuxagent.service
 test -s /etc/machine-id
 test -s /etc/ssh/ssh_host_ed25519_key
@@ -151,7 +158,13 @@ ubuntu2404_confidential_guest_collect_attestation() {
 set -Eeuo pipefail
 endpoint=$1
 nonce=$2
-sudo -n dpkg -i /tmp/azguestattestation1.deb >/dev/null
+for attempt in {1..30}; do
+  if sudo -n dpkg -i /tmp/azguestattestation1.deb >/dev/null; then
+    break
+  fi
+  test "$attempt" -lt 30
+  sleep 2
+done
 sudo -n chmod 0755 /tmp/AttestationClient
 sudo -n /tmp/AttestationClient -a "$endpoint" -n "$nonce" -o TOKEN
 GUEST
