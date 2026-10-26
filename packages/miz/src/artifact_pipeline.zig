@@ -1237,8 +1237,9 @@ pub fn deriveFixedVhd(
         target_virtual_size,
         .{
             .vhd_subformat = .fixed,
-            .unique_id = options.unique_id,
-            .timestamp_unix = options.timestamp_unix,
+            .unique_id = options.unique_id orelse
+                derivedVhdUniqueId(options.expected_input_sha256),
+            .timestamp_unix = options.timestamp_unix orelse vhd.timestamp_base,
         },
         &finalized,
     );
@@ -1313,6 +1314,18 @@ pub fn deriveFixedVhd(
         .partition_count = source_gpt.partitions.len,
         .relocation = relocation,
     };
+}
+
+fn derivedVhdUniqueId(input_sha256: Digest) [16]u8 {
+    var hasher = Sha256.init(.{});
+    hasher.update("miz-azure-derive-vhd-footer-v1\x00");
+    hasher.update(&input_sha256);
+    var digest: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&digest);
+    var result: [16]u8 = digest[0..16].*;
+    result[6] = (result[6] & 0x0f) | 0x50;
+    result[8] = (result[8] & 0x3f) | 0x80;
+    return result;
 }
 
 const QemuImgRunOptions = struct {
@@ -3083,6 +3096,42 @@ test "fixed VHD derivation relocates mirrored GPT transactionally" {
         try std.testing.expectEqual(before.first_lba, after.first_lba);
         try std.testing.expectEqual(before.last_lba, after.last_lba);
     }
+
+    const default_a_path = "test-derive-vhd-default-a.vhd";
+    const default_b_path = "test-derive-vhd-default-b.vhd";
+    defer Dir.cwd().deleteFile(io, default_a_path) catch {};
+    defer Dir.cwd().deleteFile(io, default_b_path) catch {};
+    const default_a = try deriveFixedVhd(
+        std.testing.allocator,
+        io,
+        .{
+            .input_path = input_path,
+            .expected_input_sha256 = source_before.sha256,
+            .max_input_size = 32 * 1024 * 1024,
+            .expected_virtual_size = source_size,
+            .max_virtual_size = 32 * 1024 * 1024,
+            .output_path = default_a_path,
+            .max_output_size = 32 * 1024 * 1024,
+        },
+    );
+    const default_b = try deriveFixedVhd(
+        std.testing.allocator,
+        io,
+        .{
+            .input_path = input_path,
+            .expected_input_sha256 = source_before.sha256,
+            .max_input_size = 32 * 1024 * 1024,
+            .expected_virtual_size = source_size,
+            .max_virtual_size = 32 * 1024 * 1024,
+            .output_path = default_b_path,
+            .max_output_size = 32 * 1024 * 1024,
+        },
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &default_a.artifact.sha256,
+        &default_b.artifact.sha256,
+    );
 }
 
 test "fixed VHD derivation preserves output on digest failure and rejects aliases" {

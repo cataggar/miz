@@ -2547,6 +2547,23 @@ vhd_sha256=${vhd_identity[2]}
 [[ "$vhd_current_size" == "$virtual_size" &&
     "$vhd_bytes" =~ ^[1-9][0-9]*$ &&
     "$vhd_sha256" =~ ^[0-9a-f]{64}$ ]]
+if [[ "${VALIDATION_ONLY:-false}" == true ]]; then
+  jq -e \
+    --arg qcow_sha256 "$qcow_sha256" \
+    --argjson qcow_size "$qcow_bytes" \
+    --argjson vhd_size "$vhd_bytes" \
+    --argjson virtual_size "$virtual_size" \
+    '.artifact.qcow_sha256 == $qcow_sha256 and
+     .artifact.qcow_size == $qcow_size and
+     .artifact.vhd_size == $vhd_size and
+     .artifact.virtual_size == $virtual_size' \
+    "$SOURCE_ACCEPTANCE" >/dev/null ||
+    fail "Re-derived VHD geometry does not match the accepted source artifact"
+  jq --arg vhd_sha256 "$vhd_sha256" '.artifact.vhd_sha256 = $vhd_sha256' \
+    "$SOURCE_ACCEPTANCE" >"${SOURCE_ACCEPTANCE}.normalized"
+  chmod 0600 "${SOURCE_ACCEPTANCE}.normalized"
+  mv -f -- "${SOURCE_ACCEPTANCE}.normalized" "$SOURCE_ACCEPTANCE"
+fi
 jq -e \
   --arg qcow_sha256 "$qcow_sha256" \
   --argjson qcow_size "$qcow_bytes" \
