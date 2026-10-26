@@ -991,6 +991,18 @@ jobs:
           }}
         run: |
           set -euo pipefail
+          while IFS= read -r stale_rg; do
+            [[ -n "$stale_rg" ]] || continue
+            az group delete --name "$stale_rg" --yes --output none
+          done < <(
+            az group list \
+              --tag "miz-owner=$TARGET_OWNER_TAG" \
+              --query "[?starts_with(name, 'miz-u2404-cvm-target-val-')].name" \
+              --output tsv
+          )
+          if [[ "$(az group exists --name "$SCRATCH_RESOURCE_GROUP" --output tsv)" == true ]]; then
+            az group delete --name "$SCRATCH_RESOURCE_GROUP" --yes --output none
+          fi
           az group create \
             --name "$SCRATCH_RESOURCE_GROUP" \
             --location "$AZURE_LOCATION" \
@@ -1288,7 +1300,11 @@ jobs:
               echo "::error::Fresh cleanup login failed; retaining quarantined scratch state"
               exit 1
             fi
-            scripts/ubuntu2404_confidential_capture.sh cleanup
+            if [[ "${VALIDATION_ONLY:-false}" == true ]]; then
+              scripts/ubuntu2404_confidential_capture.sh cleanup || true
+            else
+              scripts/ubuntu2404_confidential_capture.sh cleanup
+            fi
           fi
           if [[ "${VALIDATION_ONLY:-false}" == true &&
               -f "$CLEANUP_LOGIN_MARKER" &&

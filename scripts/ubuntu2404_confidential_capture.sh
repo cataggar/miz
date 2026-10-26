@@ -2295,7 +2295,7 @@ refresh_recovery_prepared_evidence() {
     '.storageProfile.osDisk.managedDisk.id' "$capture_vm_resource")
   azure_confidential_vm_capture_disk_show_args "$capture_disk_id"
   az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$capture_disk_json"
-  azure_confidential_vm_capture_snapshot_show_args \
+  azure_confidential_vm_snapshot_show_args \
     "$resource_group" "$snapshot_name"
   az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$snapshot_json"
   "$RELEASE_TOOL" capture-gallery-request \
@@ -2953,7 +2953,7 @@ capture_vm_id=$(jq -er '.id' "$capture_vm_resource")
 capture_disk_id=$(jq -er '.storageProfile.osDisk.managedDisk.id' "$capture_vm_resource")
 run_capture_vm_check "$capture_vm_resource" "$capture_vm_id" "$capture_disk_id" \
   >/dev/null
-azure_confidential_vm_capture_snapshot_show_args \
+azure_confidential_vm_snapshot_show_args \
   "$resource_group" "$snapshot_name"
 az "${AZURE_CONFIDENTIAL_VM_ARGS[@]}" >"$snapshot_json"
 [[ "$("$RELEASE_TOOL" check-capture-snapshot \
