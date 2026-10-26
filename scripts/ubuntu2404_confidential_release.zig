@@ -633,7 +633,7 @@ fn verifyVhd(
 
 fn conversionDocument(
     allocator: Allocator,
-    evidence: VhdEvidence,
+    evidence: *const VhdEvidence,
 ) !Value {
     return release.azure_compute.object(allocator, &.{
         .{ "qcow_sha256", release.azure_compute.string(&evidence.qcow_sha256) },
@@ -659,7 +659,7 @@ fn runVerifyVhd(context: Context, argv: []const []const u8) !void {
         try options.require("info"),
         context.diagnostic,
     );
-    const document = try conversionDocument(context.allocator, evidence);
+    const document = try conversionDocument(context.allocator, &evidence);
     try release.json_document.writeDocument(
         context.allocator,
         context.io,
@@ -2415,7 +2415,7 @@ pub fn parseCaptureCommandArguments(
 
 fn captureExpected(
     options: *const Options,
-    build: BuildEvidence,
+    build: *const BuildEvidence,
     source_acceptance: *const ObjectMap,
     diagnostic: *Diagnostic,
 ) !capture.Expected {
@@ -3094,7 +3094,7 @@ fn runCaptureResult(context: Context, argv: []const []const u8) !void {
     );
     const expected = try captureExpected(
         &options,
-        verified,
+        &verified,
         source_acceptance.object(),
         context.diagnostic,
     );
@@ -3221,7 +3221,7 @@ fn runVerifyCapture(context: Context, argv: []const []const u8) !void {
     );
     const expected = try captureExpected(
         &options,
-        verified,
+        &verified,
         source_acceptance.object(),
         context.diagnostic,
     );
@@ -3978,6 +3978,74 @@ test "attestation rejects identity and security claim substitutions" {
         "\"tpm-enabled\":false",
         "attested VM vTPM configuration is not true",
     );
+}
+
+test "captureExpected binds caller build evidence without dangling stack slice" {
+    const allocator = std.testing.allocator;
+    const sub_id = "00000000-0000-0000-0000-000000000000";
+    const scratch_rg = "miz-u2404-cvm-capture-00112233445566778899aabbccddeeff";
+    const target_rg = "miz-u2404-cvm-target";
+    const argv = [_][]const u8{
+        "--source-repository",      capture.repository,
+        "--repository",             capture.repository,
+        "--source-commit",          "0123456789abcdef0123456789abcdef01234567",
+        "--tool-commit",            "89abcdef0123456789abcdef0123456789abcdef",
+        "--source-release-tag",     "Ubuntu-24.04-confidential-20260417",
+        "--source-location",        "eastus",
+        "--location",               "eastus",
+        "--source-vm-size",         "Standard_DC2as_v5",
+        "--source-run-id",          "12345",
+        "--source-run-attempt",     "1",
+        "--run-id",                 "67890",
+        "--run-attempt",            "1",
+        "--subscription-id",        sub_id,
+        "--scratch-resource-group", scratch_rg,
+        "--target-resource-group",  target_rg,
+        "--source-version-id",      "/subscriptions/" ++ sub_id ++ "/resourceGroups/" ++ scratch_rg ++ "/providers/Microsoft.Compute/galleries/staging/images/ubuntu2404-confidential/versions/0.0.1",
+        "--capture-vm-id",          "/subscriptions/" ++ sub_id ++ "/resourceGroups/" ++ scratch_rg ++ "/providers/Microsoft.Compute/virtualMachines/capture-vm",
+        "--capture-disk-id",        "/subscriptions/" ++ sub_id ++ "/resourceGroups/" ++ scratch_rg ++ "/providers/Microsoft.Compute/disks/capture-osdisk",
+        "--snapshot-id",            "/subscriptions/" ++ sub_id ++ "/resourceGroups/" ++ scratch_rg ++ "/providers/Microsoft.Compute/snapshots/capture-snapshot",
+        "--definition-id",          "/subscriptions/" ++ sub_id ++ "/resourceGroups/" ++ target_rg ++ "/providers/Microsoft.Compute/galleries/release/images/ubuntu2404-confidential",
+        "--version-id",             "/subscriptions/" ++ sub_id ++ "/resourceGroups/" ++ target_rg ++ "/providers/Microsoft.Compute/galleries/release/images/ubuntu2404-confidential/versions/1.0.0",
+        "--final-vm-id",            "/subscriptions/" ++ sub_id ++ "/resourceGroups/" ++ scratch_rg ++ "/providers/Microsoft.Compute/virtualMachines/final-vm",
+        "--final-disk-id",          "/subscriptions/" ++ sub_id ++ "/resourceGroups/" ++ scratch_rg ++ "/providers/Microsoft.Compute/disks/final-datadisk",
+        "--endpoint",               "https://sharedeus.eus.attest.azure.net",
+    };
+    const options = try parseOptions(&argv, &capture_result_option_schema);
+    var source_parsed = try std.json.parseFromSlice(
+        Value,
+        allocator,
+        \\{"artifact":{"qcow_size":1024,"vhd_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","vhd_size":2048,"virtual_size":2048}}
+    ,
+        .{},
+    );
+    defer source_parsed.deinit();
+    const build: BuildEvidence = .{
+        .qcow_sha256 = release.digest.hexBytes("source qcow2"),
+        .qcow_size = 1024,
+        .virtual_size = 2048,
+        .provenance_identity = .{
+            .inode = 1,
+            .nlink = 1,
+            .size = 1,
+            .mtime_nanoseconds = 1,
+            .ctime_nanoseconds = 1,
+        },
+    };
+    var diagnostic: Diagnostic = .{};
+    const expected = try captureExpected(
+        &options,
+        &build,
+        &source_parsed.value.object,
+        &diagnostic,
+    );
+    var clobber: [256]u8 = @splat(0xff);
+    std.mem.doNotOptimizeAway(&clobber);
+    try std.testing.expectEqualStrings(
+        &release.digest.hexBytes("source qcow2"),
+        expected.source.artifact.qcow_sha256,
+    );
+    _ = try release.digest.parseHex(expected.source.artifact.qcow_sha256);
 }
 
 test {
