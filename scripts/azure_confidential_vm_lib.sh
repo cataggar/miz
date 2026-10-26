@@ -234,6 +234,10 @@ azure_confidential_vm_snapshot_show_args() {
   )
 }
 
+azure_confidential_vm_capture_snapshot_show_args() {
+  azure_confidential_vm_snapshot_show_args "$@"
+}
+
 azure_confidential_vm_capture_image_definition_create_args() {
   local resource_group=$1 gallery=$2 image=$3 offer=$4 sku=$5 location=$6
   AZURE_CONFIDENTIAL_VM_ARGS=(
