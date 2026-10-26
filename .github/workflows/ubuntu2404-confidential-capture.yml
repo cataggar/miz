@@ -991,6 +991,7 @@ jobs:
           }}
         run: |
           set -euo pipefail
+          az account get-access-token --resource https://management.azure.com/ --query accessToken --output tsv >/dev/null
           while IFS= read -r stale_rg; do
             [[ -n "$stale_rg" ]] || continue
             az group delete --name "$stale_rg" --yes --output none
@@ -1050,7 +1051,10 @@ jobs:
             steps.result_discovery.outputs.result_artifact_id == '' &&
             needs.prepare.outputs.recovery_mode == 'false'
           }}
-        run: scripts/ubuntu2404_confidential_capture.sh prepare
+        run: |
+          set -euo pipefail
+          az account get-access-token --resource https://management.azure.com/ --query accessToken --output tsv >/dev/null
+          scripts/ubuntu2404_confidential_capture.sh prepare
 
       - name: Export sanitized owner-only recovery intent before target PUT
         if: >-
@@ -1224,6 +1228,8 @@ jobs:
           RECOVERY_ACTION: ${{ steps.inspect.outputs.recovery_action }}
         run: |
           set -euo pipefail
+          az account get-access-token --resource https://management.azure.com/ --query accessToken --output tsv >/dev/null
+          AZURE_CONFIG_DIR="$PUBLICATION_AZURE_CONFIG_DIR" az account get-access-token --resource https://management.azure.com/ --query accessToken --output tsv >/dev/null
           if [[ "$RECOVERY_MODE" == true &&
               "$RECOVERY_ACTION" == resume ]]; then
             scripts/ubuntu2404_confidential_capture.sh recover

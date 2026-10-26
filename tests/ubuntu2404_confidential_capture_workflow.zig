@@ -1349,6 +1349,7 @@ test "validation_only mode gates GitHub App release mutations and cleans ephemer
         "if: inputs.validation_only != true",
         "Provision ephemeral validation scratch and target parents",
         "expected_val_target=\"miz-u2404-cvm-target-val-${ORIGIN_RUN_ID}-${ORIGIN_RUN_ATTEMPT}\"",
+        "az account get-access-token --resource https://management.azure.com/ --query accessToken --output tsv >/dev/null",
     }) |needle| try expectContains(workflow, needle);
     try expectCount(workflow, "if: inputs.validation_only != true", 5);
 }
