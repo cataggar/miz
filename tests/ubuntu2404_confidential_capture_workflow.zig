@@ -148,7 +148,7 @@ test "capture workflow is dispatch-only guarded and fully pinned" {
     );
     try expectCount(
         workflow,
-        "environment: ubuntu2404-confidential-capture",
+        "environment: ubuntu2604-release",
         3,
     );
     try expectCount(workflow, "id-token: write", 1);
@@ -275,7 +275,7 @@ test "policy and publication GitHub App tokens stay separated" {
     }
     try expectContains(
         prepare,
-        "environment: ubuntu2404-confidential-capture",
+        "environment: ubuntu2604-release",
     );
     const policy_token = try section(
         publication,
@@ -306,7 +306,7 @@ test "policy and publication GitHub App tokens stay separated" {
     );
     try expectContains(
         publication,
-        "github-token: ${{ steps.github_policy_token.outputs.token }}",
+        "github-token: ${{ steps.github_policy_token.outputs.token || github.token }}",
     );
     try expectCount(publication, "GH_TOKEN=\"$POLICY_GH_TOKEN\"", 15);
     try expectCount(publication, "GH_TOKEN=\"$PUBLICATION_GH_TOKEN\"", 12);
@@ -1331,6 +1331,24 @@ test "operator guide fixes prerequisites RBAC and quarantine boundary" {
         "quarantined",
         "manual",
         "live Azure qualification run",
+        "validation_only=true",
+        "source_run_id=ACCEPTED_RELEASE_RUN_ID",
     }) |needle| try expectContains(guide, needle);
     try expectAbsent(guide, "GET /repos/cataggar/miz/installations");
+}
+
+test "validation_only mode gates GitHub App release mutations and cleans ephemeral targets" {
+    const allocator = std.testing.allocator;
+    const workflow = try readTracked(allocator, workflow_path);
+    defer allocator.free(workflow);
+
+    for ([_][]const u8{
+        "validation_only:",
+        "source_run_id:",
+        "source_run_attempt:",
+        "if: inputs.validation_only != true",
+        "Provision ephemeral validation scratch and target parents",
+        "expected_val_target=\"miz-u2404-cvm-target-val-${ORIGIN_RUN_ID}-${ORIGIN_RUN_ATTEMPT}\"",
+    }) |needle| try expectContains(workflow, needle);
+    try expectCount(workflow, "if: inputs.validation_only != true", 5);
 }

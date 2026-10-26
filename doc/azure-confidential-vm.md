@@ -644,6 +644,21 @@ evidence.
 This workflow is not a substitute for qualification. A new region, SKU,
 definition contract, Azure API behavior, role design, or harness change
 requires a supervised live Azure qualification run before production use.
+To run an end-to-end live Azure qualification against an accepted
+`ubuntu2404-confidential-release.yml` workflow run without mutating GitHub
+releases or tags, dispatch with `validation_only=true`, `source_run_id`, and
+`source_run_attempt`:
+
+```console
+gh workflow run ubuntu2404-confidential-capture.yml --ref main \
+  -f source_release_tag=Ubuntu-24.04-confidential-YYYYMMDD \
+  -f target_gallery_version=1.0.0 \
+  -f scratch_resource_group=miz-u2404-cvm-capture-32_LOWERCASE_HEX \
+  -f validation_only=true \
+  -f source_run_id=ACCEPTED_RELEASE_RUN_ID \
+  -f source_run_attempt=1
+```
+
 Repository CI and this implementation intentionally perform no live Azure
 execution.
 

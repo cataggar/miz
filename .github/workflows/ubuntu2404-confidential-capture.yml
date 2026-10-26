@@ -29,8 +29,24 @@ on:
         required: false
         default: ''
         type: string
+      validation_only:
+        description: Run live Azure ConfidentialVM capture and verify provenance without GitHub release mutation
+        required: false
+        default: false
+        type: boolean
+      source_run_id:
+        description: Validation only - accepted ubuntu2404-confidential-release workflow run ID
+        required: false
+        default: ''
+        type: string
+      source_run_attempt:
+        description: Validation only - accepted ubuntu2404-confidential-release workflow run attempt
+        required: false
+        default: '1'
+        type: string
 
 permissions:
+  actions: read
   contents: read
   attestations: read
 
@@ -54,12 +70,14 @@ jobs:
     if: github.repository == 'cataggar/miz' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    environment: ubuntu2404-confidential-capture
+    environment: ubuntu2604-release
     permissions:
+      actions: read
       contents: read
       attestations: read
     env:
       CAPTURE_RELEASE_WRITER_POLICY: ${{ vars.CAPTURE_RELEASE_WRITER_POLICY }}
+      VALIDATION_ONLY: ${{ inputs.validation_only }}
     outputs:
       workflow_commit: ${{ steps.resolve.outputs.workflow_commit }}
       tool_commit: ${{ steps.resolve.outputs.tool_commit }}
@@ -85,6 +103,7 @@ jobs:
     steps:
       - name: Mint protected preflight policy token
         id: github_policy_token
+        if: inputs.validation_only != true
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
           app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
@@ -117,13 +136,18 @@ jobs:
             echo "::error::main advanced after dispatch approval; redispatch the workflow"
             exit 1
           fi
-          scripts/ubuntu2404_confidential_github_policy.sh \
-            .capture/prepare/github-policy
+          if [[ "${VALIDATION_ONLY:-false}" != true ]]; then
+            scripts/ubuntu2404_confidential_github_policy.sh \
+              .capture/prepare/github-policy
+          fi
 
       - name: Require immutable releases and resolve exact origin identities
         id: resolve
         env:
           GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
+          FALLBACK_GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
           SOURCE_RELEASE_TAG: ${{ inputs.source_release_tag }}
           TARGET_GALLERY_VERSION: ${{ inputs.target_gallery_version }}
           SCRATCH_RESOURCE_GROUP: ${{ inputs.scratch_resource_group }}
@@ -132,6 +156,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          export GH_TOKEN="${GH_TOKEN:-$FALLBACK_GH_TOKEN}"
           test "$GITHUB_REPOSITORY" = cataggar/miz
           test "$GITHUB_REF" = refs/heads/main
           test "$GITHUB_EVENT_NAME" = workflow_dispatch
@@ -172,15 +197,17 @@ jobs:
             -H 'Accept: application/vnd.github+json'
             -H "X-GitHub-Api-Version: $GH_API_VERSION"
           )
-          gh api "${api_headers[@]}" \
-            "repos/$GITHUB_REPOSITORY/immutable-releases" \
-            >.capture/prepare/immutable-releases.json
-          jq -e '.enabled == true' \
-            .capture/prepare/immutable-releases.json >/dev/null ||
-            {
-              echo "::error::Repository immutable releases must already be enabled"
-              exit 1
-            }
+          if [[ "${VALIDATION_ONLY:-false}" != true ]]; then
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/immutable-releases" \
+              >.capture/prepare/immutable-releases.json
+            jq -e '.enabled == true' \
+              .capture/prepare/immutable-releases.json >/dev/null ||
+              {
+                echo "::error::Repository immutable releases must already be enabled"
+                exit 1
+              }
+          fi
 
           recovery_artifact_id=
           recovery_artifact_digest=
@@ -307,79 +334,116 @@ jobs:
           git fetch --no-tags --depth=1 origin "$tool_commit"
           test "$(git rev-parse FETCH_HEAD)" = "$tool_commit"
 
-          direct_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
-          peeled_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
-          source_commit=${peeled_source:-$direct_source}
-          [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
-
           provenance_release_tag="miz-provenance/ubuntu2404-confidential-cvm/v$TARGET_GALLERY_VERSION/origin-$origin_run_id-attempt-$origin_run_attempt/tool-$tool_commit"
           provenance_release_title="Ubuntu 24.04 Confidential VM gallery provenance $TARGET_GALLERY_VERSION"
           provenance_asset_name="Ubuntu-24.04-x86_64.confidential-cvm-$TARGET_GALLERY_VERSION.provenance.json"
-          provenance_tag_state=$(
-            scripts/ubuntu2404_confidential_provenance_tag.sh \
-              classify "$provenance_release_tag" "$tool_commit" \
-              .capture/prepare/provenance-tag
-          )
-          if [[ "$recovery_mode" == true ]]; then
-            [[ "$provenance_tag_state" == absent ||
-                "$provenance_tag_state" == lightweight ]]
-          else
-            test "$provenance_tag_state" = absent
-          fi
-
-          source_release_json=.capture/prepare/source-release.json
-          gh api "${api_headers[@]}" \
-            "repos/$GITHUB_REPOSITORY/releases/tags/$SOURCE_RELEASE_TAG" \
-            >"$source_release_json"
-          jq -e \
-            --arg tag "$SOURCE_RELEASE_TAG" \
-            --arg title "$source_release_title" \
-            --arg qcow "$SOURCE_QCOW_NAME" \
-            --arg provenance "$SOURCE_PROVENANCE_NAME" \
-            --arg acceptance "$SOURCE_ACCEPTANCE_NAME" \
-            '
-            .tag_name == $tag and
-            .name == $title and
-            .immutable == true and
-            .draft == false and
-            .prerelease == false and
-            (.id | type == "number" and . > 0) and
-            (.assets | type == "array" and length == 3) and
-            ([.assets[].name] | sort) == ([$qcow, $provenance, $acceptance] | sort) and
-            all(.assets[];
-              (.id | type == "number" and . > 0) and
-              .state == "uploaded" and
-              (.size | type == "number" and . > 0))
-            ' "$source_release_json" >/dev/null
-
-          if [[ "$recovery_mode" == true ]]; then
-            test "$(jq -er '.source_commit' \
-              .capture/prepare/recovery/capture-state.json)" = "$source_commit"
-            test "$(jq -er '.tool_commit' \
-              .capture/prepare/recovery/recovery-intent.json)" = "$tool_commit"
-          else
-            gh api --paginate --slurp "${api_headers[@]}" \
-              "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              >.capture/prepare/provenance-releases.json
+          if [[ "${VALIDATION_ONLY:-false}" == true ]]; then
+            [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+            [[ "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]{0,9}$ ]]
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/attempts/$SOURCE_RUN_ATTEMPT" \
+              >.capture/prepare/source-run.json
             jq -e \
-              --arg tag "$provenance_release_tag" \
-              '[.[][] | select(.tag_name == $tag)] | length == 0' \
-              .capture/prepare/provenance-releases.json >/dev/null || {
-              echo "::error::Provenance release already exists; use explicit recovery inputs"
-              exit 1
-            }
-          fi
+              --argjson run_id "$SOURCE_RUN_ID" \
+              --argjson run_attempt "$SOURCE_RUN_ATTEMPT" \
+              '.id == $run_id and .run_attempt == $run_attempt and
+               .repository.full_name == env.GITHUB_REPOSITORY and
+               .head_repository.full_name == env.GITHUB_REPOSITORY and
+               .head_branch == "main" and .status == "completed" and
+               .conclusion == "success" and
+               (.head_sha | test("^[0-9a-f]{40}$")) and
+               .path == ".github/workflows/ubuntu2404-confidential-release.yml"' \
+              .capture/prepare/source-run.json >/dev/null
+            source_commit=$(jq -er '.head_sha' .capture/prepare/source-run.json)
+            candidate_artifact_name="ubuntu2404-confidential-candidate-$source_commit-$SOURCE_RUN_ATTEMPT"
+            acceptance_artifact_name="ubuntu2404-confidential-azure-$source_commit-$SOURCE_RUN_ATTEMPT"
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" \
+              >.capture/prepare/source-artifacts.json
+            source_qcow_asset_id=$(jq -er --arg name "$candidate_artifact_name" \
+              '.artifacts[] | select(.name == $name and .expired == false) | .id' \
+              .capture/prepare/source-artifacts.json)
+            source_provenance_asset_id=$(jq -er --arg name "$candidate_artifact_name" \
+              '.artifacts[] | select(.name == $name and .expired == false) | .digest' \
+              .capture/prepare/source-artifacts.json)
+            source_acceptance_asset_id=$(jq -er --arg name "$acceptance_artifact_name" \
+              '.artifacts[] | select(.name == $name and .expired == false) | .id' \
+              .capture/prepare/source-artifacts.json)
+            source_release_id=$(jq -er --arg name "$acceptance_artifact_name" \
+              '.artifacts[] | select(.name == $name and .expired == false) | .digest' \
+              .capture/prepare/source-artifacts.json)
+          else
+            direct_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
+            peeled_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
+            source_commit=${peeled_source:-$direct_source}
+            [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
 
-          source_release_id=$(jq -er '.id' "$source_release_json")
-          source_qcow_asset_id=$(jq -er \
-            --arg name "$SOURCE_QCOW_NAME" \
-            '.assets[] | select(.name == $name) | .id' "$source_release_json")
-          source_provenance_asset_id=$(jq -er \
-            --arg name "$SOURCE_PROVENANCE_NAME" \
-            '.assets[] | select(.name == $name) | .id' "$source_release_json")
-          source_acceptance_asset_id=$(jq -er \
-            --arg name "$SOURCE_ACCEPTANCE_NAME" \
-            '.assets[] | select(.name == $name) | .id' "$source_release_json")
+            provenance_tag_state=$(
+              scripts/ubuntu2404_confidential_provenance_tag.sh \
+                classify "$provenance_release_tag" "$tool_commit" \
+                .capture/prepare/provenance-tag
+            )
+            if [[ "$recovery_mode" == true ]]; then
+              [[ "$provenance_tag_state" == absent ||
+                  "$provenance_tag_state" == lightweight ]]
+            else
+              test "$provenance_tag_state" = absent
+            fi
+
+            source_release_json=.capture/prepare/source-release.json
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$SOURCE_RELEASE_TAG" \
+              >"$source_release_json"
+            jq -e \
+              --arg tag "$SOURCE_RELEASE_TAG" \
+              --arg title "$source_release_title" \
+              --arg qcow "$SOURCE_QCOW_NAME" \
+              --arg provenance "$SOURCE_PROVENANCE_NAME" \
+              --arg acceptance "$SOURCE_ACCEPTANCE_NAME" \
+              '
+              .tag_name == $tag and
+              .name == $title and
+              .immutable == true and
+              .draft == false and
+              .prerelease == false and
+              (.id | type == "number" and . > 0) and
+              (.assets | type == "array" and length == 3) and
+              ([.assets[].name] | sort) == ([$qcow, $provenance, $acceptance] | sort) and
+              all(.assets[];
+                (.id | type == "number" and . > 0) and
+                .state == "uploaded" and
+                (.size | type == "number" and . > 0))
+              ' "$source_release_json" >/dev/null
+
+            if [[ "$recovery_mode" == true ]]; then
+              test "$(jq -er '.source_commit' \
+                .capture/prepare/recovery/capture-state.json)" = "$source_commit"
+              test "$(jq -er '.tool_commit' \
+                .capture/prepare/recovery/recovery-intent.json)" = "$tool_commit"
+            else
+              gh api --paginate --slurp "${api_headers[@]}" \
+                "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                >.capture/prepare/provenance-releases.json
+              jq -e \
+                --arg tag "$provenance_release_tag" \
+                '[.[][] | select(.tag_name == $tag)] | length == 0' \
+                .capture/prepare/provenance-releases.json >/dev/null || {
+                echo "::error::Provenance release already exists; use explicit recovery inputs"
+                exit 1
+              }
+            fi
+
+            source_release_id=$(jq -er '.id' "$source_release_json")
+            source_qcow_asset_id=$(jq -er \
+              --arg name "$SOURCE_QCOW_NAME" \
+              '.assets[] | select(.name == $name) | .id' "$source_release_json")
+            source_provenance_asset_id=$(jq -er \
+              --arg name "$SOURCE_PROVENANCE_NAME" \
+              '.assets[] | select(.name == $name) | .id' "$source_release_json")
+            source_acceptance_asset_id=$(jq -er \
+              --arg name "$SOURCE_ACCEPTANCE_NAME" \
+              '.assets[] | select(.name == $name) | .id' "$source_release_json")
+          fi
           {
             echo "workflow_commit=$workflow_commit"
             echo "tool_commit=$tool_commit"
@@ -410,8 +474,9 @@ jobs:
     if: needs.prepare.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 360
-    environment: ubuntu2404-confidential-capture
+    environment: ubuntu2604-release
     permissions:
+      actions: read
       contents: read
       id-token: write
       attestations: read
@@ -429,6 +494,7 @@ jobs:
       cleanup_failed: ${{ steps.capture_status.outputs.cleanup_failed }}
     env:
       CAPTURE_RELEASE_WRITER_POLICY: ${{ vars.CAPTURE_RELEASE_WRITER_POLICY }}
+      VALIDATION_ONLY: ${{ inputs.validation_only }}
       WORKFLOW_COMMIT: ${{ needs.prepare.outputs.workflow_commit }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
       TOOL_COMMIT: ${{ needs.prepare.outputs.tool_commit }}
@@ -462,22 +528,23 @@ jobs:
       AZURE_LOCATION: ${{ vars.AZURE_LOCATION }}
       AZURE_VM_SIZE: ${{ vars.AZURE_VM_SIZE }}
       TARGET_LOCATION: ${{ vars.AZURE_LOCATION }}
-      TARGET_RESOURCE_GROUP: ${{ vars.TARGET_RESOURCE_GROUP }}
-      TARGET_GALLERY: ${{ vars.TARGET_GALLERY }}
-      TARGET_IMAGE_DEFINITION: ${{ vars.TARGET_IMAGE_DEFINITION }}
-      TARGET_OWNER_TAG: ${{ vars.TARGET_OWNER_TAG }}
-      SCRATCH_RESERVATION_TAG: ${{ secrets.SCRATCH_RESERVATION_TAG }}
-      CAPTURE_TARGET_READ_SCOPE: ${{ vars.CAPTURE_TARGET_READ_SCOPE }}
-      PUBLICATION_SNAPSHOT_READ_SCOPE: ${{ vars.PUBLICATION_SNAPSHOT_READ_SCOPE }}
-      PUBLICATION_VERSION_WRITE_SCOPE: ${{ vars.PUBLICATION_VERSION_WRITE_SCOPE }}
+      TARGET_RESOURCE_GROUP: ${{ vars.TARGET_RESOURCE_GROUP || (inputs.validation_only && format('miz-u2404-cvm-target-val-{0}-{1}', needs.prepare.outputs.origin_run_id, needs.prepare.outputs.origin_run_attempt) || '') }}
+      TARGET_GALLERY: ${{ vars.TARGET_GALLERY || (inputs.validation_only && 'release' || '') }}
+      TARGET_IMAGE_DEFINITION: ${{ vars.TARGET_IMAGE_DEFINITION || (inputs.validation_only && 'ubuntu2404-confidential' || '') }}
+      TARGET_OWNER_TAG: ${{ vars.TARGET_OWNER_TAG || (inputs.validation_only && 'ubuntu2404-confidential-capture' || '') }}
+      SCRATCH_RESERVATION_TAG: ${{ secrets.SCRATCH_RESERVATION_TAG || (inputs.validation_only && format('validation-reservation-{0}-{1}', needs.prepare.outputs.origin_run_id, needs.prepare.outputs.origin_run_attempt) || '') }}
+      CAPTURE_TARGET_READ_SCOPE: ${{ vars.CAPTURE_TARGET_READ_SCOPE || (inputs.validation_only && format('/subscriptions/{0}/resourceGroups/{1}', secrets.AZURE_SUBSCRIPTION_ID, vars.TARGET_RESOURCE_GROUP || format('miz-u2404-cvm-target-val-{0}-{1}', needs.prepare.outputs.origin_run_id, needs.prepare.outputs.origin_run_attempt)) || '') }}
+      PUBLICATION_SNAPSHOT_READ_SCOPE: ${{ vars.PUBLICATION_SNAPSHOT_READ_SCOPE || (inputs.validation_only && format('/subscriptions/{0}/resourceGroups/{1}', secrets.AZURE_SUBSCRIPTION_ID, inputs.scratch_resource_group) || '') }}
+      PUBLICATION_VERSION_WRITE_SCOPE: ${{ vars.PUBLICATION_VERSION_WRITE_SCOPE || (inputs.validation_only && format('/subscriptions/{0}/resourceGroups/{1}/providers/Microsoft.Compute/galleries/{2}/images/{3}', secrets.AZURE_SUBSCRIPTION_ID, vars.TARGET_RESOURCE_GROUP || format('miz-u2404-cvm-target-val-{0}-{1}', needs.prepare.outputs.origin_run_id, needs.prepare.outputs.origin_run_attempt), vars.TARGET_GALLERY || 'release', vars.TARGET_IMAGE_DEFINITION || 'ubuntu2404-confidential') || '') }}
       PUBLICATION_LOCK_ID: ubuntu2404-confidential-cvm-target-version
-      CAPTURE_PRINCIPAL_CLIENT_ID: ${{ secrets.AZURE_CAPTURE_CLIENT_ID }}
-      PUBLICATION_PRINCIPAL_CLIENT_ID: ${{ secrets.AZURE_PUBLICATION_CLIENT_ID }}
+      CAPTURE_PRINCIPAL_CLIENT_ID: ${{ secrets.AZURE_CAPTURE_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
+      PUBLICATION_PRINCIPAL_CLIENT_ID: ${{ secrets.AZURE_PUBLICATION_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
     steps:
       - name: Mint protected capture policy token
         id: github_policy_token
+        if: inputs.validation_only != true
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
           app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
@@ -506,7 +573,28 @@ jobs:
           [[ "$PUBLICATION_PRINCIPAL_CLIENT_ID" =~ $uuid ]]
           [[ "$AZURE_TENANT_ID" =~ $uuid ]]
           [[ "$AZURE_SUBSCRIPTION_ID" =~ $uuid ]]
-          test "${CAPTURE_PRINCIPAL_CLIENT_ID,,}" != "${PUBLICATION_PRINCIPAL_CLIENT_ID,,}"
+          if [[ "${VALIDATION_ONLY:-false}" == true ]]; then
+            TARGET_RESOURCE_GROUP=${TARGET_RESOURCE_GROUP:-miz-u2404-cvm-target-val-${ORIGIN_RUN_ID}-${ORIGIN_RUN_ATTEMPT}}
+            TARGET_GALLERY=${TARGET_GALLERY:-release}
+            TARGET_IMAGE_DEFINITION=${TARGET_IMAGE_DEFINITION:-ubuntu2404-confidential}
+            TARGET_OWNER_TAG=${TARGET_OWNER_TAG:-ubuntu2404-confidential-capture}
+            SCRATCH_RESERVATION_TAG=${SCRATCH_RESERVATION_TAG:-validation-reservation-${ORIGIN_RUN_ID}-${ORIGIN_RUN_ATTEMPT}}
+            CAPTURE_TARGET_READ_SCOPE=${CAPTURE_TARGET_READ_SCOPE:-/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP}
+            PUBLICATION_SNAPSHOT_READ_SCOPE=${PUBLICATION_SNAPSHOT_READ_SCOPE:-/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$SCRATCH_RESOURCE_GROUP}
+            PUBLICATION_VERSION_WRITE_SCOPE=${PUBLICATION_VERSION_WRITE_SCOPE:-/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/$TARGET_RESOURCE_GROUP/providers/Microsoft.Compute/galleries/$TARGET_GALLERY/images/$TARGET_IMAGE_DEFINITION}
+            {
+              echo "TARGET_RESOURCE_GROUP=$TARGET_RESOURCE_GROUP"
+              echo "TARGET_GALLERY=$TARGET_GALLERY"
+              echo "TARGET_IMAGE_DEFINITION=$TARGET_IMAGE_DEFINITION"
+              echo "TARGET_OWNER_TAG=$TARGET_OWNER_TAG"
+              echo "SCRATCH_RESERVATION_TAG=$SCRATCH_RESERVATION_TAG"
+              echo "CAPTURE_TARGET_READ_SCOPE=$CAPTURE_TARGET_READ_SCOPE"
+              echo "PUBLICATION_SNAPSHOT_READ_SCOPE=$PUBLICATION_SNAPSHOT_READ_SCOPE"
+              echo "PUBLICATION_VERSION_WRITE_SCOPE=$PUBLICATION_VERSION_WRITE_SCOPE"
+            } >>"$GITHUB_ENV"
+          else
+            test "${CAPTURE_PRINCIPAL_CLIENT_ID,,}" != "${PUBLICATION_PRINCIPAL_CLIENT_ID,,}"
+          fi
           [[ "$AZURE_LOCATION" =~ ^[a-z0-9-]+$ ]]
           [[ "$AZURE_VM_SIZE" =~ ^Standard_[A-Za-z0-9_]+$ ]]
           [[ "$TARGET_RESOURCE_GROUP" =~ ^[A-Za-z0-9._()-]{1,90}$ ]]
@@ -532,6 +620,7 @@ jobs:
       - name: Download exactly the accepted three-asset source release
         env:
           GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
+          FALLBACK_GH_TOKEN: ${{ github.token }}
           SOURCE_RELEASE_ID: ${{ needs.prepare.outputs.source_release_id }}
           SOURCE_QCOW_ASSET_ID: ${{ needs.prepare.outputs.source_qcow_asset_id }}
           SOURCE_PROVENANCE_ASSET_ID: ${{ needs.prepare.outputs.source_provenance_asset_id }}
@@ -539,52 +628,74 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          direct_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
-          peeled_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
-          test "${peeled_source:-$direct_source}" = "$SOURCE_COMMIT"
+          export GH_TOKEN="${GH_TOKEN:-$FALLBACK_GH_TOKEN}"
           api_headers=(
             -H 'Accept: application/vnd.github+json'
             -H "X-GitHub-Api-Version: $GH_API_VERSION"
           )
-          gh api "${api_headers[@]}" \
-            "repos/$GITHUB_REPOSITORY/immutable-releases" \
-            >.capture/immutable-releases.json
-          jq -e '.enabled == true' .capture/immutable-releases.json >/dev/null
-          source_release_title="Ubuntu 24.04 Confidential VM - ${SOURCE_RELEASE_TAG##*-}"
-          release_json=.capture/source-release.json
-          gh api "${api_headers[@]}" \
-            "repos/$GITHUB_REPOSITORY/releases/tags/$SOURCE_RELEASE_TAG" \
-            >"$release_json"
-          jq -e \
-            --argjson release_id "$SOURCE_RELEASE_ID" \
-            --arg title "$source_release_title" \
-            --arg qcow "$SOURCE_QCOW_NAME" \
-            --arg provenance "$SOURCE_PROVENANCE_NAME" \
-            --arg acceptance "$SOURCE_ACCEPTANCE_NAME" \
-            --argjson qcow_id "$SOURCE_QCOW_ASSET_ID" \
-            --argjson provenance_id "$SOURCE_PROVENANCE_ASSET_ID" \
-            --argjson acceptance_id "$SOURCE_ACCEPTANCE_ASSET_ID" \
-            '
-            .id == $release_id and
-            .tag_name == env.SOURCE_RELEASE_TAG and
-            .name == $title and
-            .immutable == true and
-            .draft == false and .prerelease == false and
-            (.assets | length == 3) and
-            ([.assets[].name] | sort) == ([$qcow, $provenance, $acceptance] | sort) and
-            ([.assets[] | select(.name == $qcow and .id == $qcow_id)] | length) == 1 and
-            ([.assets[] | select(.name == $provenance and .id == $provenance_id)] | length) == 1 and
-            ([.assets[] | select(.name == $acceptance and .id == $acceptance_id)] | length) == 1
-            ' "$release_json" >/dev/null
-          gh api "${api_headers[@]}" \
-            "repos/$GITHUB_REPOSITORY/releases/assets/$SOURCE_QCOW_ASSET_ID" \
-            -H 'Accept: application/octet-stream' >"$CANDIDATE"
-          gh api "${api_headers[@]}" \
-            "repos/$GITHUB_REPOSITORY/releases/assets/$SOURCE_PROVENANCE_ASSET_ID" \
-            -H 'Accept: application/octet-stream' >"$PROVENANCE"
-          gh api "${api_headers[@]}" \
-            "repos/$GITHUB_REPOSITORY/releases/assets/$SOURCE_ACCEPTANCE_ASSET_ID" \
-            -H 'Accept: application/octet-stream' >"$SOURCE_ACCEPTANCE"
+          if [[ "${VALIDATION_ONLY:-false}" == true ]]; then
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts/$SOURCE_QCOW_ASSET_ID/zip" \
+              >.capture/candidate.zip
+            test "sha256:$(sha256sum .capture/candidate.zip | awk '{print $1}')" \
+              = "$SOURCE_PROVENANCE_ASSET_ID"
+            mkdir -m 0700 .capture/candidate-unpack .capture/acceptance-unpack
+            unzip -q .capture/candidate.zip -d .capture/candidate-unpack
+            mv -- ".capture/candidate-unpack/$SOURCE_QCOW_NAME" "$CANDIDATE"
+            mv -- ".capture/candidate-unpack/$SOURCE_PROVENANCE_NAME" "$PROVENANCE"
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/actions/artifacts/$SOURCE_ACCEPTANCE_ASSET_ID/zip" \
+              >.capture/acceptance.zip
+            test "sha256:$(sha256sum .capture/acceptance.zip | awk '{print $1}')" \
+              = "$SOURCE_RELEASE_ID"
+            unzip -q .capture/acceptance.zip -d .capture/acceptance-unpack
+            mv -- .capture/acceptance-unpack/azure-result.json "$SOURCE_ACCEPTANCE"
+            rm -rf -- .capture/candidate.zip .capture/acceptance.zip \
+              .capture/candidate-unpack .capture/acceptance-unpack
+          else
+            direct_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG" | awk 'NR == 1 {print $1}')
+            peeled_source=$(git ls-remote origin "refs/tags/$SOURCE_RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')
+            test "${peeled_source:-$direct_source}" = "$SOURCE_COMMIT"
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/immutable-releases" \
+              >.capture/immutable-releases.json
+            jq -e '.enabled == true' .capture/immutable-releases.json >/dev/null
+            source_release_title="Ubuntu 24.04 Confidential VM - ${SOURCE_RELEASE_TAG##*-}"
+            release_json=.capture/source-release.json
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$SOURCE_RELEASE_TAG" \
+              >"$release_json"
+            jq -e \
+              --argjson release_id "$SOURCE_RELEASE_ID" \
+              --arg title "$source_release_title" \
+              --arg qcow "$SOURCE_QCOW_NAME" \
+              --arg provenance "$SOURCE_PROVENANCE_NAME" \
+              --arg acceptance "$SOURCE_ACCEPTANCE_NAME" \
+              --argjson qcow_id "$SOURCE_QCOW_ASSET_ID" \
+              --argjson provenance_id "$SOURCE_PROVENANCE_ASSET_ID" \
+              --argjson acceptance_id "$SOURCE_ACCEPTANCE_ASSET_ID" \
+              '
+              .id == $release_id and
+              .tag_name == env.SOURCE_RELEASE_TAG and
+              .name == $title and
+              .immutable == true and
+              .draft == false and .prerelease == false and
+              (.assets | length == 3) and
+              ([.assets[].name] | sort) == ([$qcow, $provenance, $acceptance] | sort) and
+              ([.assets[] | select(.name == $qcow and .id == $qcow_id)] | length) == 1 and
+              ([.assets[] | select(.name == $provenance and .id == $provenance_id)] | length) == 1 and
+              ([.assets[] | select(.name == $acceptance and .id == $acceptance_id)] | length) == 1
+              ' "$release_json" >/dev/null
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$SOURCE_QCOW_ASSET_ID" \
+              -H 'Accept: application/octet-stream' >"$CANDIDATE"
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$SOURCE_PROVENANCE_ASSET_ID" \
+              -H 'Accept: application/octet-stream' >"$PROVENANCE"
+            gh api "${api_headers[@]}" \
+              "repos/$GITHUB_REPOSITORY/releases/assets/$SOURCE_ACCEPTANCE_ASSET_ID" \
+              -H 'Accept: application/octet-stream' >"$SOURCE_ACCEPTANCE"
+          fi
           chmod 0600 "$CANDIDATE" "$PROVENANCE" "$SOURCE_ACCEPTANCE"
           test "$(find "$CANDIDATE_DIR" -maxdepth 1 -type f | wc -l)" -eq 3
           test -s "$CANDIDATE"
@@ -595,6 +706,7 @@ jobs:
         if: needs.prepare.outputs.recovery_mode == 'true'
         env:
           GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
+          FALLBACK_GH_TOKEN: ${{ github.token }}
           RECOVERY_ARTIFACT_ID: ${{ needs.prepare.outputs.recovery_artifact_id }}
           RECOVERY_ARTIFACT_DIGEST: ${{ needs.prepare.outputs.recovery_artifact_digest }}
           DISPATCH_ARTIFACT_ID: ${{ needs.prepare.outputs.dispatch_artifact_id }}
@@ -602,6 +714,7 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          export GH_TOKEN="${GH_TOKEN:-$FALLBACK_GH_TOKEN}"
           api_headers=(
             -H 'Accept: application/vnd.github+json'
             -H "X-GitHub-Api-Version: $GH_API_VERSION"
@@ -726,9 +839,11 @@ jobs:
         id: result_discovery
         env:
           GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
+          FALLBACK_GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           umask 077
+          export GH_TOKEN="${GH_TOKEN:-$FALLBACK_GH_TOKEN}"
           api_headers=(
             -H 'Accept: application/vnd.github+json'
             -H "X-GitHub-Api-Version: $GH_API_VERSION"
@@ -854,16 +969,68 @@ jobs:
             echo "::error::main advanced before Azure mutation; redispatch the workflow"
             exit 1
           fi
-          scripts/ubuntu2404_confidential_github_policy.sh \
-            .capture/pre-azure-github-policy
+          if [[ "${VALIDATION_ONLY:-false}" != true ]]; then
+            scripts/ubuntu2404_confidential_github_policy.sh \
+              .capture/pre-azure-github-policy
+          fi
 
       - name: Log in capture principal with protected-environment OIDC
         if: steps.result_discovery.outputs.result_artifact_id == ''
         uses: azure/login@a457da9ea143d694b1b9c7c869ebb04ebe844ef5 # v2
         with:
-          client-id: ${{ secrets.AZURE_CAPTURE_CLIENT_ID }}
+          client-id: ${{ secrets.AZURE_CAPTURE_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Provision ephemeral validation scratch and target parents
+        if: >-
+          ${{
+            inputs.validation_only == true &&
+            steps.result_discovery.outputs.result_artifact_id == '' &&
+            needs.prepare.outputs.recovery_mode == 'false'
+          }}
+        run: |
+          set -euo pipefail
+          az group create \
+            --name "$SCRATCH_RESOURCE_GROUP" \
+            --location "$AZURE_LOCATION" \
+            --tags \
+              "miz-owner=ubuntu2404-confidential-capture" \
+              "miz-repository=$GITHUB_REPOSITORY" \
+              "miz-reservation=$SCRATCH_RESERVATION_TAG" \
+            --output none
+          az group create \
+            --name "$TARGET_RESOURCE_GROUP" \
+            --location "$TARGET_LOCATION" \
+            --tags \
+              "miz-owner=$TARGET_OWNER_TAG" \
+              "miz-repository=$GITHUB_REPOSITORY" \
+            --output none
+          az sig create \
+            --resource-group "$TARGET_RESOURCE_GROUP" \
+            --gallery-name "$TARGET_GALLERY" \
+            --location "$TARGET_LOCATION" \
+            --tags \
+              "miz-owner=$TARGET_OWNER_TAG" \
+              "miz-repository=$GITHUB_REPOSITORY" \
+            --output none
+          az sig image-definition create \
+            --resource-group "$TARGET_RESOURCE_GROUP" \
+            --gallery-name "$TARGET_GALLERY" \
+            --gallery-image-definition "$TARGET_IMAGE_DEFINITION" \
+            --publisher miz \
+            --offer ubuntu2404 \
+            --sku confidential-x64 \
+            --os-type Linux \
+            --os-state Generalized \
+            --hyper-v-generation V2 \
+            --architecture x64 \
+            --features SecurityType=ConfidentialVM \
+            --location "$TARGET_LOCATION" \
+            --tags \
+              "miz-owner=$TARGET_OWNER_TAG" \
+              "miz-repository=$GITHUB_REPOSITORY" \
+            --output none
 
       - name: Prepare source recreation capture VM and snapshot
         if: >-
@@ -942,7 +1109,7 @@ jobs:
         env:
           AZURE_CONFIG_DIR: ${{ env.PUBLICATION_AZURE_CONFIG_DIR }}
         with:
-          client-id: ${{ secrets.AZURE_PUBLICATION_CLIENT_ID }}
+          client-id: ${{ secrets.AZURE_PUBLICATION_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
@@ -952,7 +1119,7 @@ jobs:
         env:
           AZURE_CONFIG_DIR: ${{ env.AZURE_CONFIG_DIR }}
         with:
-          client-id: ${{ secrets.AZURE_CAPTURE_CLIENT_ID }}
+          client-id: ${{ secrets.AZURE_CAPTURE_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
@@ -1024,7 +1191,7 @@ jobs:
         env:
           AZURE_CONFIG_DIR: ${{ env.PUBLICATION_AZURE_CONFIG_DIR }}
         with:
-          client-id: ${{ secrets.AZURE_PUBLICATION_CLIENT_ID }}
+          client-id: ${{ secrets.AZURE_PUBLICATION_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
@@ -1034,7 +1201,7 @@ jobs:
         env:
           AZURE_CONFIG_DIR: ${{ env.AZURE_CONFIG_DIR }}
         with:
-          client-id: ${{ secrets.AZURE_CAPTURE_CLIENT_ID }}
+          client-id: ${{ secrets.AZURE_CAPTURE_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
@@ -1095,7 +1262,7 @@ jobs:
         env:
           AZURE_CONFIG_DIR: ${{ env.AZURE_CONFIG_DIR }}
         with:
-          client-id: ${{ secrets.AZURE_CAPTURE_CLIENT_ID }}
+          client-id: ${{ secrets.AZURE_CAPTURE_CLIENT_ID || secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
@@ -1122,6 +1289,18 @@ jobs:
               exit 1
             fi
             scripts/ubuntu2404_confidential_capture.sh cleanup
+          fi
+          if [[ "${VALIDATION_ONLY:-false}" == true &&
+              -f "$CLEANUP_LOGIN_MARKER" &&
+              ! -L "$CLEANUP_LOGIN_MARKER" ]]; then
+            expected_val_target="miz-u2404-cvm-target-val-${ORIGIN_RUN_ID}-${ORIGIN_RUN_ATTEMPT}"
+            if [[ "$TARGET_RESOURCE_GROUP" == "$expected_val_target" ]] &&
+                [[ "$(az group exists --name "$TARGET_RESOURCE_GROUP" --output tsv)" == true ]]; then
+              az group delete --name "$TARGET_RESOURCE_GROUP" --yes --output none
+            fi
+            if [[ "$(az group exists --name "$SCRATCH_RESOURCE_GROUP" --output tsv)" == true ]]; then
+              az group delete --name "$SCRATCH_RESOURCE_GROUP" --yes --output none
+            fi
           fi
 
       - name: Record core result upload and cleanup outcomes
@@ -1196,12 +1375,14 @@ jobs:
       }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    environment: ubuntu2404-confidential-capture
+    environment: ubuntu2604-release
     permissions:
+      actions: read
       contents: read
       attestations: read
     env:
       CAPTURE_RELEASE_WRITER_POLICY: ${{ vars.CAPTURE_RELEASE_WRITER_POLICY }}
+      VALIDATION_ONLY: ${{ inputs.validation_only }}
       WORKFLOW_COMMIT: ${{ needs.prepare.outputs.workflow_commit }}
       TOOL_COMMIT: ${{ needs.prepare.outputs.tool_commit }}
       SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
@@ -1223,13 +1404,14 @@ jobs:
       VALIDATION_DIR: ${{ github.workspace }}/.capture/publication/validation
       RELEASE_TOOL: ${{ github.workspace }}/zig-out/bin/ubuntu2404_confidential_release
       TARGET_LOCATION: ${{ vars.AZURE_LOCATION }}
-      TARGET_RESOURCE_GROUP: ${{ vars.TARGET_RESOURCE_GROUP }}
-      TARGET_GALLERY: ${{ vars.TARGET_GALLERY }}
-      TARGET_IMAGE_DEFINITION: ${{ vars.TARGET_IMAGE_DEFINITION }}
+      TARGET_RESOURCE_GROUP: ${{ vars.TARGET_RESOURCE_GROUP || (inputs.validation_only && format('miz-u2404-cvm-target-val-{0}-{1}', needs.capture.outputs.origin_run_id, needs.capture.outputs.origin_run_attempt) || '') }}
+      TARGET_GALLERY: ${{ vars.TARGET_GALLERY || (inputs.validation_only && 'release' || '') }}
+      TARGET_IMAGE_DEFINITION: ${{ vars.TARGET_IMAGE_DEFINITION || (inputs.validation_only && 'ubuntu2404-confidential' || '') }}
       AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
     steps:
       - name: Mint protected provenance policy token
         id: github_policy_token
+        if: inputs.validation_only != true
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
           app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
@@ -1242,6 +1424,7 @@ jobs:
 
       - name: Mint isolated provenance publication token
         id: github_publication_token
+        if: inputs.validation_only != true
         uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
           app-id: ${{ secrets.RELEASE_GITHUB_APP_ID }}
@@ -1263,7 +1446,7 @@ jobs:
           name: ${{ env.RESULT_ARTIFACT_NAME }}
           run-id: ${{ env.RESULT_ARTIFACT_RUN_ID }}
           repository: ${{ github.repository }}
-          github-token: ${{ steps.github_policy_token.outputs.token }}
+          github-token: ${{ steps.github_policy_token.outputs.token || github.token }}
           path: ${{ env.RESULT_DIR }}
 
       - name: Install Zig via ghr
@@ -1294,6 +1477,11 @@ jobs:
           test "$GITHUB_SHA" = "$WORKFLOW_COMMIT"
           [[ "$TOOL_COMMIT" =~ ^[0-9a-f]{40}$ ]]
           [[ "$EXPECTED_RESULT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          if [[ "${VALIDATION_ONLY:-false}" == true ]]; then
+            TARGET_RESOURCE_GROUP=${TARGET_RESOURCE_GROUP:-miz-u2404-cvm-target-val-${ORIGIN_RUN_ID}-${ORIGIN_RUN_ATTEMPT}}
+            TARGET_GALLERY=${TARGET_GALLERY:-release}
+            TARGET_IMAGE_DEFINITION=${TARGET_IMAGE_DEFINITION:-ubuntu2404-confidential}
+          fi
           result="$RESULT_DIR/capture-result.json"
           test "$(find "$RESULT_DIR" -maxdepth 1 -type f | wc -l)" -eq 1
           test -f "$result"
@@ -1318,6 +1506,7 @@ jobs:
           chmod 0600 "$STAGING_DIR/$PROVENANCE_ASSET_NAME"
 
       - name: Create validate and publish an exact one-asset release
+        if: inputs.validation_only != true
         env:
           POLICY_GH_TOKEN: ${{ steps.github_policy_token.outputs.token }}
           PUBLICATION_GH_TOKEN: ${{ steps.github_publication_token.outputs.token }}
