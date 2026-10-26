@@ -126,6 +126,10 @@ azure_confidential_vm_captured_vm_create_args() {
     --ssh-key-values "$public_key"
     --enable-agent true
     --enable-auto-update false
+    --security-type ConfidentialVM
+    --os-disk-security-encryption-type VMGuestStateOnly
+    --enable-secure-boot true
+    --enable-vtpm true
   )
   if [[ -n "$nic_id" || -n "$os_disk_name" ]]; then
     [[ -n "$nic_id" && -n "$os_disk_name" ]] || return 1

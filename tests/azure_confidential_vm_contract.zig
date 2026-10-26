@@ -188,16 +188,23 @@ test "builders encode every independent Confidential VM resource contract" {
         examples,
         "source \"$script_dir/azure_trusted_launch_lib.sh\"",
     );
-    const inherited_create = try section(
+    const captured_create = try section(
         library,
         "azure_confidential_vm_captured_vm_create_args() {",
         "azure_confidential_vm_vm_resource_args() {",
     );
-    try expectContains(inherited_create, "--image \"$image_version_id\"");
-    try expectAbsent(inherited_create, "--security-type");
-    try expectAbsent(inherited_create, "--os-disk-security-encryption-type");
-    try expectAbsent(inherited_create, "--enable-secure-boot");
-    try expectAbsent(inherited_create, "--enable-vtpm");
+    try expectContains(captured_create, "--image \"$image_version_id\"");
+    try expectContains(
+        captured_create,
+        "--security-type " ++ confidential.vm_security_type,
+    );
+    try expectContains(
+        captured_create,
+        "--os-disk-security-encryption-type " ++
+            confidential.os_disk_security_encryption_type,
+    );
+    try expectContains(captured_create, "--enable-secure-boot true");
+    try expectContains(captured_create, "--enable-vtpm true");
     try expectAbsent(library, "If-None-Match");
     try expectAbsent(
         library,

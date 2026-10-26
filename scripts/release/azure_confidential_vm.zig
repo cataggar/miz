@@ -694,9 +694,8 @@ pub fn validateCaptureVm(
 }
 
 /// Validate a VM created from the completed `ConfidentialVM` image version.
-/// The create request must not override inherited security settings; this GET
-/// contract proves that Azure preserved ConfidentialVM, Secure Boot, vTPM, and
-/// VMGuestStateOnly on the resulting managed OS disk.
+/// This GET contract proves that Azure preserved ConfidentialVM, Secure Boot,
+/// vTPM, and VMGuestStateOnly on the resulting managed OS disk.
 pub fn validateCapturedVm(
     vm: *const ObjectMap,
     expected: CaptureContract,
