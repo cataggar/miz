@@ -500,6 +500,71 @@ fn exactLocation(document: *const ObjectMap, expected: []const u8) bool {
     return azure_compute.stringIsIgnoreCase(document.get("location"), expected);
 }
 
+fn regionMatches(value: ?Value, expected_location: []const u8) bool {
+    const actual = azure_compute.stringOf(value) orelse return false;
+    var actual_index: usize = 0;
+    var expected_index: usize = 0;
+    var matched_any = false;
+    while (true) {
+        while (actual_index < actual.len and actual[actual_index] == ' ') : (actual_index += 1) {}
+        while (expected_index < expected_location.len and expected_location[expected_index] == ' ') : (expected_index += 1) {}
+        if (actual_index == actual.len or expected_index == expected_location.len) {
+            return matched_any and
+                actual_index == actual.len and
+                expected_index == expected_location.len;
+        }
+        if (std.ascii.toLower(actual[actual_index]) !=
+            std.ascii.toLower(expected_location[expected_index]))
+        {
+            return false;
+        }
+        matched_any = true;
+        actual_index += 1;
+        expected_index += 1;
+    }
+}
+
+fn allowedResponseFields(
+    map: ObjectMap,
+    required_fields: []const []const u8,
+    optional_null_fields: []const []const u8,
+    optional_empty_array_fields: []const []const u8,
+) bool {
+    for (required_fields) |field| {
+        if (!map.contains(field)) return false;
+    }
+    var iterator = map.iterator();
+    while (iterator.next()) |entry| {
+        const key = entry.key_ptr.*;
+        var matched = false;
+        for (required_fields) |field| {
+            if (std.mem.eql(u8, key, field)) {
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+        for (optional_null_fields) |field| {
+            if (std.mem.eql(u8, key, field) and entry.value_ptr.* == .null) {
+                matched = true;
+                break;
+            }
+        }
+        if (matched) continue;
+        for (optional_empty_array_fields) |field| {
+            if (std.mem.eql(u8, key, field) and
+                (entry.value_ptr.* == .null or
+                    (entry.value_ptr.* == .array and entry.value_ptr.array.items.len == 0)))
+            {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) return false;
+    }
+    return true;
+}
+
 fn hasConfiguredReference(document: *const ObjectMap, field: []const u8) bool {
     const value = document.get(field) orelse return false;
     return value != .null;
@@ -898,7 +963,11 @@ fn validateCapturePublishingProfile(
             "Azure ConfidentialVM gallery target region is invalid",
             .{},
         );
-    if (!azure_compute.stringIsIgnoreCase(target.get("name"), location) or
+    const target_region_matches = if (strict_request)
+        azure_compute.stringIsIgnoreCase(target.get("name"), location)
+    else
+        regionMatches(target.get("name"), location);
+    if (!target_region_matches or
         azure_compute.integerOf(target.get("regionalReplicaCount")) != 1 or
         !azure_compute.stringIs(
             target.get("storageAccountType"),
@@ -942,12 +1011,33 @@ fn validateCapturePublishingProfile(
             "Azure ConfidentialVM gallery OS-disk security profile is absent",
             .{},
         );
-    if (!azure_compute.hasExactFields(encryption, &.{"osDiskImage"}) or
-        !azure_compute.hasExactFields(os_disk, &.{"securityProfile"}) or
-        !azure_compute.hasExactFields(
-            security,
-            &.{"confidentialVMEncryptionType"},
-        ) or
+    const valid_encryption_fields = if (strict_request)
+        azure_compute.hasExactFields(encryption, &.{"osDiskImage"}) and
+            azure_compute.hasExactFields(os_disk, &.{"securityProfile"}) and
+            azure_compute.hasExactFields(
+                security,
+                &.{"confidentialVMEncryptionType"},
+            )
+    else
+        allowedResponseFields(
+            encryption,
+            &.{"osDiskImage"},
+            &.{},
+            &.{"dataDiskImages"},
+        ) and
+            allowedResponseFields(
+                os_disk,
+                &.{"securityProfile"},
+                &.{"diskEncryptionSetId"},
+                &.{},
+            ) and
+            allowedResponseFields(
+                security,
+                &.{"confidentialVMEncryptionType"},
+                &.{"secureVMDiskEncryptionSetId"},
+                &.{},
+            );
+    if (!valid_encryption_fields or
         !azure_compute.stringIs(
             security.get("confidentialVMEncryptionType"),
             gallery_os_disk_encryption_type,
@@ -1077,7 +1167,7 @@ pub fn validateCapturedGalleryVersion(
             "Azure ConfidentialVM regional replication status is invalid",
             .{},
         );
-    if (!azure_compute.stringIsIgnoreCase(
+    if (!regionMatches(
         regional.get("region"),
         expected.location,
     ) or !azure_compute.stringIs(regional.get("state"), "Completed")) {
@@ -1535,6 +1625,20 @@ test "capture gallery request and response are exact and fail closed" {
     defer response.deinit();
     try validateCapturedGalleryVersion(
         &response.value.object,
+        capture_gallery_contract,
+        &diagnostic,
+    );
+
+    const display_name_response_text =
+        \\{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/galleries/g/images/confidential/versions/1.0.0","location":"eastus2","properties":{"provisioningState":"Succeeded","replicationStatus":{"aggregatedState":"Completed","summary":[{"region":"East US 2","state":"Completed","progress":100}]},"publishingProfile":{"replicationMode":"Full","targetRegions":[{"name":"East US 2","regionalReplicaCount":1,"storageAccountType":"Standard_LRS","encryption":{"dataDiskImages":null,"osDiskImage":{"diskEncryptionSetId":null,"securityProfile":{"confidentialVMEncryptionType":"EncryptedVMGuestStateOnlyWithPmk","secureVMDiskEncryptionSetId":null}}}}]},"storageProfile":{"osDiskImage":{"source":{"id":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/snapshots/capture-os"}}}}}
+    ;
+    var display_name_response = try parse(
+        std.testing.allocator,
+        display_name_response_text,
+    );
+    defer display_name_response.deinit();
+    try validateCapturedGalleryVersion(
+        &display_name_response.value.object,
         capture_gallery_contract,
         &diagnostic,
     );
