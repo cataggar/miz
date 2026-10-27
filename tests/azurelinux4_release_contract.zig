@@ -837,7 +837,10 @@ test "CI native smoke covers all hosts and optimization modes" {
     defer allocator.free(workflow);
     const native = try section(workflow, "  native-smoke:", "\n  vm-backend:");
 
-    try expectContains(native, "runs-on: ${{ matrix.os }}");
+    try expectContains(
+        native,
+        "runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' && matrix.os == 'ubuntu-24.04' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('[\"self-hosted\",\"Linux\",\"X64\",\"ubuntu2604\"]')) || matrix.os }}",
+    );
     try expectContains(native, "os: [ubuntu-24.04, macos-15, windows-2025]");
     try expectContains(native, "optimize: [debug, safe, fast, small]");
     try expectContains(
@@ -858,8 +861,17 @@ test "CI native smoke covers all hosts and optimization modes" {
     const protected = try section(workflow, "  zig-tests:", "\n  native-smoke:");
     try expectContains(protected, "name: build + test");
     try expectContains(protected, "run: zig fmt --check .");
+    const self_hosted_gate = "runs-on: ${{ vars.USE_SELF_HOSTED == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('[\"self-hosted\",\"Linux\",\"X64\",\"ubuntu2604\"]') || 'ubuntu-latest' }}";
     for ([_][]const u8{
+        quality,
+        protected,
         try section(workflow, "  vm-backend:", "\n  windows:"),
+        try section(workflow, "  windows:", "\n  unsafe-chroot:"),
+    }) |gated_job| {
+        try expectContains(gated_job, self_hosted_gate);
+        try expectAbsent(gated_job, "runs-on: ${{ matrix.os }}");
+    }
+    for ([_][]const u8{
         try section(workflow, "  unsafe-chroot:", "\n  vm-boot:"),
         try sectionToEnd(workflow, "  vm-boot:"),
     }) |linux_job| {
